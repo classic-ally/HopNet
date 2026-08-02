@@ -3,7 +3,7 @@ use axum::{
     Router,
     body::Body,
     extract::{DefaultBodyLimit, Request},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{HeaderValue, Method, StatusCode, header},
     middleware,
     response::Response,
     routing::{get, post},
@@ -21,6 +21,9 @@ const API_CONCURRENCY_LIMIT: usize = 128;
 /// this many idle connections, keeping a trickle available for background
 /// tasks that aren't behind the gate (settler retries, metrics, peer refresh).
 const DB_GATE_IDLE_HEADROOM: u32 = 2;
+use bytes::Bytes;
+use hopnet::db::{PrivKey, PubKey};
+use hopnet::*;
 use once_cell::sync::{Lazy, OnceCell};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -28,9 +31,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use bytes::Bytes;
-use hopnet::db::{PrivKey, PubKey};
-use hopnet::*;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -117,6 +117,31 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = keychain::update_base_url(&url, KeychainEnvironment::Production) {
                 tracing::warn!("FileProvider keychain base_url refresh failed: {:?}", e);
             }
+        }
+        // Same refresh for the photo-ingress daemon's credentials.
+        if keychain::load_photo_ingress_config().is_ok() {
+            let url = format!("http://127.0.0.1:{}", port);
+            if let Err(e) = keychain::update_photo_ingress_base_url(&url) {
+                tracing::warn!("photo-ingress keychain base_url refresh failed: {:?}", e);
+            }
+        }
+    }
+
+    // Linux arm of the same discovery problem (RFC-018 S8): hopnet-mount
+    // finds a same-user node through $XDG_RUNTIME_DIR/hopnet/endpoint.
+    // Written for fixed and ephemeral ports alike (harmless when fixed);
+    // skipped in test mode — stack tests boot nodes as the real user and
+    // must not clobber the session's live endpoint file.
+    #[cfg(target_os = "linux")]
+    if std::env::var("HOPNET_TEST_MODE").is_err()
+        && let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR")
+    {
+        let dir = std::path::Path::new(&runtime_dir).join("hopnet");
+        let write = std::fs::create_dir_all(&dir).and_then(|_| {
+            std::fs::write(dir.join("endpoint"), format!("http://127.0.0.1:{port}\n"))
+        });
+        if let Err(e) = write {
+            tracing::warn!("mount endpoint file write failed: {e}");
         }
     }
 
@@ -311,6 +336,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 epoch_join_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 runtime: tokio::runtime::Handle::current(),
+                change_tx: tokio::sync::broadcast::channel(16).0,
+                photos_host: Arc::new(photos::PhotosHost::new()),
             };
 
             // Epoch identity + restart listener (RFC-019 S6). The pool
@@ -387,7 +414,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                             };
                             app_state
                                 .session_store
-                                .blocking_write()
+                                .write()
+                                .await
                                 .insert(kc_user_id, session);
                             tracing::info!("Loaded owner session from keychain (auto-login ready)");
                             tokio::spawn(hopnet_takeout::jobs::maybe_resume_for_user(
@@ -532,6 +560,9 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // Boot attestation: converge the committed version claim as
             // soon as the node is set up and the engine is live.
             tokio::spawn(upgrade::jobs::attest_until_converged(app_state.clone()));
+            // Photo tombstone cleanup — randomized daily scan, 30-day
+            // recovery window. Every node runs independently.
+            photos_host::spawn_tombstone_cleanup_worker(app_state.clone());
 
             // Spawn consensus queue batch processor — on the dedicated queue
             // runtime (see consensus::queue::queue_rt) so consensus keeps
@@ -561,16 +592,18 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // comms spawns it on its dedicated net runtime (see
             // hopnet_comms::net_rt); each scope handler hops DB-touching work
             // to its own runtime. Mesh liveness must not depend on API load.
-            app_state.comms.start(net::scopes::build_registry(&app_state));
+            app_state
+                .comms
+                .start(net::scopes::build_registry(&app_state));
 
             // Restart path: an initialized node starts the consensus engine
             // now — AFTER the accept loop (QUIC handshakes only complete under
             // a polled accept; consensus participation must not precede it).
             // Fresh nodes spawn the engine from the setup/join flows instead.
-            if app_state.node_id.get().is_some() {
-                if let Err(e) = consensus::malachite::engine::spawn_engine(&app_state) {
-                    tracing::error!("failed to start consensus engine: {e}");
-                }
+            if app_state.node_id.get().is_some()
+                && let Err(e) = consensus::malachite::engine::spawn_engine(&app_state)
+            {
+                tracing::error!("failed to start consensus engine: {e}");
             }
 
             // Host capabilities (RFC-016): one seam bundle handed to every
@@ -641,7 +674,11 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     "/metrics/scores",
                     get(metrics::routes::get_placement_scores),
                 )
-                .nest("/takeout", hopnet_takeout::routes::router(takeout_state.clone()))
+                .nest(
+                    "/takeout",
+                    hopnet_takeout::routes::router(takeout_state.clone()),
+                )
+                .merge(photos::routes::router(app_state.clone()))
                 .nest("/admin", admin::routes::admin_routes())
                 .nest("/views", views::routes::router())
                 .route("/logout", post(auth::sign_out))
@@ -707,15 +744,49 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             let api_routes = Router::new()
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
+                .nest("/integrations", fileprovider::routes::health_router())
+                // Host-owned mount statfs (RFC-018 S8): the capacity math
+                // lives host-side (views::resilience), so this one route
+                // can't ride the drive-owned projection mount — but it
+                // wears the same device-token auth. A literal route, not a
+                // second nest at the projection's prefix: two nests at one
+                // path conflict, a static route beside a nest does not.
                 .route(
-                    "/integrations/fileprovider/health",
-                    get(fileprovider::routes::get_health),
+                    "/integrations/mount/statfs",
+                    get(fileprovider::routes::get_mount_statfs).layer(
+                        middleware::from_fn_with_state(
+                            app_state.clone(),
+                            devices::auth::device_token_auth_middleware,
+                        ),
+                    ),
                 )
                 .nest("/devices", devices::routes::router(app_state.clone()))
+                // Thin-client photos dispatch surface (photo-ingress daemon):
+                // device-token auth class, host-mounted because the handlers
+                // close over AppState (photos declares no projection mounts).
+                .nest(
+                    "/photos/client",
+                    photos::routes::device_router(app_state.clone()).layer(
+                        middleware::from_fn_with_state(
+                            app_state.clone(),
+                            devices::auth::device_token_auth_middleware,
+                        ),
+                    ),
+                )
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))
                 .route("/login", post(auth::sign_in));
+
+            // Photo-ingress enablement plumbing (owner-only, JWT): the
+            // future settings pane's backing routes. macOS GUI process only —
+            // SMAppService and the keychain are per-user-session concerns of
+            // the machine the daemon runs on.
+            #[cfg(all(target_os = "macos", feature = "gui"))]
+            let api_routes = api_routes.nest(
+                "/photo-ingress",
+                photo_ingress::routes::router(app_state.clone()),
+            );
 
             // Projection mounts (RFC-016 Stage 4). Host routes close over
             // AppState first; each projection's routers are Router<()> and
@@ -728,12 +799,9 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .flat_map(|m| m.mounts(&host_caps))
             {
                 let routed = match mount.auth {
-                    hopnet_projection::AuthClass::UserJwt => {
-                        mount.router.layer(middleware::from_fn_with_state(
-                            app_state.clone(),
-                            auth::auth_middleware,
-                        ))
-                    }
+                    hopnet_projection::AuthClass::UserJwt => mount.router.layer(
+                        middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware),
+                    ),
                     hopnet_projection::AuthClass::DeviceToken => {
                         mount.router.layer(middleware::from_fn_with_state(
                             app_state.clone(),
@@ -811,7 +879,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                         use tower_http::classify::ServerErrorsFailureClass as C;
                         match class {
                             C::StatusCode(StatusCode::SERVICE_UNAVAILABLE) => {
-                                tracing::debug!(latency_ms = latency.as_millis() as u64, "request shed (503)");
+                                tracing::debug!(
+                                    latency_ms = latency.as_millis() as u64,
+                                    "request shed (503)"
+                                );
                             }
                             other => {
                                 tracing::error!(
@@ -826,9 +897,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
             // Root router: /api for all endpoints, SPA fallback serves
             // index.html for any remaining path so client-side routing works.
-            let app = Router::new()
-                .nest("/api", api_routes)
-                .fallback(serve_spa);
+            let app = Router::new().nest("/api", api_routes).fallback(serve_spa);
 
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()
@@ -886,7 +955,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(not(feature = "gui"))]
     {
-        run_server(&format!("0.0.0.0:{}", HEADLESS_BACKEND_PORT)).await
+        // HOPNET_HTTP_PORT lets a dev copy run alongside a real node on the
+        // same machine (pair with XDG_DATA_HOME for storage isolation).
+        let port = std::env::var("HOPNET_HTTP_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(HEADLESS_BACKEND_PORT);
+        run_server(&format!("0.0.0.0:{}", port)).await
     }
 }
 

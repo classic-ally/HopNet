@@ -17,8 +17,7 @@ pub mod dbstats;
 pub mod host;
 
 pub use host::{
-    BoxFuture, SessionAccess, SessionError, TxGateway, TxSigner, TxSpec, TxSubmitError,
-    UserSession,
+    BoxFuture, SessionAccess, SessionError, TxGateway, TxSigner, TxSpec, TxSubmitError, UserSession,
 };
 
 use serde::{Deserialize, Serialize};
@@ -52,9 +51,7 @@ impl rusqlite::types::ToSql for CustomDateTime {
 }
 
 impl rusqlite::types::FromSql for CustomDateTime {
-    fn column_result(
-        value: rusqlite::types::ValueRef<'_>,
-    ) -> rusqlite::types::FromSqlResult<Self> {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         use chrono::DateTime;
         use rusqlite::types::{FromSqlError, ValueRef};
         match value {
@@ -116,12 +113,22 @@ pub trait ChangeNotifier: Send + Sync {
     /// A drive mutation was EXECUTED (not just validated) — OS integrations
     /// should refresh their views.
     fn files_changed(&self);
+
+    /// Subscribe to change pokes (RFC-018 S4). Every `files_changed` fires
+    /// one content-free poke; lagged receivers coalesce (a poke is
+    /// idempotent — subscribers follow with their own delta query). The
+    /// macOS FileProvider signal is conceptually just another subscriber.
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<()>;
 }
 
 /// No-op notifier for tests and non-interactive contexts.
 pub struct NullNotifier;
 impl ChangeNotifier for NullNotifier {
     fn files_changed(&self) {}
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<()> {
+        // Dead receiver: sender drops immediately, subscribers see Closed.
+        tokio::sync::broadcast::channel(1).1
+    }
 }
 
 /// Post-apply background-work scheduling. Handlers may only ENQUEUE named
@@ -146,6 +153,15 @@ pub struct HandlerCtx<'a> {
     pub fragments_dir: &'a str,
     /// This node's consensus id, when initialized.
     pub node_id: Option<i32>,
+    /// The block height this transaction is being processed under: the
+    /// DECIDING height during apply, the candidate height during
+    /// validation, 0 in non-block contexts (mempool preflight). Writers
+    /// stamping modification heights MUST use this, not
+    /// `last_decided_height` — the meta row lags the block being applied,
+    /// and rows stamped with a lagging height fall behind anchors already
+    /// handed to /changes clients (silent divergence; caught by the
+    /// RFC-018 S4 stack test).
+    pub height: u64,
     /// Post-apply change signal (host impl owns test_mode/platform gating).
     pub notifier: &'a dyn ChangeNotifier,
     /// Named background-work scheduler (host impl owns spawning/routing).
@@ -326,6 +342,17 @@ pub trait Projection: Send + Sync {
     /// registration order (= FK direction) after the substrate's.
     fn install_schema(&self, conn: &rusqlite::Connection) -> Result<(), rusqlite::Error>;
 
+    /// The tables this projection owns and that are consensus-tracked
+    /// (mutations replicated across all nodes). The host's divergence
+    /// checker hashes each in addition to the host-owned
+    /// `CONSENSUS_TABLES` list. Single source of truth: the projection's
+    /// `db::TABLES` const feeds both `install_schema`'s uninstall test
+    /// and this method, so the schema and the divergence coverage cannot
+    /// drift. Default: empty (a projection with no consensus tables).
+    fn tables(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// The projection's takeout translator, if it has one. Default: none.
     fn exporter(
         &self,
@@ -363,11 +390,7 @@ pub trait Projection: Send + Sync {
     /// decode: runs on the consensus shell thread post-decide — no DB, no
     /// IO, no awaits. Decode failures must yield an empty vec, never
     /// panic. Default: no blobs.
-    fn committed_blob_ids(
-        &self,
-        _function: &str,
-        _payload: &[u8],
-    ) -> Vec<hopnet_storage::BlobId> {
+    fn committed_blob_ids(&self, _function: &str, _payload: &[u8]) -> Vec<hopnet_storage::BlobId> {
         Vec::new()
     }
 

@@ -1,0 +1,55 @@
+[package]
+name = "ingress-publisher"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://git.bentley.sh/HopNet/HopNet"
+description = "HopNet publisher for the Apple Photos ingress daemon: RFC-011 mapping, HTTP PhotoDispatch, and the confirm-then-retry publish flow"
+
+[dependencies]
+ingress-core = { path = "../ingress-core" }
+# Cross-workspace path deps: photos-core's tree carries no iroh/sha2/sqlx
+# (verified via cargo tree), so it composes with this workspace's sqlx 0.9
+# graph — libsqlite3-sys unifies at 0.36 (rusqlite 0.38 ∩ sqlx-sqlite 0.9).
+hopnet-photos-core = { path = "../../hopnet-photos-core" }
+hopnet-common = { path = "../../common" }
+hopnet-storage = { path = "../../hopnet-storage" }
+
+async-trait = "0.1"
+chacha20poly1305 = { version = "0.10.1", features = ["stream"] }
+chrono = { version = "0.4.41", features = ["serde"] }
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.45", features = ["fs", "io-util", "rt", "rt-multi-thread", "macros"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+clap = { version = "4.5", features = ["derive"], optional = true }
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+], optional = true }
+
+[features]
+# The seed/publish/reset e2e driver (orchestrator test + dev tooling).
+e2e-bin = ["dep:clap", "dep:sqlx", "ingress-core/fixtures"]
+
+[[bin]]
+name = "ingress-publish-e2e"
+path = "src/bin/ingress-publish-e2e.rs"
+required-features = ["e2e-bin"]
+
+[dev-dependencies]
+axum = "0.8"
+tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "net"] }
+tempfile = "3"
+# Wire assertions: the stub node decodes photo_add payloads to verify the
+# fingerprint travels. Envelopes only — no projection feature.
+hopnet-photos = { path = "../../hopnet-photos", default-features = false }
+bincode = { version = "2.0.1", features = ["serde"] }

@@ -861,7 +861,7 @@ pub(crate) mod tests {
     }
 
     fn pubkey_blob(k: &SigningKey) -> Vec<u8> {
-        bincode::serde::encode_to_vec(&k.verifying_key(), bincode::config::standard()).unwrap()
+        bincode::serde::encode_to_vec(k.verifying_key(), bincode::config::standard()).unwrap()
     }
 
     /// A file-backed sealed epoch-1 database: two seated validators with

@@ -2,21 +2,19 @@
 
 ## Summary
 
-A native ingress daemon that reconciles an Apple Photos library — including iCloud Photos and iCloud Shared Photo Library content — into a content-addressed blob store on user-owned storage. The first cut targets macOS, but the design is structured around primitives that map cleanly to iOS (`PhotoKit`, `PHCloudIdentifier`, `PHAssetResource`) so a future delta-upload daemon on iOS can share the same state model and resume the same dedup contract.
+A native ingress daemon that reconciles an Apple Photos library — including iCloud Photos and iCloud Shared Photo Library content — into HopNet. The first cut targets macOS, but the design is structured around primitives that map cleanly to iOS (`PhotoKit`, `PHCloudIdentifier`, `PHAssetResource`) so a future delta-upload daemon on iOS can share the same state model and resume the same dedup contract.
 
-State (asset-to-blob mappings, ingest pipeline status, library partitioning) lives in a local SQLite database on the ingesting device. Materialized photo bytes are written to a configurable storage root — typically a network share backed by a user-controlled server — partitioned by library membership (personal vs. shared). The PhotoKit-derived metadata needed to rebuild ingest state and populate the future consensus metadata model is preserved in per-photo sidecar JSON, sized for forward portability into the full HopNet photos system described in `photos.md`.
+State (asset identity, ingest pipeline status, library partitioning, publish ledger) lives in a local SQLite database on the ingesting device. Materialized photo bytes stage briefly in a **transient spool** under the daemon's data directory, are published into HopNet as encrypted data blocks through consensus, and are deleted from the spool once the publish is consensus-decided. **HopNet is the archive of record**: fragments, distribution, per-recipient encryption, and the gallery all live mesh-side (`photos.md`).
 
-This spec is **interim**. It exists because the full HopNet photos system is a multi-quarter effort, and a reliable off-iCloud copy of photo libraries are needed in advance of that work. The state and on-disk structures defined here are designed to migrate cleanly into the consensus model when it lands; nothing captured by this daemon should need to be re-derived during migration.
+Historical note: this spec originally defined a content-addressed archive on user-owned storage (a NAS share) as the destination — a deliberate stopgap to get data out of iCloud before HopNet could hold it. That archive layer (per-library blob trees on a storage root, sidecar JSON files, remote replication, snapshot/recovery machinery, the NAS viewer) has been removed; the daemon is now purely the PhotoKit→HopNet on-ramp.
 
 ## Motivation
 
 ### Why ingress, why now
 
 - **Threat model**: Apple Advanced Data Protection is under sustained legislative pressure in multiple jurisdictions. iCloud is not a reliable long-term home for an encrypted-only-to-Apple photo library, and any forced-disclosure regime that compels Apple to disable ADP would silently demote that library to provider-readable.
-- **Capacity**: Mac internal storage often cannot hold the full iCloud Photos library. Materialization must target network-attached storage that the user controls.
-- **Forward portability**: When the full RFC-011 photos module lands, the daemon's output must be ingestible as-is — no metadata recomputation, no re-hashing, no manual re-tagging. Asset identity, grouping, resource enumeration, and capture metadata must all survive the migration.
-- **Dedup correctness across runs and devices**: Re-running the daemon on the same device, restarting after a crash, or running a future iOS daemon against the same iCloud library must not produce duplicate blobs or duplicate logical photo records.
-- **No vendor lock-in on the staging format**: Sidecar JSON + content-addressed blobs is a format that survives the absence of the daemon. If the project is abandoned, the user still has a structured, queryable archive.
+- **Capacity**: Mac internal storage often cannot hold the full iCloud Photos library. The spool must stay bounded — bytes reside locally only between fetch and decided publish.
+- **Dedup correctness across runs and devices**: Re-running the daemon on the same device, restarting after a crash, or running a future iOS daemon against the same iCloud library must not produce duplicate uploads or duplicate logical photo records (consensus `cloud_fingerprint` + ingress responsibility enforce this mesh-side; the local identity model enforces it daemon-side).
 
 ### Why a separate daemon, not just a script
 
@@ -27,24 +25,23 @@ PhotoKit's `PHPhotoLibraryChangeObserver` and `PHAssetResourceManager` model ass
 This document defines:
 
 - Local SQLite schema on the ingesting device
-- On-disk blob and sidecar layout on the storage root
+- The transient spool layout and its eviction contract
 - Library partitioning and routing rules
 - Asset discovery, resource enumeration, dedup, and write pipeline
-- Failure handling: mount loss, iCloud download failures, partial writes, daemon crashes
-- Recovery model: rebuilding state from on-disk blobs and sidecars if the local SQLite is lost
+- The HopNet publish queue and spool eviction
+- Failure handling: iCloud download failures, partial writes, daemon crashes, unreachable node
+- Recovery model: a lost `state.db` is rebuilt by re-scanning PhotoKit; mesh-held photos re-associate via adoption (consensus `cloud_fingerprint`), so nothing re-uploads
 
 This document explicitly does not define:
 
-- The encryption model for blobs (deferred to FileVault / ZFS native encryption at the MVP stage; per-recipient encryption is in `photos.md`)
-- Multi-user sharing of materialized data (also `photos.md`)
-- Replication of blobs across multiple storage roots (out of scope; user provides storage redundancy via ZFS, RAID, off-site backup, etc.)
+- The mesh-side photos model — encryption, fragments, gallery, sharing (`photos.md`)
 - iOS implementation details (mentioned only where they constrain Mac design choices)
 
 ## Architecture Overview
 
 ### Components
 
-The daemon is a single long-lived process on macOS, structured as a Swift PhotoKit shim layered over a Rust core. The split is dictated by platform constraints: PhotoKit can only be driven from Swift (or Objective-C), but everything downstream of asset enumeration — hashing, dedup, sidecar serialization, SQLite, storage I/O — is platform-agnostic.
+The daemon is a single long-lived process on macOS, structured as a Swift PhotoKit shim layered over a Rust core. The split is dictated by platform constraints: PhotoKit can only be driven from Swift (or Objective-C), but everything downstream of asset enumeration — hashing, dedup, SQLite, spool I/O, publishing — is platform-agnostic.
 
 Roughly:
 
@@ -62,43 +59,31 @@ Roughly:
 │   │   Rust core (ingress-core crate)                             │   │
 │   │     - BLAKE3 hashing                                         │   │
 │   │     - Dedup decision (cloud_id → content_hash → new)       │   │
-│   │     - SQLite state store                                     │   │
-│   │     - Sidecar JSON serialization                             │   │
-│   │     - Atomic blob writer (over POSIX, including SMB mount)   │   │
+│   │     - SQLite state store (incl. publish ledger + capsule)    │   │
+│   │     - Atomic spool writer                                    │   │
 │   │     - Pipeline scheduler + retry/backoff                     │   │
+│   │     - HopNet publish queue + spool eviction                  │   │
 │   └──────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 │   ┌─────────────────────────────────┐                                │
-│   │ ingress-cli (status / re-scan)  │  reads state.db via Rust core  │
+│   │ ingress-cli (status / config)   │  reads state.db via Rust core  │
 │   └─────────────────────────────────┘                                │
 │                                                                      │
 │   Local-only filesystem state:                                       │
 │     ~/.local/share/hopnet-photo-ingress/                             │
 │       state.db                  (authoritative ingest state)         │
-│       sidecars/<library>/...    (hot-path metadata, queried often)   │
-│       run/                      (pid, locks)                         │
+│       spool/blobs/<aa>/<bb>/<full-blake3>.<ext>   (transient bytes)  │
+│       spool/blobs/.partial/     (in-flight write temps)              │
+│       drain.lock                (exclusive run lock)                 │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
                                   │
-                                  │  SMB (or any POSIX mount)
+                                  │  HTTP (device-token auth)
                                   ▼
-┌─────────────────────── user-controlled storage ──────────────────────┐
-│                                                                      │
-│   Per-library roots:                                                 │
-│     /<root>/<library>/blobs/<aa>/<bb>/<full-blake3>.<ext>            │
-│     /<root>/<library>/blobs/.partial/    (in-flight write temps)     │
-│     /<root>/<library>/sidecars/<YYYY>/<MM>/<photo_id>.json (backup)  │
-│     /<root>/<library>/state-snapshots/state.db.<timestamp>.sqlite3   │
-│                                                                      │
-│   <ext> is the canonical extension for the resource's UTI            │
-│   (e.g. .heic, .jpg, .mov, .dng). Bytes are stored unmodified;       │
-│   files remain directly openable in Finder/Preview.                  │
-│                                                                      │
-│   Server-side encryption: out of scope for this daemon.              │
-│   Expected to be provided by FileVault on the Mac side and           │
-│   filesystem-level encryption (e.g. ZFS native encryption) on        │
-│   the storage side.                                                  │
-│                                                                      │
+┌──────────────────────────── HopNet node ─────────────────────────────┐
+│   /api/photos/client/* — resolve, data-block upload, transaction     │
+│   relay, committed probe. photo_add commits through consensus;       │
+│   fragments distribute mesh-wide; the gallery serves bytes back.     │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -108,27 +93,29 @@ Roughly:
 2. The Swift layer iterates `PHAsset` records, extracting per-asset identifiers and library scope, and hands each off to the Rust core as a structured `AssetDescriptor`.
 3. The Rust core consults `state.db` for prior ingest state, deciding whether the asset is new, already complete, partially complete, or in need of metadata-only update.
 4. For new or incomplete assets, the Rust core requests resource bytes from the Swift layer one resource at a time (`original`, `paired_video`, `raw_alternate`, etc.). The Swift layer drives `PHAssetResourceManager` with `isNetworkAccessAllowed=true` to pull originals from iCloud when needed.
-5. Bytes stream through a BLAKE3 hasher and into a temp file on the storage root, then are atomically renamed to their final content-addressed path. If the hash matches a blob already present for the target library, the temp file is discarded and the existing blob is reused.
-6. After all resources for a photo are written, the Rust core writes the sidecar JSON locally, replicates it to the storage root (best-effort, asynchronous), and commits the final `photos` + `photo_resources` rows in `state.db` in a single transaction.
-7. The pipeline advances; the daemon continues observing for further changes.
+5. Bytes stream through a BLAKE3 hasher and into a temp file in the spool, then are atomically renamed to their final content-addressed path. If the hash matches a live spool entry, the temp file is discarded and the existing bytes are reused.
+6. After all resources for a photo are written, the Rust core commits the final `photos` + `photo_resources` rows and the publish-metadata capsule (`descriptor_json`) in `state.db`.
+7. The publish tick claims completed photos, streams their spool bytes into the node as encrypted data blocks, and submits `photo_add` (decided by consensus before the submit returns).
+8. Eviction deletes spool bytes whose every referencing photo is decided; the spool stays bounded to in-flight work.
 
 ### Process model
 
-- Single LaunchAgent, label `app.hopnet.photo-ingress`, autostarted on user login.
-- One in-process tokio runtime hosting: PhotoKit observer callback, resource fetch workers, hash workers, blob writers, sidecar writers, and the SQLite executor.
-- Bounded concurrency: a configurable number of parallel resource fetches and a separate configurable number of parallel blob writes. Defaults are conservative (e.g. 4 fetches, 4 writes) and tuned per network.
+- Single LaunchAgent, label `com.hopnet.desktop.photo-ingress`, bundled inside HopNet.app (`Contents/MacOS/photo-ingress` + `Contents/Library/LaunchAgents/<label>.plist`) and lifecycle-managed via `SMAppService.agent(plistName:)` — registration/unregistration is driven by the app's owner-only `/api/photo-ingress/{enable,disable,status}` routes (the future settings pane's backing API). Login autostart and crash restart (`KeepAlive`) belong to launchd.
+- Provisioning travels through the keychain service `com.hopnet.desktop.photo-ingress` and is the device token alone: the enable route mints it (`api_key` + `base_url`); the daemon needs no other configuration — the spool is data-dir-derived and the personal library self-creates at startup via the ensure-only `ensure_personal_library` FFI (a deliberate narrow reversal of Phase 6's "libconfig is CLI-only" — the GUI app cannot link ingress-core (the crates/ workspace split), so the daemon is the only process that can create it; bind/rename/set-retention stay CLI-only). Token minting is enablement-gated: login only self-heals an existing provision, and setup mints nothing.
+- One in-process tokio runtime hosting: PhotoKit observer callback, resource fetch workers, hash workers, spool writers, and the SQLite executor.
+- Bounded concurrency: a configurable number of parallel resource fetches and a separate configurable number of parallel spool writes. Defaults are conservative (e.g. 4 fetches, 4 writes).
 - All long-running operations are interruptible via cooperative cancellation; the daemon is expected to be SIGTERM-clean on user logout or system shutdown.
+- **Lazy coupling to the HopNet node**: the daemon's lifecycle is its own — a periodic publish tick pushes completed photos into a node over HTTP (see §HopNet publish queue), and when the node is unreachable the tick PARKS (no retry budget consumed, observation and ingest continue untouched) rather than tearing anything down. Reachability edges are logged once (`node_unreachable` / `node_regained`), not per tick. The GUI node binds an ephemeral loopback port per launch, so after an unreachable pass the daemon re-reads the keychain credentials and rebuilds its HTTP client if they changed (`RefreshingPublisher`) — an app relaunch heals on the next tick without a daemon restart, and the steady state does zero keychain traffic.
 
 ### Why this shape
 
-- **Swift shim, Rust core**: minimum platform-specific surface area. The Rust core is the artifact that survives the move to iOS, the move to a future Linux ingress (e.g. reading from an exported folder), and the eventual fold-in to HopNet's `photos-core` crate described in `photos.md`.
-- **SQLite local, blobs remote**: SQLite over a network mount is hazardous (lock semantics differ, fsync semantics differ across SMB/NFS implementations) and is treated as a hard rule. Blobs are large, content-addressed, write-once, and tolerate the higher per-operation latency of a network mount.
-- **Per-library on-disk partitioning**: the storage root expects per-library subtrees so that filesystem-level ACLs on the storage side can independently constrain access to personal vs shared content. Cross-library blob sharing via symlink or hardlink is rejected to keep the access-control story simple and auditable.
-- **Sidecars duplicated (local hot path + remote backup)**: small JSON, queried frequently during gallery operations and rescans, but also needed in disaster recovery from blob-only state. Both copies are cheap; the storage cost is dominated by blob bytes.
-
+- **Swift shim, Rust core**: minimum platform-specific surface area. The Rust core is the artifact that survives the move to iOS and the eventual fold-in to HopNet's photos crates.
+- **SQLite local, spool local**: everything the daemon touches lives on the local disk; the mesh is reached only over HTTP. (The archive era's SMB-mount hazards — fsync semantics, mount loss — are gone with the mount.)
+- **Library partitioning in the ledger, not on disk**: the spool is a single hash-addressed tree; personal-vs-shared partitioning lives in the `blobs` ledger keys and the photo rows, where the publish path (and the mesh's access model) actually consume it.
+- **Spool, not archive**: local bytes exist only to decouple the expensive PhotoKit/iCloud fetch from the publish (exact-length upload, cheap retry, crash resume). Once consensus decides the publish, the local copy adds no fault tolerance — the node often shares the disk — and eviction removes it.
 ## Asset Identity Model
 
-Identity is the load-bearing concept for ingress. Everything downstream — dedup, change observation, cross-device coordination, sidecar correctness — assumes a clear answer to "is this the same photo as one I've seen before?" The model uses three layered identifiers, each with a distinct purpose.
+Identity is the load-bearing concept for ingress. Everything downstream — dedup, change observation, cross-device coordination, publish idempotency — assumes a clear answer to "is this the same photo as one I've seen before?" The model uses three layered identifiers, each with a distinct purpose.
 
 ### The three identifiers
 
@@ -136,7 +123,7 @@ Identity is the load-bearing concept for ingress. Everything downstream — dedu
 |---|---|---|---|---|
 | `cloud_id` | `PHCloudIdentifier` from PhotoKit | iCloud account | Stable across devices and reinstalls for as long as the asset exists in iCloud Photos | Primary dedup key. The lookup answer to "have I seen this asset on any device tied to this iCloud account?" |
 | `content_hash` | BLAKE3 of resource bytes | Universal | Stable forever as a property of the bytes | Secondary dedup key for local-only assets, re-imports, and assets that lost their `cloud_id` association. Also blob storage address. |
-| `photo_id` | UUIDv7 minted by the daemon at first discovery | Daemon-local (until migration) | Stable for the daemon's logical record, independent of any external identifier | Internal primary key. The identifier the daemon, sidecars, and `state.db` all agree on. Will become the consensus `photos.id` if migrated to RFC-011 without remapping. |
+| `photo_id` | UUIDv7 minted by the daemon at first discovery | Daemon-local (until publish) | Stable for the daemon's logical record, independent of any external identifier | Internal primary key. The identifier the daemon and `state.db` agree on. **Becomes the consensus `photos.id`** when this device publishes the photo first; when the mesh already holds it, the mesh's id is adopted into `consensus_photo_id` instead (see §HopNet publish queue). |
 
 #### Why all three
 
@@ -191,7 +178,7 @@ A `photo_id` is never reissued. Once minted for a given `(cloud_id, content_hash
 - Asset edits in Photos (new `photo_resources` row at `resource_type=edited`, same `photo_id`)
 - Re-imports producing the same content_hash (linked into existing `photo_id` per rule 2a)
 - Library scope changes — though see the note on Library Partitioning regarding shared-library boundary crossings, which are treated as distinct photos
-- The daemon being uninstalled and reinstalled, provided `state.db` survives (recovery from blob-only state may mint fresh `photo_id`s; see the Recovery section)
+- The daemon being uninstalled and reinstalled, provided `state.db` survives (a lost `state.db` means a re-scan minting fresh `photo_id`s, with mesh identities re-associated via adoption; see the Recovery section)
 
 ### Cross-device convergence
 
@@ -199,9 +186,9 @@ When a future iOS daemon, or a second Mac, ingests the same iCloud library, the 
 
 - `cloud_id`s match by construction (Apple's invariant).
 - `content_hash`es match by construction (BLAKE3 is deterministic).
-- `photo_id`s do **not** match — each daemon mints its own UUIDv7 at first discovery. This is acceptable because `photo_id` is daemon-internal until consensus migration, at which point the migrator resolves the device-to-device `photo_id` discrepancy by joining on `cloud_id` (primary) and `content_hash` (fallback) to identify pairs and pick a canonical id.
+- `photo_id`s do **not** match — each daemon mints its own UUIDv7 at first discovery. This is acceptable because `photo_id` is daemon-internal until publish, at which point the discrepancy is resolved by the mesh itself: the publish pass's resolve pre-pass maps `cloud_id` → cloud fingerprint → any already-committed consensus id, and a second daemon **adopts** the mesh's id into `consensus_photo_id` instead of publishing a duplicate (see §HopNet publish queue and RFC-011 §Cloud Fingerprint).
 
-This trade-off — distinct local `photo_id`s, deterministic `cloud_id` / `content_hash` — is deliberate. Forcing daemons to share `photo_id`s pre-consensus would require an online coordination primitive (some daemon must "own" first-discovery), which the MVP explicitly does not have. The migrator handles the merge at the moment cross-device coordination becomes available.
+This trade-off — distinct local `photo_id`s, deterministic `cloud_id` / `content_hash` — is deliberate. Forcing daemons to share `photo_id`s pre-publish would require an online coordination primitive (some daemon must "own" first-discovery), which the daemon explicitly does not have. The mesh IS that coordination point once publishing exists: first committed publish wins the id, everyone else adopts.
 
 ### Group identifiers
 
@@ -223,7 +210,7 @@ This derivation is **one-way**: given a `group_id` and no access to the original
 | Asset deleted from Photos and re-added from a backup | New `cloud_id` per PhotoKit. Rule 2b applies: new `photo_id`, blob refcount incremented on the shared original `content_hash`. |
 | Asset deleted from Photos and not re-added | Existing `photo_id` retains a `deleted_at` tombstone; blob refcount decremented at retention expiry; see Retention. |
 | Asset is local-only on day 1, then iCloud upload completes on day 2 | Day 1: discovered with `cloud_id = NULL`, ingested via content_hash path, `photo_id` minted. Day 2: PhotoKit reports a new `cloud_id` on the change observer; rule 2a applies (late binding), the existing `photo_id`'s `cloud_id` column is populated. |
-| Same content in personal and shared library scopes simultaneously | Two distinct `PHAsset`s with distinct `cloud_id`s. Two `photo_id`s. Two `photos` rows in different libraries. Storage-layer dedup (ZFS or refcount) handles byte sharing. |
+| Same content in personal and shared library scopes simultaneously | Two distinct `PHAsset`s with distinct `cloud_id`s. Two `photo_id`s. Two `photos` rows in different libraries, two `blobs` ledger rows — but one spool file (see Dedup namespace per library). |
 | Burst frames | Distinct `photo_id`s, distinct `cloud_id`s per frame. Shared `group_id` derived from `burstIdentifier`. One frame marked `is_group_pick = 1` per PhotoKit's "user pick" hint. |
 | Live Photo | Single `photo_id`. Two `photo_resources` rows: `original` (HEIC still) and `paired_video` (MOV). |
 | RAW + JPEG paired capture | Single `photo_id`. Two `photo_resources` rows: `original` (typically JPEG, the user-visible representation) and `raw_alternate` (the RAW companion). |
@@ -235,19 +222,19 @@ Photos are partitioned at the top level by **library** — a logical bucket corr
 - `personal` — photos in the user's personal iCloud Photos library, visible only to that account.
 - `shared` — photos in an iCloud Shared Photo Library, visible to all participants of that shared library.
 
-Additional libraries can be defined (for example a second shared library, or a non-iCloud "imported" library populated from manual file drops), but the data model treats each as a distinct partition with its own storage subtree and its own dedup namespace.
+Additional libraries can be defined (for example a second shared library, or a non-iCloud "imported" library populated from manual file drops), but the data model treats each as a distinct partition with its own dedup-ledger namespace.
 
 ### Why partition at all
 
-The on-disk storage root is expected to be a multi-user server share where filesystem-level ACLs constrain access. Personal photos sit under a path readable only by the owning user account on the server; shared photos sit under a path readable by all shared-library participants. Mixing the two in a single content-addressed pool would either require every shared participant to be granted read access to every personal photo (unacceptable) or require some cryptographic per-blob access mechanism, which is exactly the ceremony this MVP defers.
+The partition is the access-control boundary the mesh consumes. Personal-partition photos publish as the owner's personal consensus photos; shared-partition photos publish into a **mesh shared library** (RFC-011 Phase 3 multi-participant model) once the operator binds the local shared library to its consensus `shared_libraries` UUID (`library set-mesh-id`). An UNBOUND shared library has no publish target and is excluded from the publish claim — shared photos must never leak into the personal namespace (publishing them as personal-consensus records would create exactly the dedup and ownership debt the historical personal-only gate existed to avoid).
 
-Partitioning by library makes the access story trivial: server-side ACLs on the per-library subtree are the access story. The daemon never needs to reason about who can read what — it routes bytes to the correct subtree and stops there.
+Daemon-side, the partition also keeps lifecycle arithmetic per-library: refcounts, retention windows, and library transitions are all ledger operations scoped by `library_id`. The daemon never reasons about who can read what — it records which partition an asset belongs to and lets the publish path (and eventually the mesh's sharing model) consume that fact.
 
 ### Library scope detection
 
 Spike-verified reality (see `spikes/photokit/FINDINGS.md`): PhotoKit on macOS has **no public per-asset indicator** of iCloud Shared Photo Library membership. SPL assets appear in default fetches reporting `sourceType = typeUserLibrary`, indistinguishable from personal assets via documented API. The public `typeCloudShared` source type identifies only legacy iCloud Shared Albums, which are excluded from ingest scope entirely (downscaled copies, not part of the library proper — and conveniently absent from default fetches).
 
-Detection therefore uses the undocumented KVC-readable `PHAsset` property `participatesInLibraryScope` (Bool) — verified exact against a 36k-asset library with a 10k-asset shared library. This is a private-API dependency of the same tier as the `fileSize` key used by storage-aware admission. Failure mode is specified: if the key returns nil (removed in a future macOS), the daemon treats it as a **hard error and stops ingest** — it must never default to personal, which would silently route shared photos into the personal library subtree and violate the partitioning ACL story.
+Detection therefore uses the undocumented KVC-readable `PHAsset` property `participatesInLibraryScope` (Bool) — verified exact against a 36k-asset library with a 10k-asset shared library. This is a private-API dependency of the same tier as the `fileSize` key used by storage-aware admission. Failure mode is specified: if the key returns nil (removed in a future macOS), the daemon treats it as a **hard error and stops ingest** — it must never default to personal, which would silently route shared photos into the personal partition, where the publish path would upload them as personal-consensus photos.
 
 The Swift layer reads this property when constructing the `AssetDescriptor` and propagates it as an enum: `Personal` or `Shared`. iCloud supports at most one Shared Photo Library per account and PhotoKit exposes no scope identifier, so the signal is binary — the shared library's `scope_binding` is a fixed marker value (`icloud-shared-library`) rather than a PhotoKit-provided identifier. The `libraries` schema retains the general scope-binding shape for future non-PhotoKit library sources.
 
@@ -257,99 +244,83 @@ On every asset discovery — including change-observer events for previously-see
 
 1. Resolves the scope identifier to a configured `library_id` in `state.db`.
 2. If no `library_id` is configured for that scope, the asset is recorded with a special `library_unmapped` sentinel and a soft error is emitted; the daemon logs a CLI prompt inviting the user to configure the library before ingest can proceed for that asset.
-3. Otherwise, all subsequent operations (blob path resolution, sidecar path resolution, dedup queries, refcount adjustments) use the resolved `library_id`.
+3. Otherwise, all subsequent operations (dedup queries, refcount adjustments, publish claims) use the resolved `library_id`.
 
 ### Asset migrating between libraries
 
 PhotoKit supports moving an asset from the personal library into a shared library and vice versa. When this happens, the daemon observes a change event for the asset and the previously-recorded `library_id` for the asset's `cloud_id` no longer matches the current PhotoKit scope.
 
-The daemon treats a library transition as a **hard move**. The `photo_id` is retained, but bytes are physically relocated so that the photo's full state lives entirely under the destination library's subtree:
+The daemon treats a library transition as a **ledger-only move**. The `photo_id` is retained and no bytes move — the spool is a single content-addressed tree shared by all libraries — so the whole transition is one SQLite transaction:
 
 ```
-For each photo_resources row R of the transitioning photo:
-  1. Resolve src_path = <src_blob_root>/<aa>/<bb>/<hash>.<ext>
-  2. Resolve dst_path = <dst_blob_root>/<aa>/<bb>/<hash>.<ext>
-  3. Increment refcount on (dst_library_id, content_hash) in blobs;
-     if previous refcount was 0, copy src_path → dst_path
-     (write to .partial temp, fsync, rename).
-  4. Decrement refcount on (src_library_id, content_hash) in blobs;
-     if refcount reaches 0, delete src_path.
-  5. Update photos.library_id = dst_library_id.
-  6. Update sidecar's library_id field and rewrite the sidecar JSON
-     (local copy and remote backup).
-  7. Record a library_transition entry in the ingest log with both ids.
+For each photo_resources row R of the transitioning photo
+    (where R.content_hash is set):
+  1. Increment refcount on (dst_library_id, content_hash) in blobs,
+     inserting the row if absent. An inserted row inherits the source
+     row's evicted_at stamp — file presence is a per-hash fact, not a
+     per-library one.
+  2. Decrement refcount on (src_library_id, content_hash) in blobs;
+     delete the src row when it reaches 0. The file is untouched.
+
+Then:
+  3. Update photos.library_id = dst_library_id.
+  4. Record a library_transition entry in the ingest log with both ids.
 ```
 
-`photo_resources` rows stay keyed by `(photo_id, resource_type)` and need no library-aware updates; the blob path is reconstructed from `photos.library_id` and `content_hash` at read time.
+`photo_resources` rows stay keyed by `(photo_id, resource_type)` and need no library-aware updates; the spool path derives from `content_hash` alone. Pending resources ride along logically and fetch into the shared spool as usual. There is no filesystem step, and therefore no crash window beyond ordinary transaction atomicity.
 
-*Phase 5 note on step 6:* "local copy and remote backup" — the destination's remote copy arrives via the ordinary dirty-set drain, but the copy under the **source** library's `sidecar_root_remote` must be explicitly removed (best-effort, post-transaction): a lingering src document would resurrect the photo in the wrong library during a sidecar-tree recovery. A mount-down failure leaves it for fsck's remote-consistency audit.
+An earlier revision physically relocated bytes between per-library subtrees ("hard move") because each library lived under its own storage root carrying its own filesystem ACL. With HopNet as the archive of record and a single local spool, per-library physical placement has no consumer: access control is the mesh's job, and the spool is visible to nothing but the daemon.
 
-Step 3's refcount check matters: if another photo in the destination library already shares this blob (for example the user previously imported the same content into the shared library independently), the bytes are already on disk and the copy is skipped — only the refcount increments.
-
-Step 4's refcount check matters symmetrically: if another photo in the source library still references the blob (unlikely but possible), the file is not deleted; only the refcount decrements.
-
-The refcount updates (steps 3 and 4) and the `photos` row update (step 5) run inside a single SQLite transaction. The filesystem operations (copy, delete) are bracketed by but not part of that transaction. If a copy or delete fails mid-way, the daemon recovers using the rules described in the Recovery section: refcounts in `state.db` are the authoritative reference state, and the on-disk presence of a blob is reconciled against them on startup.
-
-*Implementation errata (Phase 4):* all copies run **before** the transaction, not interleaved per step 3's numbering. A dst refcount committed ahead of its copy could reference bytes that never arrived — which fsck classifies as byte loss — whereas copy-first leaves only benign orphan files on a crash, consistent with the write path's durability-precedes-commit invariant. Source-file deletes still run after the transaction.
-
-#### Why hard move, not soft
-
-An earlier draft considered leaving blobs in their original library's subtree after a transition and updating only the logical `library_id`. That approach was rejected: it would leave a `shared`-scope photo with bytes physically located under `/<root>/personal/blobs/`, which the personal-library-only ACL would correctly deny to shared-library participants. The photo's access state would become incoherent. Hard move keeps the invariant that **a photo's bytes are always under its current `library_id`'s subtree**, and this invariant is what makes the server-side ACL story work without app-level coordination.
-
-### Storage root configuration
+### Library configuration
 
 A library is fully described by these pieces of configuration, persisted in `state.db`:
 
-- `library_id` — short, stable, human-readable identifier (`personal`, `shared_household`, etc.). Used as the path component on disk and as the foreign key on `photos` and `blobs`.
+- `library_id` — short, stable identifier, generated at creation and immutable (see the `libraries` notes). Scopes the dedup ledger and is the foreign key on `photos` and `blobs`.
 - `display_name` — UI string for the CLI.
-- `blob_root` — absolute path on the ingesting device's filesystem to the per-library subtree on the storage root. Typically a path under a mounted network share (for example `/Volumes/photos-personal`).
-- `sidecar_root_local` — derived path under `~/.local/share/hopnet-photo-ingress/sidecars/<library_id>/`; hot-path location for sidecars.
-- `sidecar_root_remote` — optional path under the storage root for the periodic sidecar backup. Often a sibling of `blob_root`.
 - `scope_binding` — for shared libraries, the PhotoKit scope identifier this `library_id` is bound to. Personal libraries have no scope binding.
+- `mesh_library_id` — the consensus `shared_libraries` UUID a shared library publishes into (`library set-mesh-id`; NULL = no publish target, excluded from the publish claim). Requires `scope_binding`, and scope detach is refused while set — personal libraries publish to the personal partition by definition, so a NULL-scope row never carries a mesh target.
+- `retention_days` — soft-delete grace before hard-delete cleanup.
 
-The configuration is editable via the CLI but is not edited by the daemon itself — changing where bytes are written is a deliberate user action that requires the daemon to be stopped, the configuration to be edited, and (if the new root differs from the old) a one-time migration to be run.
+There are no storage paths to configure. All bytes stage in the shared spool under the data dir, and HopNet holds the archive; the personal library self-creates at daemon startup (`ensure_personal_library`), so a fresh install needs zero library configuration before ingest begins.
 
-The Swift layer is told which PhotoKit scope identifier maps to which `library_id` via the `scope_binding` value. This decoupling lets the user rename a library's display name without breaking the PhotoKit binding (*Phase 6 errata:* the `library_id` itself is generated and immutable — see the `libraries` notes), and lets the user opt out of shared-library ingest entirely by simply not binding its scope. Unbinding is refused while another NULL-scope row exists — the personal routing rule picks the NULL-scope row, so a second one would route personal photos arbitrarily.
+The Swift layer is told which PhotoKit scope identifier maps to which `library_id` via the `scope_binding` value. This decoupling lets the user rename a library's display name without breaking the PhotoKit binding (the `library_id` itself is generated and immutable — see the `libraries` notes), and lets the user opt out of shared-library ingest entirely by simply not binding its scope. Unbinding is refused while another NULL-scope row exists — the personal routing rule picks the NULL-scope row, so a second one would route personal photos arbitrarily.
 
-*Phase 6 note:* library configuration lives **entirely in the Rust `ingress-cli`** (`library add/list/bind/rename/set-retention`); the FFI exposes no config surface and `photo-ingress setup` shrank to data-dir creation plus the Photos authorization walk — the two things that need the PhotoKit-entitled process. Every config write takes the exclusive run lock (refused while the daemon runs, with the holder's pid) and runs the Tier-1 refcount repair on an unclean reclaim.
+*Phase 6 note:* shared-library configuration lives in the Rust `ingress-cli` (`library add/list/bind/rename/set-retention/set-mesh-id`); the FFI's only config surface is the zero-argument personal-library ensure. Every config write takes the exclusive run lock (refused while the daemon runs, with the holder's pid) and runs the Tier-1 refcount repair on an unclean reclaim.
 
 ### Dedup namespace per library
 
-All dedup logic — both `cloud_id` lookups and `content_hash` lookups — is scoped to a single `library_id`. A blob with hash `H` in `personal` is a distinct row in `blobs` from a blob with the same hash in `shared`. This follows from the access-control argument: the two blobs must live on physically separate storage subtrees with separate ACLs, so the application layer cannot share their identity.
+Dedup **accounting** is scoped to a single `library_id`: a hash `H` referenced from `personal` and from `shared` is two rows in `blobs`, each with its own refcount. The per-library ledger survives from the per-subtree era because it is what keeps library transitions, retention, and hard-delete pure per-library refcount arithmetic.
 
-Practical consequence: a photo that exists in both `personal` and `shared` — two distinct `PHAsset`s with distinct `cloud_id`s but byte-identical originals — results in two `photos` rows (one per `library_id`, each with its own `photo_id`), two writes of the same bytes to two different subtrees, and one stored copy on disk if ZFS native dedup is enabled on the storage server, or two copies otherwise.
+Dedup **bytes** are global: the spool stores at most one file per content hash, shared by every library that references it (a cross-library duplicate streams twice but the second rename lands on the same content-addressed path). The file-level rule is **hash liveness**: a spool file may be deleted only when no `blobs` row for its hash, in *any* library, remains unevicted. Every unlink site — eviction, re-edit supersede, revert, hard delete, orphan repair — gates on this check; per-library refcounts alone are never sufficient license to unlink.
 
-The daemon makes no attempt to detect or coordinate this case at the application layer. Cross-library byte-identical content is a storage-layer concern.
+A photo that exists in both `personal` and `shared` — two distinct `PHAsset`s with distinct `cloud_id`s but byte-identical originals — is therefore two `photos` rows and two ledger rows over one spool file, and each partition publishes on its own schedule (its own scope of the partitioned publish pass); the file survives until both are decided.
 
 ## Local State Schema (`state.db`)
 
-`state.db` is the authoritative ingest state, a SQLite database at `~/.local/share/hopnet-photo-ingress/state.db`, accessed only by the daemon and the CLI (via the Rust core). It never lives on the network mount — see "SQLite local, blobs remote" in the Architecture section.
+`state.db` is the authoritative ingest state, a SQLite database at `~/.local/share/hopnet-photo-ingress/state.db`, accessed only by the daemon and the CLI (via the Rust core). It shares the local data dir with the spool.
 
-Schema shapes are chosen for the RFC-011 migration contract: columns that survive migration use the same names, types, and semantics as their `photos.md` counterparts, so the migrator copies them without transformation. Ingress-only columns (identity plumbing, pipeline state, refcounts) are dropped at migration.
+Schema shapes are chosen for the RFC-011 publish contract: columns that flow into the mesh use the same names, types, and semantics as their `photos.md` counterparts, so the publish mapping copies them without transformation. Ingress-only columns (identity plumbing, pipeline state, refcounts) never leave the device.
 
 ### `libraries`
 
 ```sql
 CREATE TABLE libraries (
-    library_id           TEXT PRIMARY KEY,   -- 'personal', 'shared_household'; also the on-disk path component
+    library_id           TEXT PRIMARY KEY,   -- generated two-word id, e.g. 'crisp_harbor'
     display_name         TEXT NOT NULL,      -- UI string for the CLI
-    blob_root            TEXT NOT NULL,      -- absolute path on the ingesting device, e.g. /Volumes/photos-personal
-    sidecar_root_remote  TEXT,               -- backup root on the storage side; NULL = no remote sidecar backup
     scope_binding        TEXT UNIQUE,        -- PhotoKit shared-library scope identifier; NULL for personal
     retention_days       INTEGER NOT NULL DEFAULT 30,  -- soft-delete grace before hard-delete cleanup
-    created_at           TEXT NOT NULL       -- ISO 8601
+    created_at           TEXT NOT NULL,      -- ISO 8601
+    mesh_library_id      TEXT                -- consensus shared_libraries UUID (publish target); NULL = none
 );
 ```
 
 Notes:
 
-- `library_id` doubles as the on-disk path component (`/<root>/<library_id>/blobs/...`), so it must be filesystem-safe: lowercase, `[a-z0-9_]`, no path separators. Enforced by the CLI at configuration time. *Phase 6 errata:* the id is **generated, not user-chosen** — `library add` mints a two-word id from an embedded wordlist (`crisp_harbor`) and it is **immutable** thereafter; `display_name` is the mutable human-facing label (`library rename` edits only it). A user-supplied id duplicated `display_name`'s job while carrying path-layout and sidecar-embedded weight it could never shed; generating it removes both the naming decision and the id-rename problem (which would have meant a multi-table PK migration plus rewriting the id inside every sidecar document). An `--id` override remains for scripts and tests, validated against the charset above.
-- `sidecar_root_local` is **not** stored. It is always derived as `~/.local/share/hopnet-photo-ingress/sidecars/<library_id>/`; storing it would invite drift between the stored value and the derivation rule.
+- `library_id` is **generated, not user-chosen** — library creation mints a two-word id from an embedded wordlist (`crisp_harbor`) and it is **immutable** thereafter; `display_name` is the mutable human-facing label (`library rename` edits only it). A user-supplied id duplicated `display_name`'s job while carrying identity weight it could never shed; generating it removes both the naming decision and the id-rename problem. An `--id` override remains for scripts and tests, validated as lowercase `[a-z0-9_]`. (Historically the id was also an on-disk path component; the spool is content-addressed and library-agnostic, so the id now scopes only the ledger.)
 - `scope_binding` is `UNIQUE`: a PhotoKit scope maps to at most one library. SQLite permits multiple NULLs, so this does not constrain personal or future non-PhotoKit libraries.
 - `retention_days` is per-library — a shared library may warrant a longer window than a personal one. The hard-delete cleanup job reads the owning library's value on each run; changing it applies from the next run (see the retention edge-case table in Deletion and Retention).
-- **Exactly one personal library in the MVP.** PhotoKit exposes a single system photo library per account, so there is one row with `scope_binding IS NULL`, conventionally `library_id = 'personal'`. A future non-PhotoKit "imported" library (manual file drops) would be a second NULL-scope row; the schema requires no change, only routing rules.
-- **No `library_unmapped` sentinel row.** An asset whose PhotoKit scope has no configured binding is recorded in `photos` with `library_id = NULL` (see the `photos` table); ingest is blocked for that asset until the user binds the scope. The unmapped state is an absence, not an entity — this keeps `libraries` free of placeholder rows that would need fake `blob_root` values.
-- `sidecar_root_remote = NULL` disables the remote sidecar backup for the library. The CLI warns loudly on this configuration: without remote sidecars, recovery from a lost Mac degrades to blob-only rebuild, which loses all PhotoKit-derived metadata (capture grouping, library scope, favorites, edit relationships) and mints fresh `photo_id`s.
+- **Exactly one personal library in the MVP**, created automatically at daemon startup (`ensure_personal_library`). PhotoKit exposes a single system photo library per account, so there is one row with `scope_binding IS NULL`. A future non-PhotoKit "imported" library (manual file drops) would be a second NULL-scope row; the schema requires no change, only routing rules.
+- **No `library_unmapped` sentinel row.** An asset whose PhotoKit scope has no configured binding is recorded in `photos` with `library_id = NULL` (see the `photos` table); ingest is blocked for that asset until the user binds the scope. The unmapped state is an absence, not an entity.
 
 ### `photos`
 
@@ -370,10 +341,28 @@ CREATE TABLE photos (
     discovered_at     TEXT NOT NULL,       -- ISO 8601, when the asset first entered the Rust core's view
     asset_modified_at TEXT,                -- PHAsset.modificationDate at last successful sync
     materialized_at   TEXT,                -- NULL = not all resources written yet
-    sidecar_replicated_at TEXT,            -- NULL = local sidecar newer than remote copy (replication pending)
+    descriptor_json   TEXT,                 -- descriptor capsule; persisted at materialization
+                                           --   (see §Descriptor capsule and the publish document)
+
+    -- HopNet publish queue (see §HopNet publish queue)
+    published_at          TEXT,            -- NULL = not yet published into HopNet; set once, never reset
+    publish_attempts      INTEGER NOT NULL DEFAULT 0,
+    publish_next_retry_at TEXT,
+    publish_last_error    TEXT,
+    consensus_photo_id    TEXT,            -- set when ADOPTED (mesh already held the asset);
+                                           -- consensus identity = COALESCE(consensus_photo_id, photo_id)
 
     -- Tombstone (RFC-011-compatible; deleted_by deliberately absent, see notes)
     deleted_at        TEXT,                -- ISO 8601, NULL when active
+
+    -- Mesh convergence of the tombstone (see §Propagation to the mesh).
+    -- What the mesh has been told, as against deleted_at's "what Photos
+    -- believes"; the two disagreeing IS the propagation queue. RESETTABLE,
+    -- unlike published_at — a restore clears it so the next delete queues.
+    tombstone_published_at         TEXT,
+    tombstone_publish_attempts     INTEGER NOT NULL DEFAULT 0,
+    tombstone_publish_next_retry_at TEXT,
+    tombstone_publish_last_error   TEXT,
 
     FOREIGN KEY (library_id) REFERENCES libraries(library_id)
 );
@@ -382,6 +371,12 @@ CREATE INDEX idx_photos_library ON photos(library_id);
 CREATE INDEX idx_photos_pending ON photos(materialized_at) WHERE materialized_at IS NULL;
 CREATE INDEX idx_photos_deleted ON photos(deleted_at) WHERE deleted_at IS NOT NULL;
 CREATE INDEX idx_photos_group ON photos(group_id) WHERE group_id IS NOT NULL;
+CREATE INDEX idx_photos_unpublished ON photos(photo_id)
+    WHERE published_at IS NULL AND materialized_at IS NOT NULL;
+CREATE INDEX idx_photos_tombstone_pending ON photos(photo_id)
+    WHERE published_at IS NOT NULL
+      AND ((deleted_at IS NOT NULL AND tombstone_published_at IS NULL)
+        OR (deleted_at IS NULL AND tombstone_published_at IS NOT NULL));
 ```
 
 Notes:
@@ -390,9 +385,10 @@ Notes:
 - `local_id` is a convenience handle for PhotoKit fetch calls, not an identity key — `PHAsset.localIdentifier` is device-scoped and can change across library rebuilds. It is updated opportunistically whenever the asset is observed (match-precedence step 1).
 - `library_id = NULL` means the asset's PhotoKit scope has no configured binding (see `libraries` notes). The row exists so discovery is never lost, but the pipeline skips it until the scope is bound.
 - `materialized_at` is the pipeline's photo-level completion marker: set (in the same transaction as the final `photo_resources` state update) only once every enumerated resource for the photo has been written and committed. Per-resource fetch/retry state lives on `photo_resources`, since resources fail independently (a Live Photo's video download can fail while its still succeeds).
-- `asset_modified_at` powers the fast path's "unless metadata changed" check: if the incoming descriptor's `PHAsset.modificationDate` equals the stored value, the observer event is a no-op; if newer, sidecar metadata is refreshed and resource-level changes are re-enumerated.
-- **There is no `deleted_by` column.** The daemon has a single implicit local user and no consensus `user_id` to record — storing a sentinel would be fabricating data. The migrator sets RFC-011's `photos.deleted_by` to the importing user's `user_id` for any tombstone that flows through migration.
-- `sidecar_replicated_at` is the remote-sidecar dirty flag: every local sidecar rewrite sets it to `NULL` (in the same transaction as the state change that triggered the rewrite); successful replication to `sidecar_root_remote` stamps it. The daemon drains the dirty set (`WHERE sidecar_replicated_at IS NULL`) whenever the mount is available. This matters because metadata-only rewrites (tombstone, restore, favorite) do not require the mount and can accumulate while it is down — without a durable marker, a Mac dying with an unreplicated tombstone would resurrect the deleted photo in disaster recovery.
+- `asset_modified_at` powers the fast path's "unless metadata changed" check: if the incoming descriptor's `PHAsset.modificationDate` equals the stored value, the observer event is a no-op; if newer, the descriptor capsule is refreshed and resource-level changes are re-enumerated.
+- **There is no `deleted_by` column.** The daemon has a single implicit local user and no consensus `user_id` to record — storing a sentinel would be fabricating data. The mesh's `deleted_by` is assigned by `PhotoDeleteHandler` from the authenticated submitting user when propagation runs, so the fact is recorded exactly once, where a real identity exists.
+- `descriptor_json` is the **descriptor capsule**: the PhotoKit-computed metadata (media type/subtypes, favorite, capture metadata) that the publish document needs and that no other column stores. Written at materialization and refreshed on metadata-only changes; NULL means "materialized before the column existed" and self-heals via the reconciliation scan (see §Descriptor capsule and the publish document).
+- `published_at` is the HopNet publish terminal state and the retry ledger's clear signal (see §HopNet publish queue). It is set once and **never reset**, because a re-publish of the same `photo_id` is hard-rejected by consensus (re-edit propagation is a future content-update transaction). It is also the **eviction predicate**: a spool blob whose every referencing photo is decided — `published_at` set, by upload or adoption — is deletable (see §HopNet publish queue).
 
 ### `photo_resources`
 
@@ -400,7 +396,8 @@ Notes:
 CREATE TABLE photo_resources (
     photo_id         TEXT NOT NULL,        -- FK photos
     resource_type    INTEGER NOT NULL,     -- RFC-011 values: 0=original, 1=edited, 2=paired_video,
-                                           --   3=adjustment_data, 4=raw_alternate, 7=edited_paired_video
+                                           --   3=adjustment_data, 4=raw_alternate, 5=thumbnail_small,
+                                           --   6=thumbnail_medium, 7=edited_paired_video
     content_hash     TEXT,                 -- BLAKE3 hex of resource bytes; NULL until fetched+hashed
     ext              TEXT,                 -- canonical extension for the resource's UTI (heic, jpg, mov, dng)
     size_bytes       INTEGER,              -- recorded at write time; data_block creation needs it at migration
@@ -420,7 +417,7 @@ CREATE INDEX idx_photo_resources_hash ON photo_resources(content_hash) WHERE con
 
 Notes:
 
-- **`resource_type` uses RFC-011's enum values verbatim** (see `photos.md` Resource Types). Thumbnail types (5, 6) are deliberately never stored — thumbnails are generated client-side from the primary display resource after migration, not archived by the daemon.
+- **`resource_type` uses RFC-011's enum values verbatim** (see `photos.md` Resource Types). Thumbnail types (5, 6) are **daemon-generated JPEG renditions** (~256px small, ~1024px medium, video assets get poster frames), requested from `PHImageManager` — Apple decodes HEIC/video for free and the renditions come from the local preview cache (no iCloud round trip). They exist so gallery clients (which cannot decode HEIC in a browser) always have a decodable resource, and they flow the normal pipeline: spool, resource rows, publish.
 - **PhotoKit → ingress resource mapping** (spike-verified against a real library):
 
   | `PHAssetResourceType` | Ingress `resource_type` |
@@ -430,16 +427,23 @@ Notes:
   | `pairedVideo` (9) | `paired_video` (2) |
   | `adjustmentData` (7) | `adjustment_data` (3) |
   | `alternatePhoto` (4) | `raw_alternate` (4) |
+  | HopNet sentinel (1005)¹ | `thumbnail_small` (5) |
+  | HopNet sentinel (1006)¹ | `thumbnail_medium` (6) |
   | `fullSizePairedVideo` (10) | `edited_paired_video` (7) |
+
+  ¹ Synthetic, not `PHAssetResource`-backed: `DescriptorExtraction.swift` appends the two sentinel descriptors to every asset, and the fetcher renders them via `PHImageManager` (synchronous delivery — async returns nil-image/nil-error in the daemon's non-app context — with an ImageIO downscale fallback). Sentinels live at 1000 + RFC value because Apple's real namespace (1–12) collides with the RFC integers: PH 5/6 mean `fullSizePhoto`/`Video`. Their descriptor `fileSize` is a constant admission estimate (64 KiB / 512 KiB), never a re-edit signal.
 
   Edits never mutate the `photo`/`pairedVideo` resources — edited renders appear as separate `fullSize*` resources, and the presence of `adjustmentData` is the "this asset has edits" signal. An edited Live Photo therefore carries five resources (original still, original motion, adjustment plist, edited still, edited motion).
 - **No `status` column.** Per-resource pipeline state is derivable: `content_hash IS NULL` = not yet fetched; `written_at IS NULL AND next_retry_at IS NOT NULL` = failed, awaiting backoff; `written_at IS NOT NULL` = durably written. The CLI computes human-readable status from these columns; a stored enum would be a second source of truth that can drift.
-- **Blob paths are not stored.** A resource's blob path is reconstructed at read time as `<blob_root(photos.library_id)>/<aa>/<bb>/<content_hash>.<ext>` — this is what makes library transitions a pure refcount-plus-`photos.library_id` operation with no per-resource updates.
+- **Spool paths are not stored.** A resource's spool path is derived at read time as `<data_dir>/spool/blobs/<aa>/<bb>/<content_hash>.<ext>` — library-agnostic, which is what makes library transitions a pure refcount-plus-`photos.library_id` operation with no per-resource updates.
 - **Resource lifecycle mirrors PhotoKit's current state; no version history.**
   - *First edit* (asset gains an edited rendition): a new row with `resource_type = 1` appears alongside the untouched `original` row (for Live Photos, an `edited_paired_video = 7` row appears as well). This is additional current resources, not history.
-  - *Re-edit* (asset's edited rendition is replaced): the `edited` row is updated in place with the new `content_hash`. In the same transaction — the **write-commit transaction of the replacement bytes**, not the classification event (the new bytes must be fetched first; between classification and commit the row sits in the superseded-pending state, see §Per-resource state machine) — the superseded blob's refcount is decremented (deleting the file if it reaches 0) and the new blob's refcount is incremented. Detection is a `fileSize` compare (descriptor vs stored `size_bytes`) on written edit-mutable rows; equal or absent sizes are assumed unchanged, and a false positive (changed size, identical bytes) nets to a refcount no-op. Superseded edit renditions are not retained — the daemon archives the current iCloud state; version history is RFC-011's operation log's job post-migration.
+  - *Re-edit* (asset's edited rendition is replaced): the `edited` row is updated in place with the new `content_hash`. In the same transaction — the **write-commit transaction of the replacement bytes**, not the classification event (the new bytes must be fetched first; between classification and commit the row sits in the superseded-pending state, see §Per-resource state machine) — the superseded blob's refcount is decremented (unlinking the file at 0 only if the hash is no longer live in any library's ledger) and the new blob's refcount is incremented. Detection is a `fileSize` compare (descriptor vs stored `size_bytes`) on written edit-mutable rows; equal or absent sizes are assumed unchanged, and a false positive (changed size, identical bytes) nets to a refcount no-op. Superseded edit renditions are not retained — the daemon archives the current iCloud state; version history is RFC-011's operation log's job post-migration.
   - *Revert to original* (user discards edits): the `edited` row (and `adjustment_data` row, if PhotoKit drops it) is deleted, with the same refcount decrement semantics.
   - The `original` row is never overwritten in any of these flows.
+  - *Thumbnail regeneration*: written thumbnail rows (5, 6) reopen whenever the photo's edit-mutable set changes — first edit, re-edit, or revert — because the renditions render the *current* primary display. They are deliberately excluded from the `fileSize` re-edit compare (their descriptor size is a constant admission estimate; comparing it against real stored bytes would reopen them on every delivery). Metadata-only refreshes never touch them.
+  - *Backfill*: photos ingested before the daemon generated renditions never re-deliver descriptors (the reconciliation scan probes unchanged photos `Done`), so a schema migration mints pending 5/6 rows for materialized, library-bound, PhotoKit-addressable photos and clears their `materialized_at`. Tombstoned photos are skipped (the restore delivery heals them); unmapped-scope photos heal at adoption. Already-**published** photos re-materialize with thumbnails but do not re-publish — `published_at` is terminal until content-update propagation lands (future phase).
+  - *Thumbnail failure blocks materialization* (and therefore publish) at the retry cap, the same policy as any resource; the next scan's gave-up reset re-arms them.
 - **`adjustment_data` (type 3) is captured.** `PHAdjustmentData` is the reversible-edit recipe and cannot be re-derived once the Photos library is gone; RFC-011 expects it for edit reconstruction. The payload is a small non-image blob; it flows through the same content-addressed write path with an extension derived from its UTI.
 - A resource row is created for every resource enumerated on the asset at discovery time, before any bytes are fetched — mirroring the `photos` row's mint-before-materialize rule, so inflight per-resource progress is queryable.
 
@@ -453,6 +457,7 @@ CREATE TABLE blobs (
     size_bytes       INTEGER NOT NULL,
     ref_count        INTEGER NOT NULL,     -- number of photo_resources rows referencing this blob
     written_at       TEXT NOT NULL,        -- ISO 8601, when the atomic rename landed
+    evicted_at       TEXT,                 -- ISO 8601; spool file reclaimed after decided publish
 
     PRIMARY KEY (library_id, content_hash),
     FOREIGN KEY (library_id) REFERENCES libraries(library_id)
@@ -461,11 +466,12 @@ CREATE TABLE blobs (
 
 Notes:
 
-- **`ref_count` invariant**: `ref_count` equals the number of `photo_resources` rows whose `content_hash` matches and whose parent photo's `library_id` matches — i.e. it is fully recomputable via a JOIN through `photos`. Every increment/decrement happens in the same SQLite transaction as the `photo_resources` change that caused it.
-- **Why a stored count rather than deriving it**: a declared FK from `photo_resources` to `blobs` is not expressible (the blob key includes `library_id`, which lives on `photos`, not `photo_resources`). More importantly, the count gates eager, irreversible filesystem deletes (hard-move relocation, re-edit supersede, hard-delete cleanup) — `UPDATE ... SET ref_count = ref_count - 1 ... RETURNING ref_count` is a single atomic operation with no scoping JOIN to get subtly wrong at any call site. The redundancy is deliberate: a stored count plus a recount JOIN are two independent answers that must agree, so refcount drift from a crash or bug is detectable and repairable (recovery and a CLI `fsck`-style check recompute and diff). RFC-011's `DataBlockReferenceProvider` derives instead because its cleanup is a lazy background sweep spanning multiple modules; ingress deletes eagerly within one module, which favors the counter.
+- **`ref_count` invariant**: `ref_count` equals the number of `photo_resources` rows whose `content_hash` matches and whose parent photo's `library_id` matches — i.e. it is fully recomputable via a JOIN through `photos`. Every increment/decrement happens in the same SQLite transaction as the `photo_resources` change that caused it. The invariant counts **rows, not files**: eviction deletes the file and stamps `evicted_at` without touching `ref_count`, so the Tier-1 recount (which recomputes from resource rows) never fights a deliberate eviction. A decrement-based eviction would be silently reverted by the next recount — this is why the stamp exists.
+- **Eviction is a stamp, not a row delete.** `evicted_at` means "the mesh holds every referencing photo; the spool file was reclaimed." The row (and its refcount) survives so recounts stay truthful and dedup stays correct: a later materialization that hits an evicted row re-places the bytes and clears the stamp instead of treating ledger presence as file presence. The file-unlink gate is spool-wide hash liveness (see §Dedup namespace per library).
+- **Why a stored count rather than deriving it**: a declared FK from `photo_resources` to `blobs` is not expressible (the blob key includes `library_id`, which lives on `photos`, not `photo_resources`). More importantly, the count gates eager, irreversible filesystem deletes (re-edit supersede, revert, hard-delete cleanup) — `UPDATE ... SET ref_count = ref_count - 1 ... RETURNING ref_count` is a single atomic operation with no scoping JOIN to get subtly wrong at any call site. The redundancy is deliberate: a stored count plus a recount JOIN are two independent answers that must agree, so refcount drift from a crash or bug is detectable and repairable (recovery and a CLI `fsck`-style check recompute and diff). RFC-011's `DataBlockReferenceProvider` derives instead because its cleanup is a lazy background sweep spanning multiple modules; ingress deletes eagerly within one module, which favors the counter.
 - **`ext` is an attribute, not part of the key.** Identical bytes imply the same UTI in practice; in the pathological case of the same content arriving under two different UTIs, the first writer's extension wins and a warning is logged.
-- **Single-writer invariant**: exactly one daemon instance writes a given library subtree on the storage root. This falls out of the design anyway — `state.db` (holding the authoritative refcounts) and PhotoKit `local_id`s are both device-local, so a second device cannot meaningfully share them. A second Mac or future iOS daemon ingesting the same iCloud library targets its own storage subtree, and the RFC-011 migrator merges records at consensus time (see Cross-Device Convergence). The daemon enforces only in-process exclusivity: at most one inflight materialization per `(library_id, content_hash)`, so two photos sharing a blob don't race the same temp-write-rename.
-- No integrity/scrub column (`verified_at`) — bit-rot detection is delegated to the storage filesystem (ZFS scrub). If a future deployment targets storage without self-healing, a scrub job and column can be added then.
+- **Single-writer invariant**: the spool, like `state.db`, is device-local under one data dir, and the exclusive `drain.lock` ensures one writing process. A second Mac or future iOS daemon ingesting the same iCloud library has its own spool and converges at the mesh via the resolve/adoption pre-pass (see Cross-Device Convergence), not by sharing files. In-process, at most one inflight materialization runs per `(library_id, content_hash)`, so two photos sharing a blob don't race the same temp-write-rename.
+- No integrity/scrub column (`verified_at`) — spool residence is transient (bounded by publish latency), and post-decide durability is the mesh's job (RS-encoded fragments, mesh-side repair). Bit-rot in a file that lives locally for minutes-to-days is not a design concern.
 
 ### `ingest_log`
 
@@ -481,7 +487,7 @@ CREATE TABLE ingest_log (
 CREATE INDEX idx_ingest_log_photo ON ingest_log(photo_id) WHERE photo_id IS NOT NULL;
 ```
 
-The ingest log is **authoritative for nothing**. No code path reads it to make a decision; deleting the table changes no behavior. State tables answer "what is"; the log answers "what happened" — it is the black-box recorder for a daemon that deletes irreplaceable data. Its primary consumer is forensics: after a hard delete, the state tables retain no trace of the photo, and the log is the only artifact that can answer "where did my photo go?" (`deletion_observed` on March 3, `hard_delete` on April 2). Secondary consumers are CLI history views and incident debugging (mount flaps, ingest stalls). It does not migrate to RFC-011 — deletion state flows through `photos` columns, not log replay.
+The ingest log is **authoritative for nothing**. No code path reads it to make a decision; deleting the table changes no behavior. State tables answer "what is"; the log answers "what happened" — it is the black-box recorder for a daemon that deletes irreplaceable data. Its primary consumer is forensics: after a hard delete, the state tables retain no trace of the photo, and the log is the only artifact that can answer "where did my photo go?" (`deletion_observed` on March 3, `hard_delete` on April 2). Secondary consumers are CLI history views and incident debugging (publish parks, ingest stalls). It does not migrate to RFC-011 — deletion state flows through `photos` columns, not log replay.
 
 Logging rule: an event is logged if it **destroys bytes** or **explains a stall**. Per-retry fetch failures are never logged — `retry_count` / `last_error` on `photo_resources` carry current failure state, and a flaky iCloud connection over a 50k-asset library would flood the log.
 
@@ -494,23 +500,38 @@ Logging rule: an event is logged if it **destroys bytes** or **explains a stall*
 | `blob_superseded` | yes | old/new hash on re-edit (old bytes deleted) |
 | `resource_gave_up` | yes | resource_type, final error (retries exhausted) |
 | `scan_started` / `scan_completed` | no | counts |
-| `mount_lost` / `mount_regained` | no | library ids affected |
-| `storage_low` / `storage_recovered` | no | free bytes, reserve floor, library id |
+| `spool_evicted` | no | blobs + bytes reclaimed by a publish pass or cleanup sweep |
+| `publish_adopted` | yes | mesh-held consensus id adopted without upload |
+| `publish_not_responsible` / `responsibility_regained` | no | edge-triggered responsibility standing |
+| `publish_descriptor_missing` | yes | NULL capsule at publish claim (self-heals via scan) |
+| `storage_low` / `storage_recovered` | no | free bytes, reserve floor (data-dir disk) |
+| `node_unreachable` / `node_regained` | no | publish reachability edges |
 | `scope_unmapped` | no | PhotoKit scope id encountered with no binding |
 
 Shape is deliberately loose — `event_type` as TEXT (readable in a `sqlite3` shell, new types cost nothing), `detail` as freeform JSON — because nothing downstream parses it. Rows older than 180 days are pruned by the hourly cleanup job.
 
-## Sidecar Format
+## Descriptor capsule and the publish document
 
-One JSON document per photo, written locally (hot path) and replicated to `sidecar_root_remote` (backup), at `<root>/<YYYY>/<MM>/<photo_id>.json` keyed by `captured_at` year/month (falling back to `ingested_at` when capture date is unknown).
+There are no metadata files. The PhotoKit-derived metadata that once lived in per-photo sidecar JSON documents lives in `photos.descriptor_json` — the **descriptor capsule** — and the JSON document HopNet receives at publish time is composed on the fly from the capsule plus the live DB rows.
 
-The sidecar exists for exactly three things, and every field must justify itself against them:
+### Descriptor capsule
 
-1. **PhotoKit-computed values that raw EXIF lacks** — capture date as PhotoKit resolves it, media type/subtypes, favorite state, burst grouping and pick.
-2. **High-level query parameters** — camera, location, date, resolution — so galleries and rescans never open blob bytes.
-3. **DB-state repopulation** — if the Mac (and `state.db`) dies, the sidecar tree plus the blob tree on the surviving storage must be sufficient to rebuild `photos`, `photo_resources`, and recount `blobs.ref_count`. The `resources` array is the load-bearing field here: it is the only off-device record of the photo-to-blob mapping.
+Persisted at materialization and refreshed on metadata-only changes, the capsule carries exactly the fields that are PhotoKit-computed and stored on no other column:
 
-Anything re-extractable from surviving blob bytes fails the test and is excluded — notably the **full EXIF dump**: raw EXIF lives inside the original blobs, which survive the dead Mac by definition. Recovery or migration can re-extract exotic EXIF from blobs on demand; the sidecar carries only the curated fields.
+- `media_type` — `"image" | "video" | "live_photo"`, matching RFC-011's values.
+- `media_subtypes` — PhotoKit's computed subtype flags (`hdr`, `screenshot`, `panorama`, `slomo`, …); PhotoKit-derived, not recoverable from EXIF alone.
+- `favorite` — PhotoKit-only state, mapping to RFC-011's `photo_favorites`.
+- `capture` — capture date as PhotoKit resolves it, dimensions, orientation, duration, camera make/model, GPS. These mirror RFC-011's sidecar `photo_index` columns one-to-one, so the publish mapping constructs the metadata document without transformation.
+
+Everything else the publish document needs — identity, tombstone state, grouping, the resource list — stays authoritative on `photos`/`photo_resources` rows. This is why tombstone, restore, favorite refresh (which rewrites the capsule), and library transitions are plain row updates with no document rewrite: no document exists until publish composes one.
+
+A photo materialized before the capsule column existed has a NULL capsule; the reconciliation scan detects this and requests a full descriptor re-delivery to backfill it. Publish skips a NULL-capsule photo without burning an attempt (`publish_descriptor_missing`).
+
+Anything re-extractable from original bytes is excluded — notably the **full EXIF dump**: raw EXIF lives inside the original blobs, which the mesh holds durably. Exotic EXIF can be re-extracted from mesh-served bytes on demand; the capsule carries only the curated fields.
+
+### Publish document
+
+`Sidecar::compose` (the name survives its file-format origins) assembles the document each publish pass from the capsule and the committed rows:
 
 ```json
 {
@@ -544,17 +565,14 @@ Anything re-extractable from surviving blob bytes fails the test and is excluded
 Field notes:
 
 - `schema` versions the format; a `v2` reader handles `v1` documents, never the reverse requirement.
-- Curated metadata fields mirror RFC-011's sidecar `photo_index` columns one-to-one (`date_taken`, dimensions, orientation, media type, duration, camera, GPS), so the migrator constructs the `encrypted_metadata` blob from these fields without transformation. `media_subtypes` carries PhotoKit's computed subtype flags (`hdr`, `screenshot`, `panorama`, `slomo`, …) — PhotoKit-derived, not recoverable from EXIF alone.
-- `media_type` is `"image" | "video" | "live_photo"`, matching RFC-011's sidecar values.
 - `location` is present only when the asset has GPS data; `camera` fields are null for assets without camera metadata (screenshots, imports).
-- `favorite` is included: PhotoKit-only state, maps to RFC-011's `photo_favorites` at migration.
-- `resources` lists every written resource with `type` as the RFC-011 enum *name* (not integer — sidecars optimize for human readability). Entries appear as each resource is durably written; a sidecar's resource list reflects committed state only.
-- The sidecar is mutable and rewritten in place (temp + rename) on: resource set changes (edit, re-edit, revert), tombstone/restore (`deleted_at`), favorite toggles, and library transitions (`library_id`). The remote copy is refreshed asynchronously, best-effort, on the same triggers.
+- `resources` lists every durably-written resource with `type` as the RFC-011 enum *name* (not integer — the document optimizes for human readability).
+- The document reflects committed state at compose time. There is no stored copy to drift, replicate, or rewrite — publish composes fresh every pass.
 
 ### Explicitly excluded
 
-- **Full EXIF dump** — re-extractable from original blobs, per the three-purpose test above.
-- **Album membership** — deliberately out of scope for the MVP. Albums are structurally additive to retrofit: a future revision adds a per-library `albums.json` (one document per library mapping album names to `photo_id` lists) with no changes to per-photo sidecars or existing `state.db` tables. The retrofit can backfill from the live Photos library at any time, since PhotoKit retains album structure; the only unrecoverable scenario is the Photos library itself dying before the retrofit lands. RFC-011's album support is Phase 4, so nothing downstream blocks on this.
+- **Full EXIF dump** — re-extractable from the originals the mesh holds (see above).
+- **Album membership** — deliberately out of scope for the MVP. RFC-011's album support is Phase 4, and PhotoKit retains album structure, so a later revision can backfill albums from the live Photos library at any time; the only unrecoverable scenario is the Photos library itself dying before that lands.
 
 ## Ingest Pipeline
 
@@ -573,14 +591,14 @@ Both modes are idempotent: every descriptor resolves through match precedence (s
 
 ### Change classification
 
-Every discovery event resolves to exactly one of five kinds. All sidecar rewrites and transaction boundaries hang off this taxonomy:
+Every discovery event resolves to exactly one of five kinds. All state transitions and transaction boundaries hang off this taxonomy:
 
 | Kind | Trigger | Actions |
 |---|---|---|
 | New photo | No identity match | Mint `photo_id` + resource rows, enqueue fetches |
-| Resource change | Resource set or `edited` bytes differ | New/updated/deleted resource rows; re-edit and revert follow the lifecycle in `photo_resources` notes (refcount swap in same tx); rewrite sidecar |
-| Metadata-only | `asset_modified_at` newer, resources unchanged | Update `photos` row + rewrite sidecar; no byte movement |
-| Scope change | Known `cloud_id`, different library scope | Hard move (see Library Partitioning) |
+| Resource change | Resource set or `edited` bytes differ | New/updated/deleted resource rows; re-edit and revert follow the lifecycle in `photo_resources` notes (refcount swap in same tx) |
+| Metadata-only | `asset_modified_at` newer, resources unchanged | Update `photos` row + descriptor capsule; no byte movement |
+| Scope change | Known `cloud_id`, different library scope | Ledger-only move (see Library Partitioning) |
 | Deletion | Asset absent / inaccessible | Tombstone (see Deletion and Retention) |
 
 ### Per-resource state machine
@@ -596,11 +614,12 @@ There is deliberately no persisted intermediate ("fetched", "hashed"): bytes str
 ### Write path
 
 1. **Admission** — storage-aware check (below) before a fetch slot is granted.
-2. **Stream** — `PHAssetResourceManager.requestData` (with `isNetworkAccessAllowed = true`) delivers chunks in memory; each chunk feeds the BLAKE3 hasher and appends to `<blob_root>/blobs/.partial/<photo_id>.<resource_type>`. The temp is named by `(photo_id, resource_type)` — the hash isn't known yet, and this naming makes per-resource inflight exclusivity structural. Exception: a brand-new photo's original streams *before* any `photo_id` exists (identity rules 2a–2c resolve from its hash), so pre-mint originals use a fresh probe token (`probe-<uuid>`) under the same `.partial/` directory, swept identically at startup.
+2. **Stream** — `PHAssetResourceManager.requestData` (with `isNetworkAccessAllowed = true`) delivers chunks in memory; each chunk feeds the BLAKE3 hasher and appends to `<data_dir>/spool/blobs/.partial/<photo_id>.<resource_type>`. The temp is named by `(photo_id, resource_type)` — the hash isn't known yet, and this naming makes per-resource inflight exclusivity structural. Exception: a brand-new photo's original streams *before* any `photo_id` exists (identity rules 2a–2c resolve from its hash), so pre-mint originals use a fresh probe token (`probe-<uuid>`) under the same `.partial/` directory, swept identically at startup.
 3. **Dedup decision** — stream complete, hash known. Query `blobs(library_id, content_hash)`:
-   - **Hit**: delete the temp. Transaction: increment `ref_count`, set `content_hash`/`ext`/`size_bytes`/`written_at` on the resource row.
-   - **Miss**: fsync the temp, rename to `blobs/<aa>/<bb>/<hash>.<ext>`. Transaction: insert `blobs` row with `ref_count = 1`, update the resource row as above.
-4. **Photo completion** — if this was the photo's last unwritten resource, the same transaction sets `photos.materialized_at`. The sidecar is then written locally and queued for best-effort remote replication.
+   - **Hit on a live row**: delete the temp. Transaction: increment `ref_count`, set `content_hash`/`ext`/`size_bytes`/`written_at` on the resource row.
+   - **Hit on an evicted row**: the file is gone, but the bytes just streamed — place them (fsync + rename, as a miss) and clear `evicted_at` in the same transaction as the refcount increment. The next publish pass re-evicts once decided.
+   - **Miss**: fsync the temp, rename to `spool/blobs/<aa>/<bb>/<hash>.<ext>`. Transaction: insert `blobs` row with `ref_count = 1`, update the resource row as above.
+4. **Photo completion** — if this was the photo's last unwritten resource, the same transaction sets `photos.materialized_at`, and the descriptor capsule (`photos.descriptor_json`) is persisted from the drain-time descriptor — the photo is now publishable.
 
 **Ordering invariant: filesystem durability precedes database commit.** A committed row never references bytes that might not exist. The crash windows this leaves are all benign:
 
@@ -610,16 +629,15 @@ There is deliberately no persisted intermediate ("fetched", "hashed"): bytes str
 | After rename, before commit | Blob file with no `blobs` row | Orphan scan (see Recovery); refetch takes the dedup-hit path if the file is re-created first, or rewrites it — content addressing makes both idempotent |
 | After commit | Consistent | Nothing to do |
 
-**Temp files live on the destination filesystem** — atomic rename cannot cross filesystems, so temps cannot live in local `run/`. The cost of a dedup hit is having streamed the bytes over the network before discarding them; this is accepted because the `cloud_id` fast path catches already-ingested assets before any download, making write-stage dedup hits rare in steady state. The alternative (spool locally, hash, then copy on miss) costs strictly more total I/O and adds local disk pressure.
+**Temps live inside the spool** (`spool/blobs/.partial/`), on the same filesystem as their destination, so the finalize rename is atomic. The cost of a dedup hit is having streamed the bytes from iCloud before discarding them; this is accepted because the `cloud_id` fast path catches already-ingested assets before any download, making write-stage dedup hits rare in steady state.
 
 ### Storage-aware admission
 
 Before a fetch is admitted, the scheduler checks that the write can complete:
 
 - **Expected size** comes from `PHAssetResource`'s `fileSize` attribute — an undocumented KVC key (`value(forKey: "fileSize")`), reliable in practice but treated as advisory: it may be absent or zero for assets not yet downloaded from iCloud. Unknown sizes are assumed to be a configurable pessimistic estimate (default: the largest asset observed so far in this library).
-- **Free space** on the `blob_root` filesystem, minus the summed expected sizes of already-inflight writes, must stay above a configurable reserve floor (default 10 GiB). Breach pauses admission (inflight writes finish), emits `storage_low`, and admission resumes with `storage_recovered` once the check passes again.
-- **Vanished blob root** (errata, from the first live SMB soak): `statvfs` failing with `ENOENT`/`ENOTDIR` means the network mount is gone — an unmount rips the whole directory away. This is the same pause class as `storage_low`, NOT a per-resource failure: a dead mount fails instantly, so charging it to resources burns the full retry budget in minutes and strands the queue until the next scan's gave-up reset (observed live: 5,961 gave-ups from one overnight unmount). The scheduler pauses and re-probes on the storage poll interval; work resumes within seconds of the mount returning, with retry counts untouched.
-- **Local disk headroom**: PhotoKit stages iCloud downloads in its own cache on the Mac's local disk — this cannot be opted out of, and the daemon never sees those files. Required local headroom is approximately `fetch_concurrency × largest asset`; the bounded fetch pool is the control knob.
+- **Free space** on the data-dir filesystem (`state.db` and the spool share it), minus the summed expected sizes of already-inflight writes, must stay above a configurable reserve floor (default 10 GiB). Breach pauses admission (inflight writes finish), emits `storage_low`, and admission resumes with `storage_recovered` once the check passes again. **This is what bounds the spool**: admission stops before the disk crosses the floor, and eviction of decided publishes is what frees it — the steady-state spool footprint is the publish queue's in-flight window, not the library size.
+- **PhotoKit cache headroom**: PhotoKit stages iCloud downloads in its own cache on the same local disk — this cannot be opted out of, and the daemon never sees those files. Required extra headroom is approximately `fetch_concurrency × largest asset`; the bounded fetch pool is the control knob.
 
 ### Concurrency and cancellation
 
@@ -628,7 +646,32 @@ Before a fetch is admitted, the scheduler checks that the write can complete:
 - SIGTERM triggers cooperative cancellation: inflight streams are abandoned (their temps swept at next startup), SQLite transactions are never interrupted mid-flight (they are fast and atomic anyway).
 - Every step is re-runnable. Idempotency falls out of content addressing plus match precedence — re-fetching a written resource is a dedup hit; re-processing a discovery event is a no-op.
 
-The daemon mirrors PhotoKit deletions into its own state, but does not delete bytes from the storage root immediately. A retention window allows recovery from accidental deletes — both at the user's "oh wait" level and at the level of unexpected PhotoKit observer churn during library reorganizations.
+### HopNet publish queue
+
+The daemon-loop tick (`ingress-core/src/publish.rs`; concrete publisher in `crates/ingress-publisher`) that pushes completed photos into a HopNet node over the thin-client routes — the step that makes HopNet the archive of record: consensus-committed, RS-encoded, mesh-distributed storage.
+
+- **Claim predicate**: `published_at IS NULL AND materialized_at IS NOT NULL AND deleted_at IS NULL AND publish_attempts < cap AND (publish_next_retry_at IS NULL OR due)`, joined to libraries with a **publish target** — `scope_binding IS NULL OR mesh_library_id IS NOT NULL` (personal always publishes; a shared library only once mesh-bound; an unbound shared library published as personal-consensus photos would be exactly the dedup debt the old personal-only gate avoided). Small batches (default 4), claimed photos registered **inflight** for the pass so PhotoKit events for them defer — the same machinery that protects photo_tasks also excludes supersede/hard-move races on the streaming blob reads.
+- **The pass is partitioned by publish scope** — the photo's library's `mesh_library_id` (NULL = personal partition), personal first, then mesh ids in sorted order, each scope running its own resolve → adopt → gate → publish sequence. Responsibility standing, parking, and resolve-failure attempt burning are all **per-scope**: a kicked member's 403ing shared library backs off toward `gave_up` without starving the personal queue, and losing the personal claim holds personal photos while the shared library keeps draining. Node unreachability is the one whole-pass condition — the first unreachable scope parks everything (no attempts anywhere). The edge logs (`publish_not_responsible` / `responsibility_regained`) carry a `library` field.
+- **One spawned pass task** (unlike the inline replication tick): publishing streams multi-GB originals; inline it would stall event routing for the duration.
+- **Metadata source is the descriptor capsule plus live rows** — `Sidecar::compose` builds the publish document per pass (see §Descriptor capsule and the publish document), so the document always reflects committed state with no stored copy to drift. A NULL capsule (pre-column photo awaiting scan backfill) skips that photo without burning an attempt (`publish_descriptor_missing`) and the batch continues.
+- **A missing spool file at publish time clears the resource's `written_at`**, re-entering it into the fetch queue — belt-and-braces self-healing for a file lost outside the daemon's control, rather than burning publish attempts against bytes that cannot appear.
+- **The daemon-minted `photo_id` IS the consensus `photos.id`** for photos this device publishes itself: `PublishRequest.photo_id` carries it verbatim, so the `SourceIdentity → photo_id` persistence half of the publisher idempotency contract is satisfied by construction. The one exception is **adoption** (below), where the mesh's pre-existing id is recorded in `consensus_photo_id` — the photo's consensus identity is always `COALESCE(consensus_photo_id, photo_id)`.
+- **Resolve pre-pass (consensus photo identity)**: each scope opens with one batched `POST /api/photos/client/resolve` carrying that scope's claimed `cloud_id`s plus the scope's `library_id` (absent = personal). The node (which holds the user key at device-auth time; the daemon holds none) returns per cloud_id the keyed **cloud fingerprint**, any already-committed consensus photo id, and this device's responsibility standing **in that scope**. The fingerprint key is scope-selected (RFC-011 §Cloud Fingerprint): the per-user key for personal, the **library-scoped key** (blake3 derive from the shared library key — every member derives the same one) for shared, which is what makes one member's resolve match ANOTHER member's committed photos. Two members' daemons ingesting the same iCloud Shared Photo Library therefore converge: the second daemon adopts instead of re-uploading, and if both race the same asset, the loser's `photo_add` fails deterministically on the `(library_id, cloud_fingerprint)` UNIQUE index, re-resolves next pass, and adopts the winner's row.
+  - *Adoption*: a committed hit on a different id means the mesh already holds this asset (published by another device, or by a previous state.db of this one — the handoff case). The pass stamps `published_at` + `consensus_photo_id` WITHOUT uploading (`publish_adopted` log, `adopted` counter). A hit on the photo's **own** id is an earlier ambiguous submit that actually landed — counted `already_published`, `consensus_photo_id` stays NULL. Adoption runs in **every** responsibility standing; it is read-only node-side and what makes a designation handoff a cheap sweep instead of a full re-upload.
+  - *Responsibility gate*: if this device is not the holder for the scope (`other` | `unclaimed`), that scope's remaining photos are HELD under a distinct `parked_responsibility` state — edge-logged per scope, zero attempts consumed. Responsibility is **per (user, scope)**: `POST /api/photos/ingress/claim {device_id, library_id?}` (JWT-only; a shared-scope claim requires applied membership, and a kick dissolves the target's scope claim). Each member of a shared library claims independently for their own devices — cross-member dedup is the fingerprint's job, not responsibility's. The device transaction route rejects the claim tx kind and 403s mutations for any scope the device doesn't hold (decode-at-admission, exact per scope — holding the personal claim never admits shared writes or vice versa); the fingerprint UNIQUE pair is the correctness backstop behind that. A daemon never claims for itself; the enablement UI (or curl) designates deliberately.
+  - *Fingerprint threading*: resolve-returned fingerprints ride each `PublishItem` into the `photo_add` payload, so the mesh row carries the dedupe key. `cloud_id`-NULL photos (local-only assets) skip the resolve batch and publish fingerprint-less — exempt from dedupe.
+  - *Failure classes*: an unreachable resolve parks exactly like an unreachable publish; other resolve failures burn ONE attempt per claimed photo (bounded backoff toward `gave_up` instead of silent spinning).
+- **Confirm-then-retry**: consensus hard-rejects duplicate photo ids (proposer preflight), so every publish attempt probes `GET /api/photos/client/committed/{photo_id}` first — 200 resolves an earlier ambiguous failure as already-published (stamp, never re-submit); 404 makes the same-id submit safe. Ambiguous outcomes (opaque 500s, submit timeouts) classify as transient; the next tick's probe disambiguates. (For fingerprinted photos the resolve pre-pass usually answers first via self-resolution; the probe remains the path for `cloud_id`-NULL photos.)
+- **Retry ledger**: transient failures back off exponentially (base 60s, max 6h) up to `publish_attempts = cap` (terminal until operator reset); permanent rejections (mapping/validation, malformed fingerprints) jump straight to the cap. Node unreachability (connect/timeout/HTTP 503 shedding) consumes **no** attempts — the pass parks.
+- **Auth**: an RFC-012 device token (`{device_id}.{secret}`), so the daemon can target any node holding the consensus state, and revoking the device row kills its access mesh-wide. The node derives the device identity for the responsibility gate from the same token.
+- **Eviction rides the pass.** After each publish pass — and again on the hourly cleanup tick, which catches strays — blobs whose every referencing photo in the library is decided (`NOT EXISTS … published_at IS NULL`) are stamped `evicted_at` and their spool files deleted under the spool-wide hash-liveness gate. Stamp first, then unlink: a crash between the two leaves a lingering file that fsck classifies as a benign orphan, never byte loss. `spool_evicted` is logged when a pass reclaims anything. This is the point of the spool — residence is bounded by publish latency, not library size.
+- **Driver exit codes** (`ingress-publish-e2e publish`): 0 drained, 2 unreachable-park, 3 = SOME scope responsibility-parked — since the pass is scope-partitioned, healthy scopes were still drained first (read `published`/`parked_responsibility` in the JSON, not just the code).
+- **Kick mid-stream**: a member removed from the mesh library loses the scope on both ends — the remove handler dissolves their responsibility row, and their daemon's next scoped resolve 403s (`library_not_member`), burning attempts toward `gave_up` for that scope only. No ingress-side reaction beyond the backoff this cycle; clearing the local mesh binding stops the attempts.
+- **Out of scope (this phase)**: re-edit propagation (a re-materialized published photo is NOT re-enqueued; content updates need their own transaction type) and favorites (Phase 4). Tombstone and restore propagation ride this same pass — see §Propagation to the mesh. Shared-library publish landed with the scope-partitioned pass above — the historical "shared libraries (Phase 3)" exclusion is closed.
+
+## Deletion and Retention
+
+The daemon mirrors PhotoKit deletions into its own state, but does not delete rows (or any still-spooled bytes) immediately. A retention window allows recovery from accidental deletes — both at the user's "oh wait" level and at the level of unexpected PhotoKit observer churn during library reorganizations.
 
 The model mirrors `photos.md`'s 30-day soft-delete retention so that migration into the consensus layer carries the deletion state forward unchanged.
 
@@ -644,10 +687,11 @@ When a deletion event fires for an asset the daemon has previously ingested:
 2. No deleting actor is recorded — the daemon has a single implicit user; RFC-011's `deleted_by` is assigned to the importing user at migration (see the `photos` schema notes).
 3. `photo_resources` rows are **not** touched.
 4. `blobs.ref_count` values are **not** decremented.
-5. The sidecar's `deleted_at` field is set and the sidecar JSON is rewritten in place. This is a **read-modify-write of the existing document** — the asset no longer exists in PhotoKit, so recomposition from a descriptor is impossible; and since the sidecar path is keyed on `captured_at` (not persisted in `state.db`), the document is located by a two-level `YYYY/MM` walk. A photo that never materialized has no sidecar; the step is skipped silently.
-6. A `deletion_observed` event is recorded in the ingest log.
+5. A `deletion_observed` event is recorded in the ingest log.
 
-Steps 3 and 4 mean the bytes stay on disk and the refcount remains accurate to the (still-existing) `photo_resources` rows. The photo disappears from active queries (`WHERE deleted_at IS NULL`) but is fully restorable until the retention window expires.
+Nothing else happens — the tombstone is a single-row update. Steps 3 and 4 mean the refcount remains accurate to the (still-existing) `photo_resources` rows. The photo disappears from active queries (`WHERE deleted_at IS NULL`) but is fully restorable until the retention window expires.
+
+Spool interplay: a tombstoned photo that never published counts as a live reference (`published_at IS NULL`), so its spool bytes are **not** evicted — they survive locally through the retention window and are reclaimed at hard delete. A tombstoned photo that already published keeps its rows through retention like any other, but its bytes follow the ordinary eviction rule; the mesh copy is soft-deleted by the next propagation pass (see §Propagation to the mesh).
 
 This matches the `photos.md` reference provider's behavior: a soft-deleted `photos` row keeps its `photo_resources` rows alive, which in turn keep their data blocks alive. The daemon's `blobs.ref_count` is the analogue of the consensus layer's reference-provider check.
 
@@ -656,12 +700,68 @@ This matches the `photos.md` reference provider's behavior: a soft-deleted `phot
 If PhotoKit subsequently emits a change event indicating the asset is alive again — typically because the user un-deleted it from Recently Deleted — the daemon resolves identity by `cloud_id`, finds the tombstoned `photos` row, and:
 
 1. Clears `photos.deleted_at`.
-2. Clears the sidecar's `deleted_at` field and rewrites the sidecar JSON.
-3. Records a `restore_observed` event in the ingest log.
+2. Records a `restore_observed` event in the ingest log.
 
-No blob movement is required because nothing was moved on the original delete. Restore is atomic at the SQLite level: a single update statement on the `photos` row.
+No byte movement is required because nothing was moved on the original delete. Restore is atomic at the SQLite level: a single update statement on the `photos` row.
 
 If the asset has been deleted in PhotoKit and then re-imported as a fresh asset (new `cloud_id`), it is **not** a restore — it is a new photo, even if the bytes are identical. Rule 2b from the Asset Identity Model applies: a new `photo_id` is minted and the existing blob's refcount is incremented.
+
+### Propagation to the mesh
+
+**Status: implemented** (`crates/ingress-core/src/publish.rs`, migration `1786032000_tombstone_propagation`). Both preceding subsections describe purely local state; this one specifies how it reaches the mesh.
+
+The mesh side needed nothing new. `photo_delete` and `photo_restore` are registered handlers, and both were already in `DEVICE_TX_FUNCTIONS` — a daemon submits them over `POST /api/photos/client/transaction` under its existing device token, subject to the per-scope responsibility gate that admits every other photo-targeting transaction. Delete authorization is already the uploader **or any member of the photo's shared library**, matching Apple's Shared Photo Library semantics where any participant may delete. The delete handler is idempotent on a missing photo. The whole of the work was daemon-side: recording what the mesh has been told, and a pass to tell it.
+
+#### Why a marker column is required
+
+`published_at` doubles as both state and queue marker: `publishable_photos` selects `published_at IS NULL`, and stamping it removes the row from the queue permanently. That works because publication is **monotonic** — a photo goes unpublished to published exactly once, in one direction, and a nullable timestamp captures a one-way door completely.
+
+Deletion is **cyclic**. A user may delete, restore from Recently Deleted, and delete again without limit. A queue selecting `published_at IS NOT NULL AND deleted_at IS NOT NULL` has no off-switch: it would re-submit `photo_delete` for every tombstoned photo on every tick, through the retention window and beyond, until hard delete finally removes the row. Idempotency on the mesh side keeps this correct but not cheap — it is one consensus transaction per deleted photo per tick.
+
+So propagation state needs its own column, `tombstone_published_at`. This is consistent with the convention in §`photo_resources` that per-resource state is derivable from nullable timestamps rather than a stored `status` enum: a timestamp *is* the state, and doubles as the audit record. The prohibition is on enums shadowing timestamps, not on markers as such.
+
+#### The two-column state machine
+
+`deleted_at` records what Apple Photos believes. `tombstone_published_at` records what the mesh has been told. The queue is the delta.
+
+| `deleted_at` | `tombstone_published_at` | State | Action |
+|---|---|---|---|
+| NULL | NULL | Live; mesh agrees | none |
+| set | NULL | Deleted locally, mesh not told | submit `photo_delete`, then stamp |
+| set | set | Deleted; mesh converged | none |
+| NULL | set | Restored locally, mesh still tombstoned | submit `photo_restore`, then clear |
+
+The restore queue is the fourth row and costs nothing extra — the same column drives both directions.
+
+**`tombstone_published_at` must be resettable**, unlike `published_at`. A successful restore clears it, returning the row to the first state. If a restore left it set, the next delete would land in the third state and never propagate, leaving the mesh holding a photo Photos has discarded. This is a deliberate deviation from its neighbour in the same table, whose "set once, never reset" rule exists for the opposite reason (a re-publish of the same `photo_id` is hard-rejected by consensus).
+
+The propagation queue carries its own retry ledger rather than reusing `publish_attempts` / `publish_next_retry_at` / `publish_last_error`. Publish success resets that ledger, so the columns are technically free — but a photo that struggled to publish, succeeded, and then failed to propagate its delete would carry a blended failure history under a `publish_last_error` string describing the wrong operation.
+
+#### Where propagation runs
+
+Propagation folds into the scope pass rather than running beside it. `run_publish_pass` takes two claim lists — publishable photos and propagatable ones — partitions **both** by the same `Option<mesh_library_id>` key, and each scope runs one resolve→adopt→gate→publish→propagate sequence.
+
+Sharing the pass is not an economy, it is the correctness requirement. The node's device-tx gate rejects any transaction touching a scope the submitting device does not hold, so propagation has to respect the same holder gate publishing does; a separate pass would have had to duplicate the gate, the park/unpark edges and the scope partition, which is precisely where a divergent second copy would drift. The scope's single `resolve` call already yields the responsibility standing both halves need — a scope carrying only propagation work calls it with an empty id list purely for the standing.
+
+Propagation runs **after** the publish loop within a scope. A photo added and deleted between two passes must reach consensus before it is tombstoned there; a `photo_delete` for a photo the mesh has never seen is an idempotent no-op, and the tombstone would be lost. Adopted photos propagate under `consensus_photo_id` — the id whichever device published first, not the local one.
+
+#### Marker as cache, resolve as repair (deferred)
+
+`tombstone_published_at` is a local memo, not the truth. The truth is the mesh's `photos.deleted_at`, and the daemon already has a seam that reaches it: the resolve pre-pass deliberately resolves tombstoned rows (see §HopNet publish queue and the no-`deleted_at` rationale on the by-fingerprint lookups), it simply returns the committed id alone. Extending that projection to carry the mesh's tombstone state would let a daemon whose marker is stale or absent — a rebuilt `state.db`, a Tier 3 re-scan — reconverge instead of diverging permanently.
+
+That repair path is **not built**. Today a rebuilt `state.db` re-derives `published_at` through adoption but starts with an empty `tombstone_published_at`, so a photo the mesh already knows is deleted will be re-told once; the delete handler's idempotency makes that harmless. The gap that matters is the opposite one — a locally-live photo the mesh still has tombstoned is invisible to the queue after a rebuild, because both columns read as the "live, mesh agrees" state.
+
+The intended shape mirrors publication exactly: `published_at` is the fast local marker, and adoption-by-fingerprint is the repair when it is missing. One idea applied twice rather than two idioms side by side.
+
+#### Relationship to re-edit propagation
+
+Re-edit propagation is the same *pattern* at a different granularity, and should reuse the vocabulary rather than invent a parallel one. Both are convergence between local desired state and remote known state, with a marker recording last-converged and the delta forming the queue. Three things differ, and they are what make it separate work rather than a second instance:
+
+- **Granularity.** A tombstone is a property of the photo. An edit is a property of its resources — `photo_edit_content` carries `resources: Vec<PhotoResourceOp>`, so the marker belongs on `photo_resources`, not `photos`.
+- **Cardinality.** Deletion is a bit, so a timestamp suffices to say "told." An edit is a *value*: the marker must record *which* version the mesh holds, comparing against the resource's current `content_hash`. A bare timestamp cannot express that.
+- **Payload.** `photo_delete` carries only photo ids, so propagation is transaction-only. `photo_edit_content` carries data blocks that must be uploaded first, which means re-edit propagation drives the entire fetch/encrypt/upload pipeline, not just a submission. This is the bulk of the difference in cost.
+
+The bookkeeping generalizes; the work does not.
 
 ### Hard-delete cleanup
 
@@ -669,35 +769,35 @@ A periodic cleanup job runs on a configurable interval (default: once per hour) 
 
 ```
 For each photo P with deleted_at IS NOT NULL
-                AND datetime(deleted_at, '+30 days') < datetime('now'):
+                AND datetime(deleted_at, '+30 days') < datetime('now')
+                AND (published_at IS NULL          -- mesh never knew it
+                  OR tombstone_published_at IS NOT NULL):  -- mesh was told
 
   Inside a single SQLite transaction:
     1. For each photo_resources row R of P:
          decrement blobs(library_id, content_hash).ref_count
-         record (library_id, content_hash, ext) for post-tx cleanup
-            if the decremented count is zero
+         record (content_hash, ext) for post-tx cleanup
+            if the decremented count is zero (row deleted at zero)
     2. Delete photo_resources rows for P.
     3. Delete photos row for P.
+    4. Record a hard_delete event in the ingest log (in-tx — see errata).
 
   After the transaction commits:
-    4. For each recorded (library_id, content_hash, ext) whose
-       count reached zero, delete the blob file at
-       <blob_root>/<aa>/<bb>/<hash>.<ext>.
-    5. Delete the sidecar JSON locally
-       (<sidecar_root_local>/<YYYY>/<MM>/<photo_id>.json).
-    6. Delete the sidecar JSON on the remote backup root (best effort).
-    7. Record a hard_delete event in the ingest log.
+    5. For each recorded (content_hash, ext) whose count reached zero
+       AND whose hash is no longer live in any library's ledger,
+       delete the spool file at spool/blobs/<aa>/<bb>/<hash>.<ext>.
+       (Already-evicted blobs have no file; the unlink is a no-op.)
 ```
 
-The transaction commits before the filesystem operations because:
+**A published photo whose delete has not reached the mesh is held past its cutoff.** Reaping the row would destroy the only record that propagation is still owed, stranding the photo in HopNet permanently with nothing left to repair it — the daemon would have forgotten, and the mesh would never be told. Retention is therefore "30 days, or until the mesh knows, whichever is later". Only metadata lingers: the bytes follow the ordinary eviction rule and are long gone by then. Unpublished tombstones are unaffected — there is nothing to propagate, so they reap on schedule.
 
-- SQLite transactions are fast and authoritative.
-- Filesystem operations over a network mount are slow and can fail (mount lost, server restarting, ACL transient issues).
-- If the daemon crashes between transaction commit and filesystem cleanup, the result is orphan blob files on disk with no `blobs` row referencing them. The Recovery section describes a startup scan that reconciles this: any file under `<blob_root>` whose `(library_id, content_hash)` has no corresponding `blobs` row is an orphan and is deleted.
+The rows this holds back are counted per library as `tombstones_unpropagated` in the `status` view, so a daemon that cannot reach its node (or no longer holds ingress responsibility for the scope) shows up as a number that stops falling, rather than as silent growth.
+
+The transaction commits before the filesystem unlink because SQLite is fast and authoritative, and the crash window this leaves is benign: an orphan spool file with no live `blobs` row, which `fsck` reports and `--repair` deletes.
 
 The cleanup job is idempotent: re-running it produces no additional effect once a photo has been fully hard-deleted.
 
-*Implementation errata (Phase 5):* the `hard_delete` log event (step 7) commits **inside** the step-1–3 transaction, not after the filesystem operations — a crash between the transaction and fs cleanup must never leave a vanished photo with a silent black box, which is the exact forensic failure the ingest log exists to prevent. The detail (resources, hashes, reaped blobs) is fully known pre-fs. Each photo is its own transaction; retention cutoffs are computed Rust-side (`now − retention_days`) and bound as parameters, reading each library's `retention_days` fresh per run. Hard deletes are batch-capped per run (default 500) — a whole-library expiry processes across consecutive runs rather than stalling the daemon loop.
+*Implementation errata (Phase 5):* the `hard_delete` log event commits **inside** the step-1–3 transaction, not after the filesystem operations — a crash between the transaction and fs cleanup must never leave a vanished photo with a silent black box, which is the exact forensic failure the ingest log exists to prevent. The detail (resources, hashes, reaped blobs) is fully known pre-fs. Each photo is its own transaction; retention cutoffs are computed Rust-side (`now − retention_days`) and bound as parameters, reading each library's `retention_days` fresh per run. Hard deletes are batch-capped per run (default 500) — a whole-library expiry processes across consecutive runs rather than stalling the daemon loop.
 
 ### Edge cases
 
@@ -706,25 +806,24 @@ The cleanup job is idempotent: re-running it produces no additional effect once 
 | Soft-deleted photo's blob is also referenced by an active photo | Refcount stays > 0 during cleanup; blob file is preserved. Only the tombstoned photo's `photos` and `photo_resources` rows are removed at hard-delete time. |
 | Daemon offline when PhotoKit deletes an asset | On next observer reconciliation, the asset is reported as absent from PhotoKit while still present in `state.db`. Daemon synthesizes a deletion event and tombstones the photo. The `deleted_at` timestamp is the reconciliation moment, not the original PhotoKit delete moment, so the retention window starts from when the daemon noticed. |
 | Daemon offline for longer than 30 days | Same as above — tombstone is created with `deleted_at = now`, full 30-day window applies. No assumption that the user's PhotoKit-side grace already elapsed. |
-| User deletes the entire iCloud Shared Photo Library | Every shared-library asset transitions to a deletion event on the change observer; daemon tombstones them all. After 30 days, cleanup hard-deletes the rows and the bytes. The `libraries` row for the shared library remains until the user explicitly removes it via CLI. |
+| User deletes the entire iCloud Shared Photo Library | Every shared-library asset transitions to a deletion event on the change observer; daemon tombstones them all. After 30 days, cleanup hard-deletes the rows and any still-spooled bytes. The `libraries` row for the shared library remains until the user explicitly removes it via CLI. |
 | Photo deleted, then user attempts to re-import the same image file as a new asset | Rule 2b: new `cloud_id`, new `photo_id`. The old tombstoned record proceeds through normal hard-delete on schedule; the new record begins fresh. Blob refcount handles the byte-level overlap (single blob, refcount 2 during overlap, refcount 1 after the tombstone expires). |
 | Retention window changed (config edited from 30 to 60 days) | Cleanup job uses the new value on its next run. Photos already past the old window are not retroactively hard-deleted by re-extending; they may have already been processed. |
-| Unmapped tombstone (`library_id IS NULL`, scope never bound) | Hard-deleted after a fixed 30-day default (no per-library config exists for it); degenerates to row deletion + log — an unmapped photo holds no bytes and no sidecar. |
+| Unmapped tombstone (`library_id IS NULL`, scope never bound) | Hard-deleted after a fixed 30-day default (no per-library config exists for it); degenerates to row deletion + log — an unmapped photo holds no bytes. |
 | Tombstoned photo with a superseded-pending row (re-edit reopened, never refetched) | The row's retained `content_hash` still holds a refcount and is decremented at hard delete — same hash-gate rule as the revert path. |
 
 ### Why this matches RFC-011
 
-The daemon's deletion model is intentionally identical in shape to `photos.md`'s soft-delete approach: tombstone on the `photos` row, retain referenced data through a refcount-style check, hard-delete after a fixed retention window. The mapping at migration time is direct:
+The daemon's deletion model is intentionally identical in shape to `photos.md`'s soft-delete approach: tombstone on the `photos` row, retain referenced data through a refcount-style check, hard-delete after a fixed retention window. The mapping is direct:
 
 | Daemon | RFC-011 consensus |
 |---|---|
 | `state.db.photos.deleted_at` | `photos.deleted_at` |
-| (not stored) | `photos.deleted_by` — migrator assigns the importing user's user_id |
+| (not stored) | `photos.deleted_by` — assigned by the delete handler from the submitting user at propagation |
 | `state.db.blobs.ref_count` | `DataBlockReferenceProvider` check on `photo_resources` |
 | Periodic cleanup of tombstones past retention | RFC-011's cleanup job for expired tombstones |
-| Sidecar deletion | Sidecar rebuild on next consensus sync |
 
-No daemon state needs to be invented or re-derived during migration. The 30-day window is the same value in both layers; in-flight tombstones flow through the migration as-is.
+The 30-day window is the same value in both layers, so an in-flight tombstone carries over as-is when propagation submits it (§Propagation to the mesh): the mesh's `deleted_at` comes from the `operation_id`'s embedded UUIDv7 timestamp, and both clocks then expire it on the same schedule.
 
 ## Failure Handling
 
@@ -732,21 +831,21 @@ The spec constrains failure *semantics* — what state each failure class may an
 
 | Failure | Semantics |
 |---|---|
-| Storage mount lost | Pipeline pauses for all libraries on that mount. Pending rows are untouched — mount loss is not a resource failure and consumes no retries. `mount_lost` event; on regain, `mount_regained`, admission resumes, and the sidecar dirty set is drained. |
+| Spool disk pressure (reserve floor breached) | Daemon-wide admission pause (`storage_low`); inflight writes finish, pending rows are untouched, no retry counts are consumed. Resumes with `storage_recovered` once eviction (or the user) frees space. |
 | iCloud fetch failure | Per-resource exponential backoff via `retry_count` / `next_retry_at`. After a configurable retry cap, the resource goes terminally pending with a `resource_gave_up` event. Terminal resources are automatically re-enqueued by the next reconciliation scan — transient iCloud outages self-heal without operator action. |
-| Local disk pressure (`CloudPhotoLibraryErrorDomain` code 1005) | `cloudphotod` refuses downloads below a local-headroom threshold (spike-verified: instant failure, no network attempt; resolves when space is freed). Classified as a daemon-wide pause like `storage_low`, but for the *local* disk: fetch admission stops, no retry counts are consumed, admission resumes when headroom recovers. Treating it as a per-resource failure would spin the retry budget uselessly. |
-| Partial blob write (crash, mount drop mid-stream) | Covered by the crash-window table in the Ingest Pipeline: orphan `.partial` temps are swept at startup; a renamed-but-uncommitted blob is reconciled by the orphan scan. No committed row ever references unverified bytes. |
-| Remote sidecar replication failure | Best-effort and asynchronous by design; durability comes from the `sidecar_replicated_at` dirty flag, drained whenever the mount is up. Metadata-only rewrites (tombstone, favorite) accumulate safely while the mount is down. *(Phase 5: drained on a short interval — default 60s — with a per-pass batch cap; photos with a live fetch task are skipped for the pass, so a stamp never records a mid-rewrite copy as current. Stalls surface as edge-triggered `mount_lost`/`mount_regained` events, op-tagged.)* |
+| Local disk pressure (`CloudPhotoLibraryErrorDomain` code 1005) | `cloudphotod` refuses downloads below a local-headroom threshold (spike-verified: instant failure, no network attempt; resolves when space is freed). Classified as a daemon-wide pause like `storage_low`: fetch admission stops, no retry counts are consumed, admission resumes when headroom recovers. Treating it as a per-resource failure would spin the retry budget uselessly. |
+| Partial blob write (crash mid-stream) | Covered by the crash-window table in the Ingest Pipeline: orphan `.partial` temps are swept at startup; a renamed-but-uncommitted blob is reconciled by the orphan scan. No committed row ever references unverified bytes. |
+| HopNet node unreachable | The publish pass **parks** (connect/timeout/503 shedding consume no attempts); observation and ingest continue untouched. Reachability edges log once (`node_unreachable`/`node_regained`). Responsibility loss parks separately (`parked_responsibility`) with its own edge events. |
 | PhotoKit authorization revoked | Hard stall: the daemon stops all PhotoKit interaction, logs a loud event, and the CLI surfaces the condition. No state is modified — in particular, an empty enumeration due to lost authorization must not be interpreted as mass deletion. |
-| Local `state.db` corruption | Disaster case; recover from the most recent state snapshot (see Recovery). |
+| Local `state.db` corruption | Disaster case; wipe and re-ingest — PhotoKit re-delivers the library and the mesh resolve pre-pass adopts everything already committed, so nothing re-uploads (see Recovery). |
 
-The last row of the table deserves emphasis as a general rule: **absence of evidence from PhotoKit is only evidence of deletion when the API is healthy.** Any scan that could synthesize deletion events must verify library authorization and non-empty enumeration sanity before tombstoning anything.
+The PhotoKit-authorization row deserves emphasis as a general rule: **absence of evidence from PhotoKit is only evidence of deletion when the API is healthy.** Any scan that could synthesize deletion events must verify library authorization and non-empty enumeration sanity before tombstoning anything.
 
-fsync over SMB is weaker than local fsync — the daemon issues it, but the storage server's write cache is the real durability boundary. This is accepted: the backstop for silent byte loss is `fsck`'s blob-existence check plus filesystem-level integrity (ZFS) on the storage side.
+Durability boundaries: spool writes fsync before rename (`F_FULLFSYNC` on macOS — plain fsync does not defeat the drive's write cache); once a publish is consensus-decided, durability is the mesh's job and the local copy is disposable by design.
 
 ## Recovery
 
-Recovery is tiered: the daemon repairs benign inconsistencies automatically, audits on demand, and rebuilds from the storage root only as an explicit, operator-initiated disaster action. The daemon never decides on its own that `state.db` is disposable.
+Recovery is tiered: the daemon repairs benign inconsistencies automatically, audits on demand, and treats a lost `state.db` as a **re-ingest, not a restore** — HopNet holds the archive, and PhotoKit plus the mesh's adoption path rebuild the daemon's world from scratch. The daemon never decides on its own that `state.db` is disposable.
 
 ### Tier 1 — automatic startup reconciliation
 
@@ -755,78 +854,30 @@ On every start:
 1. Sweep all `.partial` temp files (nothing ever references them).
 2. If the previous shutdown was unclean (stale pid/lock in `run/`): recount `blobs.ref_count` from the JOIN through `photos`/`photo_resources`, diff against stored values, repair and log any drift.
 
-Startup repair never deletes blob files — orphan deletion is deliberately excluded from the automatic tier.
+Startup repair never deletes spool files — orphan deletion is deliberately excluded from the automatic tier. The recount also never touches `evicted_at`: it recomputes counts from resource **rows**, and an evicted blob's rows still exist, so repair and eviction cannot fight (this is why eviction is a stamp rather than a decrement — see the `blobs` notes).
 
 *Implementation notes (Phase 5):* the `drain.lock` file is pid-stamped. A starting process finding a lock held by a dead pid (or an empty/unparseable file) reclaims it and treats the start as unclean, running the recount before any work is admitted — repaired counts gate the irreversible file deletes. A live-pid lock is a hard error. Repair is row-level only: count mismatches are updated, zero-recount `blobs` rows deleted (the file becomes fsck's benign orphan class), missing rows inserted from a referencing resource row (file existence deliberately unchecked — a missing file is fsck's loud byte-loss class). Rows are counted by `content_hash` regardless of `written_at` (superseded-pending rows still reference their old blob). One `refcount_repaired` event per run, drift only.
 
 ### Tier 2 — `ingress-cli fsck`
 
-On-demand invariant audit across `state.db`, the sidecar trees, and the blob trees:
+On-demand invariant audit across `state.db` and the spool, in one spool-wide blob-tree walk:
 
 - Recount refcounts (as tier 1) and report drift.
-- **Missing blobs**: every `blobs` row must have its file on disk. A miss means byte loss (or manual tampering) and is reported loudly — it is not repairable from local state; the resource must be re-fetched from PhotoKit if the asset still exists there.
-- **Orphan blobs**: files under `blobs/` with no corresponding `blobs` row (the crash window between rename and commit, or leftovers from a crashed hard-delete). Deleted only under `--repair` — this is the one destructive repair, which is why it lives here and not in tier 1.
-- Sidecar consistency: every non-`NULL`-library photo has a local sidecar whose contents match its rows; remote copies match `sidecar_replicated_at` claims.
+- **Missing spool files**: a **live** (unevicted) `blobs` row must have its file on disk. A miss means byte loss (or manual tampering) and is reported loudly — not repairable from local state; the resource must be re-fetched from PhotoKit if the asset still exists there. An **evicted** row with no file is the normal post-publish state and is clean; an evicted row whose file *lingers* (crash between stamp and unlink) is a benign orphan.
+- **Orphan spool files**: files with no live row — the rename-before-commit crash window, a crashed hard delete, or a stamp-then-unlink eviction crash. Deleted only under `--repair` — this is the one destructive repair, which is why it lives here and not in tier 1.
+- Ext-mismatched and foreign (unparseable-name / wrong-depth) files are reported but never deleted — the delete gate is exact-match orphans only.
 
-*Implementation notes (Phase 6):*
+*Implementation notes:* the default run is **read-only** (read-only pool, no lock, logs nothing) so it can audit beside a live daemon; a live `drain.lock` prints an in-flight-work banner since transient states (a renamed-but-uncommitted blob) read as findings. `--repair` takes the exclusive run lock, applies the refcount repair, deletes exact-match orphans (logged as `fsck_orphans_deleted`), and runs Tier-1 first on an unclean reclaim — the reclaim signal must never be swallowed. Exit codes follow fsck(8): 0 clean, 1 findings remain, 2 operational error. A read-only SQLite connection cannot run WAL recovery, so read paths can fail against a hot `-wal` left by a crashed daemon (`SQLITE_READONLY_RECOVERY`); when no live pid holds `drain.lock`, the CLI falls back to a normal read-write open (safe: no live writer, migrations are a no-op) with a printed note.
 
-- The default run is **read-only** (read-only pool, no lock, logs nothing) so it can audit beside a live daemon; a live `drain.lock` prints an in-flight-work banner since transient states (a renamed-but-uncommitted blob) read as findings. `--repair` takes the exclusive run lock, applies the refcount repair, deletes exact-match orphans (logged as `fsck_orphans_deleted`), and runs Tier-1 first on an unclean reclaim — the reclaim signal must never be swallowed.
-- "Contents match its rows" is **db-backed fields only**: identity, tombstone, `ingested_at`, and the written-resource array. Capture metadata exists solely in the sidecar and cannot be cross-checked. Remote copies get an existence check by default; `--deep` byte-compares (replication is a byte copy, so byte equality is the oracle).
-- **Mount-down ≠ byte loss**: an entirely-absent blob or remote root is reported once under `skipped_roots` (advisory, excluded from the exit code) instead of flooding false byte-loss findings. Ext-mismatched and foreign (unparseable-name / wrong-depth) files are reported but never deleted — the delete gate is exact-match orphans only.
-- Exit codes follow fsck(8): 0 clean, 1 findings remain, 2 operational error.
+### Tier 3 — re-scan and adoption
 
-### Tier 3 — `ingress-cli recover`
+There is no restore tool, no state snapshot, and no archive-tree rebuild. A dead Mac or lost `state.db` is recovered by re-ingesting:
 
-Explicit rebuild of `state.db` from a storage root, for a dead Mac or lost local disk. Two sources, in preference order:
+1. Enable the daemon on the (new) machine; `ensure_personal_library` recreates the library row, and the keychain re-provisions via the enable route.
+2. The first reconciliation scan re-enumerates PhotoKit and mints fresh rows; materialization re-streams from iCloud into the spool as ordinary pipeline work.
+3. The publish pass's **resolve pre-pass** asks the node, per `cloud_id`, whether the mesh already holds each asset (keyed cloud fingerprint — RFC-011 §Cloud Fingerprint). Everything already committed is **adopted**: stamped `published_at` + `consensus_photo_id` with zero uploads. A full recovery re-uploads only what the mesh never received, and adopted photos evict on the same pass — the recovery's spool footprint is as transient as steady-state ingest.
 
-1. **State snapshot** (`state-snapshots/state.db.<timestamp>.sqlite3`): restore the newest snapshot, then let normal startup plus a reconciliation scan close the gap — PhotoKit re-delivers everything that changed since the snapshot, and match precedence makes re-delivery idempotent. Complete recovery: `photo_id`s, tombstones, pipeline state.
-2. **Sidecar-tree rebuild** (no usable snapshot): walk `sidecars/<YYYY>/<MM>/*.json` per library, reconstruct `photos` and `photo_resources` rows from each document, rebuild `blobs` by recounting resource references, and verify each referenced blob file exists. `photo_id`s survive — they are in the sidecars. Lost: retry state and the ingest log (both disposable) and `local_id`s, which are device-scoped and would be useless on a replacement Mac anyway — the first reconciliation scan re-links every asset by `cloud_id` (match-precedence step 1) and repopulates them.
-
-Only if both sources are absent (blobs survived, sidecars did not) does recovery degrade to the blob-only case: fresh `photo_id`s, metadata re-derived from blob bytes where possible. This is the scenario the remote sidecar backup exists to prevent — see the `sidecar_root_remote` warning in the `libraries` notes. *Phase 6 note:* blob-only recovery is **deliberately not implemented** — it needs the deferred EXIF pass and produces permanently degraded records; `recover` instead errors with a per-root inventory (snapshots found? sidecar tree? blob fan-out?) so the operator knows exactly what survived.
-
-After any tier-3 recovery, the daemon's first reconciliation scan doubles as verification: assets still in PhotoKit re-resolve by `cloud_id`, and discrepancies surface as ordinary pipeline work rather than recovery-specific logic.
-
-*Implementation notes (Phase 6):* `state.db` is dead in this scenario, so configuration comes from arguments: `--root <path>` (repeatable) names storage roots to search for snapshots; `--library id=…,blob=…[,sidecars=…][,scope=…][,retention=…][,name=…]` (repeatable) supplies the rebuild specs — the CLI spec wins over a document's embedded `library_id` (pre-rename stragglers), with a warning. An existing `state.db` is refused unless `--force`, which moves the db *and its WAL companions* aside as `state.db.pre-recover.<unix-ts>*` (never deleted; a stale `-wal` beside a restored db is a corruption hazard). The exclusive run lock is held throughout. **Local-sidecar hydration (spec gap):** a restored snapshot claims materialized-and-replicated photos, but the dead Mac's *local* sidecar tree is gone — recovery copies each library's remote tree into `~/.local/share/…/sidecars/<library_id>/` ("stamped ⇒ remote ≥ local" makes the remote copies current); unhydrated photos remain fsck findings. The sidecar rebuild inserts rows from documents (`materialized_at`/`sidecar_replicated_at = now`, `local_id = NULL` — the first scan re-links), then runs the Tier-1 recount, whose missing-row insertion path *is* the "rebuild `blobs` by recounting" step, and finally verifies every rebuilt row's blob file on disk — a flood of misses means a wrong `blob=` path in a spec.
-
-### State snapshots
-
-Written by the periodic cleanup job: once per day per library root (on the first run after the day rolls over), to `<blob_root>/state-snapshots/state.db.<unix-ts>.sqlite3`, keeping the newest 7. Snapshot staleness is benign — tier 3 reconciles the gap from PhotoKit — so no tighter cadence is warranted. Snapshot cadence is unrelated to ingest freshness: blobs and sidecars replicate continuously as changes happen.
-
-*Implementation errata (Phase 5):* snapshots use `VACUUM INTO` (an online, consistent copy since SQLite 3.27) rather than the backup API — sqlx does not expose the latter, and adding a second SQLite driver for backups alone would reintroduce the `links` conflict this workspace exists to avoid. One shared VACUUM per run lands in a local staging dir, then copies (temp + rename) to every due root. The due-check derives from the destination filenames (newest parseable timestamp's UTC day vs today) — no extra state, self-healing if snapshots are deleted. An unavailable root is skipped quietly and remains due.
-
-*Read-only caveat (Phase 6):* a read-only SQLite connection cannot run WAL recovery, so the CLI's read paths can fail against a hot `-wal` left by a crashed daemon (`SQLITE_READONLY_RECOVERY`). When that happens and no live pid holds `drain.lock`, the CLI falls back to a normal read-write open (safe: no live writer, migrations are a no-op) with a printed note.
-
-## Interim viewer
-
-The archive is useless to a human until it can be browsed. A freestanding, **read-only** web
-viewer (`crates/ingress-server`, an Axum server on the storage host) serves the materialized
-libraries — the interim way to actually *use* the off-iCloud copy before the full RFC-011 photos
-module exists. This subsection records the load-bearing decisions so the eventual fold-in into
-HopNet's own file/photo UI is copy-adapt, not rewrite. It is not a full RFC — the surface is a
-thin read shim; most of the work is frontend.
-
-- **Read source is the sidecar tree, not `state.db`.** The server runs on the storage host; the
-  live `state.db` lives on the Mac and the snapshots rotate (`snapshot_keep: 7`). The sidecar tree
-  is the complete, durable, non-rotating record already replicated to the host — so the viewer
-  indexes *it* into its own read-optimized store, rebuilt incrementally. This realizes the spec's
-  stated aim ("a structured, queryable archive that survives the absence of the daemon"). The
-  indexer reuses the same `sidecar_io::walk_sidecars` + `Sidecar::from_json` as `recover.rs`, so the
-  reconstruction path is exercised on every boot and cannot silently rot.
-- **The REST contract is the seam.** The frontend asks "list / thumbnail / full asset / metadata"
-  and never knows an ingress sits behind it. At fold-in these routes move into HopNet's server and
-  the pane into HopNet's frontend; the contract is shaped to match HopNet's existing file API.
-- **Thumbnails/renditions are a viewer-side cache, never blobs.** Consistent with the rule that
-  thumbnail resource types (5, 6) are never stored: the viewer decodes on demand (HEIC→JPEG via
-  libheif; video poster via ffmpeg) and caches by content_hash. The blob store stays RFC-011-pure.
-  RAW (RAF/DNG) is download-only — never decoded, since every RAW asset carries a display-friendly
-  original.
-- **Auth diverges deliberately.** The viewer uses OIDC (pocket-id) with a server-side session,
-  not HopNet's Bearer-JWT — it is network-exposed and HopNet credentials are not operational here.
-  Re-aligned at fold-in (or HopNet adopts sessions).
-- **Future security note (not a now-problem):** the viewer decodes *the owner's own* library, so
-  in-process C decoders (libheif/ffmpeg) run on trusted input. When this folds into HopNet with
-  multi-user sharing, those decoders would run on *other users'* files — at which point the decode
-  path should be sandboxed (subprocess / seccomp), a known image-parser CVE surface.
+Lost with the old `state.db`: retry state and the ingest log (both disposable) and the daemon-minted `photo_id`s for never-published photos (their mesh identities, where they exist, come back via adoption). This replaces the archive era's snapshot-restore and sidecar-tree-rebuild machinery outright — the mesh, not the daemon, is the durable record, and the verification step is the same reconciliation scan the daemon runs every startup anyway.
 
 ## Implementation Phases
 
@@ -889,14 +940,27 @@ Structure: a Swift executable (the LaunchAgent) linking `ingress-core` (Rust, in
 - Verified on-device (scratch env, 5 real assets): generated-id adds, seed/drain, status views against live rows, replication then `fsck --deep` clean, planted orphan + deleted blob → exit 1 with BYTE LOSS banner, `--repair` deletes only the orphan, snapshot recover into a fresh data dir (5 photos + hydration), sidecar-tree recover catching the destroyed blob in verification, `--force` interlock, live-daemon coexistence (read-only status, fsck banner, config writes refused with holder pid). 139 Rust tests across the workspace.
 
 ### Phase 7: Hardening [~]
-- LaunchAgent packaging, login autostart
+- LaunchAgent packaging, login autostart [x] (2026-07-31) — daemon bundled into HopNet.app (`Contents/MacOS/photo-ingress`, signed individually with hardened runtime + the photos-library entitlement, no profile) with the SMAppService agent plist at `Contents/Library/LaunchAgents/com.hopnet.desktop.photo-ingress.plist` (build stages 1b/3b); bundle id moved `app.hopnet.photo-ingress` → `com.hopnet.desktop.photo-ingress` (nested-code convention; TCC grants re-prompt once). Owner-only `/api/photo-ingress/{enable,disable,status}` routes on the GUI node provision keychain (token + blob_root) and drive registration; the daemon self-defaults `--data-dir`, owns its log (`--log-to-data-dir`), and auto-binds the personal library at startup via the ensure-only `ensure_personal_library` FFI (narrow reversal of Phase 6's FFI removal — the GUI can't link ingress-core across the workspace split). Stale node URL after a GUI relaunch heals via `RefreshingPublisher` (keychain re-read only after an unreachable pass). Enablement-gated minting: setup no longer provisions, login only self-heals. Smoke finding: the main app must be UNSANDBOXED — `SMAppService.agent` registration is EPERM from a sandboxed process (only `loginItem` is sandbox-compatible); `entitlements-app.plist` documents this. Live smoke (2026-08-01) verified the full enable → TCC consent → migrate → auto-bind → disable → re-enable cycle against the production `state.db` (migration `1785600000 consensus adoption`, AlreadyExists auto-bind with blob-root mismatch warning, SIGTERM-clean shutdown, zero publishes — explicit-claim parking held). Two more findings baked into the pipeline: (1) TCC attributes the bundled daemon to its CONTAINING bundle, and under the hardened runtime tccd denies Photos without prompting unless the attributed identity — the main app — carries `com.apple.security.personal-information.photos-library` (both entitlement files now have it; stage 3b stamps the matching `NSPhotoLibraryUsageDescription` onto the app's Info.plist; the grant is keyed on `com.hopnet.desktop`, so daemon re-signs don't reset it). (2) A stale BTM record from the earlier sandboxed registration attempts poisons all later registrations with EPERM even after unsandboxing — invisible in Login Items, fixed only by `sfltool resetbtm` + reboot (documented here because any tester who ran a sandboxed build hits it). The route orchestration now lives in platform-independent `photo_ingress::flow` behind a `ProvisioningDeps` seam — Linux CI pins the sequencing invariants (keychain-before-register, device-id-capture-before-wipe, owner gate, best-effort disable) with mock tests; macOS `routes.rs` is axum glue plus the real SMAppService/keychain/consensus impl.
 - Long-run soak against a full-size library — shared library (10,140 photos / 170 GiB) drained clean end-to-end; personal (~26k) in progress
 - Mount-loss / storage-low behavior under real SMB conditions [x] — vanished blob root (`statvfs` ENOENT/ENOTDIR) now maps to `StorageUnavailable` and routes into the `storage_low` pause-and-poll path instead of burning per-resource retries (one overnight unmount had driven 5,961 resources to gave-up). See §Storage-aware admission errata.
 
-### Phase 8: Interim viewer [~] — `crates/ingress-server/` (see §Interim viewer)
+### Phase 8: Interim viewer [x] — retired (crate deleted in the Phase 9 transplant; browsing is HopNet's gallery)
 - Freestanding read-only web viewer on the storage host: sidecar-tree index (own SQLite, incremental) + Renderer (libheif HEIC→JPEG, ffmpeg video poster, `image` for JPG/PNG; RAW download-only) + Axum REST + pocket-id OIDC session; forked Svelte frontend (virtualized photo grid + lightbox), reusing HopNet primitives/tokens.
 - Decode spike [x]: `libheif-rs 1.1` (real HEIC→JPEG) and `ffmpeg-next 7.1` (HEVC `.mov` poster) validated under Nix. Pin `ffmpeg_7` (ffmpeg 8 drops `avfft.h`, breaks `ffmpeg-sys-next`).
 - Backend [x]: sidecar-tree index (keyset paging, mtime-incremental refresh, membership sweep); pocket-id OIDC (auth-code+PKCE, server-side `tower-sessions` cookie) with per-library group authorization (`access.groups` ∩ token `groups`); REST (`/api/libraries`, `/api/photos`, `/api/photos/{id}`, `/photos/histogram` month buckets, `/thumb`, `/display`, `/resource/{type}` range passthrough); tri-state browse filters (`video`/`live`/`raw`/`favorite`, absent=any true=only false=exclude; `raw` via EXISTS on `raw_alternate` resource) shared by list + histogram; Renderer with content-hash JPEG cache. TLS forced to rustls/ring (no openssl/aws-lc). Live OIDC smoke passed against real pocket-id; render validated on real HEIC + HEVC. Needs C-lib devshell (`shell.nix`).
 - Frontend [x]: Svelte grid (uniform square cells, true aspect ratio, keyset infinite scroll — visibility-effect load loop + Load More fallback) + lightbox + filter dropdown (media checkmarks + tri-state subfilters) + library dropdown (one-or-many selection; multi fuses into one timeline via CSV `library` param → `IN` clause, cursor already a global total order; shared-library assets badged in fused view; per-library photo/video count breakdown via `COUNT(*) FILTER`) + month histogram rail (hover-expand, resizes grid) + pointer-following hover preview (thumb layer upgraded in place to display rendition); Storybook mocks for all presentational components. Auth UX: any 401 (boot or mid-session expiry) shows a login page (HopNet `SetupPane` card + logo, single button → `/auth/login` OIDC hand-off) instead of hard-redirecting. `LibraryEntry.shared` config flag marks shared libraries.
 - Windowed browse [x]: `/api/photos` gains `dir=older|newer` (keyset comparison + scan order flip together; `newer` pages ASC then reverses, so items are always newest-first) and `PhotoSummary.sort_ms` so the client synthesizes continuation cursors from its window edges. Frontend grid is a sliding window (cap 600, evicts the far end with measured scroll-height compensation, `overflow-anchor: none`); histogram rail is scroll-synced (current month highlighted via sticky day headers) and click-jumps re-anchor the window at the month boundary — scrolling both directions from there. Rail hover zooms the grid out via transform (constant layout width → no reflow, no scroll loss).
 - Deployed [x]: on thor via nix-config (`photo.bentley.sh`, agenix OIDC secret, SPA embedded in the binary via `include_dir!`).
+
+### Phase 9: HopNet transplant [x] — archive → transient spool (2026-08)
+- Descriptor capsule (`photos.descriptor_json`) replaces sidecar files as the publish metadata source; publish composes the document per pass (`Sidecar::compose`); NULL capsules backfill via the reconciliation scan
+- Sidecar layer deleted wholesale: writer/walker/heal, remote replication + `sidecar_replicated_at`, fsck sidecar checks, tombstone/restore/move document rewrites
+- Spool eviction on decided publish: `blobs.evicted_at` stamp + file unlink under the spool-wide hash-liveness gate; rides the publish pass and the cleanup tick; a re-fetch of an evicted hash re-places bytes and clears the stamp
+- Structural spool: single content-addressed tree at `<data_dir>/spool/blobs/`, per-library storage roots dropped from `libraries` (table rebuild), admission re-pointed at the data-dir disk, library transitions ledger-only
+- Provisioning shrank to the device token: zero-arg `ensure_personal_library`, enable route takes no body, `blob_root`/`sidecar_root_remote` purged from FFI, keychain, status, and CLI (legacy keychain accounts wiped on disable)
+- Demolition: `crates/ingress-server` (interim viewer), state snapshots, Tier-3 `recover`, mount-loss pause class, `tests/recover.rs`
+- Cutover is a fresh iCloud re-pull plus adoption, not a data migration; the old NAS archive stays as an untouched cold copy
+
+## Changelog
+
+- **2026-08 — spool transplant.** Reversed two founding decisions. (1) *"No local spooling"*: the original write path rejected a local staging tier because user-owned network storage was the destination; with HopNet as the archive of record, the local spool **is** the staging tier — bounded by admission, drained by eviction on consensus-decided publish. (2) *"User-owned storage roots are the archive"*: the per-library blob roots, sidecar trees, remote replication, snapshots, and the recover/viewer machinery all existed to make an intermediate NAS archive durable, and were deleted once consensus-committed storage subsumed that role. Phase records 0–8 describe the pre-transplant design; where they conflict with the body text, the body text is current.

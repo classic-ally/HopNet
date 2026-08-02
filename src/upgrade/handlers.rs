@@ -48,10 +48,10 @@ impl TransactionHandler for NodeStagedVersionHandler {
         if !crate::version::code_is_valid(report.running_code) {
             return Err(DatabaseError::InvalidPayload);
         }
-        if let Some(staged) = report.staged_code {
-            if !crate::version::code_is_valid(staged) || staged == report.running_code {
-                return Err(DatabaseError::InvalidPayload);
-            }
+        if let Some(staged) = report.staged_code
+            && (!crate::version::code_is_valid(staged) || staged == report.running_code)
+        {
+            return Err(DatabaseError::InvalidPayload);
         }
 
         crate::db::versions::set_node_version_tx(db_tx, &report)

@@ -19,13 +19,11 @@ use hopnet_consensus::traits::{Application, ApplyError, ValidationOrigin};
 use hopnet_consensus::types as engine;
 use hopnet_consensus::{Round, Validity};
 
-use crate::consensus::dispatch::{
-    MAX_TRANSACTION_AGE, process_transaction, process_transactions,
-};
-use crate::consensus::types::Transactions as OldTransactions;
-use crate::db::consensus as db;
 use crate::AppState;
 use crate::DISPATCH_TABLE;
+use crate::consensus::dispatch::{MAX_TRANSACTION_AGE, process_transaction, process_transactions};
+use crate::consensus::types::Transactions as OldTransactions;
+use crate::db::consensus as db;
 
 // ---------------------------------------------------------------------------
 // Type bridging
@@ -95,7 +93,11 @@ impl HopNetApplication {
         // Solo-block rule (RFC-CONSENSUS-002 membership transitions;
         // RFC-019 S5 regenesis commit): structural, both origins.
         check_solo_membership(
-            block.data.transactions.iter().map(|t| t.rpc.function.as_str()),
+            block
+                .data
+                .transactions
+                .iter()
+                .map(|t| t.rpc.function.as_str()),
             block.data.transactions.len(),
         )?;
 
@@ -237,8 +239,9 @@ impl HopNetApplication {
         }
 
         // Handler dry-run (execute=false) — deterministic, both origins.
+        let candidate_height = height.0;
         for tx in old_txs.0.iter() {
-            process_transaction(tx, &self.app_state, false, db_tx)
+            process_transaction(tx, &self.app_state, false, candidate_height, db_tx)
                 .map_err(|e| format!("handler validation ({}): {e:?}", tx.rpc.function))?;
         }
         Ok(())
@@ -285,7 +288,8 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         // execute=true: dispatch-table application + nonce insertion, in the
         // host's decide transaction. Staleness/dedup checks are validation-
         // time only (execute skips them so sync can replay old blocks).
-        process_transactions(&Some(old_txs), &self.app_state, true, tx)
+        let decided_height = height.0;
+        process_transactions(&Some(old_txs), &self.app_state, true, decided_height, tx)
             .map_err(|e| ApplyError(format!("apply at height {}: {e:?}", height.0)))
     }
 
@@ -352,9 +356,7 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         };
         for tx in block.data.transactions.iter() {
             for projection in crate::projections::manifests() {
-                for blob_id in
-                    projection.committed_blob_ids(&tx.rpc.function, &tx.rpc.payload)
-                {
+                for blob_id in projection.committed_blob_ids(&tx.rpc.function, &tx.rpc.payload) {
                     storage.notify_blob_committed(blob_id);
                 }
             }
@@ -475,8 +477,8 @@ pub fn build_value(
             // S4): the proposer never re-validates its own block through
             // validate_inner, so this is its Live attestation — and it
             // keeps us from proposing blocks the mesh would nil-vote.
-            if crate::consensus::handlers::is_membership_tx(&tx.rpc.function) {
-                if let Err(reason) =
+            if crate::consensus::handlers::is_membership_tx(&tx.rpc.function)
+                && let Err(reason) =
                     crate::consensus::membership_guards::subjective_membership_check(
                         app_state,
                         &db_tx,
@@ -484,10 +486,9 @@ pub fn build_value(
                         &tx.rpc.payload,
                         tx.submitter.id,
                     )
-                {
-                    failed.push((*i, format!("membership guard: {reason}")));
-                    continue;
-                }
+            {
+                failed.push((*i, format!("membership guard: {reason}")));
+                continue;
             }
             let sp = format!("preflight_{slot}");
             if db_tx.execute_batch(&format!("SAVEPOINT {sp}")).is_err() {
@@ -506,6 +507,7 @@ pub fn build_value(
                     };
                     let notifier = crate::handlers::HostNotifier {
                         test_mode: app_state.test_mode,
+                        change_tx: app_state.change_tx.clone(),
                     };
                     // execute=false here — the scheduler is never invoked
                     // during preflight; constructed for ctx uniformity.
@@ -515,6 +517,8 @@ pub fn build_value(
                     let ctx = crate::handlers::HandlerCtx {
                         fragments_dir: &app_state.fragments_dir,
                         node_id: app_state.node_id.get().copied(),
+                        // Mempool preflight — no block context.
+                        height: 0,
                         notifier: &notifier,
                         work: &scheduler,
                     };
@@ -570,7 +574,11 @@ pub fn build_value(
     })
     .map_err(|e| format!("block build: {e:?}"))?;
 
-    Ok(BuiltValue { block, rejected, deferred })
+    Ok(BuiltValue {
+        block,
+        rejected,
+        deferred,
+    })
 }
 
 #[cfg(test)]

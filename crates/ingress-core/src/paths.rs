@@ -1,11 +1,11 @@
 //! On-disk path derivations (spec §Architecture, §Ingest Pipeline).
 //!
-//! Every path rule lives here so the writer, sidecar I/O, and future
-//! recovery code share one source of truth. Pure path math — no I/O.
+//! Every path rule lives here so the writer and the eviction/audit code
+//! share one source of truth. Pure path math — no I/O.
 
 use std::path::{Path, PathBuf};
 
-use crate::ids::{ContentHash, LibraryId, PhotoId};
+use crate::ids::{ContentHash, PhotoId};
 use crate::model::ResourceType;
 
 /// Key for an in-flight `.partial` temp file.
@@ -40,49 +40,44 @@ impl TempKey {
     }
 }
 
-/// Per-library blob-tree paths, rooted at `libraries.blob_root`.
+/// The transient spool's content-addressed tree, rooted at
+/// `<data_dir>/spool` in production ([`DataDir::spool`]). Bytes live here
+/// between the PhotoKit fetch and the consensus-decided publish that lets
+/// eviction delete them — HopNet is the archive of record; this is staging.
 #[derive(Debug, Clone)]
-pub struct BlobPaths {
-    blob_root: PathBuf,
+pub struct SpoolPaths {
+    root: PathBuf,
 }
 
-impl BlobPaths {
-    pub fn new(blob_root: impl Into<PathBuf>) -> Self {
-        Self {
-            blob_root: blob_root.into(),
-        }
+impl SpoolPaths {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
     }
 
-    /// `<blob_root>/blobs/.partial/` — in-flight write temps. Same
-    /// filesystem as final blob paths, by construction: atomic rename.
+    /// `<spool>/blobs/.partial/` — in-flight write temps. Same filesystem
+    /// as final blob paths, by construction: atomic rename.
     pub fn partial_dir(&self) -> PathBuf {
-        self.blob_root.join("blobs").join(".partial")
+        self.root.join("blobs").join(".partial")
     }
 
     pub fn temp_path(&self, key: &TempKey) -> PathBuf {
         self.partial_dir().join(key.file_name())
     }
 
-    /// `<blob_root>/blobs/` — the content-addressed tree root (fsck's
+    /// `<spool>/blobs/` — the content-addressed tree root (fsck's
     /// orphan-scan walk starts here).
     pub fn blobs_dir(&self) -> PathBuf {
-        self.blob_root.join("blobs")
+        self.root.join("blobs")
     }
 
-    /// `<blob_root>/blobs/<aa>/<bb>/<hash>.<ext>` — final content-addressed path.
+    /// `<spool>/blobs/<aa>/<bb>/<hash>.<ext>` — final content-addressed path.
     pub fn blob_path(&self, hash: &ContentHash, ext: &str) -> PathBuf {
         let (aa, bb) = hash.fanout();
-        self.blob_root
+        self.root
             .join("blobs")
             .join(aa)
             .join(bb)
             .join(format!("{hash}.{ext}"))
-    }
-
-    /// `<blob_root>/state-snapshots/` — daily state.db snapshots on the
-    /// storage side (what Tier-3 recovery restores from on a dead Mac).
-    pub fn snapshot_dir(&self) -> PathBuf {
-        self.blob_root.join("state-snapshots")
     }
 }
 
@@ -108,17 +103,10 @@ impl DataDir {
         self.root.join("state.db")
     }
 
-    /// `<root>/sidecars/<library_id>/` — hot-path local sidecar tree.
-    /// Always derived, never stored (spec: `libraries` notes).
-    pub fn sidecar_root(&self, library: &LibraryId) -> PathBuf {
-        self.root.join("sidecars").join(library.as_str())
-    }
-
-    /// `<root>/state-snapshots-tmp/` — staging dir for `VACUUM INTO` before
-    /// the per-root copies (VACUUM refuses an existing target, so the dir is
-    /// cleaned before each use).
-    pub fn snapshot_tmp_dir(&self) -> PathBuf {
-        self.root.join("state-snapshots-tmp")
+    /// `<root>/spool/` — the transient blob spool (process-global; library
+    /// partitioning lives in the `blobs` ledger, not on disk).
+    pub fn spool(&self) -> SpoolPaths {
+        SpoolPaths::new(self.root.join("spool"))
     }
 }
 
@@ -129,26 +117,26 @@ mod tests {
     // Should: derive the spec's fan-out blob path from hash and extension.
     #[test]
     fn blob_path_fanout() {
-        let paths = BlobPaths::new("/mnt/photos/personal");
+        let paths = DataDir::new("/tmp/ingress").spool();
         let hash = ContentHash::from_hex("ab34cdef00112233445566778899aabb");
         assert_eq!(
             paths.blob_path(&hash, "heic").to_string_lossy(),
-            "/mnt/photos/personal/blobs/ab/34/ab34cdef00112233445566778899aabb.heic"
+            "/tmp/ingress/spool/blobs/ab/34/ab34cdef00112233445566778899aabb.heic"
         );
     }
 
     // Impact: temps must live on the destination filesystem — atomic rename
     // cannot cross filesystems (spec §Write path).
-    // Should: place both temp shapes under <blob_root>/blobs/.partial/.
+    // Should: place both temp shapes under <spool>/blobs/.partial/.
     #[test]
     fn temp_paths_live_under_partial() {
-        let paths = BlobPaths::new("/mnt/photos/personal");
+        let paths = SpoolPaths::new("/tmp/ingress/spool");
         let probe = paths.temp_path(&TempKey::Probe {
             token: "abc123".into(),
         });
         assert_eq!(
             probe.to_string_lossy(),
-            "/mnt/photos/personal/blobs/.partial/probe-abc123"
+            "/tmp/ingress/spool/blobs/.partial/probe-abc123"
         );
 
         let photo_id = PhotoId::mint();
@@ -158,11 +146,11 @@ mod tests {
         });
         assert_eq!(
             res.to_string_lossy(),
-            format!("/mnt/photos/personal/blobs/.partial/{photo_id}.2")
+            format!("/tmp/ingress/spool/blobs/.partial/{photo_id}.2")
         );
     }
 
-    // Should: derive state.db and per-library sidecar paths from the data root.
+    // Should: derive state.db and the spool root from the data root.
     #[test]
     fn data_dir_derivations() {
         let dir = DataDir::new("/tmp/ingress");
@@ -171,9 +159,8 @@ mod tests {
             "/tmp/ingress/state.db"
         );
         assert_eq!(
-            dir.sidecar_root(&LibraryId::new("personal"))
-                .to_string_lossy(),
-            "/tmp/ingress/sidecars/personal"
+            dir.spool().blobs_dir().to_string_lossy(),
+            "/tmp/ingress/spool/blobs"
         );
     }
 }

@@ -8,13 +8,14 @@ name: Check (Linux)
 # CI to code we already control. To run CI against a fork's branch, push it
 # into this repo manually (e.g. `git push origin pr/123-review`).
 on:
+  workflow_dispatch:
   push:
     branches: [master]
   pull_request:
 
 jobs:
   cargo:
-    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: x86_64-linux
     timeout-minutes: 60
 
@@ -41,11 +42,20 @@ jobs:
         # seeded fuzz corpus and the RFC-019 drain/seal scenarios live
         # there and must gate merges. ~15 min, dominated by the corpus.
         run: nix develop --command cargo test -p hopnet-consensus --tests
+      # The mount stack suite boots the real node binary over localhost HTTP
+      # (no /dev/fuse needed — the two kernel smokes stay #[ignore]d).
+      - name: hopnet-mount stack suite
+        run: |
+          nix develop --command cargo build --bin hopnet
+          nix develop --command cargo test -p hopnet-mount --test stack
 
   nix-build:
-    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: x86_64-linux
-    timeout-minutes: 45
+    # A workspace-wide change (toolchain bump, reformat) forces a full
+    # release rebuild (~30m alone) while the cargo job competes for the
+    # same runner's cores — 45m was calibrated for incremental pushes.
+    timeout-minutes: 75
 
     steps:
       - name: Checkout
@@ -56,3 +66,9 @@ jobs:
 
       - name: Verify headless binary
         run: test -x result/bin/hopnet
+
+      - name: nix build .#hopnet-mount
+        run: nix build .#hopnet-mount --print-build-logs
+
+      - name: Verify mount binary
+        run: test -x result/bin/hopnet-mount

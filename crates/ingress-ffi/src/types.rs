@@ -159,6 +159,17 @@ pub struct FfiScanSummary {
     pub synthesis_skipped: bool,
 }
 
+/// Outcome of the daemon's startup library ensure (see
+/// `IngressSession::ensure_personal_library`).
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiEnsureLibraryOutcome {
+    /// No personal library existed; one was created (CLI-equivalent
+    /// defaults).
+    Created { library_id: String },
+    /// A personal library already existed — nothing written.
+    AlreadyExists { library_id: String },
+}
+
 /// Daemon knobs — the drain knobs plus the lifecycle-tick cadences (the
 /// rescan timer is owned by the platform side, which also owns enumeration).
 #[derive(Debug, Clone, uniffi::Record)]
@@ -170,32 +181,56 @@ pub struct FfiDaemonOptions {
     pub reserve_floor_gib: u64,
     pub pressure_pause_secs: u64,
     pub storage_poll_secs: u64,
-    /// Hourly lifecycle job cadence (hard deletes, log pruning, snapshots).
+    /// Hourly lifecycle job cadence (hard deletes, log pruning, spool
+    /// eviction sweep).
     pub cleanup_interval_secs: u64,
-    /// Dirty-sidecar replication cadence (faster, batch-capped).
-    pub replication_interval_secs: u64,
+    /// HopNet publish tick: node base URL (WITHOUT `/api`) + RFC-012 device
+    /// token (`{device_id}.{secret}`). Both set = publishing on; either
+    /// absent = ingest-only daemon (the pre-integration behavior). The
+    /// platform side owns credential storage (keychain) — the core never
+    /// reads secrets itself.
+    pub publish_node_url: Option<String>,
+    pub publish_device_token: Option<String>,
+    /// Publish tick cadence (seconds).
+    pub publish_interval_secs: u64,
 }
 
 /// Lifecycle knobs for the one-shot `cleanup` subcommand.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiCleanupOptions {
     pub log_retention_days: i64,
-    pub snapshot_keep: u32,
     pub hard_delete_batch: u32,
-    pub replication_batch: u32,
 }
 
-/// Lifecycle outcome (mirrors `cleanup::CleanupReport` + the replication
-/// side).
+/// Lifecycle outcome (mirrors `cleanup::CleanupReport`).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiCleanupReport {
     pub photos_hard_deleted: u64,
     pub blob_files_deleted: u64,
     pub log_rows_pruned: u64,
-    pub snapshots_written: u64,
-    pub sidecars_replicated: u64,
-    pub sidecars_missing: u64,
-    pub replication_stalled: bool,
+    pub spool_evicted: u64,
+}
+
+/// Publish-tick aggregates (mirrors `publish::PublishReport`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiPublishReport {
+    pub published: u64,
+    pub already_published: u64,
+    /// Photos the mesh already held (cloud-fingerprint match) — stamped
+    /// published locally, nothing uploaded.
+    pub adopted: u64,
+    pub failed: u64,
+    pub gave_up: u64,
+    /// Skipped: publish-metadata capsule absent (awaiting heal backfill).
+    pub missing_descriptor: u64,
+    /// Blobs spool-evicted at the end of the pass (every referent decided
+    /// in HopNet; local bytes deleted).
+    pub evicted_blobs: u64,
+    /// The last pass aborted because the node was unreachable.
+    pub parked: bool,
+    /// The last pass held its photos because this device does not hold
+    /// ingress responsibility (claim via the node's JWT route to unpark).
+    pub parked_responsibility: bool,
 }
 
 /// Daemon outcome (mirrors `daemon::DaemonReport`): drain counters plus the
@@ -210,6 +245,7 @@ pub struct FfiDaemonReport {
     pub transitions: u64,
     pub resources_reopened: u64,
     pub cleanup: FfiCleanupReport,
+    pub publish: FfiPublishReport,
 }
 
 /// How the original's hash resolved (mirrors `resolve::HashResolution`).
@@ -233,6 +269,7 @@ pub struct FfiWriteOutcome {
     pub deduped: bool,
     pub blob_path: String,
     pub photo_completed: bool,
-    /// Set when `photo_completed` and the local sidecar was written.
-    pub sidecar_path: Option<String>,
+    /// Set when `photo_completed` and the publish-metadata capsule was
+    /// persisted to state.db.
+    pub descriptor_persisted: bool,
 }

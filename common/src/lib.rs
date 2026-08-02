@@ -5,6 +5,8 @@ pub mod documentprovider;
 pub mod fileprovider;
 pub mod hash;
 pub mod height;
+pub mod mount;
+pub mod photo_ingress;
 pub mod quorum;
 pub mod setup;
 pub mod shares;
@@ -27,6 +29,7 @@ pub use fileprovider::{
     HealthResponse, HealthStatus,
 };
 pub use hash::Blake3Hash;
+pub use photo_ingress::{AgentRegistration, DisableRequest, DisableResponse, PhotoIngressStatus};
 pub use shares::{
     AcceptShareRequest, IncomingShareResponse, ShareCountResponse, ShareDetailResponse,
     ShareParticipant, ShareRequest,

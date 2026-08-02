@@ -197,14 +197,12 @@ pub async fn post_nodes(
             Ok(c) => c,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let profile = hopnet_consensus::store::meta_get(
-            &conn,
-            hopnet_consensus::store::META_QUORUM_PROFILE,
-        )
-        .ok()
-        .flatten()
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_else(|| "bft".to_string());
+        let profile =
+            hopnet_consensus::store::meta_get(&conn, hopnet_consensus::store::META_QUORUM_PROFILE)
+                .ok()
+                .flatten()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_else(|| "bft".to_string());
         let height = {
             let tx = match conn.transaction() {
                 Ok(tx) => tx,
@@ -261,13 +259,17 @@ pub async fn post_nodes(
     tokio::spawn(async move {
         const ATTEMPTS: u32 = 10;
         const RETRY_DELAY: Duration = Duration::from_secs(15);
-        let payload =
-            crate::net::encode_payload(&SetupRequest::JoinDeliver(JoinDeliverRequest {
-                join_info,
-            }));
+        let payload = crate::net::encode_payload(&SetupRequest::JoinDeliver(JoinDeliverRequest {
+            join_info,
+        }));
         for attempt in 1..=ATTEMPTS {
             let reply = comms
-                .rpc(&deliver_peer, "setup", payload.clone(), Duration::from_secs(30))
+                .rpc(
+                    &deliver_peer,
+                    "setup",
+                    payload.clone(),
+                    Duration::from_secs(30),
+                )
                 .await
                 .and_then(|bytes| crate::net::decode_payload::<SetupResponse>(&bytes));
             match reply {

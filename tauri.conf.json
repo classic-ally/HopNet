@@ -25,7 +25,7 @@
     "longDescription": "A distributed consensus network with file storage capabilities",
     "macOS": {
       "frameworks": [],
-      "minimumSystemVersion": "10.15",
+      "minimumSystemVersion": "14.0",
       "signingIdentity": null,
       "hardenedRuntime": true,
       "entitlements": "apple/entitlements.plist",

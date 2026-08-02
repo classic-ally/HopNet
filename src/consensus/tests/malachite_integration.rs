@@ -11,8 +11,8 @@
 //! and catches up through decided-value sync once live gossip lands above
 //! its height.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
@@ -25,10 +25,10 @@ use hopnet_consensus::store::SqliteStorage;
 use hopnet_consensus::traits::Application;
 use hopnet_consensus::{HopNetContext, LinearTimeouts, Params, ValuePayload};
 
-use crate::consensus::malachite::app::{build_value, HopNetApplication};
-use crate::consensus::malachite::{gossip, sync, EngineHandle};
-use crate::consensus::tests::MockNetwork;
 use crate::AppState;
+use crate::consensus::malachite::app::{HopNetApplication, build_value};
+use crate::consensus::malachite::{EngineHandle, gossip, sync};
+use crate::consensus::tests::MockNetwork;
 
 type PoolStorage = SqliteStorage<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>>;
 
@@ -70,8 +70,7 @@ fn install_consensus_schema(app_state: &AppState) {
 /// HopNetApplication + pool-backed SqliteStorage), the driver task answering
 /// NeedValue / SyncNeeded, and the `app_state.malachite` handle that the
 /// comms "consensus" scope routes inbound traffic through.
-type ExtraCandidates =
-    std::sync::Arc<std::sync::Mutex<Vec<crate::consensus::types::Transaction>>>;
+type ExtraCandidates = std::sync::Arc<std::sync::Mutex<Vec<crate::consensus::types::Transaction>>>;
 
 async fn start_engine(app_state: &AppState, node_id: i32) -> EngineNode {
     start_engine_with_candidates(app_state, node_id, ExtraCandidates::default()).await
@@ -338,6 +337,10 @@ fn malachite_mesh_decides_and_laggard_syncs_over_loopback_iroh() {
         connect_mesh(&network).await;
         let mut n2 = start_engine(&network.nodes[2].app_state, 2).await;
         wait_decided(&mut n2, 6, 300).await;
+        // The laggard reaching 6 proves the mesh decided 5..=6, but node 0's
+        // local APPLY of those heights can trail its votes under load — wait
+        // for its own decided watermark before asserting its rows.
+        wait_decided(&mut n0, 6, 300).await;
 
         // The laggard's decided history is byte-identical to the mesh's.
         let rows = |st: &AppState| -> Vec<(i64, Vec<u8>)> {
@@ -448,7 +451,10 @@ fn malachite_engine_restarts_from_persisted_state() {
                 .map(|h| h.0)
                 .unwrap_or(0)
         };
-        assert!(stopped_at >= 3, "engine must have decided ≥3 before restart");
+        assert!(
+            stopped_at >= 3,
+            "engine must have decided ≥3 before restart"
+        );
 
         // Second incarnation resumes from meta (+ WAL replay if the shutdown
         // landed mid-height) and keeps going.
@@ -629,8 +635,8 @@ fn fresh_node_syncs_vote_out_chain_without_wedging() {
     });
 }
 
-/// The PRODUCTION driver stack over a test shell — spawn_driver + settler
-/// + drain watcher, spawn_engine parity minus its config reads. The
+/// The PRODUCTION driver stack over a test shell — spawn_driver, settler
+/// and drain watcher: spawn_engine parity minus its config reads. The
 /// regenesis boundary must be exercised through the code the real node
 /// runs (proposer commit injection, drain watcher, terminal halt), not a
 /// test-local approximation.

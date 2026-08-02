@@ -170,9 +170,7 @@ async fn read_envelope(
     })
 }
 
-async fn read_frame_body(
-    recv: &mut iroh::endpoint::RecvStream,
-) -> Result<Vec<u8>, CommsError> {
+async fn read_frame_body(recv: &mut iroh::endpoint::RecvStream) -> Result<Vec<u8>, CommsError> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
         .await
@@ -401,7 +399,12 @@ impl IrohComms {
         let start = Instant::now();
         let nonce = rand::random::<u64>();
         let reply = self
-            .rpc_inner(peer, PING_SCOPE, nonce.to_le_bytes().to_vec(), Duration::from_secs(5))
+            .rpc_inner(
+                peer,
+                PING_SCOPE,
+                nonce.to_le_bytes().to_vec(),
+                Duration::from_secs(5),
+            )
             .await?;
         if reply == nonce.to_le_bytes() {
             Ok(start.elapsed().as_nanos() as u64)
@@ -425,7 +428,9 @@ impl IrohComms {
         opts: CallOptions,
     ) -> Result<Call, CommsError> {
         let connect_budget = opts.connect_timeout.unwrap_or(CONNECTION_TIMEOUT);
-        let conn = self.get_connection_with_budget(peer, connect_budget).await?;
+        let conn = self
+            .get_connection_with_budget(peer, connect_budget)
+            .await?;
         let (mut send, recv) = conn
             .open_bi()
             .await
@@ -501,7 +506,7 @@ impl IrohComms {
         // With a self-hosted relay there is no discovery — pin the peer's
         // address to our relay.
         let dial_addr = {
-            let mut addr = EndpointAddr::new(peer_key.into());
+            let mut addr = EndpointAddr::new(peer_key);
             if let Some(url) = &self.custom_relay {
                 addr = addr.with_relay_url(url.clone());
             }
@@ -512,7 +517,8 @@ impl IrohComms {
         // the main runtime it would starve under API load. Abort the dial task
         // on timeout so cancelled dials don't accumulate.
         let endpoint = self.endpoint.clone();
-        let mut dial = net_rt().spawn(async move { endpoint.connect(dial_addr, HOPNET_ALPN).await });
+        let mut dial =
+            net_rt().spawn(async move { endpoint.connect(dial_addr, HOPNET_ALPN).await });
         let node_id = peer.node_id;
         let conn = match tokio::time::timeout(connect_budget, &mut dial).await {
             Err(_) => {
@@ -668,9 +674,9 @@ impl IrohComms {
             // Comms-reserved liveness ping: pure nonce echo, no app state.
             if envelope.scope == PING_SCOPE {
                 write_frame(&mut send, &envelope.payload).await?;
-                return send
-                    .finish()
-                    .map_err(|e| CommsError::Transport(TransportError::StreamFailed(e.to_string())));
+                return send.finish().map_err(|e| {
+                    CommsError::Transport(TransportError::StreamFailed(e.to_string()))
+                });
             }
 
             let Some(entry) = self
@@ -783,7 +789,7 @@ impl crate::Broadcast for IrohComms {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Broadcast, Rpc, RpcHandler, StreamHandler};
+    use crate::{Rpc, RpcHandler, StreamHandler};
     use std::sync::atomic::AtomicUsize;
 
     /// Directory that knows every peer (loopback meshes).
@@ -885,7 +891,12 @@ mod tests {
     async fn scope_roundtrip_and_ping() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut scopes = ScopeRegistry::new();
-        scopes.rpc("echo", Arc::new(Echo { calls: calls.clone() }));
+        scopes.rpc(
+            "echo",
+            Arc::new(Echo {
+                calls: calls.clone(),
+            }),
+        );
         let (a, _b, peer_b) = pair(Arc::new(AllowAll), scopes).await;
 
         let reply = a
@@ -917,7 +928,12 @@ mod tests {
     async fn dedup_same_request_id_invokes_handler_once() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut scopes = ScopeRegistry::new();
-        scopes.rpc("echo", Arc::new(Echo { calls: calls.clone() }));
+        scopes.rpc(
+            "echo",
+            Arc::new(Echo {
+                calls: calls.clone(),
+            }),
+        );
         let (a, _b, peer_b) = pair(Arc::new(AllowAll), scopes).await;
 
         let id: u64 = rand::random();
@@ -942,7 +958,12 @@ mod tests {
         // Server B knows nobody: A's connection must be rejected before any
         // stream can serve (QUIC handshake completes, then app-layer reject).
         let mut scopes = ScopeRegistry::new();
-        scopes.rpc("echo", Arc::new(Echo { calls: Arc::new(AtomicUsize::new(0)) }));
+        scopes.rpc(
+            "echo",
+            Arc::new(Echo {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
         let a = IrohComms::bind(rand::random(), Arc::new(AllowAll), None)
             .await
             .unwrap();
@@ -950,7 +971,10 @@ mod tests {
             .await
             .unwrap();
         b.start(scopes);
-        let peer_b = PeerRef { node_id: 2, pubkey: b.local_pubkey() };
+        let peer_b = PeerRef {
+            node_id: 2,
+            pubkey: b.local_pubkey(),
+        };
 
         // Either the direct connect fails, or the connection dies on use.
         let connected = a.connect_to_addr(2, loopback_addr(&b)).await;
@@ -965,7 +989,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn oversized_frame_rejected() {
         let mut scopes = ScopeRegistry::new();
-        scopes.rpc("echo", Arc::new(Echo { calls: Arc::new(AtomicUsize::new(0)) }));
+        scopes.rpc(
+            "echo",
+            Arc::new(Echo {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
         let (a, _b, peer_b) = pair(Arc::new(AllowAll), scopes).await;
 
         let oversized = vec![0u8; MAX_MESSAGE_SIZE + 1];
@@ -980,7 +1009,12 @@ mod tests {
     fn duplicate_scope_registration_panics() {
         let mut scopes = ScopeRegistry::new();
         let calls = Arc::new(AtomicUsize::new(0));
-        scopes.rpc("dup", Arc::new(Echo { calls: calls.clone() }));
+        scopes.rpc(
+            "dup",
+            Arc::new(Echo {
+                calls: calls.clone(),
+            }),
+        );
         scopes.rpc("dup", Arc::new(Echo { calls }));
     }
 
@@ -990,7 +1024,9 @@ mod tests {
         let mut scopes = ScopeRegistry::new();
         scopes.rpc(
             "ping",
-            Arc::new(Echo { calls: Arc::new(AtomicUsize::new(0)) }),
+            Arc::new(Echo {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
         );
     }
 }

@@ -7,6 +7,7 @@ const PATH_TO_PANE: Record<string, string> = {
     '/recent':             'recents',
     '/browse':             'browse',
     '/shared':             'shared',
+    '/photos':             'photos',
     '/settings/accounts':  'account',
     '/settings/nodes':     'nodes',
     '/settings/takeout':   'takeout',

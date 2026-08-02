@@ -18,7 +18,11 @@ fn idle_mesh_stays_quiescent_until_work() {
     // Nothing is scheduled: the event loop drains immediately with no decides.
     sim.run_safety_only(1_000_000).unwrap();
     for node in 0..3 {
-        assert_eq!(sim.decided_height(node), 0, "node {node} decided while idle");
+        assert_eq!(
+            sim.decided_height(node),
+            0,
+            "node {node} decided while idle"
+        );
         assert_eq!(
             sim.paused_at(node),
             Some(1),

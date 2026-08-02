@@ -47,7 +47,9 @@ pub enum ForwardReply {
     Ack,
     /// Final result after processing (phase 2).
     Result(TransactionForwardResponse),
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// Server: process forwarded transactions by pushing them into the local consensus queue.
@@ -86,7 +88,7 @@ pub async fn handle_transaction_forward(
             .consensus_queue
             .enqueue_forwarded(pending_txs)
             .await;
-        for (idx, result) in pending_indices.into_iter().zip(submit_results.into_iter()) {
+        for (idx, result) in pending_indices.into_iter().zip(submit_results) {
             results_map[idx] = Some(match result {
                 Ok(()) => TransactionForwardResult::Committed,
                 Err(super::queue::ConsensusSubmitError::Rejected(reason)) => {

@@ -56,8 +56,7 @@ impl TransactionHandler for ValidatorActivationHandler {
             // Mesh-initiated: the SUBMITTER must be seated (this also
             // structurally excludes submitter ∈ members — members must be
             // unseated below).
-            if !crate::db::consensus::is_node_active(db_tx, tx.submitter_node, committed_height)?
-            {
+            if !crate::db::consensus::is_node_active(db_tx, tx.submitter_node, committed_height)? {
                 return Err(DatabaseError::AuthorizationError);
             }
             for m in &req.members {
@@ -110,8 +109,11 @@ inventory::submit! {
 /// (RFC-CONSENSUS-002: joint constraints — one-removal-per-height, joint
 /// leave safety — are invisible to per-tx validation, so the block shape
 /// carries them).
-pub const MEMBERSHIP_TX_FUNCTIONS: &[&str] =
-    &["validator_activation", "validator_leave", "validator_vote_out"];
+pub const MEMBERSHIP_TX_FUNCTIONS: &[&str] = &[
+    "validator_activation",
+    "validator_leave",
+    "validator_vote_out",
+];
 
 pub fn is_membership_tx(function: &str) -> bool {
     MEMBERSHIP_TX_FUNCTIONS.contains(&function)
@@ -181,16 +183,10 @@ impl TransactionHandler for ValidatorLeaveHandler {
             // v−1 < quorum(v−1) is false at every v.) The real leave-safety
             // guard — survivors-I-see-live ≥ quorum(v−1) — is subjective
             // and lives in membership_guards::check_leave, Live-origin only.
-            let v = hopnet_consensus::validators::count_active_validators(
-                db_tx,
-                committed_height,
-            )
-            .map_err(|_| DatabaseError::RecallError)?;
+            let v = hopnet_consensus::validators::count_active_validators(db_tx, committed_height)
+                .map_err(|_| DatabaseError::RecallError)?;
             if v < 2 {
-                tracing::warn!(
-                    "leave refused for node {}: set floor (v={v})",
-                    req.node_id
-                );
+                tracing::warn!("leave refused for node {}: set floor (v={v})", req.node_id);
                 return Err(DatabaseError::ProcessingError);
             }
             return Ok(());
@@ -265,8 +261,7 @@ impl TransactionHandler for ValidatorVoteOutHandler {
             if !crate::db::consensus::is_node_active(db_tx, req.node_id, committed_height)? {
                 return Err(DatabaseError::ProcessingError);
             }
-            if !crate::db::consensus::is_node_active(db_tx, tx.submitter_node, committed_height)?
-            {
+            if !crate::db::consensus::is_node_active(db_tx, tx.submitter_node, committed_height)? {
                 return Err(DatabaseError::AuthorizationError);
             }
             return Ok(());
@@ -440,11 +435,12 @@ impl TransactionHandler for InsertGenesisHandler {
 
         // 7. Seed the consensus membership policy (absent keys resolve to
         // code defaults; see hopnet_consensus::membership::ConsensusPolicy).
-        hopnet_consensus::store::apply_policy_rows(db_tx, &genesis_data.consensus_policy)
-            .map_err(|e| {
+        hopnet_consensus::store::apply_policy_rows(db_tx, &genesis_data.consensus_policy).map_err(
+            |e| {
                 tracing::error!("InsertGenesisHandler: Failed to seed consensus policy: {e}");
                 DatabaseError::ProcessingError
-            })?;
+            },
+        )?;
 
         // === EXECUTION PHASE ===
         if execute {
@@ -515,7 +511,10 @@ mod leave_tests {
     use crate::handlers::{NullNotifier, NullScheduler};
     use ed25519_dalek::SigningKey;
 
-    fn setup_pool(n_validators: i32, profile: &str) -> r2d2::Pool<crate::db::SqliteConnectionManager> {
+    fn setup_pool(
+        n_validators: i32,
+        profile: &str,
+    ) -> r2d2::Pool<crate::db::SqliteConnectionManager> {
         let manager = crate::db::SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder()
             .max_size(1)
@@ -564,9 +563,11 @@ mod leave_tests {
         submitter: i32,
         execute: bool,
     ) -> HandlerResult {
-        let payload =
-            bincode::serde::encode_to_vec(&LeaveRequest { node_id: target }, bincode::config::standard())
-                .unwrap();
+        let payload = bincode::serde::encode_to_vec(
+            &LeaveRequest { node_id: target },
+            bincode::config::standard(),
+        )
+        .unwrap();
         let meta = TxMeta {
             function: "validator_leave",
             payload: &payload,
@@ -578,6 +579,7 @@ mod leave_tests {
         let ctx = HandlerCtx {
             fragments_dir: "",
             node_id: Some(submitter),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };
@@ -619,6 +621,7 @@ mod leave_tests {
         let ctx = HandlerCtx {
             fragments_dir: "",
             node_id: Some(3),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };
@@ -656,8 +659,7 @@ mod leave_tests {
         assert!(run_leave(&pool, 2, 2, true).is_ok());
 
         let conn = pool.get().unwrap();
-        let validators =
-            hopnet_consensus::validators::get_validators(&conn, 101).unwrap();
+        let validators = hopnet_consensus::validators::get_validators(&conn, 101).unwrap();
         let ids: Vec<i32> = validators.iter().map(|v| v.node_id).collect();
         assert_eq!(ids, vec![1, 3]);
         assert_eq!(
@@ -709,6 +711,7 @@ mod leave_tests {
         let ctx = HandlerCtx {
             fragments_dir: "",
             node_id: Some(3),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };
@@ -805,8 +808,7 @@ mod genesis_tests {
             ],
         };
 
-        let encoded =
-            bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
+        let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
         let meta = TxMeta {
             function: "insert_genesis",
             payload: &encoded,
@@ -818,6 +820,7 @@ mod genesis_tests {
         let ctx = crate::handlers::HandlerCtx {
             fragments_dir: "",
             node_id: Some(0),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };
@@ -906,6 +909,7 @@ mod vote_out_tests {
         let ctx = HandlerCtx {
             fragments_dir: "",
             node_id: Some(submitter),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };
@@ -979,7 +983,10 @@ mod activation_batch_tests {
     use ed25519_dalek::SigningKey;
 
     // Seat validators 1..=seated; register (but don't seat) extra..
-    fn setup_pool(seated: i32, registered_extra: &[i32]) -> r2d2::Pool<crate::db::SqliteConnectionManager> {
+    fn setup_pool(
+        seated: i32,
+        registered_extra: &[i32],
+    ) -> r2d2::Pool<crate::db::SqliteConnectionManager> {
         let manager = crate::db::SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder()
             .max_size(1)
@@ -1044,6 +1051,7 @@ mod activation_batch_tests {
         let ctx = HandlerCtx {
             fragments_dir: "",
             node_id: Some(submitter),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };

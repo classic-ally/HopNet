@@ -49,7 +49,13 @@ impl fmt::Display for ConsensusSubmitError {
 
 /// Result sent back to callers via oneshot channel.
 enum ConsensusResult {
-    Committed,
+    /// Decided AND applied on THIS node. `height` is an upper bound on
+    /// the applying block: the nonce row's presence proves local
+    /// application at some height ≤ this one, so any read anchored at
+    /// `height` observes the transaction's effects (read-your-writes).
+    Committed {
+        height: u64,
+    },
     Rejected(String),
     Failed(String),
 }
@@ -89,6 +95,12 @@ pub struct PendingPool {
     /// means the pending height should start. `notify_one` stores a permit,
     /// so a push before the driver listens is not lost.
     work: tokio::sync::Notify,
+    /// Wake signal for the SETTLER (RFC-018 S6): fired when
+    /// remote-committed entries are staged after the decide tick that
+    /// applied their block — without it they'd wait for an unrelated
+    /// later decide. `notify_one` stores a permit (same non-lost
+    /// discipline as `work`).
+    settle_kick: tokio::sync::Notify,
 }
 
 impl PendingPool {
@@ -152,8 +164,28 @@ impl PendingPool {
 
     /// Resolve an entry whose nonce is already committed (duplicate submit or
     /// a retry that raced its own earlier commit) — success for the submitter.
-    pub fn resolve_committed(&self, entry: QueuedTransaction) {
-        let _ = entry.notifier.send(ConsensusResult::Committed);
+    /// `current_height` = the local decided height at check time (a valid
+    /// upper bound; see ConsensusResult::Committed).
+    pub fn resolve_committed(&self, entry: QueuedTransaction, current_height: u64) {
+        let _ = entry.notifier.send(ConsensusResult::Committed {
+            height: current_height,
+        });
+    }
+
+    /// Stage entries whose commit was asserted by a REMOTE proposer: the
+    /// submitter must not resolve until the block lands locally, so they
+    /// join the queued set and the settler resolves them from the local
+    /// committed_tx_nonces (RFC-018 S6 — decided means applied HERE).
+    pub fn stage_for_settle(&self, entries: Vec<QueuedTransaction>) {
+        self.queued.lock().unwrap().extend(entries);
+        self.settle_kick.notify_one();
+    }
+
+    /// Await a settle kick (remote-committed entries staged after the
+    /// local decide tick may already be applied — the settler selects on
+    /// this alongside the decided watch).
+    pub async fn settle_kicked(&self) {
+        self.settle_kick.notified().await;
     }
 
     /// Settle inflight entries after `decided_height` landed: nonces present
@@ -184,7 +216,9 @@ impl PendingPool {
             let mut repool = Vec::new();
             for item in inflight.drain(..) {
                 if committed.contains(&item.entry.tx.nonce.to_string()) {
-                    let _ = item.entry.notifier.send(ConsensusResult::Committed);
+                    let _ = item.entry.notifier.send(ConsensusResult::Committed {
+                        height: decided_height,
+                    });
                 } else if item.proposed_at <= decided_height {
                     // Our proposal lost the round — retry in a later proposal.
                     repool.push(item.entry);
@@ -219,7 +253,9 @@ impl PendingPool {
                 let mut keep = Vec::new();
                 for entry in queued.drain(..) {
                     if committed.contains(&entry.tx.nonce.to_string()) {
-                        let _ = entry.notifier.send(ConsensusResult::Committed);
+                        let _ = entry.notifier.send(ConsensusResult::Committed {
+                            height: decided_height,
+                        });
                     } else {
                         keep.push(entry);
                     }
@@ -288,14 +324,15 @@ impl ConsensusQueue {
     /// Returns when the transaction is committed, rejected, or times out.
     pub async fn submit(&self, transaction: Transaction) -> Result<(), ConsensusSubmitError> {
         self.pre_validate(&transaction)?;
-        self.enqueue_one(transaction).await
+        self.enqueue_one(transaction).await.map(|_| ())
     }
 
-    /// Submit a pre-built batch. Returns per-transaction results.
+    /// Submit a pre-built batch. Per-transaction results; success carries
+    /// the decided height (decided AND applied locally — RFC-018 S6).
     pub async fn submit_batch(
         &self,
         transactions: Vec<Transaction>,
-    ) -> Vec<Result<(), ConsensusSubmitError>> {
+    ) -> Vec<Result<u64, ConsensusSubmitError>> {
         let mut results = Vec::with_capacity(transactions.len());
         let mut receivers = Vec::new();
 
@@ -309,7 +346,7 @@ impl ConsensusQueue {
             match self.enqueue_with_receiver(transaction).await {
                 Ok((_, rx)) => {
                     receivers.push((results.len(), rx));
-                    results.push(Ok(())); // placeholder
+                    results.push(Ok(0)); // placeholder
                 }
                 Err(e) => {
                     results.push(Err(e));
@@ -350,7 +387,7 @@ impl ConsensusQueue {
         }
         let mut results = Vec::with_capacity(receivers.len());
         for rx in receivers {
-            results.push(await_result(rx).await);
+            results.push(await_result(rx).await.map(|_| ()));
         }
         results
     }
@@ -388,7 +425,7 @@ impl ConsensusQueue {
         }
     }
 
-    async fn enqueue_one(&self, transaction: Transaction) -> Result<(), ConsensusSubmitError> {
+    async fn enqueue_one(&self, transaction: Transaction) -> Result<u64, ConsensusSubmitError> {
         let (result_tx, result_rx) = oneshot::channel();
         let queued = QueuedTransaction {
             tx: transaction,
@@ -424,10 +461,12 @@ impl ConsensusQueue {
     }
 }
 
-/// Await a consensus result with 120s timeout.
-async fn await_result(rx: oneshot::Receiver<ConsensusResult>) -> Result<(), ConsensusSubmitError> {
+/// Await a consensus result with 120s timeout. Success carries the
+/// decided height the submitter may anchor reads at (upper-bound
+/// semantic — see ConsensusResult::Committed).
+async fn await_result(rx: oneshot::Receiver<ConsensusResult>) -> Result<u64, ConsensusSubmitError> {
     match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
-        Ok(Ok(ConsensusResult::Committed)) => Ok(()),
+        Ok(Ok(ConsensusResult::Committed { height })) => Ok(height),
         Ok(Ok(ConsensusResult::Rejected(reason))) => Err(ConsensusSubmitError::Rejected(reason)),
         Ok(Ok(ConsensusResult::Failed(msg))) => Err(ConsensusSubmitError::InternalError(msg)),
         Ok(Err(_)) => Err(ConsensusSubmitError::InternalError(
@@ -546,8 +585,7 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
             continue;
         };
 
-        let Some((height, round, proposer)) =
-            super::malachite::engine::proposal_target(&app_state)
+        let Some((height, round, proposer)) = super::malachite::engine::proposal_target(&app_state)
         else {
             retry_holdback = batch;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -564,13 +602,7 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
             (Vec::new(), DispatchOutcome::Resolved)
         } else {
             handle_as_forwarder(
-                &app_state,
-                &engine,
-                batch,
-                height,
-                round,
-                proposer,
-                &mut conn,
+                &app_state, &engine, batch, height, round, proposer, &mut conn,
             )
             .await
         };
@@ -625,7 +657,7 @@ async fn handle_as_forwarder(
             Err(_) => return (batch, DispatchOutcome::RetryAfterDelay),
         };
         match pubkeys.get(&proposer) {
-            Some(pubkey) => pubkey.clone(),
+            Some(pubkey) => *pubkey,
             None => {
                 tracing::error!("proposer node {} not in nodes table", proposer);
                 return (batch, DispatchOutcome::RetryAfterDelay);
@@ -694,9 +726,13 @@ async fn handle_as_forwarder(
             resume_own_engine();
             (batch, DispatchOutcome::RetryAfterDelay)
         }
-        Ok(super::rpc::ForwardAckResult::AckedWithResult(results)) => {
-            process_forward_results(batch, results, proposer, conn)
-        }
+        Ok(super::rpc::ForwardAckResult::AckedWithResult(results)) => process_forward_results(
+            batch,
+            results,
+            proposer,
+            conn,
+            &app_state.consensus_queue.pending_pool(),
+        ),
         Ok(super::rpc::ForwardAckResult::AckedDecided) => {
             // A height decided before the proposer's result — the nonce table
             // already knows which of ours landed. Anything still pending
@@ -707,7 +743,13 @@ async fn handle_as_forwarder(
                 proposer
             );
             let results = synthesize_results_from_nonces(&batch, conn);
-            let (retries, outcome) = process_forward_results(batch, results, proposer, conn);
+            let (retries, outcome) = process_forward_results(
+                batch,
+                results,
+                proposer,
+                conn,
+                &app_state.consensus_queue.pending_pool(),
+            );
             let outcome = match outcome {
                 DispatchOutcome::WaitForProgress => DispatchOutcome::RetryNow,
                 other => other,
@@ -791,13 +833,19 @@ fn process_forward_results(
     results: Vec<super::rpc::TransactionForwardResult>,
     proposer: i32,
     conn: &mut r2d2::PooledConnection<SqliteConnectionManager>,
+    pool: &PendingPool,
 ) -> (Vec<QueuedTransaction>, DispatchOutcome) {
     let mut retries = Vec::new();
+    let mut settle_locally = Vec::new();
 
-    for (queued, result) in batch.into_iter().zip(results.into_iter()) {
+    for (queued, result) in batch.into_iter().zip(results) {
         match result {
             super::rpc::TransactionForwardResult::Committed => {
-                let _ = queued.notifier.send(ConsensusResult::Committed);
+                // The PROPOSER's word — its local commit, not necessarily
+                // ours. Submitters are promised decided-AND-applied-HERE
+                // (RFC-018 S6), so resolution waits for the settler to see
+                // the nonce in OUR committed_tx_nonces.
+                settle_locally.push(queued);
             }
             super::rpc::TransactionForwardResult::Rejected { reason } => {
                 let mut rejecting_leaders = queued.rejecting_leaders;
@@ -844,6 +892,10 @@ fn process_forward_results(
                 });
             }
         }
+    }
+
+    if !settle_locally.is_empty() {
+        pool.stage_for_settle(settle_locally);
     }
 
     let outcome = if retries.is_empty() {

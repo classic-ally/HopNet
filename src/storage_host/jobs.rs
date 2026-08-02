@@ -483,7 +483,10 @@ pub async fn run_watermark_eviction(
     let dir = fragments_dir.clone();
     let (total_bytes, used_bytes) = tokio::task::spawn_blocking(move || {
         let stats = fs4::statvfs(&dir)?;
-        Ok::<_, std::io::Error>((stats.total_space(), stats.total_space() - stats.available_space()))
+        Ok::<_, std::io::Error>((
+            stats.total_space(),
+            stats.total_space() - stats.available_space(),
+        ))
     })
     .await
     .map_err(|e| Error::Failed(Arc::new(format!("statvfs join: {e}").into())))?
@@ -537,7 +540,7 @@ pub async fn run_watermark_eviction(
         &fragments_dir,
         now_unix - grace_secs.unwrap_or(3600),
     )
-        .map_err(|e| Error::Failed(Arc::new(format!("disk scan: {e}").into())))?;
+    .map_err(|e| Error::Failed(Arc::new(format!("disk scan: {e}").into())))?;
     if disk.is_empty() {
         return Ok(serde_json::json!({
             "evicted": 0, "bytes_freed": 0,
@@ -572,27 +575,24 @@ pub async fn run_watermark_eviction(
     for (hash, size) in &disk {
         // Not in fragment_hashes = orphan; the orphan GC flow owns it.
         let Some(frag) = info.get(hash) else { continue };
-        let assignment = assignments
-            .entry(frag.blob_id.clone())
-            .or_insert_with(|| {
-                use std::str::FromStr;
-                let seed = hopnet_storage::BlobId::from_str(&frag.blob_id)
-                    .map(|id| hopnet_storage::placement::placement_seed(&id))
-                    .unwrap_or([0u8; 32]);
-                hopnet_storage::engine::assign_for_blob(
-                    &seed,
-                    view.members.clone(),
-                    view.metrics.clone(),
-                    &view.weights,
-                )
-                .1
-            });
+        let assignment = assignments.entry(frag.blob_id.clone()).or_insert_with(|| {
+            use std::str::FromStr;
+            let seed = hopnet_storage::BlobId::from_str(&frag.blob_id)
+                .map(|id| hopnet_storage::placement::placement_seed(&id))
+                .unwrap_or([0u8; 32]);
+            hopnet_storage::engine::assign_for_blob(
+                &seed,
+                view.members.clone(),
+                view.metrics.clone(),
+                &view.weights,
+            )
+            .1
+        });
         candidates.push(EvictionCandidate {
             fragment_hash: *hash,
             blob_id: frag.blob_id.clone(),
             size_bytes: *size,
-            responsible: assignment.get(frag.local_index as usize).copied()
-                == Some(my_node_id),
+            responsible: assignment.get(frag.local_index as usize).copied() == Some(my_node_id),
             pinned: pinned.contains(&frag.blob_id),
             other_member_holders: holder_counts.get(hash).copied().unwrap_or(0),
         });
@@ -759,15 +759,17 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json:
             .map_err(|e| Error::Failed(Arc::new(format!("fragments dir: {e:?}").into())))?;
         let slice = (day % 7) as u8;
         let dir = fragments_dir.clone();
-        let corrupted =
-            tokio::task::spawn_blocking(move || {
-                hopnet_storage::fragstore::verify_slice(&dir, slice, 7)
-            })
-            .await
-            .map_err(|e| Error::Failed(Arc::new(format!("scrub join: {e}").into())))?
-            .map_err(|e| Error::Failed(Arc::new(format!("scrub: {e}").into())))?;
+        let corrupted = tokio::task::spawn_blocking(move || {
+            hopnet_storage::fragstore::verify_slice(&dir, slice, 7)
+        })
+        .await
+        .map_err(|e| Error::Failed(Arc::new(format!("scrub join: {e}").into())))?
+        .map_err(|e| Error::Failed(Arc::new(format!("scrub: {e}").into())))?;
         if !corrupted.is_empty() {
-            tracing::warn!("scrub: {} corrupt fragments on slice {slice}", corrupted.len());
+            tracing::warn!(
+                "scrub: {} corrupt fragments on slice {slice}",
+                corrupted.len()
+            );
             for hash in &corrupted {
                 let _ = hopnet_storage::fragstore::delete_fragment(&fragments_dir, hash);
             }

@@ -57,7 +57,7 @@ fn node_staged_version_authorized() {
 
     let mut conn = node.app_state.db_pool.get().unwrap();
     let db_tx = conn.transaction().unwrap();
-    process_transaction(&tx, &node.app_state, false, &db_tx).unwrap();
+    process_transaction(&tx, &node.app_state, false, 0, &db_tx).unwrap();
     let _ = db_tx.rollback();
 }
 
@@ -79,7 +79,7 @@ fn node_staged_version_unauthorized() {
 
     let mut conn = node.app_state.db_pool.get().unwrap();
     let db_tx = conn.transaction().unwrap();
-    let err = process_transaction(&tx, &node.app_state, false, &db_tx).unwrap_err();
+    let err = process_transaction(&tx, &node.app_state, false, 0, &db_tx).unwrap_err();
     assert!(matches!(err, DatabaseError::AuthorizationError));
     let _ = db_tx.rollback();
 }
@@ -106,7 +106,7 @@ fn node_staged_version_overwrites_and_self_cleans() {
         )
         .unwrap();
         let db_tx = conn.transaction().unwrap();
-        let result = process_transaction(&tx, &node.app_state, true, &db_tx);
+        let result = process_transaction(&tx, &node.app_state, true, 0, &db_tx);
         db_tx.commit().unwrap();
         result
     };
@@ -160,7 +160,7 @@ fn node_staged_version_rejects_malformed_claims() {
         )
         .unwrap();
         let db_tx = conn.transaction().unwrap();
-        let err = process_transaction(&tx, &node.app_state, true, &db_tx).unwrap_err();
+        let err = process_transaction(&tx, &node.app_state, true, 0, &db_tx).unwrap_err();
         assert!(matches!(err, DatabaseError::InvalidPayload));
         db_tx.commit().unwrap();
     }

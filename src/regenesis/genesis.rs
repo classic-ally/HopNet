@@ -434,10 +434,10 @@ impl ChainAnchor {
 ///
 /// Returns the last (target-epoch) record on success — its
 /// `snapshot_hash` is what the joiner's downloaded artifact must match.
-pub fn verify_lineage_chain<'a>(
-    records: &'a [LineageRecord],
+pub fn verify_lineage_chain(
+    records: &[LineageRecord],
     anchor: ChainAnchor,
-) -> Result<&'a LineageRecord, String> {
+) -> Result<&LineageRecord, String> {
     if records.is_empty() {
         return Err("empty lineage chain".into());
     }
@@ -518,7 +518,7 @@ mod tests {
     }
 
     fn pubkey_blob(k: &SigningKey) -> Vec<u8> {
-        bincode::serde::encode_to_vec(&k.verifying_key(), bincode::config::standard()).unwrap()
+        bincode::serde::encode_to_vec(k.verifying_key(), bincode::config::standard()).unwrap()
     }
 
     /// A sealed epoch-N database with two seated validators and a real

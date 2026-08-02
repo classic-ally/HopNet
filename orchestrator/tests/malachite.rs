@@ -200,13 +200,7 @@ impl TestScenario for ConsensusLeaderDown {
             .iter()
             .find(|n| n.node_id != proposer)
             .expect("a surviving node");
-        let upload = upload_file(
-            submit_to,
-            "/leader-down",
-            "survives.txt",
-            vec![0x5A; 1024],
-        )
-        .await;
+        let upload = upload_file(submit_to, "/leader-down", "survives.txt", vec![0x5A; 1024]).await;
         print_and_add_check(
             &mut result,
             Check {
@@ -235,11 +229,16 @@ impl TestScenario for ConsensusLeaderDown {
         // full mesh; it restarts PAUSED (on-demand) and catches up once fresh
         // work wakes it — wait_caught_up_to_tip drives that.
         start_node(&docker, mesh_id, proposer).await?;
-        let mut back = nodes.iter().find(|n| n.node_id == proposer).unwrap().clone();
+        let mut back = nodes
+            .iter()
+            .find(|n| n.node_id == proposer)
+            .unwrap()
+            .clone();
         wait_for_node_ready(&back, Duration::from_secs(30)).await?;
         refresh_jwt(&mut back, mesh_id).await?; // rolled JWT key on restart
         let caught_up =
-            wait_caught_up_to_tip(&back, submit_to, "/leader-down", Duration::from_secs(90)).await?;
+            wait_caught_up_to_tip(&back, submit_to, "/leader-down", Duration::from_secs(90))
+                .await?;
         print_and_add_check(
             &mut result,
             Check {
@@ -319,7 +318,8 @@ impl TestScenario for ConsensusLaggingCatchUp {
         wait_for_node_ready(&laggard, Duration::from_secs(30)).await?;
         refresh_jwt(&mut laggard, mesh_id).await?; // rolled JWT key on restart
         let synced =
-            wait_caught_up_to_tip(&laggard, &nodes[0], "/catch-up", Duration::from_secs(120)).await?;
+            wait_caught_up_to_tip(&laggard, &nodes[0], "/catch-up", Duration::from_secs(120))
+                .await?;
         let tip = decided_height(&nodes[0]).await?;
         print_and_add_check(
             &mut result,
@@ -435,7 +435,12 @@ impl TestScenario for ConsensusBarrierDecideWindow {
         "before_decide hold opens a divergence window, release converges (majority profile)"
     }
 
-    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
+    async fn run(
+        &self,
+        _mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
         let mut result = TestResult::new();
         let start = Instant::now();
         anyhow::ensure!(nodes.len() >= 3, "needs a 3-node mesh");
@@ -509,7 +514,12 @@ impl TestScenario for ConsensusBarrierProposalHold {
         "before_publish_proposal hold stalls commits; release recovers (majority profile)"
     }
 
-    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
+    async fn run(
+        &self,
+        _mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
         let mut result = TestResult::new();
         let start = Instant::now();
         anyhow::ensure!(nodes.len() >= 3, "needs a 3-node mesh");

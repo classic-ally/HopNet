@@ -158,8 +158,7 @@ pub fn get_folder_contents(
 
             // Current decided height (malachite schema — the legacy blocks
             // table died with the bespoke engine at Stage 5b)
-            let current_consensus_height =
-                crate::db::current_height(&db_lock)?;
+            let current_consensus_height = crate::db::current_height(&db_lock)?;
 
             Ok(FileProviderEnumerateResult {
                 items,
@@ -382,8 +381,7 @@ pub fn get_folder_changes_since_height(
 
             // Current decided height (malachite schema — same as
             // get_folder_contents)
-            let current_consensus_height =
-                crate::db::current_height(&db_lock)?;
+            let current_consensus_height = crate::db::current_height(&db_lock)?;
 
             tracing::debug!(
                 "Found {} changed items and {} deleted items since height {}",

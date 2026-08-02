@@ -174,12 +174,10 @@ pub fn find_chunks_with_missing_classes(
         .map_err(|_| DatabaseError::ProcessingError)?;
 
     use std::collections::BTreeMap;
-    let mut chunks: BTreeMap<(String, u32), Vec<(u32, Vec<i32>)>> = BTreeMap::new();
+    type MissingByChunk = BTreeMap<(String, u32), Vec<(u32, Vec<i32>)>>;
+    let mut chunks: MissingByChunk = BTreeMap::new();
     for (blob, chunk, class, holders) in rows {
-        let holder_ids: Vec<i32> = holders
-            .split(',')
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let holder_ids: Vec<i32> = holders.split(',').filter_map(|s| s.parse().ok()).collect();
         chunks
             .entry((blob, chunk))
             .or_default()
@@ -252,7 +250,7 @@ mod tests {
         .unwrap();
         for n in 1..=3 {
             // nodes.pubkey is UNIQUE — each fixture node needs its own key.
-            let node_key = ed25519_dalek::SigningKey::from_bytes(&[n as u8; 32]);
+            let node_key = ed25519_dalek::SigningKey::from_bytes(&[100 + n as u8; 32]);
             let node_pubkey = crate::db::PubKey(node_key.verifying_key());
             conn.execute(
                 "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, 1, ?)",

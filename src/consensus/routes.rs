@@ -271,15 +271,14 @@ pub async fn post_leave(State(app_state): State<AppState>) -> impl IntoResponse 
         )
             .into_response();
     };
-    let payload = match bincode::serde::encode_to_vec(
-        &LeaveRequest { node_id },
-        bincode::config::standard(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")).into_response();
-        }
-    };
+    let payload =
+        match bincode::serde::encode_to_vec(&LeaveRequest { node_id }, bincode::config::standard())
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")).into_response();
+            }
+        };
     let tx = match create_signed_transaction(&app_state, "validator_leave".to_string(), payload) {
         Ok(t) => t,
         Err(e) => {

@@ -252,7 +252,7 @@ mod tests {
         assert_eq!(report.manifest.top_hash.to_hex(), EMPTY_TOP_HASH);
     }
 
-    const EMPTY_TOP_HASH: &str = "98a6b6eb298ae078036e9a91b1ce9bbc13600f48f7d6db33fbac17738a5c53dc";
+    const EMPTY_TOP_HASH: &str = "131ae3b061db3eb36dccb57b4272dc1ce137da50e1d8698ba0ae2d9fbe5137f5";
     const EMPTY_SECTION_HASHES: &[(&str, &str)] = &[
         (
             "host",
@@ -269,6 +269,10 @@ mod tests {
         (
             "drive",
             "e97564093bd2fc9180738c64b3a8a5a00b2c1c1c3d00b3f3dfd354e33cd96950",
+        ),
+        (
+            "photos",
+            "9b442521498105dd6fbdc4952e9935599c9f9d9e7b61bbaa41e298c5223935a9",
         ),
         (
             "takeout",
@@ -296,10 +300,10 @@ mod tests {
     }
 
     const SEEDED_TOP_HASH: &str =
-        "731999ef6d44ae6797b7f2735db193ff2cb6ceae9064deb3164f65b8b330937e";
+        "74a25fcc71019d733368d96f28303b894cd73934f69cae337886c61ae63a32e0";
     const SEEDED_ARTIFACT_HASH: &str =
-        "1ce11ba7a4a57dfbf9b0032eda5391715a606994a0e4a00cfa43ce96bfe3fae1";
-    const SEEDED_ARTIFACT_LEN: usize = 3207;
+        "65260e409f60456e30302828bbb6ee5b1c9e5fa2ef8a0b1d554c6eeef5eed6b5";
+    const SEEDED_ARTIFACT_LEN: usize = 4559;
 
     // Should: report identical manifests from the hash-only walk and the
     // full export, and byte-identical artifacts from two independently
@@ -373,7 +377,7 @@ mod tests {
             let tx = target.transaction().unwrap();
             let report = import_snapshot_tx(&tx, &artifact).unwrap();
             assert!(report.skipped.is_empty());
-            assert_eq!(report.imported.len(), 5);
+            assert_eq!(report.imported.len(), 6);
             tx.commit().unwrap();
         }
 
@@ -442,13 +446,17 @@ mod tests {
         drop(tx);
 
         let all = sections();
-        let without_takeout = &all[..4];
+        // Drop the LAST section (takeout) rather than a fixed index, so
+        // registering a new projection cannot silently turn this into a
+        // two-section-missing test.
+        let without_takeout = &all[..all.len() - 1];
+        assert_eq!(all.last().unwrap().name, "takeout");
         let target_pool = fresh_pool();
         let mut target = target_pool.get().unwrap();
         let tx = target.transaction().unwrap();
         let report =
             hopnet_common::snapshot::import_snapshot(&tx, without_takeout, &artifact).unwrap();
-        assert_eq!(report.imported.len(), 4);
+        assert_eq!(report.imported.len(), 5);
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].name, "takeout");
         assert_eq!(

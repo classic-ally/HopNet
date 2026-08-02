@@ -23,7 +23,6 @@ use chrono::{DateTime, Utc};
 use crate::descriptor::LibraryScope;
 use crate::error::Result;
 use crate::ids::PhotoId;
-use crate::paths::DataDir;
 use crate::store::StateStore;
 
 /// Light per-asset probe — the fields identity resolution and change
@@ -91,12 +90,7 @@ pub fn mark_seen(scan: &ScanState, photo_id: &PhotoId) {
 /// Probe one enumerated asset. Resolution mirrors identity precedence:
 /// `cloud_id` first, then the same-device `local_id` guard for cloud-less
 /// assets. Any resolved photo is marked seen regardless of verdict.
-pub async fn probe(
-    store: &StateStore,
-    data_dir: &DataDir,
-    scan: &ScanState,
-    p: &ScanProbe,
-) -> Result<ScanVerdict> {
+pub async fn probe(store: &StateStore, scan: &ScanState, p: &ScanProbe) -> Result<ScanVerdict> {
     scan.probes.fetch_add(1, Ordering::Relaxed);
 
     let photo = match p.cloud_id.as_deref() {
@@ -146,17 +140,15 @@ pub async fn probe(
     }
 
     // Self-heal the crash-window class: a materialized, active photo whose
-    // local sidecar is missing (the completion tx committed but
-    // `write_photo_sidecar` never landed) is otherwise invisible — the light
-    // probe sees no metadata drift, and the replication drain skips it
-    // unstamped forever (`report.missing`). Force a full descriptor so
-    // `apply_change` can recompose it; only the full path carries the
-    // sidecar-only fields (media type, favorite, capture metadata) that are
-    // not persisted in `state.db`, so nothing else could regenerate it.
+    // publish-metadata capsule is NULL (the completion tx committed but the
+    // capsule write never landed, or the row predates the capsule migration)
+    // is otherwise invisible — the light probe sees no metadata drift, and
+    // publish skips it forever. Force a full descriptor so `apply_change`
+    // can backfill it; only the full path carries the capsule fields (media
+    // type, favorite, capture metadata), so nothing else could regenerate it.
     if photo.materialized_at.is_some()
-        && let Some(library_id) = &photo.library_id
-        && crate::sidecar_io::find_sidecar(&data_dir.sidecar_root(library_id), &photo.photo_id)?
-            .is_none()
+        && photo.library_id.is_some()
+        && photo.descriptor_json.is_none()
     {
         scan.needed_full.fetch_add(1, Ordering::Relaxed);
         return Ok(ScanVerdict::NeedsFull);
@@ -174,7 +166,6 @@ pub async fn probe(
 /// synthesis AND the gave-up reset (no evidence either way).
 pub async fn finish(
     store: &StateStore,
-    data_dir: &DataDir,
     scan: &ScanState,
     enumerated: u64,
     retry_cap: i64,
@@ -195,7 +186,7 @@ pub async fn finish(
             let Some(photo) = store.photo(&photo_id).await? else {
                 continue;
             };
-            if crate::classify::tombstone_photo(store, data_dir, &photo).await? {
+            if crate::classify::tombstone_photo(store, &photo).await? {
                 deletions_synthesized += 1;
             }
         }

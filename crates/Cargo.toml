@@ -4,4 +4,9 @@
 # Rejoin the parent workspace once iroh drops the prerelease pin.
 [workspace]
 resolver = "3"
-members = ["ingress-cli", "ingress-core", "ingress-ffi", "ingress-server"]
+members = [
+    "ingress-cli",
+    "ingress-core",
+    "ingress-ffi",
+    "ingress-publisher",
+]

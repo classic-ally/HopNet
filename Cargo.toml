@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "common", "hopnet-comms", "hopnet-consensus", "hopnet-storage", "hopnet-projection", "hopnet-drive", "hopnet-takeout"]
+members = [".", "common", "hopnet-comms", "hopnet-consensus", "hopnet-storage", "hopnet-projection", "hopnet-drive", "hopnet-mount", "hopnet-photos", "hopnet-photos-core", "hopnet-takeout"]
 # crates/ingress-core is deliberately NOT a member: its sqlx 0.9 dependency
 # (via optional sqlx-mysql) requires sha2 ^0.11.0, which cannot unify with
 # iroh-base's sha2 =0.11.0-rc.5 pin. It is a standalone workspace with its
@@ -39,6 +39,9 @@ hopnet-consensus = { path = "hopnet-consensus", features = ["shell"] }
 hopnet-storage = { path = "hopnet-storage", features = ["engine"] }
 hopnet-projection = { path = "hopnet-projection" }
 hopnet-drive = { path = "hopnet-drive" }
+hopnet-photos = { path = "hopnet-photos" }
+hopnet-photos-core = { path = "hopnet-photos-core", features = ["sidecar"] }
+async-trait = "0.1"
 hopnet-takeout = { path = "hopnet-takeout" }
 axum = { version = "0.8.4", features = ["multipart", "macros"] }
 chrono = { version = "0.4.41", features = ["serde"] }
@@ -110,6 +113,8 @@ objc2-file-provider = "0.3.1"
 objc2-foundation = "0.3.1"
 objc2 = "0.6.2"
 block2 = "0.6.1"
+# SMAppService for the bundled photo-ingress LaunchAgent
+objc2-service-management = "0.3.2"
 # Security framework for keychain access
 security-framework = "3.3.0"
 
@@ -131,6 +136,10 @@ path = "orchestrator/main.rs"
 [[bin]]
 name = "snapshotter"
 path = "snapshotter/main.rs"
+
+[[bin]]
+name = "photo-seeder"
+path = "seeder/main.rs"
 
 [patch.crates-io]
 iroh = { git = "https://github.com/classic-ally/iroh", branch = "auth-before-register-v0.98" }

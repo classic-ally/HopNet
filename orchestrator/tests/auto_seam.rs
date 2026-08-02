@@ -54,15 +54,13 @@ impl TestScenario for AutoSeam {
         "AUTO crosses the V_bft seam upward: quorum flips 3/4->5 live, data served across it"
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
         let client = Client::new();
-        anyhow::ensure!(nodes.len() == 6, "auto-seam expects a 6-node mesh (it adds the 7th)");
+        anyhow::ensure!(
+            nodes.len() == 6,
+            "auto-seam expects a 6-node mesh (it adds the 7th)"
+        );
         let docker = Docker::connect_with_local_defaults()?;
 
         println!("\nRunning auto-seam checks:");
@@ -107,7 +105,10 @@ impl TestScenario for AutoSeam {
             Check {
                 name: "Pre-seam quorum matches the majority formula (v/2+1)".to_string(),
                 passed: stable && q_pre == v_pre / 2 + 1,
-                detail: Some(format!("quorum({v_pre})={q_pre}, expected {}", v_pre / 2 + 1)),
+                detail: Some(format!(
+                    "quorum({v_pre})={q_pre}, expected {}",
+                    v_pre / 2 + 1
+                )),
             },
         );
         if !stable {
@@ -142,7 +143,7 @@ impl TestScenario for AutoSeam {
         let deadline = Instant::now() + Duration::from_secs(120);
         while Instant::now() < deadline {
             if let Some((v, q)) = v_and_quorum(&client, &nodes[0]).await {
-                if v < 7 && v >= 1 && q != v / 2 + 1 {
+                if (1..7).contains(&v) && q != v / 2 + 1 {
                     sub_seam_ok = false;
                 }
                 if v == 7 && q != 5 {
@@ -158,7 +159,8 @@ impl TestScenario for AutoSeam {
         print_and_add_check(
             &mut result,
             Check {
-                name: "Seam crossed upward: v=7, quorum flipped to 5 (BFT) observed live".to_string(),
+                name: "Seam crossed upward: v=7, quorum flipped to 5 (BFT) observed live"
+                    .to_string(),
                 passed: reached_seam,
                 detail: Some(format!("from v_pre={v_pre}/quorum={q_pre}")),
             },
@@ -208,7 +210,8 @@ impl TestScenario for AutoSeam {
         print_and_add_check(
             &mut result,
             Check {
-                name: "File served by all 7 across the seam (majority upload, BFT read)".to_string(),
+                name: "File served by all 7 across the seam (majority upload, BFT read)"
+                    .to_string(),
                 passed: served,
                 detail: None,
             },

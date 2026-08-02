@@ -36,3 +36,14 @@ pub use types::{
     BlobAccess, BlobId, DeleteOrphanedDataBlocksPayload, MeshKeyGrant, PlacementUpdate,
     SelfCheckFragments,
 };
+
+// Public crypto seam — consumers (photos-core, future projections) wrap
+// keys through these without touching the private primitives.
+pub use crypto::{
+    unwrap_key_v1_in_domain, wrap_key_v1_in_domain, RecipientKey, StaticRecipient, WrapDomain,
+    BLOB_WRAP_DOMAIN,
+};
+// The dalek vocabulary types are part of the crypto seam's public API
+// (RecipientKey references them); re-export so consumers don't drift onto
+// an incompatible version.
+pub use x25519_dalek;

@@ -158,3 +158,37 @@ impl FromSql for OnboardingFlags {
         }
     }
 }
+
+/// Register the `uuid_extract_timestamp(uuid_text) → INTEGER` SQL function
+/// on a connection. NULL-safe (NULL in → NULL out). Parses the first 12
+/// hex digits of a UUIDv7 (the 48-bit millisecond timestamp) and returns
+/// epoch milliseconds. Returns 0 for malformed/too-short input.
+///
+/// Used by retention-aware queries (e.g. the photos reference provider's
+/// bulk subquery) to filter rows by age without round-tripping through
+/// Rust. The host registers this on every pooled connection via
+/// `on_acquire`; tests that build their own connections must call this
+/// directly.
+pub fn register_uuid_extract_timestamp(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.create_scalar_function(
+        "uuid_extract_timestamp",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let uuid_str: Option<String> = ctx.get(0)?;
+            match uuid_str {
+                None => Ok(None),
+                Some(s) => {
+                    let hex_only: String = s.replace('-', "");
+                    if hex_only.len() < 12 {
+                        return Ok(Some(0i64));
+                    }
+                    match i64::from_str_radix(&hex_only[..12], 16) {
+                        Ok(millis) => Ok(Some(millis)),
+                        Err(_) => Ok(Some(0i64)),
+                    }
+                }
+            }
+        },
+    )
+}

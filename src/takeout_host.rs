@@ -132,9 +132,13 @@ pub async fn handle_takeout_maintenance(
     _ctx: apalis_cron::CronContext<chrono::Utc>,
     data: apalis::prelude::Data<AppState>,
 ) -> Result<(), apalis::prelude::Error> {
-    hopnet_takeout::jobs::run_takeout_maintenance(&takeout_state(&data)).await.map_err(|msg| {
-        apalis::prelude::Error::Failed(std::sync::Arc::new(Box::new(std::io::Error::other(msg))))
-    })
+    hopnet_takeout::jobs::run_takeout_maintenance(&takeout_state(&data))
+        .await
+        .map_err(|msg| {
+            apalis::prelude::Error::Failed(std::sync::Arc::new(Box::new(std::io::Error::other(
+                msg,
+            ))))
+        })
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]

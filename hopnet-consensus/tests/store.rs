@@ -188,10 +188,7 @@ fn torn_final_wal_entry_dropped_mid_corruption_errors() {
     .unwrap();
     drop(conn);
     let mut s = open_storage(&path);
-    assert!(matches!(
-        s.wal_fetch(Height(2)),
-        Err(StoreError::Codec(_))
-    ));
+    assert!(matches!(s.wal_fetch(Height(2)), Err(StoreError::Codec(_))));
     let _ = std::fs::remove_file(&path);
 }
 
@@ -212,8 +209,13 @@ fn decided_range_stops_at_gap() {
             signatures: Vec::new(),
         };
         s.decide_atomically(|tx| {
-            SqliteStorage::<hopnet_consensus::store::OwnedConn>::store_decided_tx(tx, &block, &cert)?;
-            SqliteStorage::<hopnet_consensus::store::OwnedConn>::set_last_decided_tx(tx, Height(h))?;
+            SqliteStorage::<hopnet_consensus::store::OwnedConn>::store_decided_tx(
+                tx, &block, &cert,
+            )?;
+            SqliteStorage::<hopnet_consensus::store::OwnedConn>::set_last_decided_tx(
+                tx,
+                Height(h),
+            )?;
             Ok(())
         })
         .unwrap();
@@ -284,7 +286,7 @@ fn single_node_decides_heights_over_sqlite() {
     drop(core);
 
     let rows = decided_heights(&path);
-    assert_eq!(rows.len() >= 5, true);
+    assert!(rows.len() >= 5);
     for (i, (h, _)) in rows.iter().take(5).enumerate() {
         assert_eq!(*h, (i + 1) as i64);
     }
@@ -376,12 +378,14 @@ fn two_node_crash_midheight_replays_wal_without_equivocation() {
     // No equivocation: every vote node 0 ever published (pre + post crash)
     // has a unique value per (height, round, type).
     let mut signed: BTreeMap<(u64, i64, bool), Option<Blake3Hash>> = BTreeMap::new();
-    let all_votes = pre_crash_votes.iter().cloned().chain(
-        log0.iter().chain(post_log0.iter()).filter_map(|m| match m {
-            WireConsensusMsg::Vote(v) | WireConsensusMsg::LivenessVote(v) => Some(v.clone()),
-            _ => None,
-        }),
-    );
+    let all_votes =
+        pre_crash_votes
+            .iter()
+            .cloned()
+            .chain(log0.iter().chain(post_log0.iter()).filter_map(|m| match m {
+                WireConsensusMsg::Vote(v) | WireConsensusMsg::LivenessVote(v) => Some(v.clone()),
+                _ => None,
+            }));
     for v in all_votes {
         let key = (
             v.height,

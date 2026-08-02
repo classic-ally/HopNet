@@ -30,6 +30,31 @@ impl StateStore {
             .await?;
         Ok(n)
     }
+
+    /// Persist the publish-metadata capsule (serialized
+    /// [`crate::descriptor::DescriptorCapsule`]). Rides the same trigger
+    /// points as materialization, metadata refresh, and heal — so the
+    /// column tracks the live descriptor.
+    pub async fn update_descriptor_capsule(&self, id: &PhotoId, json: &str) -> Result<()> {
+        sqlx::query("UPDATE photos SET descriptor_json = ? WHERE photo_id = ?")
+            .bind(json)
+            .bind(id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Persist the capsule straight from a live descriptor — the single
+    /// metadata write every materialization/refresh/heal path funnels
+    /// through (the successor of the sidecar-file write).
+    pub async fn persist_descriptor(
+        &self,
+        id: &PhotoId,
+        desc: &crate::descriptor::AssetDescriptor,
+    ) -> Result<()> {
+        let json = serde_json::to_string(&crate::descriptor::DescriptorCapsule::from(desc))?;
+        self.update_descriptor_capsule(id, &json).await
+    }
 }
 
 pub(crate) async fn photo_by_cloud_id<'e, E>(exec: E, cloud_id: &str) -> Result<Option<PhotoRecord>>
@@ -191,58 +216,29 @@ pub(crate) async fn set_asset_modified_at<'e, E>(
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    // The metadata refresh rewrote the sidecar just before this stamp — the
-    // remote copy is stale, so the dirty flag rides the same statement (T6).
-    sqlx::query(
-        "UPDATE photos SET asset_modified_at = ?, sidecar_replicated_at = NULL WHERE photo_id = ?",
-    )
-    .bind(at)
-    .bind(id)
-    .execute(exec)
-    .await?;
-    Ok(())
-}
-
-/// Every local sidecar rewrite dirties the remote copy (spec §photos notes:
-/// the NULL commits in the same transaction as the triggering state change).
-pub(crate) async fn mark_sidecar_dirty<'e, E>(exec: E, id: &PhotoId) -> Result<()>
-where
-    E: Executor<'e, Database = Sqlite>,
-{
-    sqlx::query("UPDATE photos SET sidecar_replicated_at = NULL WHERE photo_id = ?")
+    sqlx::query("UPDATE photos SET asset_modified_at = ? WHERE photo_id = ?")
+        .bind(at)
         .bind(id)
         .execute(exec)
         .await?;
     Ok(())
 }
 
-/// Stamp a successful remote replication. Guarded on still-NULL: a rewrite
-/// that landed after the copy was taken must win (the stamp would otherwise
-/// record a stale remote as current).
-pub(crate) async fn stamp_sidecar_replicated<'e, E>(
-    exec: E,
-    id: &PhotoId,
-    at: DateTime<Utc>,
-) -> Result<bool>
-where
-    E: Executor<'e, Database = Sqlite>,
-{
-    Ok(sqlx::query(
-        "UPDATE photos SET sidecar_replicated_at = ? \
-         WHERE photo_id = ? AND sidecar_replicated_at IS NULL",
-    )
-    .bind(at)
-    .bind(id)
-    .execute(exec)
-    .await?
-    .rows_affected()
-        > 0)
-}
-
 /// Hard-delete candidates: tombstones past their retention cutoff. The
 /// caller computes the cutoff per library (Rust-side, chrono-bound — house
 /// pattern) so per-library `retention_days` applies fresh each run;
 /// `library = None` selects unmapped tombstones (NULL library).
+///
+/// A published photo whose delete has NOT yet reached the mesh is held back
+/// past its cutoff: reaping the row would destroy the only record that the
+/// mesh still needs telling, stranding the photo in HopNet permanently with
+/// nothing left to repair it. Retention is therefore "30 days, or until the
+/// mesh knows, whichever is later". Unpublished tombstones are unaffected —
+/// there is nothing to propagate. Only metadata lingers; the bytes follow
+/// the ordinary eviction rule and are already gone.
+///
+/// The guard clause is repeated verbatim in both branches rather than
+/// interpolated — sqlx rejects non-'static query strings outright.
 pub(crate) async fn expired_tombstones<'e, E>(
     exec: E,
     library: Option<&LibraryId>,
@@ -256,6 +252,7 @@ where
         Some(lib) => Ok(sqlx::query_as(
             "SELECT * FROM photos \
              WHERE deleted_at IS NOT NULL AND deleted_at < ? AND library_id = ? \
+               AND (published_at IS NULL OR tombstone_published_at IS NOT NULL) \
              ORDER BY deleted_at LIMIT ?",
         )
         .bind(cutoff)
@@ -266,6 +263,7 @@ where
         None => Ok(sqlx::query_as(
             "SELECT * FROM photos \
              WHERE deleted_at IS NOT NULL AND deleted_at < ? AND library_id IS NULL \
+               AND (published_at IS NULL OR tombstone_published_at IS NOT NULL) \
              ORDER BY deleted_at LIMIT ?",
         )
         .bind(cutoff)
@@ -275,47 +273,212 @@ where
     }
 }
 
-/// The replication work queue: dirty photos in libraries with a remote root.
-/// `materialized_at IS NOT NULL` keeps never-materialized photos (no sidecar
-/// exists) out of every pass; tombstoned materialized photos keep the stamp,
-/// so their deleted_at sidecar replicates — the resurrection case the column
-/// exists to prevent. Mid-re-edit photos defer to completion.
-pub(crate) async fn dirty_sidecar_photos<'e, E>(exec: E, limit: i64) -> Result<Vec<PhotoRecord>>
+/// The publish work queue: materialized, active, unpublished photos of any
+/// library WITH a publish target — the personal partition (`scope_binding
+/// IS NULL`) always has one, a scope-bound (shared) library only once an
+/// operator sets `mesh_library_id` (an unbound shared library published as
+/// personal-consensus photos would be exactly the dedup debt the old
+/// personal-only gate existed to avoid). Tombstones are excluded:
+/// tombstone propagation is out of scope, and a deleted-then-published
+/// photo would be unreachable in HopNet anyway. Attempts at the cap are
+/// terminal until an operator resets them.
+pub(crate) async fn publishable_photos<'e, E>(
+    exec: E,
+    now: DateTime<Utc>,
+    retry_cap: i64,
+    limit: i64,
+) -> Result<Vec<PhotoRecord>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
     Ok(sqlx::query_as(
         "SELECT p.* FROM photos p \
          JOIN libraries l ON l.library_id = p.library_id \
-         WHERE p.sidecar_replicated_at IS NULL \
-           AND l.sidecar_root_remote IS NOT NULL \
+         WHERE (l.scope_binding IS NULL OR l.mesh_library_id IS NOT NULL) \
+           AND p.published_at IS NULL \
            AND p.materialized_at IS NOT NULL \
+           AND p.deleted_at IS NULL \
+           AND p.publish_attempts < ? \
+           AND (p.publish_next_retry_at IS NULL OR p.publish_next_retry_at <= ?) \
          ORDER BY p.photo_id \
          LIMIT ?",
     )
+    .bind(retry_cap)
+    .bind(now)
     .bind(limit)
     .fetch_all(exec)
     .await?)
 }
 
-/// Every materialized photo of one library, tombstoned included — fsck's
-/// sidecar-consistency population (a materialized photo must have a local
-/// sidecar; tombstoned ones carry their `deleted_at` in it).
-pub(crate) async fn materialized_photos<'e, E>(
+/// Terminal publish success: stamp once and clear the retry ledger. Guarded
+/// on still-NULL so a duplicate mark (confirm race) is a no-op.
+pub(crate) async fn mark_published<'e, E>(exec: E, id: &PhotoId, at: DateTime<Utc>) -> Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query(
+        "UPDATE photos SET published_at = ?, publish_attempts = 0, \
+         publish_next_retry_at = NULL, publish_last_error = NULL \
+         WHERE photo_id = ? AND published_at IS NULL",
+    )
+    .bind(at)
+    .bind(id)
+    .execute(exec)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// Remote adoption: the mesh already holds this asset (cloud-fingerprint
+/// match), published by another device or a previous state.db. Stamp
+/// published_at WITHOUT uploading and record the remote consensus id.
+/// Same still-NULL guard as [`mark_published`].
+pub(crate) async fn mark_adopted<'e, E>(
     exec: E,
-    library: &LibraryId,
+    id: &PhotoId,
+    consensus_photo_id: &str,
+    at: DateTime<Utc>,
+) -> Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query(
+        "UPDATE photos SET published_at = ?, consensus_photo_id = ?, publish_attempts = 0, \
+         publish_next_retry_at = NULL, publish_last_error = NULL \
+         WHERE photo_id = ? AND published_at IS NULL",
+    )
+    .bind(at)
+    .bind(consensus_photo_id)
+    .bind(id)
+    .execute(exec)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// Record one failed publish attempt. `attempts` is the caller-computed new
+/// total (set to the cap for permanent rejections); `next_retry_at = None`
+/// leaves the photo immediately claimable once attempts allow.
+pub(crate) async fn record_publish_failure<'e, E>(
+    exec: E,
+    id: &PhotoId,
+    attempts: i64,
+    next_retry_at: Option<DateTime<Utc>>,
+    error: &str,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        "UPDATE photos SET publish_attempts = ?, publish_next_retry_at = ?, \
+         publish_last_error = ? WHERE photo_id = ?",
+    )
+    .bind(attempts)
+    .bind(next_retry_at)
+    .bind(error)
+    .bind(id)
+    .execute(exec)
+    .await?;
+    Ok(())
+}
+
+/// Photos whose local tombstone state disagrees with what the mesh was
+/// told (spec §Propagation to the mesh). Covers BOTH directions in one
+/// query — a pending delete (`deleted_at` set, marker NULL) and a pending
+/// restore (`deleted_at` NULL, marker set) — because they share a scope
+/// partition, a responsibility gate and a retry ledger; the caller reads
+/// `deleted_at` to pick the transaction.
+///
+/// `published_at IS NOT NULL` is load-bearing: the mesh never heard of an
+/// unpublished photo, so there is nothing to tell it.
+pub(crate) async fn tombstone_propagatable_photos<'e, E>(
+    exec: E,
+    now: DateTime<Utc>,
+    retry_cap: i64,
+    limit: i64,
 ) -> Result<Vec<PhotoRecord>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
     Ok(sqlx::query_as(
         "SELECT * FROM photos \
-         WHERE library_id = ? AND materialized_at IS NOT NULL \
-         ORDER BY photo_id",
+         WHERE published_at IS NOT NULL \
+           AND ((deleted_at IS NOT NULL AND tombstone_published_at IS NULL) \
+             OR (deleted_at IS NULL AND tombstone_published_at IS NOT NULL)) \
+           AND tombstone_publish_attempts < ? \
+           AND (tombstone_publish_next_retry_at IS NULL \
+                OR tombstone_publish_next_retry_at <= ?) \
+         ORDER BY photo_id \
+         LIMIT ?",
     )
-    .bind(library)
+    .bind(retry_cap)
+    .bind(now)
+    .bind(limit)
     .fetch_all(exec)
     .await?)
+}
+
+/// The mesh has been told this photo is deleted. Clears the retry ledger.
+pub(crate) async fn mark_tombstone_published<'e, E>(
+    exec: E,
+    id: &PhotoId,
+    at: DateTime<Utc>,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        "UPDATE photos SET tombstone_published_at = ?, tombstone_publish_attempts = 0, \
+         tombstone_publish_next_retry_at = NULL, tombstone_publish_last_error = NULL \
+         WHERE photo_id = ?",
+    )
+    .bind(at)
+    .bind(id)
+    .execute(exec)
+    .await?;
+    Ok(())
+}
+
+/// The mesh has been told this photo is restored. Clearing the marker (not
+/// stamping a second one) is what lets a later delete propagate again.
+pub(crate) async fn clear_tombstone_published<'e, E>(exec: E, id: &PhotoId) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        "UPDATE photos SET tombstone_published_at = NULL, tombstone_publish_attempts = 0, \
+         tombstone_publish_next_retry_at = NULL, tombstone_publish_last_error = NULL \
+         WHERE photo_id = ?",
+    )
+    .bind(id)
+    .execute(exec)
+    .await?;
+    Ok(())
+}
+
+/// Record one failed propagation attempt. Same contract as
+/// [`record_publish_failure`], against the tombstone ledger.
+pub(crate) async fn record_tombstone_failure<'e, E>(
+    exec: E,
+    id: &PhotoId,
+    attempts: i64,
+    next_retry_at: Option<DateTime<Utc>>,
+    error: &str,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        "UPDATE photos SET tombstone_publish_attempts = ?, tombstone_publish_next_retry_at = ?, \
+         tombstone_publish_last_error = ? WHERE photo_id = ?",
+    )
+    .bind(attempts)
+    .bind(next_retry_at)
+    .bind(error)
+    .bind(id)
+    .execute(exec)
+    .await?;
+    Ok(())
 }
 
 /// Tombstone (spec §Deletion): set `deleted_at` only when active. Returns
@@ -425,12 +588,180 @@ mod tests {
     use super::*;
     use crate::fixtures::{AssetDescriptorBuilder, store_with_personal};
     use crate::resolve::{SeedOutcome, seed_descriptor};
+    use chrono::Duration;
 
     async fn seed_one(store: &StateStore, desc: &crate::descriptor::AssetDescriptor) -> PhotoId {
         match seed_descriptor(store, desc).await.expect("seed") {
             SeedOutcome::MintedPending { photo_id, .. } => photo_id,
             other => panic!("expected MintedPending, got {other:?}"),
         }
+    }
+
+    /// Seed a photo and stamp it published, the precondition for every
+    /// propagation queue test (an unpublished photo has nothing to tell).
+    async fn seed_published(
+        store: &StateStore,
+        desc: &crate::descriptor::AssetDescriptor,
+    ) -> PhotoId {
+        let id = seed_one(store, desc).await;
+        mark_published(store.pool(), &id, Utc::now()).await.unwrap();
+        id
+    }
+
+    async fn propagatable(store: &StateStore) -> Vec<PhotoId> {
+        tombstone_propagatable_photos(store.pool(), Utc::now(), 5, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.photo_id)
+            .collect()
+    }
+
+    // Impact: the two columns disagreeing IS the queue — there is no other
+    // record of what the mesh has been told, so a wrong predicate here
+    // either floods consensus or silently strands deletes.
+    // Should: queue a published photo tombstoned but not yet propagated.
+    // Should: queue a published photo restored while the marker is still set.
+    // Should not: queue either converged state (both set, or both clear).
+    #[tokio::test]
+    async fn propagation_queue_is_the_disagreement_between_the_two_columns() {
+        let (store, _) = store_with_personal().await;
+        let id = seed_published(&store, &AssetDescriptorBuilder::simple_image().build()).await;
+
+        // Live, mesh agrees.
+        assert!(propagatable(&store).await.is_empty());
+
+        // Deleted locally, mesh not told.
+        tombstone_photo(store.pool(), &id, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(propagatable(&store).await, vec![id.clone()]);
+
+        // Converged.
+        mark_tombstone_published(store.pool(), &id, Utc::now())
+            .await
+            .unwrap();
+        assert!(propagatable(&store).await.is_empty());
+
+        // Restored locally, mesh still tombstoned.
+        restore_photo(store.pool(), &id).await.unwrap();
+        assert_eq!(propagatable(&store).await, vec![id.clone()]);
+
+        // Converged again — clearing, not re-stamping, is what closes it.
+        clear_tombstone_published(store.pool(), &id).await.unwrap();
+        assert!(propagatable(&store).await.is_empty());
+    }
+
+    // Impact: a delete → restore → delete cycle only converges because the
+    // marker resets; were it set-once like published_at, the second delete
+    // would read as already-converged and never reach the mesh.
+    // Should: re-queue a second delete after a restore has cleared the marker.
+    #[tokio::test]
+    async fn second_delete_after_restore_queues_again() {
+        let (store, _) = store_with_personal().await;
+        let id = seed_published(&store, &AssetDescriptorBuilder::simple_image().build()).await;
+
+        tombstone_photo(store.pool(), &id, Utc::now())
+            .await
+            .unwrap();
+        mark_tombstone_published(store.pool(), &id, Utc::now())
+            .await
+            .unwrap();
+        restore_photo(store.pool(), &id).await.unwrap();
+        clear_tombstone_published(store.pool(), &id).await.unwrap();
+
+        tombstone_photo(store.pool(), &id, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(propagatable(&store).await, vec![id]);
+    }
+
+    // Should not: queue a tombstoned photo the mesh never received.
+    #[tokio::test]
+    async fn unpublished_tombstone_never_queues() {
+        let (store, _) = store_with_personal().await;
+        let id = seed_one(&store, &AssetDescriptorBuilder::simple_image().build()).await;
+        tombstone_photo(store.pool(), &id, Utc::now())
+            .await
+            .unwrap();
+        assert!(propagatable(&store).await.is_empty());
+    }
+
+    // Should not: queue a photo whose attempts have reached the cap.
+    // Should not: queue one still inside its backoff window.
+    #[tokio::test]
+    async fn propagation_queue_honours_the_retry_ledger() {
+        let (store, _) = store_with_personal().await;
+        let id = seed_published(&store, &AssetDescriptorBuilder::simple_image().build()).await;
+        tombstone_photo(store.pool(), &id, Utc::now())
+            .await
+            .unwrap();
+
+        record_tombstone_failure(store.pool(), &id, 5, None, "boom")
+            .await
+            .unwrap();
+        assert!(propagatable(&store).await.is_empty());
+
+        let later = Utc::now() + Duration::hours(1);
+        record_tombstone_failure(store.pool(), &id, 1, Some(later), "boom")
+            .await
+            .unwrap();
+        assert!(propagatable(&store).await.is_empty());
+
+        record_tombstone_failure(store.pool(), &id, 1, None, "boom")
+            .await
+            .unwrap();
+        assert_eq!(propagatable(&store).await, vec![id]);
+    }
+
+    // Impact: this predicate is the only thing standing between a daemon
+    // that was offline for the whole retention window and a photo stranded
+    // in the mesh forever — reaping the row destroys the last record that
+    // the mesh still needs telling.
+    // Should: hold a published tombstone past its cutoff until propagated.
+    // Should: reap it once the marker is set.
+    // Should: reap an unpublished tombstone immediately — nothing to tell.
+    #[tokio::test]
+    async fn hard_delete_waits_for_propagation() {
+        let (store, library) = store_with_personal().await;
+        let long_ago = Utc::now() - Duration::days(60);
+        let cutoff = Utc::now() - Duration::days(30);
+
+        let published =
+            seed_published(&store, &AssetDescriptorBuilder::simple_image().build()).await;
+        let unpublished = seed_one(
+            &store,
+            &AssetDescriptorBuilder::simple_image()
+                .with_local_id("OTHER/L0/002")
+                .with_cloud_id("cloud-other")
+                .build(),
+        )
+        .await;
+        for id in [&published, &unpublished] {
+            tombstone_photo(store.pool(), id, long_ago).await.unwrap();
+        }
+
+        let expired = |ids: Vec<PhotoRecord>| -> Vec<PhotoId> {
+            ids.into_iter().map(|p| p.photo_id).collect()
+        };
+
+        // The published tombstone is held back; the unpublished one is not.
+        let candidates = expired(
+            expired_tombstones(store.pool(), Some(&library), cutoff, 100)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(candidates, vec![unpublished]);
+
+        mark_tombstone_published(store.pool(), &published, Utc::now())
+            .await
+            .unwrap();
+        let candidates = expired(
+            expired_tombstones(store.pool(), Some(&library), cutoff, 100)
+                .await
+                .unwrap(),
+        );
+        assert!(candidates.contains(&published));
     }
 
     // Impact: PhotoKit delivers 2–4 near-identical events per user action

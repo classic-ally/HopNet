@@ -138,6 +138,22 @@ pub const WRAP_NONCE_CONTEXT_V1: &str = "hopnet-storage wrap_nonce v1";
 pub const INTEGRITY_CONTEXT_V1: &str = "hopnet-storage integrity v1";
 pub const MESH_KEY_ID_CONTEXT_V1: &str = "hopnet-storage mesh_key id v1";
 
+/// A v1 wrap domain: the (key, nonce) derive-key context pair. Frozen
+/// wire-format constants — never edit an existing domain's strings; new
+/// consumers mint their own `WrapDomain` const beside their envelope
+/// freeze surface.
+pub struct WrapDomain {
+    pub key_context: &'static str,
+    pub nonce_context: &'static str,
+}
+
+/// The substrate's own domain — bit-compatible with every existing
+/// `blob_access` and `mesh_key_access` row.
+pub const BLOB_WRAP_DOMAIN: WrapDomain = WrapDomain {
+    key_context: WRAP_KEY_CONTEXT_V1,
+    nonce_context: WRAP_NONCE_CONTEXT_V1,
+};
+
 /// Capability proving read access for ONE recipient pubkey. Implementations
 /// hold the X25519 private key; it never crosses this trait — the substrate
 /// receives only per-wrap shared secrets (single-use: every wrap has a fresh
@@ -162,9 +178,9 @@ impl RecipientKey for StaticRecipient {
     }
 }
 
-fn wrap_key_v1(shared_secret: &[u8; 32]) -> chacha20poly1305::Key {
+fn wrap_key_v1(domain: &WrapDomain, shared_secret: &[u8; 32]) -> chacha20poly1305::Key {
     let mut key_bytes = [0u8; 32];
-    let mut hasher = blake3::Hasher::new_derive_key(WRAP_KEY_CONTEXT_V1);
+    let mut hasher = blake3::Hasher::new_derive_key(domain.key_context);
     hasher.update(shared_secret);
     hasher.finalize_xof().fill(&mut key_bytes);
     key_bytes.into()
@@ -174,12 +190,13 @@ fn wrap_key_v1(shared_secret: &[u8; 32]) -> chacha20poly1305::Key {
 /// ephemeral is fresh per wrap so the wrap key is already single-use; the
 /// bindings are defense-in-depth against cross-row ciphertext transplants.
 fn wrap_nonce_v1(
+    domain: &WrapDomain,
     id_bytes: &[u8; 16],
     recipient_pubkey: &[u8; 32],
     ephemeral_pubkey: &[u8; 32],
 ) -> [u8; 12] {
     let mut nonce_bytes = [0u8; 12];
-    let mut hasher = blake3::Hasher::new_derive_key(WRAP_NONCE_CONTEXT_V1);
+    let mut hasher = blake3::Hasher::new_derive_key(domain.nonce_context);
     hasher.update(id_bytes);
     hasher.update(recipient_pubkey);
     hasher.update(ephemeral_pubkey);
@@ -188,6 +205,7 @@ fn wrap_nonce_v1(
 }
 
 fn wrap_to_recipient_v1(
+    domain: &WrapDomain,
     id_bytes: &[u8; 16],
     recipient: &X25519PublicKey,
     key: &chacha20poly1305::Key,
@@ -196,8 +214,13 @@ fn wrap_to_recipient_v1(
     let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
     let shared = ephemeral_secret.diffie_hellman(recipient);
 
-    let wrap_key = wrap_key_v1(shared.as_bytes());
-    let nonce = wrap_nonce_v1(id_bytes, recipient.as_bytes(), ephemeral_public.as_bytes());
+    let wrap_key = wrap_key_v1(domain, shared.as_bytes());
+    let nonce = wrap_nonce_v1(
+        domain,
+        id_bytes,
+        recipient.as_bytes(),
+        ephemeral_public.as_bytes(),
+    );
 
     let wrapped = ChaCha20Poly1305::new(&wrap_key)
         .encrypt(&nonce.into(), key.as_slice())
@@ -213,8 +236,12 @@ pub fn wrap_blob_key(
     recipient: &X25519PublicKey,
     per_blob_key: &chacha20poly1305::Key,
 ) -> Result<crate::types::BlobAccess, StorageError> {
-    let (ephemeral_pubkey, wrapped_key) =
-        wrap_to_recipient_v1(blob_id.as_bytes(), recipient, per_blob_key)?;
+    let (ephemeral_pubkey, wrapped_key) = wrap_to_recipient_v1(
+        &BLOB_WRAP_DOMAIN,
+        blob_id.as_bytes(),
+        recipient,
+        per_blob_key,
+    )?;
     Ok(crate::types::BlobAccess {
         blob_id: blob_id.clone(),
         recipient_pubkey: *recipient.as_bytes(),
@@ -229,6 +256,7 @@ pub fn unwrap_blob_key(
     reader: &dyn RecipientKey,
 ) -> Result<chacha20poly1305::Key, StorageError> {
     unwrap_v1(
+        &BLOB_WRAP_DOMAIN,
         access.blob_id.as_bytes(),
         &access.recipient_pubkey,
         &access.ephemeral_pubkey,
@@ -237,7 +265,41 @@ pub fn unwrap_blob_key(
     )
 }
 
+/// Wrap a 32-byte key to a recipient pubkey under a wrap domain (v1).
+/// Returns (ephemeral_pubkey, wrapped_key / 48 bytes). New consumers mint
+/// their own [`WrapDomain`] const; the substrate's own `blob_access` rows
+/// use [`BLOB_WRAP_DOMAIN`] for wire-compatibility with the public
+/// `wrap_blob_key` entry point.
+pub fn wrap_key_v1_in_domain(
+    domain: &WrapDomain,
+    id: &[u8; 16],
+    recipient: &X25519PublicKey,
+    plaintext_key: &chacha20poly1305::Key,
+) -> Result<([u8; 32], Vec<u8>), StorageError> {
+    wrap_to_recipient_v1(domain, id, recipient, plaintext_key)
+}
+
+/// Unwrap a key under a wrap domain (v1), given the reader capability.
+pub fn unwrap_key_v1_in_domain(
+    domain: &WrapDomain,
+    id: &[u8; 16],
+    recipient_pubkey: &[u8; 32],
+    ephemeral_pubkey: &[u8; 32],
+    wrapped_key: &[u8],
+    reader: &dyn RecipientKey,
+) -> Result<chacha20poly1305::Key, StorageError> {
+    unwrap_v1(
+        domain,
+        id,
+        recipient_pubkey,
+        ephemeral_pubkey,
+        wrapped_key,
+        reader,
+    )
+}
+
 fn unwrap_v1(
+    domain: &WrapDomain,
     id_bytes: &[u8; 16],
     recipient_pubkey: &[u8; 32],
     ephemeral_pubkey: &[u8; 32],
@@ -246,8 +308,8 @@ fn unwrap_v1(
 ) -> Result<chacha20poly1305::Key, StorageError> {
     let ephemeral = X25519PublicKey::from(*ephemeral_pubkey);
     let shared = reader.dh(&ephemeral);
-    let wrap_key = wrap_key_v1(&shared);
-    let nonce = wrap_nonce_v1(id_bytes, recipient_pubkey, ephemeral_pubkey);
+    let wrap_key = wrap_key_v1(domain, &shared);
+    let nonce = wrap_nonce_v1(domain, id_bytes, recipient_pubkey, ephemeral_pubkey);
 
     let key_bytes = ChaCha20Poly1305::new(&wrap_key)
         .decrypt(&nonce.into(), wrapped_key)
@@ -279,7 +341,7 @@ pub fn wrap_mesh_privkey(
 ) -> Result<([u8; 32], Vec<u8>), StorageError> {
     let id = mesh_key_wrap_id(mesh_pubkey);
     let key: chacha20poly1305::Key = mesh_privkey.to_bytes().into();
-    wrap_to_recipient_v1(&id, recipient, &key)
+    wrap_to_recipient_v1(&BLOB_WRAP_DOMAIN, &id, recipient, &key)
 }
 
 /// Unwrap the mesh private key via a member capability (v1).
@@ -291,7 +353,14 @@ pub fn unwrap_mesh_privkey(
     reader: &dyn RecipientKey,
 ) -> Result<x25519_dalek::StaticSecret, StorageError> {
     let id = mesh_key_wrap_id(mesh_pubkey);
-    let key = unwrap_v1(&id, recipient_pubkey, ephemeral_pubkey, wrapped_privkey, reader)?;
+    let key = unwrap_v1(
+        &BLOB_WRAP_DOMAIN,
+        &id,
+        recipient_pubkey,
+        ephemeral_pubkey,
+        wrapped_privkey,
+        reader,
+    )?;
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(key.as_slice());
     Ok(x25519_dalek::StaticSecret::from(bytes))
@@ -501,8 +570,7 @@ mod tests {
         let mesh_pub = X25519PublicKey::from(&mesh_secret);
         let member = StaticRecipient(x25519_dalek::StaticSecret::random_from_rng(OsRng));
 
-        let (eph, wrapped) =
-            wrap_mesh_privkey(&mesh_pub, &mesh_secret, &member.pubkey()).unwrap();
+        let (eph, wrapped) = wrap_mesh_privkey(&mesh_pub, &mesh_secret, &member.pubkey()).unwrap();
         let recovered = unwrap_mesh_privkey(
             &mesh_pub,
             member.pubkey().as_bytes(),
@@ -602,5 +670,72 @@ mod tests {
         assert!(cipher
             .decrypt(&wrong_nonce.into(), wrapped.wrapped_key.as_slice())
             .is_err());
+    }
+
+    /// Equivalence pin: generic domain-path functions are interoperable with
+    /// the legacy `wrap_blob_key` / `unwrap_blob_key` wrappers (same domain =
+    /// same derivation, so generic unwrap of legacy output succeeds and vice
+    /// versa). Byte-identical output is not asserted — every wrap draws a
+    /// fresh random ephemeral.
+    #[test]
+    fn generic_path_equivalent_to_legacy_wrappers() {
+        let reader = StaticRecipient(x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let per_blob_key = fixed_key();
+        let blob_id = fixed_fid();
+
+        let access = wrap_blob_key(&blob_id, &reader.pubkey(), &per_blob_key).unwrap();
+
+        // Generic unwrap of legacy output succeeds.
+        let generic_unwrapped = unwrap_key_v1_in_domain(
+            &BLOB_WRAP_DOMAIN,
+            access.blob_id.as_bytes(),
+            &access.recipient_pubkey,
+            &access.ephemeral_pubkey,
+            &access.wrapped_key,
+            &reader,
+        )
+        .unwrap();
+        assert_eq!(generic_unwrapped.as_slice(), per_blob_key.as_slice());
+
+        // Generic wrap → legacy unwrap also succeeds (same domain).
+        let (eph, wrapped) = wrap_key_v1_in_domain(
+            &BLOB_WRAP_DOMAIN,
+            blob_id.as_bytes(),
+            &reader.pubkey(),
+            &per_blob_key,
+        )
+        .unwrap();
+        let synthetic = crate::types::BlobAccess {
+            blob_id: blob_id.clone(),
+            recipient_pubkey: *reader.pubkey().as_bytes(),
+            ephemeral_pubkey: eph,
+            wrapped_key: wrapped,
+        };
+        let legacy_unwrapped = unwrap_blob_key(&synthetic, &reader).unwrap();
+        assert_eq!(legacy_unwrapped.as_slice(), per_blob_key.as_slice());
+    }
+
+    /// Cross-domain: a key wrapped under BLOB_WRAP_DOMAIN must not unwrap
+    /// via a different domain.
+    #[test]
+    fn cross_domain_unwrap_fails() {
+        let reader = StaticRecipient(x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let per_blob_key = fixed_key();
+        let blob_id = fixed_fid();
+        let access = wrap_blob_key(&blob_id, &reader.pubkey(), &per_blob_key).unwrap();
+
+        let wrong_domain = WrapDomain {
+            key_context: "hopnet-photos metadata_key v1",
+            nonce_context: "hopnet-photos metadata_nonce v1",
+        };
+        assert!(unwrap_key_v1_in_domain(
+            &wrong_domain,
+            access.blob_id.as_bytes(),
+            &access.recipient_pubkey,
+            &access.ephemeral_pubkey,
+            &access.wrapped_key,
+            &reader,
+        )
+        .is_err());
     }
 }

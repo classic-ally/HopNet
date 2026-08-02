@@ -230,8 +230,7 @@ pub fn assign_classes_by_score(
     if members.is_empty() {
         return Vec::new();
     }
-    let mut loads: std::collections::HashMap<i32, u32> =
-        members.iter().map(|&m| (m, 0)).collect();
+    let mut loads: std::collections::HashMap<i32, u32> = members.iter().map(|&m| (m, 0)).collect();
     let mut assignment = Vec::with_capacity(n_classes as usize);
     for class in 0..n_classes {
         let min_load = *loads.values().min().expect("members non-empty");
@@ -503,8 +502,7 @@ mod tests {
     // properties (the model states hash quality is non-load-bearing).
     #[test]
     fn balanced_matches_qnt_verify_table() {
-        let weights: std::collections::HashMap<i32, i64> =
-            [(1, 3), (2, 2), (3, 1), (4, 1)].into();
+        let weights: std::collections::HashMap<i32, i64> = [(1, 3), (2, 2), (3, 1), (4, 1)].into();
         let table: &[(&[i32], [i32; 6])] = &[
             (&[1], [1, 1, 1, 1, 1, 1]),
             (&[2], [2, 2, 2, 2, 2, 2]),
@@ -551,7 +549,7 @@ mod tests {
         row.latency_score = 1.0;
         row.stability_score = 1.0;
         assert_eq!(quantized_weight(&row), 16); // ceiling clamped
-        // Jitter within one bucket does not move the weight.
+                                                // Jitter within one bucket does not move the weight.
         row.availability_score = 0.80;
         let w1 = quantized_weight(&row);
         row.availability_score = 0.81;

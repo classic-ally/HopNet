@@ -1,13 +1,9 @@
-//! Sidecar JSON documents (spec §Sidecar Format).
-//!
-//! One document per photo; the off-device half of the recovery contract.
-//! Serialization matches the spec example literally: `camera` / `location` /
-//! `group` / `cloud_id` are omitted when absent; `deleted_at` / `duration_ms`
-//! are explicit nulls.
+//! The recomposed publish-metadata document: what `assemble_item` builds
+//! from the photo row + descriptor capsule + resource records and hands to
+//! the publisher's `PhotoAsset` mapping. (Historically the on-disk sidecar
+//! format; the file layer is gone — this is an in-memory shape now.)
 
-use std::path::PathBuf;
-
-use chrono::{DateTime, Datelike, FixedOffset, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::descriptor::{Camera, CaptureMetadata, Location, MediaType};
@@ -163,30 +159,4 @@ impl Sidecar {
         })
     }
 
-    /// Parse and version-check a sidecar document.
-    pub fn from_json(json: &str) -> Result<Self> {
-        #[derive(Deserialize)]
-        struct SchemaOnly {
-            schema: String,
-        }
-        let probe: SchemaOnly = serde_json::from_str(json)?;
-        if probe.schema != SIDECAR_SCHEMA_V1 {
-            return Err(IngressError::UnsupportedSidecarSchema(probe.schema));
-        }
-        Ok(serde_json::from_str(json)?)
-    }
-
-    pub fn to_json(&self) -> Result<String> {
-        Ok(serde_json::to_string_pretty(self)?)
-    }
-
-    /// Relative path under a sidecar root: `YYYY/MM/<photo_id>.json`, keyed
-    /// by capture date, falling back to ingest date.
-    pub fn rel_path(&self) -> PathBuf {
-        let (y, m) = match self.captured_at {
-            Some(t) => (t.year(), t.month()),
-            None => (self.ingested_at.year(), self.ingested_at.month()),
-        };
-        PathBuf::from(format!("{y:04}/{m:02}/{}.json", self.photo_id))
-    }
 }

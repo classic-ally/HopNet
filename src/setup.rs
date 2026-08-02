@@ -32,8 +32,12 @@ pub enum SetupRequest {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SetupResponse {
     /// Ack for JoinDeliver
-    JoinAck { success: bool },
-    Error { message: String },
+    JoinAck {
+        success: bool,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub async fn get_setup(State(app_state): State<AppState>) -> impl IntoResponse {
@@ -253,6 +257,10 @@ pub async fn post_setup(
                                 e
                             );
                         }
+                        // Photo ingress deliberately NOT provisioned here:
+                        // minting is enablement-gated behind the
+                        // /photo-ingress/enable route (a fresh node cannot
+                        // already be enabled).
                     });
                 }
             }

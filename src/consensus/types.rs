@@ -10,10 +10,7 @@ use bincode::serde::encode_to_vec;
 use blake3::Hasher;
 use ed25519_dalek::Signature;
 use hopnet_common::CustomUUID;
-use rusqlite::{
-    ToSql, types::FromSql, types::FromSqlResult, types::ToSqlOutput,
-    types::ValueRef,
-};
+use rusqlite::{ToSql, types::FromSql, types::FromSqlResult, types::ToSqlOutput, types::ValueRef};
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 
@@ -167,4 +164,3 @@ impl FromSql for Transactions {
         }
     }
 }
-

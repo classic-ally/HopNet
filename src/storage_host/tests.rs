@@ -6,9 +6,9 @@ use crate::storage_host::functions::{
     CHUNK_SIZE, MAX_FRAGMENT_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK,
     calculate_chunked_fragments, calculate_padding_and_chunks,
 };
-use hopnet_storage::store::BlobManifest;
 use crate::storage_host::routes::process_uploaded_file;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng as ChaChaOsRng};
+use hopnet_storage::store::BlobManifest;
 use rand::prelude::*;
 use rusqlite::params;
 use std::collections::HashMap;
@@ -250,8 +250,7 @@ async fn run_round_trip(plaintext: Vec<u8>) {
 
     let manifest = build_manifest(plaintext.len(), &blob_op, &dataid);
 
-    let stream =
-        hopnet_storage::api::get_local(fragments_dir, manifest, Some(per_file_key), None);
+    let stream = hopnet_storage::api::get_local(fragments_dir, manifest, Some(per_file_key), None);
     tokio::pin!(stream);
 
     let mut reconstructed = Vec::with_capacity(plaintext.len());

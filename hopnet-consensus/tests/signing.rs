@@ -44,18 +44,8 @@ fn vote_payloads_are_injective() {
                 for v in &values {
                     for &voter in &voters {
                         for vote in [
-                            ctx.new_prevote(
-                                Height(h),
-                                r,
-                                v.clone(),
-                                hopnet_consensus::Address(voter),
-                            ),
-                            ctx.new_precommit(
-                                Height(h),
-                                r,
-                                v.clone(),
-                                hopnet_consensus::Address(voter),
-                            ),
+                            ctx.new_prevote(Height(h), r, *v, hopnet_consensus::Address(voter)),
+                            ctx.new_precommit(Height(h), r, *v, hopnet_consensus::Address(voter)),
                         ] {
                             assert!(
                                 seen.insert(vote_sign_bytes(chain, &vote)),

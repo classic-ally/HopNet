@@ -37,13 +37,17 @@ pub fn set_node_version_tx(
     Ok(())
 }
 
+/// One node's committed `(running, staged)` version codes; either side is
+/// None when unset.
+pub type NodeVersionCodes = (Option<u32>, Option<u32>);
+
 /// The committed (running, staged) codes for one node — attested height
 /// deliberately EXCLUDED so the emission job's convergence compare is not
 /// poisoned by height motion. None = node row absent.
 pub fn read_node_version(
     conn: &rusqlite::Connection,
     node_id: i32,
-) -> Result<Option<(Option<u32>, Option<u32>)>, DatabaseError> {
+) -> Result<Option<NodeVersionCodes>, DatabaseError> {
     conn.query_row(
         "SELECT running_version_code, staged_version_code FROM nodes WHERE node_id = ?",
         [node_id],

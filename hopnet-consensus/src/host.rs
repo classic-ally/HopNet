@@ -82,7 +82,9 @@ pub fn node_id_from_peer(peer: &PeerId) -> Option<i32> {
 
 #[derive(Debug)]
 pub enum HostError<E> {
-    Engine(malachitebft_core_consensus::Error<HopNetContext>),
+    /// Boxed: the engine error embeds full proposal/vote payloads, and an
+    /// inline variant would bloat every `Result` on the host's hot paths.
+    Engine(Box<malachitebft_core_consensus::Error<HopNetContext>>),
     Storage(E),
     Codec(codec::CodecError),
     /// A decided value_id had no matching stored block — a host bug.
@@ -151,6 +153,10 @@ where
     G: Gossip,
     T: Timers,
 {
+    // A constructor injecting every seam (app/storage/gossip/timers) plus the
+    // boot consensus parameters; grouping them into a struct would just move
+    // the same eleven names one level down.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         chain_id: Blake3Hash,
         signer: PrivKey,
@@ -336,8 +342,7 @@ where
                     // there (drain_stashed_proposals). Beyond the window the
                     // sync client fetches the DECIDED value instead.
                     let stashed: usize = self.stashed_proposals.values().map(Vec::len).sum();
-                    if w.height <= current + PROPOSAL_STASH_AHEAD && stashed < PROPOSAL_STASH_MAX
-                    {
+                    if w.height <= current + PROPOSAL_STASH_AHEAD && stashed < PROPOSAL_STASH_MAX {
                         self.stashed_proposals.entry(w.height).or_default().push(w);
                     }
                     return Ok(());
@@ -617,7 +622,7 @@ where
                 profile: *profile,
             }, effect)
         );
-        result.map_err(HostError::Engine)
+        result.map_err(|e| HostError::Engine(Box::new(e)))
     }
 }
 

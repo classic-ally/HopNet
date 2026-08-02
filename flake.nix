@@ -10,7 +10,7 @@
     };
   };
 
-  outputs = { nixpkgs, rust-overlay, crane, ... }:
+  outputs = { self, nixpkgs, rust-overlay, crane, ... }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = fn: nixpkgs.lib.genAttrs systems (system:
@@ -128,6 +128,22 @@
               mkdir -p frontend/dist
               cp -r ${frontend}/* frontend/dist/
             '';
+          });
+
+          # Linux-only FUSE daemon (RFC-018). Its own deps-only artifact:
+          # commonArgs hardcodes `--bin hopnet`, so the shared artifact
+          # set never compiled fuser and friends. Shares the vendor dir —
+          # the [patch.crates-io] iroh fork applies workspace-wide.
+          mountArgs = commonArgs // {
+            cargoExtraArgs = "-p hopnet-mount";
+            buildInputs = [ pkgs.openssl pkgs.fuse3 ];
+          };
+
+          hopnet-mount = craneLib.buildPackage (mountArgs // {
+            cargoArtifacts = craneLib.buildDepsOnly mountArgs;
+            pname = "hopnet-mount";
+            version = "0.1.0";
+            meta.mainProgram = "hopnet-mount";
           });
 
           # Self-hosted iroh relay, built from the SAME fork/rev the nodes
@@ -273,12 +289,17 @@
           default = hopnet;
           inherit ingress-server;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          inherit hopnet-mount;
+
           dockerImage = pkgs.dockerTools.buildLayeredImage {
             name = "hopnet";
             tag = "latest";
             # iroh-relay rides along so the orchestrator can run a relay
             # container from this same image (entrypoint override).
-            contents = [ hopnet iroh-relay ];
+            # hopnet-mount + fuse3 serve the mount-cross-node-consistency
+            # test (fusermount3 for the daemon's stale-mount cleanup);
+            # busybox gives docker exec a shell for debugging and test IO.
+            contents = [ hopnet hopnet-mount pkgs.fuse3 pkgs.busybox iroh-relay ];
             config = {
               Entrypoint = [ "${hopnet}/bin/hopnet" ];
               ExposedPorts."34632/tcp" = {};
@@ -331,6 +352,28 @@
         }
       );
 
+      # hopnet-mount as a per-user service (RFC-018 S8). One shared unit
+      # definition, two consumption flavors: home-manager for users who
+      # manage their own profile, NixOS `systemd.user.services` for
+      # host-level config. The daemon runs per-user either way — the
+      # node itself may run as a different (system) user; pair with
+      # `hopnet-mount login` in that deployment.
+      homeManagerModules = rec {
+        hopnet-mount = import ./nix/hopnet-mount-module.nix {
+          inherit self;
+          flavor = "hm";
+        };
+        default = hopnet-mount;
+      };
+
+      nixosModules = rec {
+        hopnet-mount = import ./nix/hopnet-mount-module.nix {
+          inherit self;
+          flavor = "nixos";
+        };
+        default = hopnet-mount;
+      };
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           buildInputs = [
@@ -346,6 +389,14 @@
             # frontend
             pkgs.nodejs_24
             pkgs.pnpm
+
+            # ingress-ffi smoke tests read state.db back through the sqlite3
+            # CLI rather than take a sqlx dev-dep; macOS ships one, Linux
+            # does not, so the shell has to supply it.
+            pkgs.sqlite
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            # hopnet-mount (RFC-018): fuser links libfuse3
+            pkgs.fuse3
           ];
 
           shellHook = ''

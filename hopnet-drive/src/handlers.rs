@@ -74,7 +74,7 @@ impl TransactionHandler for InsertFilesHandler {
                 // Substrate half: register blobs (stored_locally probed
                 // against this node's disk in-crate), then the projection
                 // half: inodes referencing them by id.
-                insert_files(db_tx, &blob_ops, inodes, ctx.fragments_dir)?;
+                insert_files(db_tx, &blob_ops, inodes, ctx.fragments_dir, ctx.height)?;
 
                 // Signal FileProvider to refresh when files are actually inserted (execute=true)
                 if execute {
@@ -142,12 +142,10 @@ impl TransactionHandler for ModifyItemHandler {
                     payload_data.user_id,
                     payload_data.inode_id.clone(),
                     payload_data.new_encrypted_path.clone(),
-                    payload_data
-                        .content_update
-                        .clone()
-                        .map(|u| u.blob_op),
+                    payload_data.content_update.clone().map(|u| u.blob_op),
                     payload_data.incoming_share_updates.clone(),
                     ctx.fragments_dir,
+                    ctx.height,
                 )?;
 
                 if execute {
@@ -215,6 +213,7 @@ impl TransactionHandler for DeleteFilesHandler {
                     db_tx,
                     payload_data.encrypted_path,
                     payload_data.user_id,
+                    ctx.height,
                 ) {
                     Ok(()) => {}
                     Err(DatabaseError::NotFound) => {} // Idempotent: already deleted or not found
@@ -416,8 +415,8 @@ impl TransactionHandler for AcceptShareHandler {
         // 5. Delete the incoming_share record
         crate::db::shares::delete_incoming_share(db_tx, &payload.incoming_share_id)?;
 
-        // 6. Log modification for FileProvider
-        let current_height = crate::db::current_height(db_tx)?;
+        // 6. Log modification for FileProvider (deciding block height)
+        let current_height = ctx.height;
         crate::db::files::log_modification(
             db_tx,
             payload.inode_id,

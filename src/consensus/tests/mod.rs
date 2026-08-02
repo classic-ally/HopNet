@@ -328,29 +328,32 @@ impl MockNetwork {
         // node's decided tip is empty and parent-linkage validation rejects
         // every block the genesis node proposes.
         {
-            let copy_table = |sql_select: &str, sql_insert: &str| -> Result<(), crate::db::DatabaseError> {
-                let mut stmt = source_db.prepare(sql_select).map_err(|e| {
-                    eprintln!("Failed to prepare {sql_select}: {e:?}");
-                    crate::db::DatabaseError::RecallError
-                })?;
-                let rows: Vec<Vec<rusqlite::types::Value>> = stmt
-                    .query_map([], |row| {
-                        let n = row.as_ref().column_count();
-                        (0..n).map(|i| row.get::<_, rusqlite::types::Value>(i)).collect()
-                    })
-                    .map_err(|_| crate::db::DatabaseError::RecallError)?
-                    .flatten()
-                    .collect();
-                for values in rows {
-                    dest_db
-                        .execute(sql_insert, rusqlite::params_from_iter(values))
-                        .map_err(|e| {
-                            eprintln!("Failed to copy row via {sql_insert}: {e:?}");
-                            crate::db::DatabaseError::ProcessingError
-                        })?;
-                }
-                Ok(())
-            };
+            let copy_table =
+                |sql_select: &str, sql_insert: &str| -> Result<(), crate::db::DatabaseError> {
+                    let mut stmt = source_db.prepare(sql_select).map_err(|e| {
+                        eprintln!("Failed to prepare {sql_select}: {e:?}");
+                        crate::db::DatabaseError::RecallError
+                    })?;
+                    let rows: Vec<Vec<rusqlite::types::Value>> = stmt
+                        .query_map([], |row| {
+                            let n = row.as_ref().column_count();
+                            (0..n)
+                                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                                .collect()
+                        })
+                        .map_err(|_| crate::db::DatabaseError::RecallError)?
+                        .flatten()
+                        .collect();
+                    for values in rows {
+                        dest_db
+                            .execute(sql_insert, rusqlite::params_from_iter(values))
+                            .map_err(|e| {
+                                eprintln!("Failed to copy row via {sql_insert}: {e:?}");
+                                crate::db::DatabaseError::ProcessingError
+                            })?;
+                    }
+                    Ok(())
+                };
             copy_table(
                 "SELECT height, block_hash, round, block FROM decided_blocks",
                 "INSERT OR REPLACE INTO decided_blocks (height, block_hash, round, block) VALUES (?, ?, ?, ?)",
@@ -494,6 +497,8 @@ fn create_test_app_state_on_manager(
         // Tests run sync (no ambient runtime) — reuse the shared test
         // runtime so scheduled work has somewhere real to land.
         runtime: test_iroh_rt().handle().clone(),
+        change_tx: tokio::sync::broadcast::channel(16).0,
+        photos_host: Arc::new(crate::photos::PhotosHost::new()),
     };
     // Same scope map as production (build_registry keeps them from
     // drifting); comms spawns the accept loop on its net runtime.

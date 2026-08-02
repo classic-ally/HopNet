@@ -52,16 +52,16 @@ fn test_mode() -> bool {
 /// well-formed CalVer token (malformed overrides are ignored, not
 /// errors). All runtime version-identity consumers go through this.
 pub fn effective_running_code() -> u32 {
-    if test_mode() {
-        if let Ok(v) = std::env::var("HOPNET_UPGRADE_VERSION_OVERRIDE") {
-            if let Some(code) = parse_code(&v) {
-                return code;
-            }
-            tracing::warn!(
-                override_value = %v,
-                "ignoring malformed HOPNET_UPGRADE_VERSION_OVERRIDE"
-            );
+    if test_mode()
+        && let Ok(v) = std::env::var("HOPNET_UPGRADE_VERSION_OVERRIDE")
+    {
+        if let Some(code) = parse_code(&v) {
+            return code;
         }
+        tracing::warn!(
+            override_value = %v,
+            "ignoring malformed HOPNET_UPGRADE_VERSION_OVERRIDE"
+        );
     }
     running_version_code()
 }
@@ -72,10 +72,10 @@ pub fn effective_running_code() -> u32 {
 /// staged); otherwise staging is the upgrade provider's business and
 /// this returns None — the v1 git-release provider never stages.
 pub fn effective_staged_code() -> Option<u32> {
-    if test_mode() {
-        if let Ok(v) = std::env::var("HOPNET_UPGRADE_STAGED_OVERRIDE") {
-            return parse_code(&v);
-        }
+    if test_mode()
+        && let Ok(v) = std::env::var("HOPNET_UPGRADE_STAGED_OVERRIDE")
+    {
+        return parse_code(&v);
     }
     None
 }

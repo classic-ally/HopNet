@@ -29,8 +29,7 @@ impl TransactionHandler for InsertUserHandler {
 
         // Grant must target the new user's pubkey — a mismatched grant would
         // strand the member outside all-users blobs.
-        if payload.mesh_grant.recipient_pubkey
-            != *payload.user.x25519_pubkey.as_x25519().as_bytes()
+        if payload.mesh_grant.recipient_pubkey != *payload.user.x25519_pubkey.as_x25519().as_bytes()
         {
             return Err(DatabaseError::InvalidPayload);
         }

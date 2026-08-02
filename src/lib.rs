@@ -18,18 +18,22 @@ pub mod devices;
 // Drive-owned (RFC-015, Stage D4): the DocumentProvider routes live in
 // hopnet_drive::http::documentprovider; the host mounts them in main.rs.
 pub mod capabilities;
+pub mod dev_seed;
 pub mod fileprovider;
-pub mod storage_host;
 pub mod handlers;
 pub mod metrics;
 pub mod net;
 pub mod nodes;
 pub mod passphrase;
+pub mod photo_ingress;
+pub mod photos;
+pub mod photos_host;
 pub mod projections;
 pub mod reference_providers;
 pub mod regenesis;
 pub mod setup;
 pub mod shares;
+pub mod storage_host;
 pub mod takeout_host;
 pub mod types;
 pub mod upgrade;
@@ -100,6 +104,7 @@ pub struct AppState {
     /// static: several in-process nodes share one process in tests, and
     /// each must be able to rejoin independently.
     pub epoch_join_inflight: Arc<std::sync::atomic::AtomicBool>,
+    pub photos_host: Arc<photos::PhotosHost>,
     /// The MAIN multi-thread runtime's handle, captured at startup.
     /// Host-side background work scheduled from consensus apply
     /// (`HostWorkScheduler`) spawns here — apply runs on the consensus
@@ -107,6 +112,11 @@ pub struct AppState {
     /// blocking work there stalls consensus), so `tokio::spawn` from apply
     /// must not land on the ambient runtime.
     pub runtime: tokio::runtime::Handle,
+    /// Change-poke broadcast (RFC-018 S4). HostNotifier is constructed
+    /// per-transaction, so the one channel every notifier sends into and
+    /// every /watch subscriber listens on must live here. Content-free;
+    /// send() is sync and never blocks (lagged subscribers coalesce).
+    pub change_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl AppState {

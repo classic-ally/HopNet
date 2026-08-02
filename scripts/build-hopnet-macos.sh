@@ -59,6 +59,16 @@ else
     exit 1
 fi
 
+# Stage 1b: Build photo-ingress daemon (Rust staticlib + UniFFI + Swift)
+echo ""
+echo "=================================================================================="
+if [ -x "$MACOS_SCRIPTS_DIR/photo-ingress-build.sh" ]; then
+    "$MACOS_SCRIPTS_DIR/photo-ingress-build.sh"
+else
+    echo "❌ Stage 1b script (photo-ingress-build.sh) not found or not executable"
+    exit 1
+fi
+
 # Stage 2: Build Main Rust Application
 echo ""
 echo "=================================================================================="
@@ -76,6 +86,16 @@ if [ -x "$MACOS_SCRIPTS_DIR/03-create-extension-bundle.sh" ]; then
     "$MACOS_SCRIPTS_DIR/03-create-extension-bundle.sh"
 else
     echo "❌ Stage 3 script not found or not executable"
+    exit 1
+fi
+
+# Stage 3b: Embed photo-ingress daemon + LaunchAgent plist
+echo ""
+echo "=================================================================================="
+if [ -x "$MACOS_SCRIPTS_DIR/03b-embed-photo-ingress.sh" ]; then
+    "$MACOS_SCRIPTS_DIR/03b-embed-photo-ingress.sh"
+else
+    echo "❌ Stage 3b script not found or not executable"
     exit 1
 fi
 
@@ -122,6 +142,15 @@ if [ -f "$MACOS_SCRIPTS_DIR/.app_bundle_path" ]; then
         echo "✅ Extension binary exists and is executable"
     else
         echo "❌ Extension binary missing or not executable"
+        exit 1
+    fi
+
+    DAEMON_BINARY="$APP_BUNDLE/Contents/MacOS/photo-ingress"
+    AGENT_PLIST="$APP_BUNDLE/Contents/Library/LaunchAgents/com.hopnet.desktop.photo-ingress.plist"
+    if [ -x "$DAEMON_BINARY" ] && [ -f "$AGENT_PLIST" ]; then
+        echo "✅ photo-ingress daemon + agent plist embedded"
+    else
+        echo "❌ photo-ingress daemon or agent plist missing"
         exit 1
     fi
     

@@ -92,7 +92,7 @@ fn apply(node: &MockNode, function: &str, payload: Vec<u8>) -> Result<(), Databa
     .unwrap();
     let mut conn = node.app_state.db_pool.get().unwrap();
     let db_tx = conn.transaction().unwrap();
-    let result = process_transaction(&tx, &node.app_state, true, &db_tx);
+    let result = process_transaction(&tx, &node.app_state, true, 0, &db_tx);
     match result {
         Ok(_) => {
             db_tx.commit().unwrap();

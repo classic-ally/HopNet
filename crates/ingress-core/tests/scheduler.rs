@@ -33,6 +33,8 @@ struct FakeFetcher {
     barrier: Option<Arc<Barrier>>,
     cancel_on_fetch: Option<CancelToken>,
     fetch_calls: AtomicU64,
+    /// ph_resource_type of every fetch, in call order (ordering assertions).
+    fetch_order: Mutex<Vec<i32>>,
 }
 
 impl FakeFetcher {
@@ -74,6 +76,10 @@ impl ResourceFetcher for FakeFetcher {
         sink: Arc<StreamSink>,
     ) -> Result<(), FetchFailure> {
         self.fetch_calls.fetch_add(1, Ordering::Relaxed);
+        self.fetch_order
+            .lock()
+            .unwrap()
+            .push(request.ph_resource_type);
         if let Some(b) = &self.barrier {
             b.wait();
         }
@@ -127,11 +133,10 @@ async fn rig() -> Rig {
         .insert_library(&ingress_core::LibraryConfig {
             library_id: library.clone(),
             display_name: "Personal".into(),
-            blob_root: blob_dir.path().to_string_lossy().into_owned(),
-            sidecar_root_remote: None,
             scope_binding: None,
             retention_days: 30,
             created_at: chrono::Utc::now(),
+            mesh_library_id: None,
         })
         .await
         .unwrap();
@@ -155,8 +160,8 @@ async fn rig() -> Rig {
             // Long intervals: lifecycle ticks stay out of the way unless a
             // test opts in by zeroing them.
             cleanup_interval: Duration::from_secs(3600),
-            replication_interval: Duration::from_secs(3600),
             cleanup: ingress_core::cleanup::CleanupConfig::default(),
+            publish: ingress_core::publish::PublishConfig::default(),
         },
         _dirs: (blob_dir, data_tmp),
     }
@@ -490,20 +495,7 @@ async fn unmapped_then_adopted_then_drained() {
     // Drain does nothing — NULL-library rows are not eligible.
     assert_eq!(scheduler(&rig).drain().await.unwrap().photos_completed, 0);
 
-    let shared_lib = add_shared(&rig.store).await;
-    sqlx::query("UPDATE libraries SET blob_root = ? WHERE library_id = ?")
-        .bind(
-            rig._dirs
-                .0
-                .path()
-                .join("shared")
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .bind(shared_lib.as_str())
-        .execute(rig.store.raw_pool())
-        .await
-        .unwrap();
+    let _shared_lib = add_shared(&rig.store).await;
 
     match seed_descriptor(&rig.store, &desc).await.unwrap() {
         SeedOutcome::Adopted { .. } => {}
@@ -583,15 +575,7 @@ async fn events_for_inflight_photo_are_deferred() {
     });
     let rig = r;
 
-    // Bind the shared library with its own temp root.
     let shared_lib = add_shared(&rig.store).await;
-    let shared_root = rig._dirs.0.path().join("shared");
-    sqlx::query("UPDATE libraries SET blob_root = ? WHERE library_id = ?")
-        .bind(shared_root.to_string_lossy().into_owned())
-        .bind(shared_lib.as_str())
-        .execute(rig.store.raw_pool())
-        .await
-        .unwrap();
 
     let desc = AssetDescriptorBuilder::simple_image().build();
     seed_asset(&rig, &desc, b"moving-bytes", None).await;
@@ -650,12 +634,9 @@ async fn events_for_inflight_photo_are_deferred() {
         1
     );
 
-    // Bytes live under the destination — and only there.
+    // The spool file stays put — the move is ledger-only.
     let hash = ingress_core::ContentHash::of_bytes(b"moving-bytes");
-    let src_paths = ingress_core::paths::BlobPaths::new(rig._dirs.0.path());
-    let dst_paths = ingress_core::paths::BlobPaths::new(&shared_root);
-    assert!(dst_paths.blob_path(&hash, "heic").is_file());
-    assert!(!src_paths.blob_path(&hash, "heic").is_file());
+    assert!(rig.data_dir.spool().blob_path(&hash, "heic").is_file());
 }
 
 // Impact: reordering deferred events resurrects deleted renders — an edit
@@ -845,27 +826,14 @@ async fn cancel_exits_daemon_with_report() {
 
 // Impact: the lifecycle job must run INSIDE the daemon without an operator —
 // hard deletes, log pruning, and replication all ride the loop's timers.
-// Should: with zero intervals, an expired tombstone hard-deletes and a dirty
-// sidecar replicates during run_daemon; the report carries both.
+// Should: with a zero interval, an expired tombstone hard-deletes during
+// run_daemon; the report carries the cleanup counters.
 #[tokio::test(flavor = "multi_thread")]
-async fn daemon_tick_runs_cleanup_and_replication() {
+async fn daemon_tick_runs_cleanup() {
     let mut r = rig().await;
     r.config.cleanup_interval = Duration::ZERO;
-    r.config.replication_interval = Duration::ZERO;
     let rig = r;
 
-    // Remote sidecar root for the personal library.
-    let remote = rig._dirs.0.path().join("remote");
-    sqlx::query("UPDATE libraries SET sidecar_root_remote = ? WHERE library_id = 'personal'")
-        .bind(remote.to_string_lossy().into_owned())
-        .execute(rig.store.raw_pool())
-        .await
-        .unwrap();
-
-    // One photo to materialize (dirty sidecar → replication) and one
-    // pre-materialized tombstone past retention (hard delete).
-    let live = AssetDescriptorBuilder::simple_image().build();
-    seed_asset(&rig, &live, b"live-bytes", None).await;
     let dead = AssetDescriptorBuilder::simple_image().build();
     seed_asset(&rig, &dead, b"dead-bytes", None).await;
     scheduler(&rig).drain().await.unwrap();
@@ -876,7 +844,7 @@ async fn daemon_tick_runs_cleanup_and_replication() {
         .unwrap()
         .unwrap()
         .photo_id;
-    ingress_core::classify::apply_removal(&rig.store, &rig.data_dir, &dead.local_id)
+    ingress_core::classify::apply_removal(&rig.store, &dead.local_id)
         .await
         .unwrap();
     sqlx::query("UPDATE photos SET deleted_at = ? WHERE photo_id = ?")
@@ -901,27 +869,11 @@ async fn daemon_tick_runs_cleanup_and_replication() {
         async move { store.photo(&id).await.unwrap().is_none() }
     })
     .await;
-    let store = rig.store.clone();
-    wait_until("dirty sidecar replicated", || {
-        let store = store.clone();
-        async move {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM photos WHERE sidecar_replicated_at IS NOT NULL",
-            )
-            .fetch_one(store.raw_pool())
-            .await
-            .unwrap()
-                > 0
-        }
-    })
-    .await;
 
     rig.cancel.cancel();
     handle.wake();
     let report = daemon.await.unwrap().unwrap();
     assert!(report.cleanup.photos_hard_deleted >= 1);
-    assert!(report.replication.replicated >= 1);
-    assert!(remote.join("sidecars").parent().is_some()); // remote tree exists
     let events = rig.store.log_events("hard_delete").await.unwrap();
     assert_eq!(events.len(), 1);
 }
@@ -985,4 +937,129 @@ async fn seed_is_idempotent() {
         SeedOutcome::AlreadyKnown { .. }
     ));
     assert_eq!(rig.store.count_photos().await.unwrap(), 2);
+}
+
+// Impact: original-first ordering is what the late-binding identity merge
+// depends on — renditions must never preempt it; and the thumbnail rows must
+// flow the full write path (blob, ext derivation, sidecar) like any resource.
+// Should: fetch thumbnails LAST (after every real resource), commit them
+// with ext jpg, and list them in the completed photo's sidecar.
+#[tokio::test(flavor = "multi_thread")]
+async fn thumbnails_drain_last_and_flow_the_write_path() {
+    let rig = rig().await;
+    let desc = AssetDescriptorBuilder::live_photo()
+        .with_thumbnails()
+        .build();
+    rig.fetcher.add_asset(&desc, b"original-bytes", Some(b"paired-bytes"));
+    {
+        let mut bytes = rig.fetcher.bytes.lock().unwrap();
+        bytes.insert((desc.local_id.clone(), 1005), b"small-jpeg".to_vec());
+        bytes.insert((desc.local_id.clone(), 1006), b"medium-jpeg".to_vec());
+    }
+    match seed_descriptor(&rig.store, &desc).await.unwrap() {
+        SeedOutcome::MintedPending { .. } => {}
+        other => panic!("expected MintedPending, got {other:?}"),
+    }
+
+    let report = scheduler(&rig).drain().await.unwrap();
+    assert_eq!(report.photos_completed, 1);
+    assert_eq!(report.resources_written, 4);
+
+    let order = rig.fetcher.fetch_order.lock().unwrap().clone();
+    assert_eq!(order, vec![1, 9, 1005, 1006], "original first, thumbnails last");
+
+    let photo_id = rig
+        .store
+        .photo_by_cloud_id(desc.cloud_id.as_ref().unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .photo_id;
+    let rows = rig.store.resources_for_photo(&photo_id).await.unwrap();
+    for rt in [
+        ingress_core::ResourceType::ThumbnailSmall,
+        ingress_core::ResourceType::ThumbnailMedium,
+    ] {
+        let row = rows
+            .iter()
+            .find(|r| r.resource_type == rt)
+            .unwrap_or_else(|| panic!("{rt:?} row"));
+        assert!(row.written_at.is_some());
+        assert_eq!(row.ext.as_deref(), Some("jpg"));
+    }
+
+    let photo = rig.store.photo(&photo_id).await.unwrap().unwrap();
+    let capsule_json = photo.descriptor_json.expect("capsule persisted at completion");
+    let capsule: ingress_core::descriptor::DescriptorCapsule =
+        serde_json::from_str(&capsule_json).unwrap();
+    let library = rig
+        .store
+        .library(&ingress_core::LibraryId::new("personal"))
+        .await
+        .unwrap()
+        .unwrap();
+    let photo = rig.store.photo(&photo_id).await.unwrap().unwrap();
+    let doc = ingress_core::Sidecar::compose(
+        &photo,
+        &library,
+        capsule.media_type,
+        &capsule.media_subtypes,
+        capsule.favorite,
+        &capsule.capture,
+        &rows,
+    )
+    .unwrap();
+    let names: Vec<&str> = doc.resources.iter().map(|r| r.resource_type.as_str()).collect();
+    assert!(names.contains(&"thumbnail_small") && names.contains(&"thumbnail_medium"));
+}
+
+// Impact: a stale Swift binary (Rust knows the sentinels, descriptors lack
+// them) must degrade to thumbnail-only retry burn — never block the photo's
+// real resources.
+// Should: write the enumerated resources and burn retries only on the
+// thumbnail rows ("resource no longer enumerated").
+// Should not: materialize the photo while thumbnail rows stay pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_sentinels_burn_only_thumbnail_retries() {
+    let rig = rig().await;
+    // Seeded WITH thumbnails (rows exist), but the fetcher's descriptor —
+    // what drain re-enumerates — lacks the sentinels.
+    let seeded = AssetDescriptorBuilder::simple_image().with_thumbnails().build();
+    let mut stale = seeded.clone();
+    stale.resources.retain(|r| r.ph_resource_type < 1000);
+    rig.fetcher.add_asset(&stale, b"original-bytes", None);
+    match seed_descriptor(&rig.store, &seeded).await.unwrap() {
+        SeedOutcome::MintedPending { .. } => {}
+        other => panic!("expected MintedPending, got {other:?}"),
+    }
+
+    let report = scheduler(&rig).drain().await.unwrap();
+    assert_eq!(report.photos_completed, 0, "thumbnails gate materialization");
+
+    let photo_id = rig
+        .store
+        .photo_by_cloud_id(seeded.cloud_id.as_ref().unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .photo_id;
+    let rows = rig.store.resources_for_photo(&photo_id).await.unwrap();
+    let original = rows
+        .iter()
+        .find(|r| r.resource_type == ingress_core::ResourceType::Original)
+        .unwrap();
+    assert!(original.written_at.is_some(), "real resource unaffected");
+    for rt in [
+        ingress_core::ResourceType::ThumbnailSmall,
+        ingress_core::ResourceType::ThumbnailMedium,
+    ] {
+        let row = rows.iter().find(|r| r.resource_type == rt).unwrap();
+        assert!(row.written_at.is_none());
+        assert_eq!(row.retry_count, rig.config.retry_cap, "burned to the cap");
+        assert!(
+            row.last_error.as_deref().unwrap_or_default().contains("no longer enumerated"),
+            "error: {:?}",
+            row.last_error
+        );
+    }
 }

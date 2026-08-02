@@ -38,7 +38,7 @@ pub struct GuardInputs<'a> {
     pub pending_height: u64,
 }
 
-fn lookup<'a>(snap: &'a [(i32, PeerEvidenceView)], id: i32) -> Option<&'a PeerEvidenceView> {
+fn lookup(snap: &[(i32, PeerEvidenceView)], id: i32) -> Option<&PeerEvidenceView> {
     snap.binary_search_by_key(&id, |(k, _)| *k)
         .ok()
         .map(|i| &snap[i].1)
@@ -159,10 +159,7 @@ pub struct BatchMember {
 /// member the liveness floor, the S_min span, and the catch-up bound.
 /// ELIGIBILITY ONLY — never ranking: any eligible batch passes
 /// regardless of which candidates the proposer picked (spec Selection).
-pub fn check_activation(
-    inp: &GuardInputs<'_>,
-    members: &[BatchMember],
-) -> Result<(), String> {
+pub fn check_activation(inp: &GuardInputs<'_>, members: &[BatchMember]) -> Result<(), String> {
     let est = live_estimate(
         inp.snapshot,
         inp.origin,
@@ -196,9 +193,7 @@ pub fn check_activation(
         if age > inp.policy.t_unresponsive(est.band) {
             return Err(format!("member {} is not currently live", m.node_id));
         }
-        let required = inp
-            .policy
-            .req_span(exposed, m.last_departure, est.headroom);
+        let required = inp.policy.req_span(exposed, m.last_departure, est.headroom);
         let span = bright_span(view, inp.origin, inp.policy, est.band, inp.now);
         if span < required {
             return Err(format!(
@@ -247,15 +242,13 @@ pub fn plan_seating_batch(
         .iter()
         .filter_map(|(id, dep)| {
             let view = lookup(inp.snapshot, *id);
-            let alive = contact_age(view, inp.origin, inp.now)
-                <= inp.policy.t_unresponsive(est.band);
-            let caught_up = view
-                .and_then(|vw| vw.last_known_height)
-                .is_some_and(|h| {
-                    h >= inp
-                        .pending_height
-                        .saturating_sub(hopnet_consensus::membership::CATCH_UP_TOLERANCE)
-                });
+            let alive =
+                contact_age(view, inp.origin, inp.now) <= inp.policy.t_unresponsive(est.band);
+            let caught_up = view.and_then(|vw| vw.last_known_height).is_some_and(|h| {
+                h >= inp
+                    .pending_height
+                    .saturating_sub(hopnet_consensus::membership::CATCH_UP_TOLERANCE)
+            });
             if !alive || !caught_up {
                 return None;
             }
@@ -278,9 +271,7 @@ pub fn plan_seating_batch(
         let exposed = exposure(inp.profile, v, bu) > 0;
         let eligible: Vec<i32> = viable
             .iter()
-            .filter(|(_, dep, span)| {
-                *span >= inp.policy.req_span(exposed, *dep, est.headroom)
-            })
+            .filter(|(_, dep, span)| *span >= inp.policy.req_span(exposed, *dep, est.headroom))
             .map(|(id, _, _)| *id)
             .collect();
         if eligible.len() >= b {
@@ -305,17 +296,15 @@ pub fn subjective_membership_check(
         .get_node_id()
         .map_err(|_| "node identity not initialized".to_string())?;
     let policy = hopnet_consensus::store::read_policy(db_tx).unwrap_or_default();
-    let profile = hopnet_consensus::store::meta_get(
-        db_tx,
-        hopnet_consensus::store::META_QUORUM_PROFILE,
-    )
-    .ok()
-    .flatten()
-    .and_then(|b| String::from_utf8(b).ok())
-    .and_then(|s| QuorumProfile::parse(&s))
-    .unwrap_or(QuorumProfile::Auto);
-    let committed = crate::db::consensus::get_current_consensus_height(db_tx)
-        .map_err(|e| format!("{e:?}"))?;
+    let profile =
+        hopnet_consensus::store::meta_get(db_tx, hopnet_consensus::store::META_QUORUM_PROFILE)
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| QuorumProfile::parse(&s))
+            .unwrap_or(QuorumProfile::Auto);
+    let committed =
+        crate::db::consensus::get_current_consensus_height(db_tx).map_err(|e| format!("{e:?}"))?;
     let pending = committed.saturating_add(1);
     let seated: Vec<i32> = hopnet_consensus::validators::get_validators(db_tx, pending)
         .map_err(|e| format!("{e}"))?
@@ -324,8 +313,7 @@ pub fn subjective_membership_check(
         .collect();
     let mut seat_starts: Vec<(i32, u64)> = Vec::with_capacity(seated.len());
     for id in &seated {
-        if let Ok(Some(h)) = hopnet_consensus::validators::activation_height(db_tx, *id, pending)
-        {
+        if let Ok(Some(h)) = hopnet_consensus::validators::activation_height(db_tx, *id, pending) {
             seat_starts.push((*id, h));
         }
     }
@@ -368,9 +356,8 @@ pub fn subjective_membership_check(
             .map_err(|_| "activation payload".to_string())?;
             let mut members = Vec::with_capacity(req.members.len());
             for m in &req.members {
-                let last_departure =
-                    crate::db::consensus::last_departure(db_tx, *m, pending)
-                        .map_err(|e| format!("{e:?}"))?;
+                let last_departure = crate::db::consensus::last_departure(db_tx, *m, pending)
+                    .map_err(|e| format!("{e:?}"))?;
                 members.push(BatchMember {
                     node_id: *m,
                     last_departure,
@@ -453,7 +440,10 @@ mod tests {
         let f = fixture();
         // seated [1,2,3]; node 2 fresh, node 3 dark with 2 probes.
         let snap = vec![
-            (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
+            (
+                2,
+                view_at(f.now - Duration::from_secs(1), 0, Some(f.origin)),
+            ),
             (3, view_at(f.now - Duration::from_secs(60), 2, None)),
         ];
         let seated = [1, 2, 3];
@@ -465,7 +455,10 @@ mod tests {
 
         // Under-probed: dark age but only one probe.
         let snap2 = vec![
-            (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
+            (
+                2,
+                view_at(f.now - Duration::from_secs(1), 0, Some(f.origin)),
+            ),
             (3, view_at(f.now - Duration::from_secs(60), 1, None)),
         ];
         let inp2 = inputs(&f, &snap2, &seated);
@@ -483,7 +476,10 @@ mod tests {
         // Node 3 dark: if node 2 leaves, survivors {1,3} have live 1 <
         // quorum(2) = 2 — refuse.
         let snap = vec![
-            (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
+            (
+                2,
+                view_at(f.now - Duration::from_secs(1), 0, Some(f.origin)),
+            ),
             (3, view_at(f.now - Duration::from_secs(120), 3, None)),
         ];
         let inp = inputs(&f, &snap, &seated);
@@ -491,8 +487,14 @@ mod tests {
 
         // Everyone live: node 2 leaving leaves {1,3} live 2 >= 2 — pass.
         let snap2 = vec![
-            (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
-            (3, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
+            (
+                2,
+                view_at(f.now - Duration::from_secs(1), 0, Some(f.origin)),
+            ),
+            (
+                3,
+                view_at(f.now - Duration::from_secs(1), 0, Some(f.origin)),
+            ),
         ];
         let inp2 = inputs(&f, &snap2, &seated);
         assert!(check_leave(&inp2, 2).is_ok());
@@ -503,7 +505,10 @@ mod tests {
     // ranking.
     // Impact: the mesh-initiated seating gate.
     fn member(id: i32, dep: Option<DepartureKind>) -> BatchMember {
-        BatchMember { node_id: id, last_departure: dep }
+        BatchMember {
+            node_id: id,
+            last_departure: dep,
+        }
     }
 
     #[test]
@@ -513,7 +518,12 @@ mod tests {
         // Majority v=3: a single seat (3->4) is lateral => posture refuses.
         let seated3 = [1, 2, 3];
         let bright: Vec<(i32, PeerEvidenceView)> = (2..=5)
-            .map(|id| (id, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))))
+            .map(|id| {
+                (
+                    id,
+                    view_at(f.now - Duration::from_secs(1), 0, Some(f.origin)),
+                )
+            })
             .collect();
         let inp3 = inputs(&f, &bright, &seated3);
         assert!(
@@ -527,15 +537,35 @@ mod tests {
         // member needs the cliff floor 2s; 3s bright passes, 1s fails.
         let seated2 = [1, 2];
         let ok = vec![
-            (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
-            (3, view_at(f.now - Duration::from_secs(1), 0, Some(f.now - Duration::from_secs(3)))),
+            (
+                2,
+                view_at(f.now - Duration::from_secs(1), 0, Some(f.origin)),
+            ),
+            (
+                3,
+                view_at(
+                    f.now - Duration::from_secs(1),
+                    0,
+                    Some(f.now - Duration::from_secs(3)),
+                ),
+            ),
         ];
         let inp = inputs(&f, &ok, &seated2);
         assert!(check_activation(&inp, &[member(3, Some(DepartureKind::VotedOut))]).is_ok());
 
         let short = vec![
-            (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
-            (3, view_at(f.now - Duration::from_secs(1), 0, Some(f.now - Duration::from_secs(1)))),
+            (
+                2,
+                view_at(f.now - Duration::from_secs(1), 0, Some(f.origin)),
+            ),
+            (
+                3,
+                view_at(
+                    f.now - Duration::from_secs(1),
+                    0,
+                    Some(f.now - Duration::from_secs(1)),
+                ),
+            ),
         ];
         let inp = inputs(&f, &short, &seated2);
         assert!(check_activation(&inp, &[member(3, Some(DepartureKind::VotedOut))]).is_err());
@@ -544,8 +574,14 @@ mod tests {
 
         // Currently-dark member: liveness floor refuses even at required 0.
         let dark = vec![
-            (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
-            (3, view_at(f.now - Duration::from_secs(120), 4, Some(f.origin))),
+            (
+                2,
+                view_at(f.now - Duration::from_secs(1), 0, Some(f.origin)),
+            ),
+            (
+                3,
+                view_at(f.now - Duration::from_secs(120), 4, Some(f.origin)),
+            ),
         ];
         let inp = inputs(&f, &dark, &seated2);
         assert!(check_activation(&inp, &[member(3, Some(DepartureKind::Voluntary))]).is_err());
@@ -554,7 +590,10 @@ mod tests {
         let mut unknown = view_at(f.now - Duration::from_secs(1), 0, Some(f.origin));
         unknown.last_known_height = None;
         let snap = vec![
-            (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
+            (
+                2,
+                view_at(f.now - Duration::from_secs(1), 0, Some(f.origin)),
+            ),
             (3, unknown),
         ];
         let inp = inputs(&f, &snap, &seated2);

@@ -293,13 +293,11 @@ pub fn decided_range(
     })?;
 
     let mut out = Vec::new();
-    let mut expected = from.as_db();
-    for row in rows {
+    for (i, row) in rows.enumerate() {
         let (height, block_bytes, cert_bytes) = row?;
-        if height != expected {
+        if height != from.as_db() + i as i64 {
             break; // gap — serve the contiguous prefix only
         }
-        expected += 1;
         let block: Block = codec::decode(&block_bytes).map_err(StoreError::Codec)?;
         let cert: WireCommitCertificate = codec::decode(&cert_bytes).map_err(StoreError::Codec)?;
         out.push((block, cert));

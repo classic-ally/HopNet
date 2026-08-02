@@ -178,7 +178,7 @@ pub async fn recreate_node_with_env(
     let container_name = format!("hopnet-orchestrator-{mesh_id}-{node_id}");
     let network_name = format!("hopnet-orchestrator-{mesh_id}-0");
     let created =
-        crate::create_hopnet_container(docker, &container_name, &network_name, runtime).await;
+        crate::create_hopnet_container(docker, mesh_id, node_id, &container_name, &network_name, runtime).await;
     for (k, _) in extra_env {
         unsafe { std::env::remove_var(k) };
     }

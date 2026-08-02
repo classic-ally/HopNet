@@ -16,12 +16,7 @@ use hopnet_common::quorum::QuorumProfile;
 /// Deliberately no 48 h tier — it would fire Sunday evening on every
 /// weekend-idle machine. Values are mesh policy config
 /// (`hopnet_storage_policy`); this is the code default.
-pub const DEFAULT_DECAY_TIERS: [i64; 4] = [
-    6 * 3600,
-    24 * 3600,
-    72 * 3600,
-    7 * 24 * 3600,
-];
+pub const DEFAULT_DECAY_TIERS: [i64; 4] = [6 * 3600, 24 * 3600, 72 * 3600, 7 * 24 * 3600];
 
 /// Spans required before a node's own history outweighs the cold-start
 /// tier.
@@ -69,9 +64,9 @@ impl StoragePolicy {
                 "decay_tiers" => {
                     let tiers: Option<Vec<i64>> =
                         value.split(',').map(|t| t.trim().parse().ok()).collect();
-                    if let Some(tiers) = tiers.filter(|t| {
-                        !t.is_empty() && t.windows(2).all(|w| w[0] < w[1]) && t[0] > 0
-                    }) {
+                    if let Some(tiers) = tiers
+                        .filter(|t| !t.is_empty() && t.windows(2).all(|w| w[0] < w[1]) && t[0] > 0)
+                    {
                         policy.decay_tiers = tiers;
                     }
                 }
@@ -177,11 +172,7 @@ pub fn derive_tier(closed_spans: &[i64], tiers: &[i64], min_history: usize) -> i
         // Nearest-rank P95.
         let rank = (sorted.len() * 95).div_ceil(100);
         let p95 = sorted[rank - 1];
-        tiers
-            .iter()
-            .copied()
-            .find(|&t| t > p95)
-            .unwrap_or(ceiling)
+        tiers.iter().copied().find(|&t| t > p95).unwrap_or(ceiling)
     };
 
     if closed_spans.len() < min_history {
@@ -567,7 +558,7 @@ mod tests {
         assert_eq!(watermark(3, Auto), 20); // majority B=1, reserve caps at advMax=10
         assert_eq!(watermark(5, Auto), 22); // majority B=2
         assert_eq!(watermark(6, Auto), 20); // majority B=2
-        // AUTO / BFT arm at and above the seam — identical to the old formula.
+                                            // AUTO / BFT arm at and above the seam — identical to the old formula.
         assert_eq!(watermark(10, Auto), 19); // spec session table value
         assert_eq!(watermark(15, Auto), 18);
         assert_eq!(watermark(30, Auto), 15);
@@ -586,7 +577,11 @@ mod tests {
     // chunks lazy while one member from unreconstructable.
     #[test]
     fn watermark_at_or_above_floor_when_fault_tolerant() {
-        for profile in [QuorumProfile::Auto, QuorumProfile::Bft, QuorumProfile::Majority] {
+        for profile in [
+            QuorumProfile::Auto,
+            QuorumProfile::Bft,
+            QuorumProfile::Majority,
+        ] {
             for v in 1..=30usize {
                 let tolerant = v.saturating_sub(profile.quorum(v as u64) as usize) >= 1;
                 if !tolerant {

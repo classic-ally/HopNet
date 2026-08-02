@@ -21,11 +21,10 @@ pub async fn store_with_personal() -> (StateStore, LibraryId) {
         .insert_library(&LibraryConfig {
             library_id: id.clone(),
             display_name: "Personal".into(),
-            blob_root: "/tmp/blobs/personal".into(),
-            sidecar_root_remote: None,
             scope_binding: None,
             retention_days: 30,
             created_at: Utc::now(),
+            mesh_library_id: None,
         })
         .await
         .expect("seed personal library");
@@ -39,11 +38,10 @@ pub async fn add_shared(store: &StateStore) -> LibraryId {
         .insert_library(&LibraryConfig {
             library_id: id.clone(),
             display_name: "Shared".into(),
-            blob_root: "/tmp/blobs/shared".into(),
-            sidecar_root_remote: None,
             scope_binding: Some(ICLOUD_SHARED_LIBRARY_BINDING.into()),
             retention_days: 30,
             created_at: Utc::now(),
+            mesh_library_id: None,
         })
         .await
         .expect("seed shared library");
@@ -167,6 +165,27 @@ impl AssetDescriptorBuilder {
     /// archive-known-and-log tests).
     pub fn with_ph_resource(mut self, ph_type: i32, uti: &str) -> Self {
         self.desc.resources.push(resource(ph_type, uti));
+        self
+    }
+
+    /// Append the two synthetic thumbnail sentinels exactly as
+    /// `DescriptorExtraction.swift` does: uti public.jpeg, no filename,
+    /// constant admission estimates (64 KiB / 512 KiB), locally available.
+    /// Opt-in — the plain builders model spike-verified PhotoKit shapes.
+    pub fn with_thumbnails(mut self) -> Self {
+        use crate::model::{PH_SENTINEL_THUMBNAIL_MEDIUM, PH_SENTINEL_THUMBNAIL_SMALL};
+        for (ph, size) in [
+            (PH_SENTINEL_THUMBNAIL_SMALL, 65_536),
+            (PH_SENTINEL_THUMBNAIL_MEDIUM, 524_288),
+        ] {
+            self.desc.resources.push(ResourceDescriptor {
+                ph_resource_type: ph,
+                uti: "public.jpeg".to_string(),
+                original_filename: None,
+                expected_size: Some(size),
+                locally_available: Some(true),
+            });
+        }
         self
     }
 

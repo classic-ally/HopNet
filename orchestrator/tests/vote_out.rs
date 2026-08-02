@@ -31,15 +31,13 @@ impl TestScenario for VoteOutAfterKill {
         "Killed validator is voted out by the mesh, then auto-readmitted after restart"
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
         let client = Client::new();
-        anyhow::ensure!(nodes.len() == 3, "vote-out-after-kill expects a 3-node mesh");
+        anyhow::ensure!(
+            nodes.len() == 3,
+            "vote-out-after-kill expects a 3-node mesh"
+        );
         let victim = &nodes[2];
         let survivors = [nodes[0].clone(), nodes[1].clone()];
 
@@ -150,11 +148,11 @@ impl TestScenario for VoteOutAfterKill {
         let mut kind_ok = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
         while std::time::Instant::now() < deadline {
-            if let Ok(vs) = view_state(&client, &victim, eviction_tip as i64 + 1).await {
-                if vs.last_departure_kind.as_deref() == Some("voted_out") {
-                    kind_ok = true;
-                    break;
-                }
+            if let Ok(vs) = view_state(&client, &victim, eviction_tip as i64 + 1).await
+                && vs.last_departure_kind.as_deref() == Some("voted_out")
+            {
+                kind_ok = true;
+                break;
             }
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
@@ -172,10 +170,9 @@ impl TestScenario for VoteOutAfterKill {
         // Cliff; exposure-free under majority 2->3).
         let refreshed: Vec<NodeInfo> =
             vec![survivors[0].clone(), survivors[1].clone(), victim.clone()];
-        let restored =
-            wait_validator_count(&client, &refreshed, 3, None, Duration::from_secs(120))
-                .await
-                .unwrap_or(false);
+        let restored = wait_validator_count(&client, &refreshed, 3, None, Duration::from_secs(120))
+            .await
+            .unwrap_or(false);
         print_and_add_check(
             &mut result,
             Check {

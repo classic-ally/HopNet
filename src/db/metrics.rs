@@ -417,7 +417,7 @@ pub fn get_availability_history_with_conn(
     let Some(anchor_ts) = anchor else {
         return Ok(AvailabilityGrid {
             anchor: None,
-            step_secs: step_secs,
+            step_secs,
             per_node: Default::default(),
         });
     };
@@ -488,7 +488,7 @@ pub fn get_availability_history_with_conn(
 
     Ok(AvailabilityGrid {
         anchor: Some(anchor_bucket),
-        step_secs: step_secs,
+        step_secs,
         per_node,
     })
 }
@@ -521,7 +521,7 @@ mod tests {
         .unwrap();
         for n in 1..=count {
             // nodes.pubkey is UNIQUE — each fixture node needs its own key.
-            let node_key = ed25519_dalek::SigningKey::from_bytes(&[n as u8; 32]);
+            let node_key = ed25519_dalek::SigningKey::from_bytes(&[100 + n as u8; 32]);
             let node_pubkey = crate::db::PubKey(node_key.verifying_key());
             conn.execute(
                 "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, ?, ?)",
@@ -533,7 +533,12 @@ mod tests {
 
     /// Insert one availability observation at `minutes_before` the fixed
     /// anchor "2026-07-01 12:00:00" (10-minute aligned).
-    fn insert_availability(conn: &rusqlite::Connection, to_node: i32, minutes_before: i64, available: bool) {
+    fn insert_availability(
+        conn: &rusqlite::Connection,
+        to_node: i32,
+        minutes_before: i64,
+        available: bool,
+    ) {
         conn.execute(
             "INSERT INTO metrics (from_node, to_node, start_time, height, available)
              VALUES (1, ?1, datetime('2026-07-01 12:00:00', '-' || ?2 || ' minutes'), 5, ?3)",
@@ -613,7 +618,10 @@ mod tests {
 
         let metrics = get_all_node_metrics_with_conn(&conn, 10).unwrap();
         let node2 = metrics.iter().find(|m| m.node_id == 2).unwrap();
-        assert_eq!(node2.sample_count_7d, 2, "anchored window must see the rows");
+        assert_eq!(
+            node2.sample_count_7d, 2,
+            "anchored window must see the rows"
+        );
         assert!(
             node2.availability_score > 0.9,
             "available rows inside the anchored 24h window must score: {}",

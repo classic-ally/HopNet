@@ -45,10 +45,7 @@ where
     loop {
         match f().await {
             Ok(v) => return Ok(v),
-            Err(e)
-                if start.elapsed() < deadline
-                    && e.to_string().contains("status 503") =>
-            {
+            Err(e) if start.elapsed() < deadline && e.to_string().contains("status 503") => {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             Err(e) => return Err(e),
@@ -58,7 +55,10 @@ where
 
 async fn update_user_profile(node: &NodeInfo, first_name: &str, last_name: &str) -> Result<()> {
     let client = Client::new();
-    let url = format!("http://{}:{}/api/users/me/profile", node.ip_address, node.port);
+    let url = format!(
+        "http://{}:{}/api/users/me/profile",
+        node.ip_address, node.port
+    );
 
     let response = client
         .put(&url)
@@ -91,7 +91,10 @@ struct RegisterDeviceResponse {
 /// POST /devices/register
 async fn register_device(node: &NodeInfo, device_name: &str) -> Result<RegisterDeviceResponse> {
     let client = Client::new();
-    let url = format!("http://{}:{}/api/devices/register", node.ip_address, node.port);
+    let url = format!(
+        "http://{}:{}/api/devices/register",
+        node.ip_address, node.port
+    );
 
     let response = client
         .post(&url)

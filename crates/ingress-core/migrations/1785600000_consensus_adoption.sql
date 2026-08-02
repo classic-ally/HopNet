@@ -1,0 +1,13 @@
+-- Remote adoption (consensus photo identity).
+--
+-- When the mesh already holds a photo with this asset's cloud fingerprint
+-- (published by another device, or by a previous state.db of this device),
+-- the publish pass ADOPTS it: published_at is stamped without uploading and
+-- the remote consensus id is recorded here. NULL = unpublished, or published
+-- under the local photo_id (self-published). The publisher and any future
+-- content-update path must use COALESCE(consensus_photo_id, photo_id) as
+-- the photo's consensus identity.
+--
+-- Mirror of docs/specs/apple-photos-ingress.md §Local State Schema — keep in
+-- sync by hand.
+ALTER TABLE photos ADD COLUMN consensus_photo_id TEXT;

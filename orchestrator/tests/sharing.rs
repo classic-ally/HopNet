@@ -38,7 +38,10 @@ async fn share_file(node: &NodeInfo, inode_id: &str, recipient_username: &str) -
 /// GET /shares/incoming — list pending incoming shares.
 async fn get_incoming_shares(node: &NodeInfo) -> Result<Vec<serde_json::Value>> {
     let client = Client::new();
-    let url = format!("http://{}:{}/api/shares/incoming", node.ip_address, node.port);
+    let url = format!(
+        "http://{}:{}/api/shares/incoming",
+        node.ip_address, node.port
+    );
 
     let response = client
         .get(&url)

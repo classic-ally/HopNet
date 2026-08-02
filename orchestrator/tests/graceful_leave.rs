@@ -29,7 +29,10 @@ pub(crate) struct ViewState {
 }
 
 pub(crate) async fn view_state(client: &Client, node: &NodeInfo, height: i64) -> Result<ViewState> {
-    let url = format!("http://{}:{}/api/consensus/view", node.ip_address, node.port);
+    let url = format!(
+        "http://{}:{}/api/consensus/view",
+        node.ip_address, node.port
+    );
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
@@ -192,8 +195,9 @@ impl TestScenario for GracefulLeave {
         print_and_add_check(
             &mut result,
             Check {
-                name: "Leave committed: v=2 without leaver, departure_kind voluntary (height-scoped)"
-                    .to_string(),
+                name:
+                    "Leave committed: v=2 without leaver, departure_kind voluntary (height-scoped)"
+                        .to_string(),
                 passed: leave_height.is_some() && kind_ok,
                 detail: None,
             },
@@ -226,10 +230,9 @@ impl TestScenario for GracefulLeave {
         // 5. MONEY: v=3 restored on every node with NO request anywhere —
         // mesh-initiated auto-reseat. This transitively proves the leaver
         // caught up (seating requires it) and was noticed by the mesh.
-        let restored =
-            wait_validator_count(&client, nodes, 3, None, Duration::from_secs(60))
-                .await
-                .unwrap_or(false);
+        let restored = wait_validator_count(&client, nodes, 3, None, Duration::from_secs(60))
+            .await
+            .unwrap_or(false);
         print_and_add_check(
             &mut result,
             Check {

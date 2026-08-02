@@ -11,32 +11,37 @@ pub use crate::NodeInfo;
 pub mod files;
 
 // Test implementations
+mod auto_seam;
 mod consensus_queue;
 mod db_pragma_bench;
 mod device_tokens;
-mod eviction;
 mod documentprovider_write;
+mod eviction;
+pub(crate) mod evidence_observe;
 mod evidence_voteout;
 mod file_upload;
 mod fileprovider_device_token;
 mod fragment_distribution;
-pub(crate) mod evidence_observe;
-mod auto_seam;
-pub(crate) mod mesh_growth;
-pub(crate) mod graceful_leave;
-mod three_timescales;
-mod vote_out;
 mod fragment_health_check;
+pub(crate) mod graceful_leave;
 mod import;
 mod iroh_ping;
 mod iroh_reject_unknown;
 mod malachite;
+pub(crate) mod mesh_growth;
 mod metrics;
+mod mount;
 mod multi_size_files;
 pub(crate) mod multi_user;
 mod orphan_cleanup;
 mod performance;
 pub(crate) mod persistence;
+mod photos;
+mod photos_ingress_identity;
+pub(crate) mod photos_ingress_publish;
+mod photos_ingress_shared;
+pub(crate) mod photos_ingress_tombstone;
+pub(crate) mod photos_shared_library;
 mod post_files_mixed;
 mod post_files_shape;
 mod range_download;
@@ -45,8 +50,10 @@ pub(crate) mod reencode;
 pub(crate) mod regenesis;
 mod sharing;
 mod takeout;
+mod three_timescales;
 mod tier_membership;
 mod upload_and_confirm_placement;
+mod vote_out;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -112,11 +119,15 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
             // 4-node BFT mesh forms.
             ("HOPNET_GENESIS_CONSENSUS_POLICY", "s_full=6;p_prove=6"),
         ],
-        "auto-seam" => vec![
-            ("HOPNET_GENESIS_CONSENSUS_POLICY", "probe_base=2;grace=1;s_full=6;p_prove=6"),
-        ],
+        "auto-seam" => vec![(
+            "HOPNET_GENESIS_CONSENSUS_POLICY",
+            "probe_base=2;grace=1;s_full=6;p_prove=6",
+        )],
         "mesh-growth" => vec![
-            ("HOPNET_GENESIS_CONSENSUS_POLICY", "probe_base=2;grace=1;s_full=6;p_prove=6"),
+            (
+                "HOPNET_GENESIS_CONSENSUS_POLICY",
+                "probe_base=2;grace=1;s_full=6;p_prove=6",
+            ),
             // AUTO (default): majority below v=7 — the growth stays in the
             // majority region, no forcing.
         ],
@@ -309,6 +320,11 @@ pub async fn run_test_by_name(
                 .await
         }
         "metrics-collection" => metrics::MetricsCollection.run(mesh_id, nodes, flags).await,
+        "mount-cross-node-consistency" => {
+            mount::MountCrossNodeConsistency
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "eviction-under-pressure" => {
             eviction::EvictionUnderPressure
                 .run(mesh_id, nodes, flags)
@@ -319,12 +335,8 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
-        "auto-seam" => {
-            auto_seam::AutoSeam.run(mesh_id, nodes, flags).await
-        }
-        "mesh-growth" => {
-            mesh_growth::MeshGrowth.run(mesh_id, nodes, flags).await
-        }
+        "auto-seam" => auto_seam::AutoSeam.run(mesh_id, nodes, flags).await,
+        "mesh-growth" => mesh_growth::MeshGrowth.run(mesh_id, nodes, flags).await,
         "three-timescales" => {
             three_timescales::ThreeTimescales
                 .run(mesh_id, nodes, flags)
@@ -416,6 +428,36 @@ pub async fn run_test_by_name(
         }
         "fileprovider-device-token-auth" => {
             fileprovider_device_token::FileProviderDeviceTokenAuth
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "photos-upload-consistency" => {
+            photos::PhotosUploadConsistency
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "photos-ingress-publish" => {
+            photos_ingress_publish::PhotosIngressPublish
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "photos-ingress-identity" => {
+            photos_ingress_identity::PhotosIngressIdentity
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "photos-shared-library" => {
+            photos_shared_library::PhotosSharedLibrary
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "photos-ingress-shared" => {
+            photos_ingress_shared::PhotosIngressShared
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "photos-ingress-tombstone" => {
+            photos_ingress_tombstone::PhotosIngressTombstone
                 .run(mesh_id, nodes, flags)
                 .await
         }
@@ -538,6 +580,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "consensus-barrier-decide-window",
         "consensus-barrier-proposal-hold",
         "metrics-collection",
+        "mount-cross-node-consistency",
         "tier-membership",
         "eviction-under-pressure",
         "re-encode-after-departure",
@@ -550,6 +593,12 @@ pub fn list_test_names() -> Vec<&'static str> {
         "orphan-cleanup",
         "device-token-session-bootstrap",
         "fileprovider-device-token-auth",
+        "photos-upload-consistency",
+        "photos-ingress-publish",
+        "photos-ingress-identity",
+        "photos-shared-library",
+        "photos-ingress-shared",
+        "photos-ingress-tombstone",
         "recents-ordering",
         "range-download",
         "takeout-happy-path",

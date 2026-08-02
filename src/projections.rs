@@ -10,11 +10,12 @@
 use hopnet_projection::Projection;
 
 /// Registration order = schema install order = FK direction (drive FKs
-/// users/data_blocks; takeout's work tables reference nothing forward).
+/// users/data_blocks; photos FKs users/data_blocks/shared_libraries;
+/// takeout's work tables reference nothing forward).
 pub fn manifests() -> &'static [&'static dyn Projection] {
     &[
         &hopnet_drive::DriveProjection,
+        &hopnet_photos::PhotosProjection,
         &hopnet_takeout::TakeoutProjection,
-        // photos: add its manifest here.
     ]
 }

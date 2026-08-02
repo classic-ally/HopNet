@@ -209,28 +209,10 @@ pub fn apply_connection_pragmas(conn: &rusqlite::Connection) -> Result<(), rusql
 /// Register custom SQL functions needed by queries across the codebase
 pub fn register_custom_functions(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // uuid_extract_timestamp(uuid_text) → INTEGER (NULL-safe: NULL in → NULL out)
-    // Parse UUIDv7 hex, extract 48-bit timestamp, return epoch millis
-    conn.create_scalar_function(
-        "uuid_extract_timestamp",
-        1,
-        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-        |ctx| {
-            let uuid_str: Option<String> = ctx.get(0)?;
-            match uuid_str {
-                None => Ok(None),
-                Some(s) => {
-                    let hex_only: String = s.replace('-', "");
-                    if hex_only.len() < 12 {
-                        return Ok(Some(0i64));
-                    }
-                    match i64::from_str_radix(&hex_only[..12], 16) {
-                        Ok(millis) => Ok(Some(millis)),
-                        Err(_) => Ok(Some(0i64)),
-                    }
-                }
-            }
-        },
-    )?;
+    // Parse UUIDv7 hex, extract 48-bit timestamp, return epoch millis.
+    // Implementation lives in hopnet-common so projections (and their tests)
+    // can register the same function without depending on the host crate.
+    hopnet_common::db_impl::register_uuid_extract_timestamp(conn)?;
 
     // reverse(text) → TEXT
     // String reversal for parent-path extraction patterns
@@ -459,7 +441,7 @@ pub fn initialize(db: &rusqlite::Connection) -> Result<(), DuckdbError> {
     // Malachite engine tables (consensus_wal, decided_blocks,
     // decided_certificates, consensus_meta, validators) — owned by
     // hopnet-consensus.
-    hopnet_consensus::store::install_schema(&db).map_err(|e| match e {
+    hopnet_consensus::store::install_schema(db).map_err(|e| match e {
         hopnet_consensus::store::StoreError::Db(db_err) => db_err,
         // install_schema only executes DDL — non-Db variants are unreachable
         other => rusqlite::Error::InvalidParameterName(other.to_string()),
@@ -474,9 +456,9 @@ pub fn initialize(db: &rusqlite::Connection) -> Result<(), DuckdbError> {
     // below the projection seam), then every registered projection's unit
     // in manifest order (= FK direction; storage FKs the host's nodes
     // table; drive FKs users (host) and data_blocks (storage)).
-    hopnet_storage::store::install_schema(&db)?;
+    hopnet_storage::store::install_schema(db)?;
     for projection in crate::projections::manifests() {
-        projection.install_schema(&db)?;
+        projection.install_schema(db)?;
     }
 
     Ok(())

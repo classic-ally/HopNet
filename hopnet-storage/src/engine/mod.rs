@@ -24,9 +24,9 @@ use crate::traits::{
 };
 use crate::types::{BlobId, PlacementUpdate};
 use hopnet_common::Blake3Hash;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex, Semaphore};
 
 /// Process-wide send bound (held across a send's domain retries; no DB conn
 /// is ever held here).
@@ -282,9 +282,7 @@ impl EngineHandle {
                     if let Err(e) =
                         distribute_one(&seams, &config, &placement_tx, blob_id.clone()).await
                     {
-                        tracing::error!(
-                            "distribution worker {worker}: blob {blob_id} failed: {e}"
-                        );
+                        tracing::error!("distribution worker {worker}: blob {blob_id} failed: {e}");
                     }
                 }
             });
@@ -432,7 +430,7 @@ where
                 if *stored_locally {
                     continue;
                 }
-                if new_assignment.get(*local_index as usize).copied() == Some(my_node_id) {
+                if new_assignment.get(*local_index).copied() == Some(my_node_id) {
                     wanted.push((*local_index as u32, *hash));
                 }
             }
@@ -446,9 +444,7 @@ where
         let mut sources = seams.state.fragment_sources(&hashes)?;
         for (_, hash) in &wanted {
             let hint = sources.remove(hash);
-            match crate::api::find_fragment_via(&seams.transport, hash, &old_selected, hint)
-                .await
-            {
+            match crate::api::find_fragment_via(&seams.transport, hash, &old_selected, hint).await {
                 Some(data) => {
                     if let Err(e) = fragstore::store_fragment(fragments_dir, hash, data) {
                         tracing::warn!("repair: store fragment {} failed: {e}", hash.to_hex());
@@ -602,10 +598,8 @@ where
     let successful_placements = Arc::new(AtomicUsize::new(0));
 
     // class → responsible peer, resolved once for all workers.
-    let targets: std::collections::HashMap<i32, PeerRef> = selected_nodes
-        .iter()
-        .map(|p| (p.node_id, p.clone()))
-        .collect();
+    let targets: std::collections::HashMap<i32, PeerRef> =
+        selected_nodes.iter().map(|p| (p.node_id, *p)).collect();
     let assignment = Arc::new(assignment);
     let targets = Arc::new(targets);
     let mut worker_handles = Vec::new();
@@ -794,7 +788,8 @@ async fn send_fragment_to_peer<T: Transport>(
                 }
                 return Err(EngineError::Transfer(format!(
                     "Fragment store failed after {} attempts: {}",
-                    policy::SEND_MAX_RETRIES, msg
+                    policy::SEND_MAX_RETRIES,
+                    msg
                 )));
             }
             Err(TransportError::Transport(msg)) => {
@@ -1048,7 +1043,11 @@ mod tests {
         let mut chunks: HashMap<u32, crate::store::ChunkFragmentMaps> = HashMap::new();
         for f in &outcome.fragments {
             let entry = chunks.entry(f.chunk_number).or_default();
-            let bucket = if f.recovery { &mut entry.1 } else { &mut entry.0 };
+            let bucket = if f.recovery {
+                &mut entry.1
+            } else {
+                &mut entry.0
+            };
             bucket.insert(
                 f.local_index as usize,
                 (f.fragment_hash, f.fragment_id.clone(), false),
@@ -1094,7 +1093,10 @@ mod tests {
         assert_eq!(update.placement_height, 9);
         // Pulled fragments verify on disk
         for f in &outcome.fragments {
-            assert!(fragstore::fragment_exists_and_valid(&dir_dst, &f.fragment_hash));
+            assert!(fragstore::fragment_exists_and_valid(
+                &dir_dst,
+                &f.fragment_hash
+            ));
         }
 
         // Unchanged selection → no-op (old and new both = node 2)
