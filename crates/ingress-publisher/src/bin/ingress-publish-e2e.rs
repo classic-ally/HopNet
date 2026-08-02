@@ -34,7 +34,8 @@ use ingress_core::descriptor::AssetDescriptor;
 use ingress_core::fixtures::AssetDescriptorBuilder;
 use ingress_core::paths::DataDir;
 use ingress_core::publish::{
-    PublishState, claim_publishable, claim_tombstone_propagatable, run_publish_pass,
+    PassWork, PublishState, claim_editable, claim_publishable, claim_tombstone_propagatable,
+    run_publish_pass,
 };
 use ingress_core::scheduler::{
     CancelToken, FetchFailure, FetchRequest, FreeSpaceProbe, ResourceFetcher, Scheduler,
@@ -296,7 +297,10 @@ async fn main() {
                 let propagatable = claim_tombstone_propagatable(&store, &cfg, &HashSet::new())
                     .await
                     .expect("claim propagatable");
-                if claimed.is_empty() && propagatable.is_empty() {
+                let editable = claim_editable(&store, &cfg, &HashSet::new())
+                    .await
+                    .expect("claim editable");
+                if claimed.is_empty() && propagatable.is_empty() && editable.is_empty() {
                     break;
                 }
                 let report = run_publish_pass(
@@ -304,8 +308,11 @@ async fn main() {
                     &spool,
                     &publisher,
                     &cfg,
-                    claimed,
-                    propagatable,
+                    PassWork {
+                        claimed,
+                        propagatable,
+                        editable,
+                    },
                     &mut state,
                 )
                 .await
@@ -322,7 +329,9 @@ async fn main() {
                     + report.already_published
                     + report.adopted
                     + report.tombstones_propagated
-                    + report.restores_propagated;
+                    + report.restores_propagated
+                    + report.edits_propagated
+                    + report.metadata_propagated;
                 let parked = report.parked;
                 totals.absorb(&report);
                 if parked || progress == 0 {
@@ -339,6 +348,8 @@ async fn main() {
                 "missing_descriptor": totals.missing_descriptor,
                 "tombstones_propagated": totals.tombstones_propagated,
                 "restores_propagated": totals.restores_propagated,
+                "edits_propagated": totals.edits_propagated,
+                "metadata_propagated": totals.metadata_propagated,
                 "evicted_blobs": totals.evicted_blobs,
                 "parked": totals.parked,
                 "parked_responsibility": totals.parked_responsibility,

@@ -51,6 +51,13 @@ impl StateStore {
     /// (`published_at` set — adoption sets it too) — the spool-eviction
     /// work queue. A single undecided referent keeps the blob.
     pub async fn evictable_blobs(&self, limit: i64) -> Result<Vec<BlobRecord>> {
+        // The second disjunct is the edit guard. Eviction rides the end of
+        // every publish pass, so a refetched edit whose propagation parked
+        // (node unreachable, responsibility lost) would otherwise have its
+        // new bytes deleted before the next pass could ever send them —
+        // and PhotoKit will not re-deliver an unchanged asset. The bytes
+        // stay until the mesh has them, which is the same trade the
+        // hard-delete guard makes for tombstones.
         Ok(sqlx::query_as(
             "SELECT b.* FROM blobs b \
              WHERE b.evicted_at IS NULL \
@@ -59,7 +66,8 @@ impl StateStore {
                  JOIN photos p ON p.photo_id = r.photo_id \
                  WHERE p.library_id = b.library_id \
                    AND r.content_hash = b.content_hash \
-                   AND p.published_at IS NULL) \
+                   AND (p.published_at IS NULL \
+                     OR r.published_content_hash IS NOT r.content_hash)) \
              ORDER BY b.written_at \
              LIMIT ?",
         )

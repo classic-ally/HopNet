@@ -167,12 +167,57 @@ pub enum TombstoneOp {
     Restore,
 }
 
+/// One resource an edit uploads, resolved to its on-disk blob.
+#[derive(Debug, Clone)]
+pub struct EditResource {
+    pub resource_type: ResourceType,
+    pub content_hash: ContentHash,
+    pub ext: String,
+    pub size_bytes: i64,
+    pub blob_path: PathBuf,
+}
+
+/// Everything a publisher needs to tell the mesh a published photo changed.
+///
+/// Unlike [`PublishItem`] this carries no full resource set with blob paths:
+/// after a photo publishes its bytes are evicted from the spool, so the only
+/// blobs an edit can promise are the ones it just refetched.
+#[derive(Debug, Clone)]
+pub struct EditItem {
+    pub photo: PhotoRecord,
+    pub library: LibraryConfig,
+    /// The id consensus holds — `COALESCE(consensus_photo_id, photo_id)`.
+    /// An adopted photo lives under the first publisher's id.
+    pub consensus_photo_id: String,
+    /// Metadata source, composed from the photo's LIVE resource state.
+    pub sidecar: Sidecar,
+    /// The `Original`'s extension, which is what distinguishes a raw image
+    /// from an ordinary one in the RFC-011 media-type code. Read from the
+    /// DB row, never from disk.
+    pub original_ext: Option<String>,
+    /// Resources whose bytes the mesh does not have.
+    pub resources: Vec<EditResource>,
+    /// Kinds removed locally that the mesh still serves (a revert).
+    pub removals: Vec<ResourceType>,
+    /// Whether the metadata diverged too. False means send the resources
+    /// alone and leave the mesh's ciphertext as published.
+    pub metadata_changed: bool,
+}
+
 /// The publish seam. Core stays free of HTTP/HopNet types the same way
 /// `ResourceFetcher` keeps PhotoKit out — the concrete impl (HTTP dispatch +
 /// RFC-011 mapping) lives out-of-crate.
 #[async_trait::async_trait]
 pub trait Publisher: Send + Sync + 'static {
     async fn publish(&self, item: PublishItem) -> std::result::Result<PublishOutcome, PublishError>;
+
+    /// Tell the mesh a published photo's bytes or metadata changed.
+    ///
+    /// Without a default for the same reason `propagate_tombstone` has
+    /// none: a silent no-op would let the pass stamp an edit converged
+    /// that never left the machine, and the local bytes would then be
+    /// evicted with nothing to re-derive them from.
+    async fn publish_edit(&self, item: EditItem) -> std::result::Result<(), PublishError>;
 
     /// Tell the mesh a published photo's tombstone state changed, under the
     /// id consensus actually holds (`COALESCE(consensus_photo_id,
@@ -228,6 +273,12 @@ pub struct PublishReport {
     pub tombstones_propagated: u64,
     /// Restores the mesh was told about this pass (`photo_restore`).
     pub restores_propagated: u64,
+    /// Content edits the mesh was told about (`photo_edit_content`) —
+    /// re-edits, first edits, and reverts.
+    pub edits_propagated: u64,
+    /// Metadata-only refreshes the mesh was told about
+    /// (`photo_edit_metadata`).
+    pub metadata_propagated: u64,
     /// Blobs spool-evicted at the end of the pass (every referent decided).
     pub evicted_blobs: u64,
     /// The pass aborted early because the node was unreachable.
@@ -248,6 +299,8 @@ impl PublishReport {
         self.missing_descriptor += other.missing_descriptor;
         self.tombstones_propagated += other.tombstones_propagated;
         self.restores_propagated += other.restores_propagated;
+        self.edits_propagated += other.edits_propagated;
+        self.metadata_propagated += other.metadata_propagated;
         self.evicted_blobs += other.evicted_blobs;
         self.parked = other.parked;
         self.parked_responsibility = other.parked_responsibility;
@@ -300,6 +353,33 @@ pub async fn claim_tombstone_propagatable(
     .collect())
 }
 
+/// Claim helper for the daemon tick: photos whose bytes or metadata have
+/// moved on from what the mesh holds, minus `skip`.
+pub async fn claim_editable(
+    store: &StateStore,
+    cfg: &PublishConfig,
+    skip: &HashSet<PhotoId>,
+) -> Result<Vec<PhotoRecord>> {
+    Ok(
+        crate::store::photos::editable_photos(store.pool(), Utc::now(), cfg.retry_cap, cfg.batch)
+            .await?
+            .into_iter()
+            .filter(|p| !skip.contains(&p.photo_id))
+            .collect(),
+    )
+}
+
+/// One pass's three claims. They travel together because they share a
+/// resolve call, a responsibility gate and a scope partition — claiming
+/// them separately would mean three resolves per scope and three chances
+/// for the gate to disagree with itself mid-pass.
+#[derive(Debug, Default)]
+pub struct PassWork {
+    pub claimed: Vec<PhotoRecord>,
+    pub propagatable: Vec<PhotoRecord>,
+    pub editable: Vec<PhotoRecord>,
+}
+
 /// Run one publish pass over `claimed` and one propagation pass over
 /// `propagatable`. The caller has already registered both id sets inflight
 /// (their PhotoKit events defer until the pass ends, which also excludes
@@ -324,10 +404,14 @@ pub async fn run_publish_pass(
     spool: &SpoolPaths,
     publisher: &dyn Publisher,
     cfg: &PublishConfig,
-    claimed: Vec<PhotoRecord>,
-    propagatable: Vec<PhotoRecord>,
+    work: PassWork,
     state: &mut PublishState,
 ) -> Result<PublishReport> {
+    let PassWork {
+        claimed,
+        propagatable,
+        editable,
+    } = work;
     let mut report = PublishReport::default();
 
     let libraries = store.libraries().await?;
@@ -363,7 +447,19 @@ pub async fn run_publish_pass(
     }
     for photo in propagatable {
         let i = slot(scope_of(&photo), &mut partitions);
-        partitions[i].1.propagate.push(photo);
+        // Split by direction here rather than in the scope body: the scope
+        // runs restores BEFORE edits and deletes AFTER them, because
+        // `photo_edit_content` is rejected outright against a photo the mesh
+        // still believes is tombstoned.
+        if photo.deleted_at.is_some() {
+            partitions[i].1.delete.push(photo);
+        } else {
+            partitions[i].1.restore.push(photo);
+        }
+    }
+    for photo in editable {
+        let i = slot(scope_of(&photo), &mut partitions);
+        partitions[i].1.edit.push(photo);
     }
     partitions.sort_by(|(a, _), (b, _)| a.cmp(b)); // None (personal) first
 
@@ -392,15 +488,17 @@ enum ScopeControl {
     ParkAll,
 }
 
-/// One scope's two work lists.
+/// One scope's work lists, in the order the scope executes them.
 #[derive(Debug, Default)]
 struct ScopeWork {
     publish: Vec<PhotoRecord>,
-    propagate: Vec<PhotoRecord>,
+    restore: Vec<PhotoRecord>,
+    edit: Vec<PhotoRecord>,
+    delete: Vec<PhotoRecord>,
 }
 
-/// One scope's resolve→adopt→gate→publish→propagate sequence (the v1
-/// whole-pass body, scoped). Mutates the shared `report`; per-scope
+/// One scope's resolve→adopt→gate→publish→restore→edit→delete sequence (the
+/// v1 whole-pass body, scoped). Mutates the shared `report`; per-scope
 /// failures burn attempts only for this scope's photos.
 #[allow(clippy::too_many_arguments)]
 async fn run_scope_pass(
@@ -415,7 +513,9 @@ async fn run_scope_pass(
 ) -> Result<ScopeControl> {
     let ScopeWork {
         publish: claimed,
-        propagate,
+        restore,
+        edit,
+        delete,
     } = work;
 
     // --- Resolve pre-pass: fingerprints + remote adoption + standing. ---
@@ -450,8 +550,11 @@ async fn run_scope_pass(
             for photo in &claimed {
                 record_failure(store, cfg, photo, &msg, report).await?;
             }
-            for photo in &propagate {
+            for photo in restore.iter().chain(&delete) {
                 record_propagate_failure(store, cfg, photo, &msg, report).await?;
+            }
+            for photo in &edit {
+                record_edit_failure(store, cfg, photo, &msg, report).await?;
             }
             return Ok(ScopeControl::Continue);
         }
@@ -510,7 +613,13 @@ async fn run_scope_pass(
     // --- Responsibility gate: mutations are holder-only, per scope. ---
     let scope_key = scope.map(str::to_string);
     if resolved.responsibility != Responsibility::Holder {
-        if !remaining.is_empty() || !propagate.is_empty() {
+        // Every mutation this scope would make is gated the same way —
+        // publishes, tombstones in both directions, and edits alike.
+        let held_back = !remaining.is_empty()
+            || !restore.is_empty()
+            || !edit.is_empty()
+            || !delete.is_empty();
+        if held_back {
             if state.not_responsible.insert(scope_key) {
                 let status = match resolved.responsibility {
                     Responsibility::Other => "other",
@@ -614,10 +723,47 @@ async fn run_scope_pass(
     }
 
     // --- Propagation: tell the mesh what Photos did to already-published
-    // photos. Runs after publishing so a photo added and deleted between
-    // two passes publishes first and is then tombstoned, rather than being
-    // deleted before consensus has heard of it.
-    for photo in propagate {
+    // photos, in an order the handlers accept.
+    //
+    // Publishing comes first so a photo added and deleted between two
+    // passes reaches consensus before it is tombstoned there — a
+    // `photo_delete` for a photo the mesh has never seen is an idempotent
+    // no-op and the tombstone would be lost.
+    //
+    // Restores then precede edits, and deletes follow them, because both
+    // edit handlers reject a photo the mesh still believes is tombstoned.
+    // A restore-then-edit in one pass would otherwise burn an attempt on a
+    // ConflictError and only converge next pass.
+    if propagate_tombstones(store, publisher, cfg, restore, state, report).await?
+        == ScopeControl::ParkAll
+    {
+        return Ok(ScopeControl::ParkAll);
+    }
+    if propagate_edits(store, spool, publisher, cfg, edit, state, report).await?
+        == ScopeControl::ParkAll
+    {
+        return Ok(ScopeControl::ParkAll);
+    }
+    if propagate_tombstones(store, publisher, cfg, delete, state, report).await?
+        == ScopeControl::ParkAll
+    {
+        return Ok(ScopeControl::ParkAll);
+    }
+
+    Ok(ScopeControl::Continue)
+}
+
+/// One direction's tombstone propagation. `photos` is already partitioned by
+/// direction; `deleted_at` is re-read per row only to name the operation.
+async fn propagate_tombstones(
+    store: &StateStore,
+    publisher: &dyn Publisher,
+    cfg: &PublishConfig,
+    photos: Vec<PhotoRecord>,
+    state: &mut PublishState,
+    report: &mut PublishReport,
+) -> Result<ScopeControl> {
+    for photo in photos {
         // `deleted_at` is read from the row as claimed. A PhotoKit event
         // between claim and here cannot race it: the caller registered
         // these ids inflight for the pass's duration.
@@ -656,22 +802,10 @@ async fn run_scope_pass(
                         report.restores_propagated += 1;
                     }
                 }
-                if state.unreachable {
-                    state.unreachable = false;
-                    let _ = store.append_log("node_regained", None, None).await;
-                }
+                note_reachable(store, state).await;
             }
             Err(PublishError::NodeUnreachable(msg)) => {
-                if !state.unreachable {
-                    state.unreachable = true;
-                    let _ = store
-                        .append_log(
-                            "node_unreachable",
-                            None,
-                            Some(serde_json::json!({ "error": msg })),
-                        )
-                        .await;
-                }
+                note_unreachable(store, state, &msg).await;
                 report.parked = true;
                 return Ok(ScopeControl::ParkAll);
             }
@@ -698,8 +832,134 @@ async fn run_scope_pass(
             }
         }
     }
-
     Ok(ScopeControl::Continue)
+}
+
+/// Tell the mesh about diverged bytes and metadata.
+async fn propagate_edits(
+    store: &StateStore,
+    spool: &SpoolPaths,
+    publisher: &dyn Publisher,
+    cfg: &PublishConfig,
+    photos: Vec<PhotoRecord>,
+    state: &mut PublishState,
+    report: &mut PublishReport,
+) -> Result<ScopeControl> {
+    for photo in photos {
+        let item = match assemble_edit_item(store, spool, &photo).await? {
+            Ok(item) => item,
+            Err(AssembleSkip::MissingDescriptor) => {
+                // Nothing to compose metadata from. The scan backfills the
+                // capsule; burning attempts here would only exhaust the cap
+                // before it can.
+                report.missing_descriptor += 1;
+                let _ = store
+                    .append_log("edit_descriptor_missing", Some(&photo.photo_id), None)
+                    .await;
+                continue;
+            }
+            Err(AssembleSkip::Transient(msg)) => {
+                record_edit_failure(store, cfg, &photo, &msg, report).await?;
+                continue;
+            }
+        };
+        // What the mesh will hold once this lands — captured BEFORE the
+        // submit so the stamp records what was sent, not what the row says
+        // afterwards.
+        let sent: Vec<(ResourceType, ContentHash)> = item
+            .resources
+            .iter()
+            .map(|r| (r.resource_type, r.content_hash.clone()))
+            .collect();
+        let removed = item.removals.clone();
+        let metadata_sent = item.metadata_changed;
+        let content_edit = !sent.is_empty() || !removed.is_empty();
+
+        match publisher.publish_edit(item).await {
+            Ok(()) => {
+                let mut tx = store.pool().begin().await?;
+                for (resource_type, hash) in &sent {
+                    crate::store::resources::mark_resource_edit_published(
+                        &mut *tx,
+                        &photo.photo_id,
+                        *resource_type,
+                        hash,
+                    )
+                    .await?;
+                }
+                for resource_type in &removed {
+                    crate::store::resources::finish_resource_removal(
+                        &mut *tx,
+                        &photo.photo_id,
+                        *resource_type,
+                    )
+                    .await?;
+                }
+                if metadata_sent {
+                    crate::store::photos::mark_metadata_published(&mut *tx, &photo.photo_id)
+                        .await?;
+                }
+                crate::store::photos::clear_edit_failure(&mut *tx, &photo.photo_id).await?;
+                tx.commit().await?;
+
+                if content_edit {
+                    report.edits_propagated += 1;
+                } else {
+                    report.metadata_propagated += 1;
+                }
+                note_reachable(store, state).await;
+            }
+            Err(PublishError::NodeUnreachable(msg)) => {
+                note_unreachable(store, state, &msg).await;
+                report.parked = true;
+                return Ok(ScopeControl::ParkAll);
+            }
+            Err(PublishError::Rejected(msg)) => {
+                crate::store::photos::record_edit_failure(
+                    store.pool(),
+                    &photo.photo_id,
+                    cfg.retry_cap,
+                    None,
+                    &msg,
+                )
+                .await?;
+                report.gave_up += 1;
+                let _ = store
+                    .append_log(
+                        "edit_rejected",
+                        Some(&photo.photo_id),
+                        Some(serde_json::json!({ "error": msg })),
+                    )
+                    .await;
+            }
+            Err(PublishError::Transient(msg)) => {
+                record_edit_failure(store, cfg, &photo, &msg, report).await?;
+            }
+        }
+    }
+    Ok(ScopeControl::Continue)
+}
+
+/// Reachability edges, shared by every mutation loop so one recovery cannot
+/// be logged twice or missed.
+async fn note_reachable(store: &StateStore, state: &mut PublishState) {
+    if state.unreachable {
+        state.unreachable = false;
+        let _ = store.append_log("node_regained", None, None).await;
+    }
+}
+
+async fn note_unreachable(store: &StateStore, state: &mut PublishState, msg: &str) {
+    if !state.unreachable {
+        state.unreachable = true;
+        let _ = store
+            .append_log(
+                "node_unreachable",
+                None,
+                Some(serde_json::json!({ "error": msg })),
+            )
+            .await;
+    }
 }
 
 /// Eviction cap per pass (same stall rationale as the hard-delete batch).
@@ -813,6 +1073,163 @@ async fn assemble_item(
         resources,
         cloud_fingerprint: None, // stamped by the pass from the resolve entry
     }))
+}
+
+/// Resolve one claimed photo to an [`EditItem`].
+///
+/// Shares `assemble_item`'s capsule → `Sidecar::compose` path so metadata
+/// composition cannot drift between the two, but relaxes the blob rule: only
+/// the DIVERGED resources need bytes on disk. A published photo's other
+/// blobs have been evicted from the spool by design, and requiring them
+/// would make every edit unassemblable.
+async fn assemble_edit_item(
+    store: &StateStore,
+    spool: &SpoolPaths,
+    photo: &PhotoRecord,
+) -> Result<std::result::Result<EditItem, AssembleSkip>> {
+    let Some(library_id) = &photo.library_id else {
+        return Ok(Err(AssembleSkip::Transient("photo has no library".into())));
+    };
+    let Some(library) = store.library(library_id).await? else {
+        return Ok(Err(AssembleSkip::Transient(format!(
+            "library {library_id} vanished"
+        ))));
+    };
+    if library.scope_binding.is_some() && library.mesh_library_id.is_none() {
+        return Ok(Err(AssembleSkip::Transient(
+            "shared library not bound to a mesh library".into(),
+        )));
+    }
+
+    let Some(capsule_json) = &photo.descriptor_json else {
+        return Ok(Err(AssembleSkip::MissingDescriptor));
+    };
+    let capsule: DescriptorCapsule = match serde_json::from_str(capsule_json) {
+        Ok(capsule) => capsule,
+        Err(e) => {
+            return Ok(Err(AssembleSkip::Transient(format!(
+                "descriptor capsule unreadable: {e}"
+            ))));
+        }
+    };
+
+    let records = store.resources_for_photo(&photo.photo_id).await?;
+    let mut resources = Vec::new();
+    for record in &records {
+        if record.written_at.is_none() || record.published_content_hash == record.content_hash {
+            continue;
+        }
+        let (Some(hash), Some(ext), Some(size)) =
+            (&record.content_hash, &record.ext, record.size_bytes)
+        else {
+            return Ok(Err(AssembleSkip::Transient(format!(
+                "written resource {} missing hash/ext/size",
+                record.resource_type.as_str()
+            ))));
+        };
+        let blob_path = spool.blob_path(hash, ext);
+        if !blob_path.exists() {
+            // The eviction guard spares un-propagated bytes, so this means
+            // real loss (a manual spool wipe, a crashed fsck) rather than
+            // ordinary housekeeping — transient so fsck has a chance to
+            // repair it before the cap is reached.
+            return Ok(Err(AssembleSkip::Transient(format!(
+                "edited blob missing on disk: {}",
+                blob_path.display()
+            ))));
+        }
+        resources.push(EditResource {
+            resource_type: record.resource_type,
+            content_hash: hash.clone(),
+            ext: ext.clone(),
+            size_bytes: size,
+            blob_path,
+        });
+    }
+
+    let removals = crate::store::resources::pending_removals(store.pool(), &photo.photo_id).await?;
+    let metadata_changed = photo.published_asset_modified_at != photo.asset_modified_at;
+    if resources.is_empty() && removals.is_empty() && !metadata_changed {
+        // The divergence the claim saw is gone (a concurrent repair, or a
+        // resource still mid-refetch). Nothing to say, nothing to burn.
+        return Ok(Err(AssembleSkip::Transient(
+            "no divergence left to propagate".into(),
+        )));
+    }
+
+    let original_ext = records
+        .iter()
+        .find(|r| r.resource_type == ResourceType::Original)
+        .and_then(|r| r.ext.clone());
+
+    let sidecar = match Sidecar::compose(
+        photo,
+        &library,
+        capsule.media_type,
+        &capsule.media_subtypes,
+        capsule.favorite,
+        &capsule.capture,
+        &records,
+    ) {
+        Ok(sidecar) => sidecar,
+        Err(e) => {
+            return Ok(Err(AssembleSkip::Transient(format!(
+                "metadata recompose failed: {e}"
+            ))));
+        }
+    };
+
+    Ok(Ok(EditItem {
+        consensus_photo_id: photo
+            .consensus_photo_id
+            .clone()
+            .unwrap_or_else(|| photo.photo_id.to_string()),
+        photo: photo.clone(),
+        library,
+        sidecar,
+        original_ext,
+        resources,
+        removals,
+        metadata_changed,
+    }))
+}
+
+/// [`record_failure`] against the edit ledger, for the same reason the
+/// tombstone ledger is separate: an edit rejected by the node must not
+/// overwrite the publish or tombstone error that explains a different
+/// stall.
+async fn record_edit_failure(
+    store: &StateStore,
+    cfg: &PublishConfig,
+    photo: &PhotoRecord,
+    msg: &str,
+    report: &mut PublishReport,
+) -> Result<()> {
+    let attempts = photo.edit_publish_attempts + 1;
+    let next_retry = Utc::now()
+        + chrono::Duration::from_std(crate::scheduler::backoff::delay(&cfg.backoff, attempts))
+            .unwrap_or_else(|_| chrono::Duration::hours(6));
+    crate::store::photos::record_edit_failure(
+        store.pool(),
+        &photo.photo_id,
+        attempts,
+        Some(next_retry),
+        msg,
+    )
+    .await?;
+    if attempts >= cfg.retry_cap {
+        report.gave_up += 1;
+        let _ = store
+            .append_log(
+                "edit_gave_up",
+                Some(&photo.photo_id),
+                Some(serde_json::json!({ "error": msg, "attempts": attempts })),
+            )
+            .await;
+    } else {
+        report.failed += 1;
+    }
+    Ok(())
 }
 
 /// [`record_failure`] against the tombstone ledger. Separate columns, not a
