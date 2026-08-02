@@ -20,6 +20,7 @@ async fn rig(tmp: &std::path::Path) -> (StateStore, LibraryId, DataDir) {
             scope_binding: None,
             retention_days: 30,
             created_at: Utc::now(),
+            mesh_library_id: None,
         })
         .await
         .unwrap();

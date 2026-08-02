@@ -127,10 +127,11 @@ async fn run_library(data_dir: &DataDir, cmd: LibraryCommand) -> Result<ExitCode
                             l.display_name.clone(),
                             l.scope_binding.clone().unwrap_or_else(|| "personal".into()),
                             l.retention_days.to_string(),
+                            l.mesh_library_id.clone().unwrap_or_else(|| "-".into()),
                         ]
                     })
                     .collect();
-                render::table(&["ID", "NAME", "SCOPE", "RETENTION"], &rows);
+                render::table(&["ID", "NAME", "SCOPE", "RETENTION", "MESH"], &rows);
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -157,6 +158,17 @@ async fn run_library(data_dir: &DataDir, cmd: LibraryCommand) -> Result<ExitCode
             let id = LibraryId::parse(&id)?;
             ingress_core::libconfig::set_retention(&store, data_dir, &id, days).await?;
             println!("retention for {id} set to {days} days");
+            Ok(ExitCode::SUCCESS)
+        }
+        LibraryCommand::SetMeshId { id, mesh_id, clear } => {
+            let store = open_existing_rw(data_dir).await?;
+            let id = LibraryId::parse(&id)?;
+            let mesh = if clear { None } else { mesh_id.as_deref() };
+            ingress_core::libconfig::set_mesh_library_id(&store, data_dir, &id, mesh).await?;
+            match mesh {
+                Some(mesh) => println!("{id} publishes into mesh library {mesh}"),
+                None => println!("cleared mesh binding for {id}"),
+            }
             Ok(ExitCode::SUCCESS)
         }
     }

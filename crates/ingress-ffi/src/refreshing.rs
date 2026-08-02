@@ -98,9 +98,13 @@ impl<P: Publisher> Publisher for RefreshingPublisher<P> {
         result
     }
 
-    async fn resolve(&self, cloud_ids: &[String]) -> Result<ResolveOutcome, PublishError> {
+    async fn resolve(
+        &self,
+        library_id: Option<&str>,
+        cloud_ids: &[String],
+    ) -> Result<ResolveOutcome, PublishError> {
         self.refresh_if_stale().await;
-        let result = self.state.lock().await.0.resolve(cloud_ids).await;
+        let result = self.state.lock().await.0.resolve(library_id, cloud_ids).await;
         self.note(&result);
         result
     }
@@ -129,7 +133,11 @@ mod tests {
             unreachable!("tests drive the wrapper through resolve only")
         }
 
-        async fn resolve(&self, _cloud_ids: &[String]) -> Result<ResolveOutcome, PublishError> {
+        async fn resolve(
+            &self,
+            _library_id: Option<&str>,
+            _cloud_ids: &[String],
+        ) -> Result<ResolveOutcome, PublishError> {
             self.calls.lock().unwrap().push(self.built_from.clone());
             match self.results.lock().unwrap().remove(0) {
                 Ok(()) => Ok(ResolveOutcome {
@@ -203,7 +211,7 @@ mod tests {
     }
 
     async fn resolve(f: &Fixture) -> Result<ResolveOutcome, PublishError> {
-        f.publisher.resolve(&[]).await
+        f.publisher.resolve(None, &[]).await
     }
 
     // Should not: touch the credential source while the node is reachable.

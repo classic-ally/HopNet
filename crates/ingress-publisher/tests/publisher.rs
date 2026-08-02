@@ -79,6 +79,7 @@ fn make_item(dir: &std::path::Path, resources: Vec<(&str, &str, Vec<u8>)>) -> Pu
             scope_binding: None,
             retention_days: 30,
             created_at: now,
+            mesh_library_id: None,
         },
         sidecar: Sidecar {
             schema: "hopnet-photo-ingress/v1".into(),
@@ -273,6 +274,10 @@ struct Stub {
     resolve_response: Mutex<Option<serde_json::Value>>,
     /// cloud_id batches received by `/resolve`.
     resolve_seen: Mutex<Vec<Vec<String>>>,
+    /// The library_id each `/resolve` body carried (None = personal).
+    resolve_libraries: Mutex<Vec<Option<String>>>,
+    /// Raw query string of each `/membership` request.
+    membership_queries: Mutex<Vec<Option<String>>>,
 }
 
 struct UploadRecord {
@@ -294,11 +299,16 @@ fn bearer(headers: &HeaderMap) -> String {
 async fn start_stub() -> (Arc<Stub>, String) {
     let stub = Arc::new(Stub::default());
 
-    async fn membership(State(stub): State<Arc<Stub>>, headers: HeaderMap) -> impl IntoResponse {
+    async fn membership(
+        State(stub): State<Arc<Stub>>,
+        headers: HeaderMap,
+        axum::extract::RawQuery(query): axum::extract::RawQuery,
+    ) -> impl IntoResponse {
         stub.calls
             .lock()
             .unwrap()
             .push(("membership".into(), bearer(&headers)));
+        stub.membership_queries.lock().unwrap().push(query);
         let pubkey = hopnet_storage::x25519_dalek::PublicKey::from([0x42u8; 32]);
         axum::Json(LibraryMembership {
             uploaded_by: 7,
@@ -383,6 +393,10 @@ async fn start_stub() -> (Arc<Stub>, String) {
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
         stub.resolve_seen.lock().unwrap().push(cloud_ids);
+        stub.resolve_libraries
+            .lock()
+            .unwrap()
+            .push(body["library_id"].as_str().map(String::from));
         let response = stub
             .resolve_response
             .lock()
@@ -577,7 +591,7 @@ async fn resolve_maps_wire_to_outcome() {
         ],
     }));
     let outcome = publisher
-        .resolve(&["c1".into(), "c2".into()])
+        .resolve(None, &["c1".into(), "c2".into()])
         .await
         .unwrap();
     assert_eq!(outcome.responsibility, ingress_core::publish::Responsibility::Other);
@@ -595,7 +609,7 @@ async fn resolve_maps_wire_to_outcome() {
         "responsibility": "supreme-leader",
         "entries": [],
     }));
-    let err = publisher.resolve(&[]).await.unwrap_err();
+    let err = publisher.resolve(None, &[]).await.unwrap_err();
     assert!(matches!(err, PublishError::Transient(_)), "got {err:?}");
 }
 
@@ -608,7 +622,7 @@ async fn resolve_connection_refused_is_unreachable() {
     drop(listener);
 
     let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
-    let err = publisher.resolve(&["c1".into()]).await.unwrap_err();
+    let err = publisher.resolve(None, &["c1".into()]).await.unwrap_err();
     assert!(matches!(err, PublishError::NodeUnreachable(_)), "got {err:?}");
 }
 
@@ -650,6 +664,72 @@ async fn fingerprint_travels_into_photo_add_payload() {
     let bodies = stub.tx_bodies.lock().unwrap();
     let payload = decode(&bodies[1]);
     assert_eq!(payload.entries[0].cloud_fingerprint, None);
+}
+
+// Impact: the mesh binding is the entire shared-vs-personal routing
+// decision at the wire — dropping it publishes shared photos into the
+// personal partition; corrupting it must never silently spin.
+// Should: put the library's mesh UUID into the photo_add payload, the
+// membership query, and the resolve body.
+// Should not: publish an item whose stored mesh id fails to parse
+// (Rejected — attempts jump to the cap; only direct DB edits can
+// produce one).
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_carries_library_id() {
+    const MESH: &str = "0198f3a2-aaaa-bbbb-cccc-dddddddddddd";
+    let dir = tempfile::tempdir().unwrap();
+    let (stub, base_url) = start_stub().await;
+    let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
+
+    let mut item = simple_item(dir.path());
+    item.library.scope_binding = Some(ingress_core::model::ICLOUD_SHARED_LIBRARY_BINDING.into());
+    item.library.mesh_library_id = Some(MESH.into());
+    publisher.publish(item).await.unwrap();
+
+    {
+        let bodies = stub.tx_bodies.lock().unwrap();
+        let bytes: Vec<u8> = bodies[0]["payload"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u8)
+            .collect();
+        let payload: hopnet_photos::envelopes::PhotoAddPayload =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .unwrap()
+                .0;
+        assert_eq!(
+            payload.entries[0].library_id.as_ref().map(|l| l.to_string()),
+            Some(MESH.to_string())
+        );
+    }
+    assert_eq!(
+        *stub.membership_queries.lock().unwrap(),
+        vec![Some(format!("library_id={MESH}"))],
+        "member fetch must be library-scoped"
+    );
+
+    publisher.resolve(Some(MESH), &["c1".into()]).await.unwrap();
+    assert_eq!(
+        *stub.resolve_libraries.lock().unwrap(),
+        vec![Some(MESH.to_string())]
+    );
+}
+
+// Should not: publish an item with a malformed stored mesh id — Rejected
+// locally, nothing uploaded (libconfig validates on write, so this only
+// trips on direct DB edits, and a transient would spin forever).
+#[tokio::test(flavor = "multi_thread")]
+async fn bad_mesh_id_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stub, base_url) = start_stub().await;
+    let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
+
+    let mut item = simple_item(dir.path());
+    item.library.mesh_library_id = Some("not-a-uuid".into());
+    let err = publisher.publish(item).await.unwrap_err();
+    assert!(matches!(err, PublishError::Rejected(_)), "got {err:?}");
+    assert_eq!(call_names(&stub), vec!["committed"], "no bytes moved");
 }
 
 // Should: reject a malformed fingerprint locally (Rejected, nothing

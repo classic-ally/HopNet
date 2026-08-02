@@ -98,10 +98,12 @@ impl HttpDispatch {
     }
 
     /// Resolve pre-pass (`POST /resolve`): cloud_ids → fingerprints +
-    /// committed ids + responsibility standing. Not part of the
+    /// committed ids + responsibility standing, scoped to one publish
+    /// target (`library_id` None = personal partition). Not part of the
     /// `PhotoDispatch` trait — publish-flow only.
     pub async fn resolve_cloud_ids(
         &self,
+        library_id: Option<&str>,
         cloud_ids: &[String],
     ) -> Result<ResolveResponseWire, PhotosCoreError> {
         let response = self
@@ -109,7 +111,7 @@ impl HttpDispatch {
             .post(self.url("/resolve"))
             .bearer_auth(&self.device_token)
             .timeout(SMALL_TIMEOUT)
-            .json(&serde_json::json!({ "cloud_ids": cloud_ids }))
+            .json(&serde_json::json!({ "cloud_ids": cloud_ids, "library_id": library_id }))
             .send()
             .await
             .map_err(Self::transport_err)?;

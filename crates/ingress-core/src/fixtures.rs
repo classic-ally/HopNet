@@ -24,6 +24,7 @@ pub async fn store_with_personal() -> (StateStore, LibraryId) {
             scope_binding: None,
             retention_days: 30,
             created_at: Utc::now(),
+            mesh_library_id: None,
         })
         .await
         .expect("seed personal library");
@@ -40,6 +41,7 @@ pub async fn add_shared(store: &StateStore) -> LibraryId {
             scope_binding: Some(ICLOUD_SHARED_LIBRARY_BINDING.into()),
             retention_days: 30,
             created_at: Utc::now(),
+            mesh_library_id: None,
         })
         .await
         .expect("seed shared library");

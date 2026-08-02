@@ -164,15 +164,20 @@ pub struct ResolveOutcome {
 pub trait Publisher: Send + Sync + 'static {
     async fn publish(&self, item: PublishItem) -> std::result::Result<PublishOutcome, PublishError>;
 
-    /// Pre-pass identity resolution: cloud_ids → fingerprints + committed
-    /// ids + the caller's responsibility standing. The default is the
-    /// legacy/no-dedupe publisher — proceeds as holder with no
-    /// fingerprints, preserving pre-identity behavior for mocks.
+    /// Pre-pass identity resolution for ONE publish scope: cloud_ids →
+    /// fingerprints + committed ids + the caller's responsibility standing
+    /// in that scope. `library_id` None = the personal partition, Some =
+    /// the mesh shared-library UUID (the node then fingerprints under the
+    /// library-scoped key, so entries match ANY member's committed
+    /// photos). The default is the legacy/no-dedupe publisher — proceeds
+    /// as holder with no fingerprints, preserving pre-identity behavior
+    /// for mocks.
     async fn resolve(
         &self,
+        library_id: Option<&str>,
         cloud_ids: &[String],
     ) -> std::result::Result<ResolveOutcome, PublishError> {
-        let _ = cloud_ids;
+        let _ = (library_id, cloud_ids);
         Ok(ResolveOutcome {
             responsibility: Responsibility::Holder,
             entries: Vec::new(),
@@ -220,10 +225,13 @@ impl PublishReport {
 }
 
 /// Edge-trigger for reachability logging (mirrors `ReplicationState`).
+/// Responsibility parking is tracked per publish scope (None = personal,
+/// Some = mesh library UUID) — losing standing in one shared library must
+/// not mute or flap the edges of the others.
 #[derive(Debug, Default, Clone)]
 pub struct PublishState {
     unreachable: bool,
-    not_responsible: bool,
+    not_responsible: std::collections::HashSet<Option<String>>,
 }
 
 /// Claim helper for the daemon tick: publishable photos minus `skip`.
@@ -244,6 +252,14 @@ pub async fn claim_publishable(
 /// Run one publish pass over `claimed`. The caller has already registered
 /// the claimed ids inflight (their PhotoKit events defer until the pass
 /// ends, which also excludes supersede/hard-move races on the blob reads).
+///
+/// The pass partitions by publish scope — the photo's library's
+/// `mesh_library_id` (None = personal partition) — and runs one
+/// resolve→adopt→gate→publish sequence per scope, personal first, then
+/// mesh ids in sorted order. Responsibility standing, parking, and
+/// resolve-failure attempt burning are all per-scope: a kicked member's
+/// 403ing shared library must not starve the personal queue. Node
+/// unreachability is the one whole-pass condition — it parks everything.
 pub async fn run_publish_pass(
     store: &StateStore,
     spool: &SpoolPaths,
@@ -254,11 +270,74 @@ pub async fn run_publish_pass(
 ) -> Result<PublishReport> {
     let mut report = PublishReport::default();
 
+    let libraries = store.libraries().await?;
+    let mesh_of: std::collections::HashMap<&crate::ids::LibraryId, Option<&str>> = libraries
+        .iter()
+        .map(|l| (&l.library_id, l.mesh_library_id.as_deref()))
+        .collect();
+
+    // Partition preserving claim order within each scope. A photo whose
+    // library is unknown or mesh-unbound lands in the personal partition
+    // here; assemble_item re-reads the library fresh and skips it before
+    // anything is published (claim-vs-pass race window only).
+    let mut partitions: Vec<(Option<String>, Vec<PhotoRecord>)> = Vec::new();
+    for photo in claimed {
+        let scope: Option<String> = photo
+            .library_id
+            .as_ref()
+            .and_then(|lib| mesh_of.get(lib).copied().flatten())
+            .map(str::to_string);
+        match partitions.iter_mut().find(|(s, _)| *s == scope) {
+            Some((_, photos)) => photos.push(photo),
+            None => partitions.push((scope, vec![photo])),
+        }
+    }
+    partitions.sort_by(|(a, _), (b, _)| a.cmp(b)); // None (personal) first
+
+    for (scope, photos) in partitions {
+        let control =
+            run_scope_pass(store, spool, publisher, cfg, scope.as_deref(), photos, state, &mut report)
+                .await?;
+        if control == ScopeControl::ParkAll {
+            break;
+        }
+    }
+
+    // Spool eviction rides the end of every pass so decided bytes leave
+    // local disk with minimal residence; the cleanup tick sweeps whatever a
+    // crash window strands.
+    report.evicted_blobs =
+        crate::cleanup::evict_published_blobs(store, spool, EVICT_BATCH).await?;
+
+    Ok(report)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ScopeControl {
+    Continue,
+    /// The node is unreachable — no other scope can do better this pass.
+    ParkAll,
+}
+
+/// One scope's resolve→adopt→gate→publish sequence (the v1 whole-pass
+/// body, scoped). Mutates the shared `report`; per-scope failures burn
+/// attempts only for this scope's photos.
+#[allow(clippy::too_many_arguments)]
+async fn run_scope_pass(
+    store: &StateStore,
+    spool: &SpoolPaths,
+    publisher: &dyn Publisher,
+    cfg: &PublishConfig,
+    scope: Option<&str>,
+    claimed: Vec<PhotoRecord>,
+    state: &mut PublishState,
+    report: &mut PublishReport,
+) -> Result<ScopeControl> {
     // --- Resolve pre-pass: fingerprints + remote adoption + standing. ---
-    // One batch call; NULL-cloud_id photos simply get no entry (they publish
-    // with no fingerprint and are exempt from dedupe).
+    // One batch call per scope; NULL-cloud_id photos simply get no entry
+    // (they publish with no fingerprint and are exempt from dedupe).
     let cloud_ids: Vec<String> = claimed.iter().filter_map(|p| p.cloud_id.clone()).collect();
-    let resolved = match publisher.resolve(&cloud_ids).await {
+    let resolved = match publisher.resolve(scope, &cloud_ids).await {
         Ok(outcome) => outcome,
         Err(PublishError::NodeUnreachable(msg)) => {
             if !state.unreachable {
@@ -272,17 +351,19 @@ pub async fn run_publish_pass(
                     .await;
             }
             report.parked = true;
-            return Ok(report);
+            return Ok(ScopeControl::ParkAll);
         }
         Err(e) => {
-            // A failing resolve blocks the whole batch: burn one attempt per
-            // claimed photo so a persistently broken resolve backs off and
-            // eventually surfaces as gave_up instead of spinning silently.
+            // A failing resolve blocks this scope: burn one attempt per
+            // claimed photo so a persistently broken resolve (e.g. a 403ing
+            // library after a kick) backs off and eventually surfaces as
+            // gave_up instead of spinning silently — while the other scopes
+            // keep publishing.
             let msg = format!("resolve failed: {e}");
             for photo in &claimed {
-                record_failure(store, cfg, photo, &msg, &mut report).await?;
+                record_failure(store, cfg, photo, &msg, report).await?;
             }
-            return Ok(report);
+            return Ok(ScopeControl::Continue);
         }
     };
     // Deliberately NOT the reachability recovery edge: `node_regained` stays
@@ -336,11 +417,11 @@ pub async fn run_publish_pass(
         }
     }
 
-    // --- Responsibility gate: mutations are holder-only. ---
+    // --- Responsibility gate: mutations are holder-only, per scope. ---
+    let scope_key = scope.map(str::to_string);
     if resolved.responsibility != Responsibility::Holder {
         if !remaining.is_empty() {
-            if !state.not_responsible {
-                state.not_responsible = true;
+            if state.not_responsible.insert(scope_key) {
                 let status = match resolved.responsibility {
                     Responsibility::Other => "other",
                     _ => "unclaimed",
@@ -349,17 +430,22 @@ pub async fn run_publish_pass(
                     .append_log(
                         "publish_not_responsible",
                         None,
-                        Some(serde_json::json!({ "holder": status })),
+                        Some(serde_json::json!({ "holder": status, "library": scope })),
                     )
                     .await;
             }
             report.parked_responsibility = true;
         }
-        return Ok(report);
+        return Ok(ScopeControl::Continue);
     }
-    if state.not_responsible {
-        state.not_responsible = false;
-        let _ = store.append_log("responsibility_regained", None, None).await;
+    if state.not_responsible.remove(&scope_key) {
+        let _ = store
+            .append_log(
+                "responsibility_regained",
+                None,
+                Some(serde_json::json!({ "library": scope })),
+            )
+            .await;
     }
 
     for (photo, fingerprint) in remaining {
@@ -378,7 +464,7 @@ pub async fn run_publish_pass(
                             .await;
                     }
                     AssembleSkip::Transient(msg) => {
-                        record_failure(store, cfg, &photo, &msg, &mut report).await?;
+                        record_failure(store, cfg, &photo, &msg, report).await?;
                     }
                 }
                 continue;
@@ -411,7 +497,7 @@ pub async fn run_publish_pass(
                         .await;
                 }
                 report.parked = true;
-                break;
+                return Ok(ScopeControl::ParkAll);
             }
             Err(PublishError::Rejected(msg)) => {
                 crate::store::photos::record_publish_failure(
@@ -432,18 +518,12 @@ pub async fn run_publish_pass(
                     .await;
             }
             Err(PublishError::Transient(msg)) => {
-                record_failure(store, cfg, &photo, &msg, &mut report).await?;
+                record_failure(store, cfg, &photo, &msg, report).await?;
             }
         }
     }
 
-    // Spool eviction rides the end of every pass so decided bytes leave
-    // local disk with minimal residence; the cleanup tick sweeps whatever a
-    // crash window strands.
-    report.evicted_blobs =
-        crate::cleanup::evict_published_blobs(store, spool, EVICT_BATCH).await?;
-
-    Ok(report)
+    Ok(ScopeControl::Continue)
 }
 
 /// Eviction cap per pass (same stall rationale as the hard-delete batch).
@@ -475,10 +555,13 @@ async fn assemble_item(
             "library {library_id} vanished"
         ))));
     };
-    if library.scope_binding.is_some() {
-        // Re-bound to the shared partition between claim and pass.
+    if library.scope_binding.is_some() && library.mesh_library_id.is_none() {
+        // Scope-bound with no publish target: re-bound (or mesh-unbound)
+        // between claim and pass. Defense-in-depth — libconfig writes take
+        // the exclusive run lock, so a live daemon only sees this after
+        // direct DB edits.
         return Ok(Err(AssembleSkip::Transient(
-            "library re-bound to a shared scope".into(),
+            "shared library not bound to a mesh library".into(),
         )));
     }
 

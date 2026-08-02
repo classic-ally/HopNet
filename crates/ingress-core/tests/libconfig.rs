@@ -3,7 +3,7 @@
 //! retention edits — all under the exclusive run lock.
 
 use ingress_core::libconfig::{
-    AddLibraryOptions, add_library, bind_scope, rename_library, set_retention,
+    AddLibraryOptions, add_library, bind_scope, rename_library, set_mesh_library_id, set_retention,
 };
 use ingress_core::model::ICLOUD_SHARED_LIBRARY_BINDING;
 use ingress_core::paths::DataDir;
@@ -215,4 +215,83 @@ async fn writes_refused_while_daemon_lock_held() {
     assert!(rename_library(&store, &data_dir, &id, "X").await.is_err());
     assert!(set_retention(&store, &data_dir, &id, 10).await.is_err());
     assert!(lock_path.is_file(), "foreign lock not consumed");
+}
+
+// Impact: the scope-bound ⇒ mesh-id invariant is what lets the publish
+// pass use mesh_library_id alone as its partition key — a personal row
+// carrying a mesh target would route personal photos into a shared
+// consensus library.
+// Should: bind a mesh id to a scope-bound library, clear it, and log both.
+// Should not: bind to a personal (NULL-scope) library or accept a
+// non-UUID mesh id.
+#[tokio::test]
+async fn mesh_binding_requires_shared_scope_and_uuid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, data_dir) = rig(tmp.path()).await;
+    let personal = add_library(&store, &data_dir, &opts(LibraryScope::Personal))
+        .await
+        .unwrap();
+    let shared = add_library(&store, &data_dir, &opts(LibraryScope::Shared))
+        .await
+        .unwrap();
+    let mesh = "0198f3a2-aaaa-bbbb-cccc-dddddddddddd";
+
+    assert!(
+        set_mesh_library_id(&store, &data_dir, &personal.config.library_id, Some(mesh))
+            .await
+            .is_err(),
+        "personal libraries publish to the personal partition"
+    );
+    assert!(
+        set_mesh_library_id(
+            &store,
+            &data_dir,
+            &shared.config.library_id,
+            Some("not-a-uuid")
+        )
+        .await
+        .is_err()
+    );
+
+    set_mesh_library_id(&store, &data_dir, &shared.config.library_id, Some(mesh))
+        .await
+        .unwrap();
+    let row = store.library(&shared.config.library_id).await.unwrap().unwrap();
+    assert_eq!(row.mesh_library_id.as_deref(), Some(mesh));
+
+    set_mesh_library_id(&store, &data_dir, &shared.config.library_id, None)
+        .await
+        .unwrap();
+    let row = store.library(&shared.config.library_id).await.unwrap().unwrap();
+    assert_eq!(row.mesh_library_id, None);
+    assert_eq!(store.log_events("mesh_library_bound").await.unwrap().len(), 2);
+}
+
+// Should not: detach the shared scope while a mesh binding is present —
+// clearing the mesh binding must come first.
+#[tokio::test]
+async fn detach_refused_while_mesh_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, data_dir) = rig(tmp.path()).await;
+    let shared = add_library(&store, &data_dir, &opts(LibraryScope::Shared))
+        .await
+        .unwrap();
+    let mesh = "0198f3a2-aaaa-bbbb-cccc-dddddddddddd";
+    set_mesh_library_id(&store, &data_dir, &shared.config.library_id, Some(mesh))
+        .await
+        .unwrap();
+
+    assert!(
+        bind_scope(&store, &data_dir, &shared.config.library_id, None)
+            .await
+            .is_err(),
+        "detach must be refused while mesh-bound"
+    );
+
+    set_mesh_library_id(&store, &data_dir, &shared.config.library_id, None)
+        .await
+        .unwrap();
+    bind_scope(&store, &data_dir, &shared.config.library_id, None)
+        .await
+        .unwrap();
 }

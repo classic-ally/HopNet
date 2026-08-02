@@ -197,6 +197,12 @@ pub struct LibraryConfig {
     pub scope_binding: Option<String>,
     pub retention_days: i64,
     pub created_at: DateTime<Utc>,
+    /// The consensus `shared_libraries` UUID this library publishes into.
+    /// None = no publish target: a scope-bound library without one is
+    /// excluded from the publish claim. Requires `scope_binding` —
+    /// personal libraries publish to the personal partition by
+    /// definition (libconfig enforces both directions).
+    pub mesh_library_id: Option<String>,
 }
 
 /// The fixed `scope_binding` marker for the iCloud Shared Photo Library.

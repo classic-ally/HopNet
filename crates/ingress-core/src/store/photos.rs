@@ -260,12 +260,15 @@ where
     }
 }
 
-/// The publish work queue: materialized, active, unpublished photos of the
-/// PERSONAL partition (`scope_binding IS NULL` — publishing the iCloud-shared
-/// partition as personal-consensus photos would create Phase-3 dedup debt).
-/// Tombstones are excluded: tombstone propagation is out of scope, and a
-/// deleted-then-published photo would be unreachable in HopNet anyway.
-/// Attempts at the cap are terminal until an operator resets them.
+/// The publish work queue: materialized, active, unpublished photos of any
+/// library WITH a publish target — the personal partition (`scope_binding
+/// IS NULL`) always has one, a scope-bound (shared) library only once an
+/// operator sets `mesh_library_id` (an unbound shared library published as
+/// personal-consensus photos would be exactly the dedup debt the old
+/// personal-only gate existed to avoid). Tombstones are excluded:
+/// tombstone propagation is out of scope, and a deleted-then-published
+/// photo would be unreachable in HopNet anyway. Attempts at the cap are
+/// terminal until an operator resets them.
 pub(crate) async fn publishable_photos<'e, E>(
     exec: E,
     now: DateTime<Utc>,
@@ -278,7 +281,7 @@ where
     Ok(sqlx::query_as(
         "SELECT p.* FROM photos p \
          JOIN libraries l ON l.library_id = p.library_id \
-         WHERE l.scope_binding IS NULL \
+         WHERE (l.scope_binding IS NULL OR l.mesh_library_id IS NOT NULL) \
            AND p.published_at IS NULL \
            AND p.materialized_at IS NOT NULL \
            AND p.deleted_at IS NULL \

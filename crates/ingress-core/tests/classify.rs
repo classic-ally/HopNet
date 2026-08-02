@@ -33,6 +33,7 @@ async fn store_with_roots() -> (StateStore, LibraryId, LibraryId) {
                 scope_binding: binding,
                 retention_days: 30,
                 created_at: Utc::now(),
+                mesh_library_id: None,
             })
             .await
             .unwrap();

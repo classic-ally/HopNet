@@ -51,17 +51,40 @@ where
 {
     sqlx::query(
         "INSERT INTO libraries \
-         (library_id, display_name, scope_binding, retention_days, created_at) \
-         VALUES (?, ?, ?, ?, ?)",
+         (library_id, display_name, scope_binding, retention_days, created_at, mesh_library_id) \
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&lib.library_id)
     .bind(&lib.display_name)
     .bind(&lib.scope_binding)
     .bind(lib.retention_days)
     .bind(lib.created_at)
+    .bind(&lib.mesh_library_id)
     .execute(exec)
     .await?;
     Ok(())
+}
+
+/// Set or clear a library's mesh publish target. Returns false if the
+/// library does not exist. Invariant checks (scope-bound, UUID shape)
+/// live in libconfig — this is the raw write.
+pub(crate) async fn update_mesh_library_id<'e, E>(
+    exec: E,
+    id: &LibraryId,
+    mesh: Option<&str>,
+) -> Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(
+        sqlx::query("UPDATE libraries SET mesh_library_id = ? WHERE library_id = ?")
+            .bind(mesh)
+            .bind(id)
+            .execute(exec)
+            .await?
+            .rows_affected()
+            > 0,
+    )
 }
 
 /// Set or clear a library's PhotoKit scope binding. Returns false if the

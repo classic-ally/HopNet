@@ -78,8 +78,12 @@ struct FakePublisher {
     seen_sidecars: Mutex<Vec<ingress_core::sidecar::Sidecar>>,
     /// None = use the trait's legacy default (Holder, no entries).
     resolve_result: Mutex<Option<Result<ResolveOutcome, PublishError>>>,
-    /// The cloud_id batches the pass sent to resolve.
-    resolve_seen: Mutex<Vec<Vec<String>>>,
+    /// Per-scope scripted resolves (key None = personal); falls back to
+    /// `resolve_result`, then the trait default.
+    resolve_results:
+        Mutex<std::collections::HashMap<Option<String>, Result<ResolveOutcome, PublishError>>>,
+    /// The (scope, cloud_id batch) pairs the pass sent to resolve.
+    resolve_seen: Mutex<Vec<(Option<String>, Vec<String>)>>,
     gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
@@ -97,6 +101,7 @@ impl FakePublisher {
             seen_fingerprints: Mutex::new(Vec::new()),
             seen_sidecars: Mutex::new(Vec::new()),
             resolve_result: Mutex::new(None),
+            resolve_results: Mutex::new(std::collections::HashMap::new()),
             resolve_seen: Mutex::new(Vec::new()),
             gate: None,
         }
@@ -104,6 +109,13 @@ impl FakePublisher {
 
     fn set_resolve(&self, result: Result<ResolveOutcome, PublishError>) {
         *self.resolve_result.lock().unwrap() = Some(result);
+    }
+
+    fn set_resolve_for(&self, scope: Option<&str>, result: Result<ResolveOutcome, PublishError>) {
+        self.resolve_results
+            .lock()
+            .unwrap()
+            .insert(scope.map(str::to_string), result);
     }
 }
 
@@ -139,11 +151,21 @@ impl Publisher for FakePublisher {
         scripted.unwrap_or_else(|| (self.fallback)())
     }
 
-    async fn resolve(&self, cloud_ids: &[String]) -> Result<ResolveOutcome, PublishError> {
-        self.resolve_seen.lock().unwrap().push(cloud_ids.to_vec());
-        match &*self.resolve_result.lock().unwrap() {
+    async fn resolve(
+        &self,
+        library_id: Option<&str>,
+        cloud_ids: &[String],
+    ) -> Result<ResolveOutcome, PublishError> {
+        self.resolve_seen
+            .lock()
+            .unwrap()
+            .push((library_id.map(str::to_string), cloud_ids.to_vec()));
+        match self.resolve_results.lock().unwrap().get(&library_id.map(str::to_string)) {
             Some(result) => result.clone(),
-            None => Ok(outcome(Responsibility::Holder, Vec::new())),
+            None => match &*self.resolve_result.lock().unwrap() {
+                Some(result) => result.clone(),
+                None => Ok(outcome(Responsibility::Holder, Vec::new())),
+            },
         }
     }
 }
@@ -170,6 +192,7 @@ async fn rig() -> Rig {
             scope_binding: None,
             retention_days: 30,
             created_at: Utc::now(),
+            mesh_library_id: None,
         })
         .await
         .unwrap();
@@ -206,12 +229,52 @@ async fn rig() -> Rig {
     }
 }
 
+/// Insert the daemon's single shared (SPL-bound) library, optionally with
+/// a mesh publish target. The marker is UNIQUE — one shared library per
+/// daemon, so scope tests run personal + shared.
+async fn add_shared_library(rig: &Rig, mesh_library_id: Option<&str>) {
+    rig.store
+        .insert_library(&ingress_core::LibraryConfig {
+            library_id: ingress_core::LibraryId::new("shared"),
+            display_name: "Shared".into(),
+            scope_binding: Some(ingress_core::model::ICLOUD_SHARED_LIBRARY_BINDING.into()),
+            retention_days: 30,
+            created_at: Utc::now(),
+            mesh_library_id: mesh_library_id.map(str::to_string),
+        })
+        .await
+        .unwrap();
+}
+
+async fn set_mesh_binding(rig: &Rig, mesh_library_id: Option<&str>) {
+    sqlx::query("UPDATE libraries SET mesh_library_id = ? WHERE library_id = 'shared'")
+        .bind(mesh_library_id)
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+}
+
 /// Seed + drain one image asset to full materialization (blob + sidecar on
 /// disk, exactly as production leaves them), returning its photo id.
 async fn materialize(rig: &Rig, local_id: &str, bytes: &[u8]) -> PhotoId {
+    materialize_scoped(rig, local_id, bytes, ingress_core::descriptor::LibraryScope::Personal)
+        .await
+}
+
+async fn materialize_shared(rig: &Rig, local_id: &str, bytes: &[u8]) -> PhotoId {
+    materialize_scoped(rig, local_id, bytes, ingress_core::descriptor::LibraryScope::Shared).await
+}
+
+async fn materialize_scoped(
+    rig: &Rig,
+    local_id: &str,
+    bytes: &[u8],
+    scope: ingress_core::descriptor::LibraryScope,
+) -> PhotoId {
     let desc = AssetDescriptorBuilder::simple_image()
         .with_cloud_id(&format!("cloud-{local_id}"))
         .with_local_id(local_id)
+        .scope(scope)
         .build();
     rig.fetcher
         .descriptors
@@ -758,8 +821,8 @@ async fn fingerprints_thread_into_publish_items() {
     assert_eq!(report.published, 2);
     assert_eq!(
         *publisher.resolve_seen.lock().unwrap(),
-        vec![vec!["cloud-a".to_string()]],
-        "only cloud-bearing photos enter the resolve batch"
+        vec![(None, vec!["cloud-a".to_string()])],
+        "only cloud-bearing photos enter the resolve batch, personal scope"
     );
     let mut fingerprints = publisher.seen_fingerprints.lock().unwrap().clone();
     fingerprints.sort();
@@ -807,6 +870,229 @@ async fn resolve_failure_burns_one_attempt_per_photo() {
         assert_eq!(row.publish_attempts, 1);
         assert!(row.publish_last_error.as_deref().unwrap().contains("resolve"));
     }
+}
+
+// ------------------------------------------------------ scoped publish pass
+
+const MESH_LIB: &str = "0198f3a2-aaaa-bbbb-cccc-dddddddddddd";
+
+// Impact: the claim predicate is the only thing standing between the
+// iCloud shared partition and the personal consensus namespace — an
+// unbound shared library published as personal photos is exactly the
+// dedup debt the old personal-only gate existed to avoid.
+// Should: claim shared-library photos once the library is mesh-bound.
+// Should not: claim shared photos while the mesh binding is absent —
+// the v1 exclusion is preserved verbatim for unbound rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_requires_publish_target() {
+    let rig = rig().await;
+    add_shared_library(&rig, None).await;
+    let personal = materialize(&rig, "p", b"p-bytes").await;
+    let shared = materialize_shared(&rig, "s", b"s-bytes").await;
+
+    let claimed = claim(&rig).await;
+    assert_eq!(
+        claimed.iter().map(|p| p.photo_id.clone()).collect::<Vec<_>>(),
+        vec![personal.clone()],
+        "unbound shared photos must stay unclaimed"
+    );
+
+    set_mesh_binding(&rig, Some(MESH_LIB)).await;
+    let claimed = claim(&rig).await;
+    let ids: Vec<PhotoId> = claimed.iter().map(|p| p.photo_id.clone()).collect();
+    assert!(ids.contains(&personal) && ids.contains(&shared));
+}
+
+// Should: issue exactly one resolve per scope — personal first, carrying
+// only that scope's cloud ids, byte-identical to the v1 personal call.
+#[tokio::test(flavor = "multi_thread")]
+async fn pass_partitions_resolve_per_scope() {
+    let rig = rig().await;
+    add_shared_library(&rig, Some(MESH_LIB)).await;
+    materialize(&rig, "p", b"p-bytes").await;
+    materialize_shared(&rig, "s1", b"s1-bytes").await;
+    materialize_shared(&rig, "s2", b"s2-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.published, 3);
+
+    let seen = publisher.resolve_seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].0, None, "personal scope resolves first");
+    assert_eq!(seen[0].1, vec!["cloud-p".to_string()]);
+    assert_eq!(seen[1].0.as_deref(), Some(MESH_LIB));
+    let mut shared_ids = seen[1].1.clone();
+    shared_ids.sort();
+    assert_eq!(shared_ids, vec!["cloud-s1".to_string(), "cloud-s2".to_string()]);
+}
+
+// Impact: v1 parked the WHOLE batch on lost standing; per-scope parking is
+// what lets the personal queue keep draining while a shared library waits
+// for a claim (or after a kick).
+// Should: park only the not-responsible scope's photos, burning no
+// attempts for them, while the other scope publishes in the same pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn responsibility_parks_per_scope() {
+    let rig = rig().await;
+    add_shared_library(&rig, Some(MESH_LIB)).await;
+    let personal = materialize(&rig, "p", b"p-bytes").await;
+    let shared = materialize_shared(&rig, "s", b"s-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    publisher.set_resolve_for(Some(MESH_LIB), Ok(outcome(Responsibility::Other, Vec::new())));
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.published, 1);
+    assert!(report.parked_responsibility);
+    assert_eq!(*publisher.seen.lock().unwrap(), vec![personal]);
+    let row = photo(&rig, &shared).await;
+    assert_eq!(row.publish_attempts, 0, "parking must not burn attempts");
+    assert!(row.published_at.is_none());
+}
+
+// Should: run adoption for a non-holder scope before parking it — a
+// responsibility handoff (or another member's publish) stays a cheap
+// sweep per scope.
+#[tokio::test(flavor = "multi_thread")]
+async fn adoption_precedes_scope_park() {
+    let rig = rig().await;
+    add_shared_library(&rig, Some(MESH_LIB)).await;
+    let shared = materialize_shared(&rig, "s", b"s-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    publisher.set_resolve_for(
+        Some(MESH_LIB),
+        Ok(outcome(
+            Responsibility::Other,
+            vec![entry("cloud-s", &"ab".repeat(32), Some("remote-id"))],
+        )),
+    );
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.adopted, 1);
+    assert!(!report.parked_responsibility, "nothing left to park after adoption");
+    assert_eq!(photo(&rig, &shared).await.consensus_photo_id.as_deref(), Some("remote-id"));
+}
+
+// Impact: a kicked member's shared-scope resolve 403s forever — that
+// must back its own photos off toward gave_up without starving the
+// personal queue.
+// Should: burn attempts only for the failing scope's photos on a
+// non-unreachable resolve error; the other scope proceeds untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_failure_isolated_to_scope() {
+    let rig = rig().await;
+    add_shared_library(&rig, Some(MESH_LIB)).await;
+    let personal = materialize(&rig, "p", b"p-bytes").await;
+    let shared = materialize_shared(&rig, "s", b"s-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    publisher.set_resolve_for(
+        Some(MESH_LIB),
+        Err(PublishError::Transient("http 403: library_not_member".into())),
+    );
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.published, 1);
+    assert_eq!(report.failed, 1);
+    assert_eq!(photo(&rig, &personal).await.publish_attempts, 0);
+    let row = photo(&rig, &shared).await;
+    assert_eq!(row.publish_attempts, 1);
+    assert!(row.publish_last_error.as_deref().unwrap().contains("403"));
+}
+
+// Should: park the entire pass on NodeUnreachable regardless of scope —
+// no later scope resolves, no attempts burned anywhere (regression on the
+// v1 whole-pass park).
+#[tokio::test(flavor = "multi_thread")]
+async fn unreachable_parks_whole_pass() {
+    let rig = rig().await;
+    add_shared_library(&rig, Some(MESH_LIB)).await;
+    let personal = materialize(&rig, "p", b"p-bytes").await;
+    let shared = materialize_shared(&rig, "s", b"s-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    publisher.set_resolve_for(None, Err(PublishError::NodeUnreachable("refused".into())));
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert!(report.parked);
+    assert_eq!(publisher.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        publisher.resolve_seen.lock().unwrap().len(),
+        1,
+        "the shared scope must not resolve after the park"
+    );
+    for id in [&personal, &shared] {
+        assert_eq!(photo(&rig, id).await.publish_attempts, 0);
+    }
+}
+
+// Should: edge-trigger publish_not_responsible / responsibility_regained
+// per scope, tagging the log entry with the library.
+#[tokio::test(flavor = "multi_thread")]
+async fn responsibility_edges_are_scoped() {
+    let rig = rig().await;
+    add_shared_library(&rig, Some(MESH_LIB)).await;
+    materialize(&rig, "p", b"p-bytes").await;
+    materialize_shared(&rig, "s", b"s-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    publisher.set_resolve_for(Some(MESH_LIB), Ok(outcome(Responsibility::Other, Vec::new())));
+    let mut state = PublishState::default();
+    pass(&rig, &publisher, &mut state).await;
+    pass(&rig, &publisher, &mut state).await;
+
+    let parked = rig.store.log_events("publish_not_responsible").await.unwrap();
+    assert_eq!(parked.len(), 1, "edge fires once while parked");
+    assert!(
+        parked[0].detail.as_deref().unwrap().contains(MESH_LIB),
+        "park edge names the library"
+    );
+
+    publisher.set_resolve_for(Some(MESH_LIB), Ok(outcome(Responsibility::Holder, Vec::new())));
+    pass(&rig, &publisher, &mut state).await;
+    let regained = rig.store.log_events("responsibility_regained").await.unwrap();
+    assert_eq!(regained.len(), 1);
+    assert!(regained[0].detail.as_deref().unwrap().contains(MESH_LIB));
+}
+
+// Should: skip (transient, publisher untouched) a scope-bound photo whose
+// library lost its mesh binding between claim and assemble — the
+// defense-in-depth re-check behind the run lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn assemble_skips_mesh_unbound() {
+    let rig = rig().await;
+    add_shared_library(&rig, Some(MESH_LIB)).await;
+    let shared = materialize_shared(&rig, "s", b"s-bytes").await;
+
+    let claimed = claim(&rig).await;
+    assert_eq!(claimed.len(), 1);
+    set_mesh_binding(&rig, None).await;
+
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let report = run_publish_pass(
+        &rig.store,
+        &rig.data_dir.spool(),
+        &publisher,
+        &rig.config.publish,
+        claimed,
+        &mut state,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.published, 0);
+    assert_eq!(report.failed, 1);
+    assert_eq!(publisher.calls.load(Ordering::Relaxed), 0);
+    let row = photo(&rig, &shared).await;
+    assert!(row.publish_last_error.as_deref().unwrap().contains("not bound"));
 }
 
 // ------------------------------------------------------------ spool eviction

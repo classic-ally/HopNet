@@ -8,9 +8,17 @@
 //! equals the blake3 of the plaintext bytes the node must serve back.
 //!
 //! Commands:
-//!   seed             --data-dir D [--count N]     fabricate N photos
+//!   seed             --data-dir D [--count N] [--mesh-library-id U]
+//!                    fabricate N photos (personal, or shared when a mesh
+//!                    library id is given)
 //!   publish          --data-dir D --node-url U --device-token T
 //!   reset-published  --data-dir D                 clear published_at (probe)
+//!
+//! Publish exit codes: 0 = queue drained; 2 = node unreachable (pass
+//! parked); 3 = SOME publish scope parked on responsibility — since the
+//! pass is scope-partitioned, healthy scopes were still drained first
+//! (check `published`/`parked_responsibility` in the JSON, not just the
+//! code).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -40,7 +48,9 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Fabricate a personal library with N fully-materialized photos.
+    /// Fabricate a library with N fully-materialized photos — personal by
+    /// default, or the SPL-bound shared library (mesh-bound, publishable)
+    /// when `--mesh-library-id` is given.
     Seed {
         #[arg(long, default_value_t = 6)]
         count: u32,
@@ -49,6 +59,10 @@ enum Cmd {
         /// seed a second dir with the same identities as another.
         #[arg(long, default_value_t = 0)]
         start: u32,
+        /// Seed into the shared library instead, bound to this consensus
+        /// shared_libraries UUID as its publish target.
+        #[arg(long)]
+        mesh_library_id: Option<String>,
     },
     /// Publish everything claimable into the node; loops until the queue is
     /// drained or the pass parks.
@@ -168,7 +182,14 @@ async fn main() {
     let data_dir = DataDir::new(&args.data_dir);
 
     match args.cmd {
-        Cmd::Seed { count, start } => {
+        Cmd::Seed {
+            count,
+            start,
+            mesh_library_id,
+        } => {
+            // The personal library always exists (scope routing needs it);
+            // shared-mode seeding additionally provisions the SPL-bound
+            // library with its mesh publish target.
             let library_id = ingress_core::LibraryId::new("personal");
             if store.library(&library_id).await.expect("library").is_none() {
                 store
@@ -178,10 +199,33 @@ async fn main() {
                         scope_binding: None,
                         retention_days: 30,
                         created_at: chrono::Utc::now(),
+                        mesh_library_id: None,
                     })
                     .await
                     .expect("insert library");
             }
+            let scope = match &mesh_library_id {
+                None => ingress_core::descriptor::LibraryScope::Personal,
+                Some(mesh) => {
+                    let shared_id = ingress_core::LibraryId::new("shared");
+                    if store.library(&shared_id).await.expect("library").is_none() {
+                        store
+                            .insert_library(&ingress_core::LibraryConfig {
+                                library_id: shared_id,
+                                display_name: "Shared".into(),
+                                scope_binding: Some(
+                                    ingress_core::model::ICLOUD_SHARED_LIBRARY_BINDING.into(),
+                                ),
+                                retention_days: 30,
+                                created_at: chrono::Utc::now(),
+                                mesh_library_id: Some(mesh.clone()),
+                            })
+                            .await
+                            .expect("insert shared library");
+                    }
+                    ingress_core::descriptor::LibraryScope::Shared
+                }
+            };
 
             let mut descriptors = std::collections::HashMap::new();
             for index in start..start + count {
@@ -189,6 +233,7 @@ async fn main() {
                     .with_cloud_id(&format!("e2e-cloud-{index}"))
                     .with_local_id(&format!("e2e-{index}"))
                     .with_thumbnails()
+                    .scope(scope)
                     .build();
                 match seed_descriptor(&store, &desc).await.expect("seed") {
                     SeedOutcome::MintedPending { .. } => {}
@@ -251,6 +296,7 @@ async fn main() {
                 "failed": totals.failed,
                 "gave_up": totals.gave_up,
                 "missing_descriptor": totals.missing_descriptor,
+                "evicted_blobs": totals.evicted_blobs,
                 "parked": totals.parked,
                 "parked_responsibility": totals.parked_responsibility,
                 "photos": photo_reports(&store).await,

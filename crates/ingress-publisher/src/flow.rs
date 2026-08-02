@@ -75,15 +75,28 @@ impl Publisher for NodePublisher {
             byte_sources.push((kind, ByteSource::Stream(Box::new(file))));
         }
 
-        // 4. The full client-side publish: validate → encrypt metadata →
-        //    mint blob keys → wrap to members → upload per resource →
-        //    photo_add. All over HttpDispatch.
+        // 4. The publish target: the library's mesh binding (None = the
+        //    personal partition). A malformed stored id is permanent —
+        //    libconfig validates the UUID on write, so this only trips on
+        //    direct DB edits, and a transient here would spin forever.
+        let library_id = item
+            .library
+            .mesh_library_id
+            .as_deref()
+            .map(CustomUUID::from_str)
+            .transpose()
+            .map_err(|e| PublishError::Rejected(format!("mesh library id not a uuid: {e}")))?;
+
+        // 5. The full client-side publish: validate → encrypt metadata →
+        //    mint blob keys → wrap to members (the node's membership
+        //    endpoint returns members ∪ invitees for a shared library) →
+        //    upload per resource → photo_add. All over HttpDispatch.
         match publish_photo_add(
             &self.dispatch,
             PublishRequest {
                 asset: &asset,
                 photo_id,
-                library_id: None, // personal partition only this phase
+                library_id,
                 byte_sources,
                 cloud_fingerprint,
             },
@@ -95,10 +108,14 @@ impl Publisher for NodePublisher {
         }
     }
 
-    async fn resolve(&self, cloud_ids: &[String]) -> Result<ResolveOutcome, PublishError> {
+    async fn resolve(
+        &self,
+        library_id: Option<&str>,
+        cloud_ids: &[String],
+    ) -> Result<ResolveOutcome, PublishError> {
         let wire = self
             .dispatch
-            .resolve_cloud_ids(cloud_ids)
+            .resolve_cloud_ids(library_id, cloud_ids)
             .await
             .map_err(classify)?;
         let responsibility = match wire.responsibility.as_str() {

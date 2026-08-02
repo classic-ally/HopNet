@@ -1,6 +1,6 @@
 //! Library configuration commands (spec §Storage root configuration):
-//! add, bind, rename (display name), set-retention. List is a plain read
-//! via [`StateStore::libraries`].
+//! add, bind, rename (display name), set-retention, set-mesh-id. List is
+//! a plain read via [`StateStore::libraries`].
 //!
 //! `library_id` is GENERATED (two words from an embedded list, e.g.
 //! `brave_otter`) and immutable — it is the PK, an FK target, and the
@@ -141,6 +141,7 @@ pub async fn add_library(
         scope_binding,
         retention_days: opts.retention_days,
         created_at: Utc::now(),
+        mesh_library_id: None,
     };
 
     let mut tx = store.pool().begin().await?;
@@ -175,9 +176,9 @@ pub async fn bind_scope(
     let _lock = acquire_repairing(store, data_dir).await?;
 
     let existing = store.libraries().await?;
-    if !existing.iter().any(|l| &l.library_id == id) {
+    let Some(target) = existing.iter().find(|l| &l.library_id == id) else {
         return Err(IngressError::Invariant(format!("no library {id}")));
-    }
+    };
     let binding = match scope {
         Some(LibraryScope::Shared) => {
             if let Some(l) = existing.iter().find(|l| {
@@ -192,6 +193,13 @@ pub async fn bind_scope(
             Some(ICLOUD_SHARED_LIBRARY_BINDING)
         }
         Some(LibraryScope::Personal) | None => {
+            if target.mesh_library_id.is_some() {
+                return Err(IngressError::Invariant(
+                    "library is bound to a mesh shared library — clear the mesh \
+                     binding first (a NULL-scope row must never carry a mesh target)"
+                        .into(),
+                ));
+            }
             if let Some(l) = existing
                 .iter()
                 .find(|l| l.scope_binding.is_none() && &l.library_id != id)
@@ -215,6 +223,51 @@ pub async fn bind_scope(
         Some(serde_json::json!({
             "library": id.to_string(),
             "binding": binding,
+        })),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Set or clear the mesh publish target for a shared library. Setting
+/// requires the row to be scope-bound — personal libraries publish to the
+/// personal partition by definition, and the publish pass partitions by
+/// `mesh_library_id` alone on the strength of this invariant. The value
+/// is validated as a UUID here (CLI is the only writer), so a malformed
+/// stored id can only come from direct DB edits.
+pub async fn set_mesh_library_id(
+    store: &StateStore,
+    data_dir: &DataDir,
+    id: &LibraryId,
+    mesh: Option<&str>,
+) -> Result<()> {
+    let _lock = acquire_repairing(store, data_dir).await?;
+    let target = store
+        .library(id)
+        .await?
+        .ok_or_else(|| IngressError::Invariant(format!("no library {id}")))?;
+    if let Some(mesh) = mesh {
+        if target.scope_binding.is_none() {
+            return Err(IngressError::Invariant(
+                "only a scope-bound (shared) library can bind a mesh library — \
+                 personal libraries publish to the personal partition"
+                    .into(),
+            ));
+        }
+        uuid::Uuid::parse_str(mesh)
+            .map_err(|e| IngressError::Invariant(format!("mesh library id is not a UUID: {e}")))?;
+    }
+
+    let mut tx = store.pool().begin().await?;
+    crate::store::libraries::update_mesh_library_id(&mut *tx, id, mesh).await?;
+    crate::store::log::append(
+        &mut *tx,
+        "mesh_library_bound",
+        None,
+        Some(serde_json::json!({
+            "library": id.to_string(),
+            "mesh_library_id": mesh,
         })),
     )
     .await?;

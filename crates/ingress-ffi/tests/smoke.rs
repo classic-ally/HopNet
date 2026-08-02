@@ -78,6 +78,7 @@ fn rig() -> Rig {
                     scope_binding: None,
                     retention_days: 30,
                     created_at: chrono::Utc::now(),
+                    mesh_library_id: None,
                 })
                 .await
                 .unwrap();

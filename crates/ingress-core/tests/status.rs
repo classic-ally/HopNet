@@ -22,6 +22,7 @@ async fn store_personal_only(tmp: &std::path::Path) -> (StateStore, LibraryId) {
             scope_binding: None,
             retention_days: 30,
             created_at: Utc::now(),
+            mesh_library_id: None,
         })
         .await
         .unwrap();
@@ -37,6 +38,7 @@ async fn add_shared_library(store: &StateStore, _tmp: &std::path::Path) -> Libra
             scope_binding: Some(ICLOUD_SHARED_LIBRARY_BINDING.to_string()),
             retention_days: 30,
             created_at: Utc::now(),
+            mesh_library_id: None,
         })
         .await
         .unwrap();

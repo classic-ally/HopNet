@@ -81,6 +81,18 @@ pub enum LibraryCommand {
     Rename { id: String, display_name: String },
     /// Change the tombstone retention window.
     SetRetention { id: String, days: i64 },
+    /// Bind a scope-bound (shared) library to a consensus shared-library
+    /// UUID — its publish target. Photos of a shared library publish only
+    /// while this is set.
+    SetMeshId {
+        id: String,
+        /// The mesh shared_libraries UUID.
+        #[arg(required_unless_present = "clear")]
+        mesh_id: Option<String>,
+        /// Clear the binding (stops shared publishing for this library).
+        #[arg(long, conflicts_with = "mesh_id")]
+        clear: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
