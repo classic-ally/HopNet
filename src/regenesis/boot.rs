@@ -174,10 +174,20 @@ pub fn boot_transition(db_path: &str, running_code: u32) -> BootOutcome {
     if let Err(e) = crate::db::shared::apply_connection_pragmas(&conn) {
         return BootOutcome::Fatal(format!("pragmas on {db_path}: {e}"));
     }
+    // A staged epoch join (RFC-019 S7) is checked BEFORE both the
+    // state-A cleanup below and the sealed gates: a straggler is not
+    // sealed, so state A would return NoBoundary and it would never
+    // cross; and a node parked by a failed gate must be able to rebuild
+    // from peers rather than fail the same local gate forever.
+    if let Some(outcome) = staged_join_transition(db_path, running_code, &mut conn) {
+        return outcome;
+    }
+
     if seal::sealed_marker(&conn).is_none() {
         // State A: normal boot. Clean anything a crashed transition or a
         // completed upgrade left behind — but NEVER the retained
-        // database (rollback window; the cleanup task owns it).
+        // database (rollback window; the cleanup task owns it), and
+        // never join staging (an in-progress download resumes).
         remove_with_sidecars(&next);
         let _ = std::fs::remove_file(&awaiting);
         return BootOutcome::NoBoundary;
@@ -282,30 +292,15 @@ pub fn boot_transition(db_path: &str, running_code: u32) -> BootOutcome {
         return park("import", format!("lineage write: {e}"));
     }
 
-    // Swap. Checkpoint and close the old database first so its WAL is
-    // empty and its sidecars can be dropped — a leftover database.db-wal
-    // would otherwise be adopted by the NEW database.db after rename 2.
-    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-        remove_with_sidecars(&next);
-        return park("import", format!("old database checkpoint: {e}"));
+    if let Err(e) = checkpoint_and_swap(db_path, conn) {
+        return match e {
+            SwapError::Refused(detail) => {
+                remove_with_sidecars(&next);
+                park("import", detail)
+            }
+            SwapError::Interrupted(detail) => BootOutcome::Fatal(detail),
+        };
     }
-    drop(conn);
-    for s in sidecars(db) {
-        let _ = std::fs::remove_file(s);
-    }
-    if let Err(e) = std::fs::rename(db, &sealed) {
-        remove_with_sidecars(&next);
-        return park("import", format!("retain rename: {e}"));
-    }
-    if let Err(e) = std::fs::rename(&next, db) {
-        // Recoverable on next boot as state C — do not touch anything.
-        return BootOutcome::Fatal(format!(
-            "epoch swap interrupted after retain: rename {} -> {db_path}: {e} \
-             (next boot completes the swap)",
-            next.display()
-        ));
-    }
-    let _ = std::fs::remove_file(&awaiting);
 
     let epoch = epoch_genesis.record.epoch;
     tracing::info!(
@@ -315,6 +310,245 @@ pub fn boot_transition(db_path: &str, running_code: u32) -> BootOutcome {
         "epoch boundary crossed: fresh database installed, engine will start at H+1"
     );
     BootOutcome::Transitioned { epoch }
+}
+
+/// How a swap failed: before anything moved (the old database is intact
+/// and the boundary can be retried), or between the two renames (state C
+/// on the next boot completes it).
+enum SwapError {
+    Refused(String),
+    Interrupted(String),
+}
+
+/// Retire the old database and swap the freshly built `.next` in.
+///
+/// Checkpoint and close the old database FIRST so its WAL is empty and
+/// its sidecars can be dropped — a leftover `database.db-wal` would
+/// otherwise be adopted by the NEW `database.db` after rename 2.
+fn checkpoint_and_swap(db_path: &str, conn: rusqlite::Connection) -> Result<(), SwapError> {
+    let db = Path::new(db_path);
+    let next = next_path(db_path);
+    let sealed = sealed_path(db_path);
+
+    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        return Err(SwapError::Refused(format!("old database checkpoint: {e}")));
+    }
+    drop(conn);
+    for s in sidecars(db) {
+        let _ = std::fs::remove_file(s);
+    }
+    if let Err(e) = std::fs::rename(db, &sealed) {
+        return Err(SwapError::Refused(format!("retain rename: {e}")));
+    }
+    if let Err(e) = std::fs::rename(&next, db) {
+        return Err(SwapError::Interrupted(format!(
+            "epoch swap interrupted after retain: rename {} -> {db_path}: {e} \
+             (next boot completes the swap)",
+            next.display()
+        )));
+    }
+    let _ = std::fs::remove_file(awaiting_upgrade_path(db_path));
+    Ok(())
+}
+
+/// Cross an epoch boundary from inputs a peer served and this node
+/// already verified once online (RFC-019 S7). Returns `None` to fall
+/// through to the ordinary boot paths.
+///
+/// Everything staged is re-verified here over the same immutable bytes:
+/// the online pass proves the download is worth keeping, this pass is
+/// what the swap actually trusts. A straggler may also have sealed
+/// itself in the meantime (a still-sealed peer can serve it the final
+/// block); the staged path takes precedence and builds the same
+/// certified state either way.
+fn staged_join_transition(
+    db_path: &str,
+    running_code: u32,
+    conn: &mut rusqlite::Connection,
+) -> Option<BootOutcome> {
+    use crate::regenesis::join;
+
+    let staging = join::staging_path(db_path);
+    if !staging.exists() {
+        return None;
+    }
+    let Some(manifest) = join::read_manifest(&staging) else {
+        // Incomplete: a download was interrupted. KEEP the partials —
+        // the next online attempt resumes from them.
+        tracing::info!(
+            path = %staging.display(),
+            "join staging is incomplete: keeping partial download for resume"
+        );
+        return None;
+    };
+
+    // A leftover from a transition that already completed (the swap
+    // happens before the cleanup).
+    if genesis::current_epoch(conn) >= manifest.target_epoch {
+        join::clear_staging(&staging);
+        return None;
+    }
+
+    // Gate 1: VERSION, before anything touches schema — a straggler
+    // coming back across an UPGRADE boundary must not build the new
+    // epoch's database with the old binary. Staging is kept: the
+    // download is certified and the upgraded binary boots into it.
+    if running_code != manifest.required_version_code {
+        let required = manifest.required_version_code;
+        tracing::warn!(
+            required = %crate::version::format_code(required),
+            running = %crate::version::format_code(running_code),
+            "staged epoch join requires a different version: parking awaiting upgrade"
+        );
+        write_awaiting_marker(db_path, required);
+        return Some(BootOutcome::Parked(ParkReason::AwaitingUpgrade {
+            required,
+            running: running_code,
+        }));
+    }
+
+    let records = match join::read_staged_lineage(&staging, &manifest) {
+        Ok(r) => r,
+        Err(e) => return Some(poison(&staging, format!("staged lineage unreadable: {e}"))),
+    };
+
+    // Gate 2: CHAIN + OVERLAP against our OWN last-trusted state. This
+    // passed online over these same bytes, so a failure here means the
+    // staging was corrupted on disk — discard it and refetch.
+    let mut anchor = match genesis::ChainAnchor::from_db(conn) {
+        Ok(a) => a,
+        Err(e) => return Some(poison(&staging, format!("anchor: {e}"))),
+    };
+    if manifest.manual_anchor {
+        // Operator re-trust: weak subjectivity is exactly what they
+        // overrode. Linkage, per-hop quorum and the snapshot hash below
+        // are all still enforced.
+        anchor.trusted = None;
+    }
+    let target = match genesis::verify_lineage_chain(&records, anchor) {
+        Ok(t) => t,
+        Err(e) => return Some(poison(&staging, e)),
+    };
+    if target.record.epoch != manifest.target_epoch {
+        return Some(poison(
+            &staging,
+            format!(
+                "manifest claims epoch {} but the chain ends at {}",
+                manifest.target_epoch, target.record.epoch
+            ),
+        ));
+    }
+
+    // Gate 3: SNAPSHOT — the artifact must be exactly what the verified
+    // chain certifies.
+    let artifact = match std::fs::read(join::staged_snapshot_path(&staging)) {
+        Ok(bytes) => bytes,
+        Err(e) => return Some(poison(&staging, format!("staged snapshot: {e}"))),
+    };
+    if *blake3::hash(&artifact).as_bytes() != target.record.snapshot_hash {
+        return Some(poison(&staging, "staged snapshot fails its certified hash".into()));
+    }
+
+    // Rebuild with the SAME machinery the sealed path uses: certified
+    // import, node-local carry, genesis at H, fresh meta, roundtrip gate.
+    let epoch_genesis = match staged_epoch_genesis(target) {
+        Ok(g) => g,
+        Err(e) => return Some(poison(&staging, e)),
+    };
+    let next = next_path(db_path);
+    remove_with_sidecars(&next);
+    if let Err(e) = build_next(&next, db_path, &artifact, &epoch_genesis) {
+        remove_with_sidecars(&next);
+        return Some(park("staged-join", e));
+    }
+
+    // Every verified record is kept forever — that is what lets a node
+    // that arrived by join answer the next straggler.
+    let dir = Path::new(db_path).parent().unwrap_or_else(|| Path::new("."));
+    for lr in &records {
+        match bincode::serde::encode_to_vec(lr, bincode::config::standard()) {
+            Ok(bytes) => {
+                if let Err(e) = genesis::write_lineage_bytes(dir, lr.record.epoch, &bytes) {
+                    remove_with_sidecars(&next);
+                    return Some(park("staged-join", format!("lineage write: {e}")));
+                }
+            }
+            Err(e) => {
+                remove_with_sidecars(&next);
+                return Some(park("staged-join", format!("lineage encode: {e}")));
+            }
+        }
+    }
+
+    let owned = std::mem::replace(conn, match rusqlite::Connection::open_in_memory() {
+        Ok(c) => c,
+        Err(e) => {
+            remove_with_sidecars(&next);
+            return Some(park("staged-join", format!("placeholder connection: {e}")));
+        }
+    });
+    if let Err(e) = checkpoint_and_swap(db_path, owned) {
+        return Some(match e {
+            SwapError::Refused(detail) => {
+                remove_with_sidecars(&next);
+                park("staged-join", detail)
+            }
+            SwapError::Interrupted(detail) => BootOutcome::Fatal(detail),
+        });
+    }
+
+    // Post-swap, pre-engine: the fragment store survived untouched but
+    // the inventory it is measured against was just replaced. Log-only —
+    // a reconcile failure must never strand a node that just rejoined.
+    match rusqlite::Connection::open(db_path) {
+        Ok(fresh) => {
+            let fragments_dir = hopnet_storage::fragstore::get_fragments_dir()
+                .unwrap_or_else(|_| String::new());
+            match join::reconcile_fragment_store(&fresh, &fragments_dir, join::now_unix()) {
+                Ok((remarked, orphans)) => tracing::info!(
+                    remarked,
+                    orphans,
+                    "fragment store reconciled against the joined epoch"
+                ),
+                Err(e) => tracing::warn!("fragment reconcile failed (harmless): {e}"),
+            }
+        }
+        Err(e) => tracing::warn!("fragment reconcile skipped: {e}"),
+    }
+
+    join::clear_staging(&staging);
+    let epoch = epoch_genesis.record.epoch;
+    tracing::info!(
+        epoch,
+        seal_height = epoch_genesis.record.seal_height,
+        hops = records.len(),
+        "epoch join complete: rebuilt from peer-served lineage and snapshot"
+    );
+    Some(BootOutcome::Transitioned { epoch })
+}
+
+/// A staged chain's target record is a full genesis: the canonical block
+/// derives from the record, and the lineage evidence rides along.
+fn staged_epoch_genesis(
+    target: &genesis::LineageRecord,
+) -> Result<genesis::EpochGenesis, String> {
+    let final_block = hopnet_consensus::codec::decode(&target.final_block)
+        .map_err(|e| format!("target final block: {e:?}"))?;
+    let final_cert = hopnet_consensus::codec::decode(&target.final_cert)
+        .map_err(|e| format!("target final cert: {e:?}"))?;
+    Ok(genesis::EpochGenesis {
+        block: genesis::genesis_block_for(&target.record)?,
+        record: target.record.clone(),
+        final_block,
+        final_cert,
+    })
+}
+
+/// A staged input failed verification at boot after passing online: the
+/// staging is corrupt, so discard it and let the next attempt refetch.
+fn poison(staging: &Path, detail: String) -> BootOutcome {
+    crate::regenesis::join::clear_staging(staging);
+    park("staged-join", detail)
 }
 
 /// Build the fresh epoch database at `next`: schema, certified import,
@@ -582,6 +816,299 @@ pub(crate) mod tests {
 
     fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    // ------------------------------------------------------------------
+    // Staged epoch join (RFC-019 S7): the boot half of a rejoin.
+    // ------------------------------------------------------------------
+
+    use crate::regenesis::join::{self, StagedJoinManifest};
+
+    /// A "mesh" database that already crossed into epoch 2, and the
+    /// staged inputs a straggler would have downloaded from it.
+    struct JoinFixture {
+        /// The straggler's own (unsealed, epoch-1) database.
+        db_path: String,
+        staging: PathBuf,
+        target_epoch: u64,
+        snapshot: Vec<u8>,
+        lineage: Vec<u8>,
+    }
+
+    /// Build a straggler beside a transitioned peer: the straggler is the
+    /// S6 sealed fixture with its seal cleared (it simply slept through
+    /// the boundary), and staging holds the peer's real lineage record
+    /// and artifact.
+    fn join_fixture(client_dir: &Path, server_dir: &Path) -> JoinFixture {
+        let server = sealed_db(server_dir);
+        match boot_transition(&server, TARGET) {
+            BootOutcome::Transitioned { epoch: 2 } => {}
+            other => panic!("server fixture failed: {other:?}"),
+        }
+        // The transition leaves no artifact file; ask the serving path
+        // for it exactly as a joiner would.
+        match crate::regenesis::rpc::serve_request(
+            &server,
+            crate::regenesis::rpc::RegenesisNetRequest::SnapshotInfo { epoch: 2 },
+        ) {
+            crate::regenesis::rpc::RegenesisNetResponse::SnapshotInfo { .. } => {}
+            other => panic!("server cannot serve its snapshot: {other:?}"),
+        }
+        let snapshot =
+            std::fs::read(server_dir.join(seal::SEAL_ARTIFACT_FILENAME)).unwrap();
+        let lineage = std::fs::read(genesis::lineage_path(server_dir, 2)).unwrap();
+
+        let db_path = sealed_db(client_dir);
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            crate::db::shared::apply_connection_pragmas(&conn).unwrap();
+            conn.execute("DELETE FROM regenesis_state", []).unwrap();
+            conn.execute(
+                "DELETE FROM consensus_meta WHERE key = ?",
+                [seal::META_SEALED_AT],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+
+        let staging = join::staging_path(&db_path);
+        JoinFixture {
+            db_path,
+            staging,
+            target_epoch: 2,
+            snapshot,
+            lineage,
+        }
+    }
+
+    impl JoinFixture {
+        /// Write a complete staging (manifest last), as the online join
+        /// would leave it.
+        fn stage(&self, manual_anchor: bool) {
+            self.stage_with(manual_anchor, &self.snapshot, &self.lineage);
+        }
+
+        fn stage_with(&self, manual_anchor: bool, snapshot: &[u8], lineage: &[u8]) {
+            std::fs::create_dir_all(&self.staging).unwrap();
+            std::fs::write(self.staging.join("epoch-2.bin"), lineage).unwrap();
+            std::fs::write(join::staged_snapshot_path(&self.staging), snapshot).unwrap();
+            let record = genesis::decode_lineage(&self.lineage).unwrap().record;
+            let manifest = StagedJoinManifest {
+                format_version: 1,
+                from_epoch: 1,
+                target_epoch: self.target_epoch,
+                lineage_epochs: vec![2],
+                required_version_code: record.required_version_code,
+                snapshot_hash: record.snapshot_hash,
+                snapshot_len: snapshot.len() as u64,
+                manual_anchor,
+            };
+            let bytes =
+                bincode::serde::encode_to_vec(&manifest, bincode::config::standard()).unwrap();
+            std::fs::write(join::manifest_path(&self.staging), bytes).unwrap();
+        }
+    }
+
+    // Impact: this is the straggler's rebuild — a node that missed the
+    // boundary entirely ends up byte-for-byte on the new epoch's
+    // certified state, keeping its own identity and fragment bookkeeping.
+    // Should: cross into the target epoch from staged inputs, retain the
+    // old database for rollback, persist the lineage record, and clear
+    // the staging.
+    #[test]
+    fn staged_join_crosses_the_boundary() {
+        let client = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let fx = join_fixture(client.path(), server.path());
+        fx.stage(false);
+
+        match boot_transition(&fx.db_path, TARGET) {
+            BootOutcome::Transitioned { epoch: 2 } => {}
+            other => panic!("expected a staged crossing, got {other:?}"),
+        }
+
+        let conn = open(&fx.db_path);
+        assert_eq!(genesis::current_epoch(&conn), 2);
+        assert_eq!(genesis::epoch_genesis_height(&conn), Some(H));
+        // The genesis sits at H and the old epoch's history is gone.
+        assert_eq!(
+            hopnet_consensus::store::last_decided_height(&conn).unwrap(),
+            Some(Height(H))
+        );
+        // Node-local identity carried; the seal did NOT.
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM this_node"), 1);
+        assert!(seal::sealed_marker(&conn).is_none());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM regenesis_state"), 0);
+
+        assert!(sealed_path(&fx.db_path).exists(), "rollback window retained");
+        assert!(genesis::lineage_path(client.path(), 2).exists(), "lineage kept");
+        assert!(!fx.staging.exists(), "staging cleared after the crossing");
+    }
+
+    // Impact: an upgrade-boundary straggler running the old binary must
+    // never build the new epoch's database — the node-local carry copies
+    // rows blind, and only the exact-version gate makes that safe.
+    // Should: park awaiting upgrade and KEEP the staged inputs, then
+    // cross once the right binary boots.
+    // Should not: touch the live database while parked.
+    #[test]
+    fn staged_join_version_gate_parks_and_keeps_staging() {
+        let client = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let fx = join_fixture(client.path(), server.path());
+        fx.stage(false);
+        let before = std::fs::read(&fx.db_path).unwrap();
+
+        match boot_transition(&fx.db_path, TARGET + 100) {
+            BootOutcome::Parked(ParkReason::AwaitingUpgrade { required, .. }) => {
+                assert_eq!(required, TARGET)
+            }
+            other => panic!("expected an awaiting-upgrade park, got {other:?}"),
+        }
+        assert!(join::read_manifest(&fx.staging).is_some(), "staging kept");
+        assert_eq!(std::fs::read(&fx.db_path).unwrap(), before, "database untouched");
+        assert!(awaiting_upgrade_path(&fx.db_path).exists());
+
+        // The upgraded binary completes it.
+        match boot_transition(&fx.db_path, TARGET) {
+            BootOutcome::Transitioned { epoch: 2 } => {}
+            other => panic!("expected the crossing after upgrade, got {other:?}"),
+        }
+        assert!(!awaiting_upgrade_path(&fx.db_path).exists());
+    }
+
+    // Impact: staged bytes passed verification once online, so a failure
+    // at boot means the staging rotted on disk — retrying it forever
+    // would wedge the node.
+    // Should: park and DISCARD the staging so the next attempt refetches.
+    #[test]
+    fn corrupt_staging_is_discarded() {
+        for (name, corrupt) in [
+            ("snapshot", true),
+            ("lineage", false),
+        ] {
+            let client = tempfile::tempdir().unwrap();
+            let server = tempfile::tempdir().unwrap();
+            let fx = join_fixture(client.path(), server.path());
+            if corrupt {
+                let mut bad = fx.snapshot.clone();
+                bad[0] ^= 0xFF;
+                fx.stage_with(false, &bad, &fx.lineage);
+            } else {
+                let mut bad = genesis::decode_lineage(&fx.lineage).unwrap();
+                bad.record.prev_chain_id = [0x5A; 32];
+                let bytes =
+                    bincode::serde::encode_to_vec(&bad, bincode::config::standard()).unwrap();
+                fx.stage_with(false, &fx.snapshot, &bytes);
+            }
+            let before = std::fs::read(&fx.db_path).unwrap();
+
+            match boot_transition(&fx.db_path, TARGET) {
+                BootOutcome::Parked(ParkReason::GateFailed { gate, .. }) => {
+                    assert_eq!(gate, "staged-join", "{name}")
+                }
+                other => panic!("{name}: expected a park, got {other:?}"),
+            }
+            assert!(!fx.staging.exists(), "{name}: staging discarded");
+            assert_eq!(
+                std::fs::read(&fx.db_path).unwrap(),
+                before,
+                "{name}: database untouched"
+            );
+        }
+    }
+
+    // Impact: an operator re-trust is the escape hatch when churn moved
+    // past the overlap window — it must waive weak subjectivity and
+    // nothing else.
+    // Should: cross when the staged chain overlaps nothing this node
+    // trusted, provided the manifest says an operator asked for it.
+    // Should not: cross on the same inputs without that flag.
+    #[test]
+    fn manual_anchor_waives_only_the_overlap() {
+        let client = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let fx = join_fixture(client.path(), server.path());
+
+        // Re-seat the straggler under validators the boundary
+        // certificate knows nothing about: churn beyond overlap.
+        {
+            let conn = rusqlite::Connection::open(&fx.db_path).unwrap();
+            crate::db::shared::apply_connection_pragmas(&conn).unwrap();
+            conn.execute("DELETE FROM validators", []).unwrap();
+            for id in [8i32, 9i32] {
+                conn.execute(
+                    "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, 1, ?)",
+                    params![id, format!("node{id}"), pubkey_blob(&key(id as u8))],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO validators (effective_height, node_id, is_active) VALUES (1, ?, 1)",
+                    params![id],
+                )
+                .unwrap();
+            }
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+
+        fx.stage(false);
+        match boot_transition(&fx.db_path, TARGET) {
+            BootOutcome::Parked(ParkReason::GateFailed { gate, detail }) => {
+                assert_eq!(gate, "staged-join");
+                assert!(detail.contains("overlap"), "{detail}");
+            }
+            other => panic!("expected an overlap refusal, got {other:?}"),
+        }
+
+        fx.stage(true);
+        match boot_transition(&fx.db_path, TARGET) {
+            BootOutcome::Transitioned { epoch: 2 } => {}
+            other => panic!("expected the operator-anchored crossing, got {other:?}"),
+        }
+    }
+
+    // Impact: a download interrupted by a crash is the common case on a
+    // bad link — deleting the partial would restart it from zero every
+    // boot.
+    // Should: leave an incomplete staging alone and boot normally.
+    #[test]
+    fn incomplete_staging_survives_a_normal_boot() {
+        let client = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let fx = join_fixture(client.path(), server.path());
+        std::fs::create_dir_all(&fx.staging).unwrap();
+        let partial = fx.staging.join("snapshot.bin.partial");
+        std::fs::write(&partial, &fx.snapshot[..64]).unwrap();
+
+        match boot_transition(&fx.db_path, TARGET) {
+            BootOutcome::NoBoundary => {}
+            other => panic!("expected a normal boot, got {other:?}"),
+        }
+        assert!(partial.exists(), "partial download kept for resume");
+    }
+
+    // Impact: the swap happens before the cleanup, so a crash in between
+    // leaves staging behind on an already-transitioned database.
+    // Should: discard leftover staging for an epoch already reached and
+    // boot normally.
+    #[test]
+    fn staging_for_an_epoch_already_reached_is_cleared() {
+        let client = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let fx = join_fixture(client.path(), server.path());
+        fx.stage(false);
+        assert!(matches!(
+            boot_transition(&fx.db_path, TARGET),
+            BootOutcome::Transitioned { epoch: 2 }
+        ));
+
+        // Re-stage the same (now redundant) inputs and boot again.
+        fx.stage(false);
+        match boot_transition(&fx.db_path, TARGET) {
+            BootOutcome::NoBoundary => {}
+            other => panic!("expected a normal boot, got {other:?}"),
+        }
+        assert!(!fx.staging.exists(), "redundant staging cleared");
     }
 
     // Impact: this is the boundary itself — every assertion here is a

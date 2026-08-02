@@ -313,11 +313,23 @@ pub fn write_lineage(dir: &std::path::Path, genesis: &EpochGenesis) -> Result<st
     };
     let bytes = bincode::serde::encode_to_vec(&record, bincode::config::standard())
         .map_err(|e| format!("lineage encode: {e}"))?;
-    let path = lineage_path(dir, genesis.record.epoch);
+    write_lineage_bytes(dir, genesis.record.epoch, &bytes)
+}
+
+/// Persist an ALREADY-ENCODED lineage record. A node that arrived by
+/// epoch join holds its chain in exactly the form the serving scope
+/// hands out; keeping every record it verified is what lets it answer
+/// the next straggler (records are kept forever).
+pub fn write_lineage_bytes(
+    dir: &std::path::Path,
+    epoch: u64,
+    bytes: &[u8],
+) -> Result<std::path::PathBuf, String> {
+    let path = lineage_path(dir, epoch);
     let parent = path.parent().expect("lineage path has a parent");
     std::fs::create_dir_all(parent).map_err(|e| format!("lineage dir: {e}"))?;
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, &bytes).map_err(|e| format!("lineage write: {e}"))?;
+    std::fs::write(&tmp, bytes).map_err(|e| format!("lineage write: {e}"))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("lineage rename: {e}"))?;
     Ok(path)
 }

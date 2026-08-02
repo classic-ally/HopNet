@@ -51,6 +51,11 @@ pub struct StagedJoinManifest {
     pub target_epoch: u64,
     /// Contiguous `from_epoch + 1 ..= target_epoch`.
     pub lineage_epochs: Vec<u64>,
+    /// The version the target epoch requires. Carried here so the boot
+    /// path can run its version gate before reading, verifying, or
+    /// importing anything — an old binary must never build the new
+    /// epoch's database.
+    pub required_version_code: u32,
     pub snapshot_hash: [u8; 32],
     pub snapshot_len: u64,
     /// Operator re-trust: the boot path skips the OVERLAP check only.
@@ -327,6 +332,7 @@ fn stage_manifest(
         from_epoch,
         target_epoch: target.epoch,
         lineage_epochs,
+        required_version_code: target.required_version_code,
         snapshot_hash: target.snapshot_hash,
         snapshot_len,
         manual_anchor,
@@ -531,6 +537,86 @@ async fn request(
     transport.request(peer, req, timeout).await
 }
 
+/// Reconcile the fragment store against a freshly imported inventory
+/// (RFC-019 S7), in both directions:
+///
+/// - a fragment the new epoch's inventory backs but that imported with
+///   `stored_locally = 0` is re-marked if the bytes are on disk and hash
+///   correctly (a joiner has no old database to carry the flag from);
+/// - a fragment on disk that the new inventory does not back at all is
+///   an orphan and is deleted.
+///
+/// Direct SQL, deliberately NOT the attestation path: `apply_self_check`
+/// guards on an exact previous count, which is right for a live
+/// attestation and wrong for a wholesale post-import reconciliation.
+/// `self_verified_height` is left NULL — the existing self-check cron
+/// re-attests over time, at its own pace.
+///
+/// Runs at boot before the engine starts, so the zero grace period on
+/// the orphan scan is safe: there are no in-flight stores to race. The
+/// scan still only considers fragments strictly older than `now_unix`,
+/// so anything written in the current second survives to the next pass —
+/// under-collecting orphans is harmless, over-collecting is not.
+/// Returns `(remarked, orphans_deleted)`.
+pub fn reconcile_fragment_store(
+    conn: &rusqlite::Connection,
+    fragments_dir: &str,
+    now_unix: u64,
+) -> Result<(usize, usize), String> {
+    let unmarked: Vec<(String, i64, i64, Vec<u8>)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT data_block_id, chunk_number, local_index, fragment_hash
+                 FROM fragment_hashes WHERE stored_locally = 0",
+            )
+            .map_err(|e| format!("unmarked query: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(|e| format!("unmarked rows: {e}"))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|e| format!("unmarked collect: {e}"))?
+    };
+
+    let mut remarked = 0usize;
+    for (block_id, chunk, index, hash_bytes) in unmarked {
+        let Ok(raw) = <[u8; 32]>::try_from(hash_bytes.as_slice()) else {
+            continue;
+        };
+        let hash = hopnet_storage::Blake3Hash::from_bytes(raw);
+        if !hopnet_storage::fragstore::fragment_exists_and_valid(fragments_dir, &hash) {
+            continue;
+        }
+        conn.execute(
+            "UPDATE fragment_hashes SET stored_locally = 1
+             WHERE data_block_id = ? AND chunk_number = ? AND local_index = ?",
+            rusqlite::params![block_id, chunk, index],
+        )
+        .map_err(|e| format!("re-mark: {e}"))?;
+        remarked += 1;
+    }
+
+    let scan =
+        hopnet_storage::maintenance::scan_orphaned_fragments(conn, fragments_dir, 0, now_unix)
+            .map_err(|e| format!("orphan scan: {e:?}"))?;
+    let cleanup = hopnet_storage::maintenance::cleanup_orphaned_fragments(
+        fragments_dir,
+        scan,
+        now_unix as i64,
+    )
+    .map_err(|e| format!("orphan cleanup: {e:?}"))?;
+    Ok((remarked, cleanup.deleted_count))
+}
+
+/// Seconds since the epoch, for the reconcile clock.
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Spawn an epoch join unless one is already inflight. The trigger seam
 /// shared by the sync classification, the tip poll, and the probe pong —
 /// all of which can observe an epoch-ahead peer concurrently.
@@ -655,6 +741,7 @@ mod tests {
             from_epoch: 1,
             target_epoch: 2,
             lineage_epochs: vec![2],
+            required_version_code: TARGET,
             snapshot_hash: [0; 32],
             snapshot_len: 0,
             manual_anchor: false,
@@ -675,6 +762,73 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("database.db").to_string_lossy().into_owned();
         assert_eq!(staging_path(&db_path), dir.path().join(JOIN_STAGING_DIR));
+    }
+
+    // Impact: a rejoining node's fragment store survives the boundary
+    // but the inventory it is measured against is replaced wholesale —
+    // without this pass a joiner reports holding nothing it actually
+    // holds, and keeps bytes the new epoch no longer knows about.
+    // Should: re-mark on-disk fragments the new inventory backs, and
+    // delete on-disk fragments it does not.
+    // Should not: re-mark a row whose bytes are absent or corrupt.
+    #[test]
+    fn reconcile_remarks_local_fragments_and_drops_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = sealed_db(dir.path());
+        let frag_dir = dir.path().join("fragments");
+        std::fs::create_dir_all(&frag_dir).unwrap();
+        let frags = frag_dir.to_string_lossy().into_owned();
+
+        let backed = b"a fragment the new epoch still backs".to_vec();
+        let backed_hash =
+            hopnet_storage::Blake3Hash::from_bytes(*blake3::hash(&backed).as_bytes());
+        let orphan = b"a fragment nothing backs any more".to_vec();
+        let orphan_hash =
+            hopnet_storage::Blake3Hash::from_bytes(*blake3::hash(&orphan).as_bytes());
+        hopnet_storage::fragstore::store_fragment(&frags, &backed_hash, backed).unwrap();
+        hopnet_storage::fragstore::store_fragment(&frags, &orphan_hash, orphan).unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::db::shared::apply_connection_pragmas(&conn).unwrap();
+        // The imported inventory backs the first fragment but, having
+        // come from a snapshot, claims nothing is stored locally. Add a
+        // second row whose bytes were never on disk.
+        conn.execute(
+            "UPDATE fragment_hashes SET fragment_hash = ?, stored_locally = 0",
+            rusqlite::params![backed_hash.0.as_bytes().to_vec()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fragment_hashes
+             (data_block_id, chunk_number, local_index, fragment_id, fragment_hash, chunk_type, stored_locally)
+             VALUES ('blob1', 0, 1, 'frag2', ?, 0, 0)",
+            rusqlite::params![vec![0xEEu8; 32]],
+        )
+        .unwrap();
+
+        // The scan only sees fragments strictly older than the clock it
+        // is given, so look from one second in the future.
+        let (remarked, orphans) =
+            reconcile_fragment_store(&conn, &frags, now_unix() + 1).unwrap();
+        assert_eq!(remarked, 1, "only the fragment actually on disk");
+        assert_eq!(orphans, 1, "the unbacked file is deleted");
+
+        let marked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fragment_hashes WHERE stored_locally = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marked, 1);
+        assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags,
+            &backed_hash
+        ));
+        assert!(!hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags,
+            &orphan_hash
+        ));
     }
 
     // ------------------------------------------------------------------
