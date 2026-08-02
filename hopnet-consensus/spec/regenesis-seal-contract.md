@@ -65,3 +65,12 @@ path at H+1 is S6's.
   seal and restart recovers by recomputing, never by peers.
 - Boot the new epoch as a fresh engine at H+1 with the carried
   committed state and an empty evidence map.
+
+> **Landed (S6).** The restart path consuming this contract shipped in
+> RFC-019 S6: `regenesis::boot::boot_transition` (pre-pool, crash-safe
+> swap), `regenesis::genesis` (canonical record; chain id = genesis
+> block hash at H), exit code 75 restart derivation, and the
+> `(epoch, version)` handshake. The contract's five clauses are
+> exercised end-to-end by the in-process transition roundtrip and the
+> orchestrator `regenesis-restart` / `regenesis-awaiting-upgrade`
+> scenarios.

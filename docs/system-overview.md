@@ -78,10 +78,25 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       blake3 of the artifact bytes), durable seal marker + byte-
       certified artifact next to the database; evidence at four
       layers (handler/vote-time units, seeded sim drain+seal
-      scenarios, real-engine loopback e2e, orchestrator
-      regenesis-seal ending deliberately sealed). Next: S6 genesis
-      construction + restart (boot gates, awaiting-upgrade parking,
-      epoch/version handshake).
+      scenarios, real-engine loopback e2e, orchestrator scenario);
+      S6 genesis construction + restart — deterministic
+      EpochGenesisRecord in a genesis Block at boundary height H
+      (chain_id(N+1) = its hash; the node-local decide certificate
+      rides BESIDE the genesis in the forever-kept lineage record),
+      pre-pool boot transition (`regenesis::boot`: VERSION/LINEAGE/
+      IMPORT/CARRY gates, one-transaction fresh-DB build, atomic
+      swap, rollback window until the first epoch-2 decide), derived
+      restart (exit 75 at version match; awaiting-upgrade parked
+      ALIVE otherwise, surfaced on the status view), (epoch, version)
+      handshake on the status probe + DecidedFetch, test-gated
+      version-override seams; evidence: boot/genesis units incl. a
+      canonical-bytes golden, in-process single-node transition
+      roundtrip (epoch 2 decides H+1 and seals itself again),
+      orchestrator regenesis-restart (full cycle, exit 75, epoch-2
+      coherence) + regenesis-awaiting-upgrade (parked-alive, per-node
+      swap, liveness gate). Next: S7 stragglers + rejoin (overlap
+      verification, snapshot/lineage fetch, epoch join, fragment
+      reconcile).
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

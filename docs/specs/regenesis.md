@@ -598,8 +598,70 @@ protocol it checks.
       epoch-mismatch + lineage); with on-demand heights the window is
       tiny (a drained moratorium is height-stable), but S7 should keep
       it explicitly in scope
-- [ ] S6 — genesis construction + restart: lineage, boot gates,
+- [x] S6 — genesis construction + restart: lineage, boot gates,
       awaiting-upgrade parking, `(epoch, version)` handshake
+    - the canonical genesis is a deterministic engine Block at the
+      boundary height H whose single synthetic transaction carries the
+      `EpochGenesisRecord`; **chain_id(N+1) = that block's hash** —
+      the epoch-1 rule reapplied, so the signing domain rotates at
+      every boundary. The node-divergent input (the final decide
+      certificate — `decided_certificates` is node-local by design)
+      is EXCLUDED from the canonical bytes and travels beside the
+      genesis in the lineage record (`lineage/epoch-E.bin`, kept
+      forever) as per-node evidence, verified against the seated set
+      rather than compared byte-for-byte. A golden test pins the
+      canonical encoding
+    - the transition runs at BOOT, pre-pool (`regenesis::boot`), as a
+      crash-safe state machine over file presence: build the fresh
+      database at `database.db.next` (ONE transaction: certified
+      import with any skipped section fatal, node-local carry —
+      whole tables by ATTACH-copy, fragment columns by primary-key
+      join — genesis at H, fresh consensus meta incl. `epoch` and
+      `epoch_genesis_height`), checkpoint both files, rename old →
+      `database.db.sealed` (rollback window: deleted at the new
+      epoch's first decide), rename next → live. The between-renames
+      crash window is completed on the next boot without re-running
+      gates; a live-db-missing state with only a retained database is
+      fatal-loud, never a fresh boot over a mesh identity
+    - restart behavior DERIVED per spec: the seal work compares the
+      committed target with `version::effective_running_code()`;
+      match → `restart_signal` and the BINARY exits **75**
+      (EX_TEMPFAIL; systemd `RestartForceExitStatus=75` or plain
+      Restart=always — the orchestrator restarts containers
+      explicitly). Library code never exits, so in-process tests
+      observe the Notify. Mismatch → awaiting-upgrade: marker file +
+      status surface (`awaiting_upgrade`, `running_version`, `epoch`,
+      `rollback_retained`, `boundary_error` on the status view),
+      process parked ALIVE on the sealed database
+    - handshake v1: status Ping/Pong carries `(epoch, version_code)`
+      both ways (structured warn on mismatch — the silent signature-
+      domain failure made diagnosable); `DecidedFetch` carries the
+      requester's epoch, refused with a structured error on mismatch
+      — the exact hook S7's epoch join extends into a lineage answer.
+      DecidedFetch is now served WITHOUT a live engine (a sealed/
+      parked node answering a laggard its final blocks is rejoin
+      machinery). Bincode positional wire compat with older binaries
+      is broken by these fields — accepted, dev meshes are disposable
+    - test seams: `HOPNET_UPGRADE_VERSION_OVERRIDE` /
+      `HOPNET_UPGRADE_STAGED_OVERRIDE`, honoured in test mode only —
+      a release-image node can claim a different running/staged
+      version, so awaiting-upgrade parking and upgrade-target starts
+      are testable without a second image (the real binary swap is
+      S8's)
+    - sim + Quint: NOTHING added — `epoch_policy`'s `restartEpoch`
+      already models the transition (the S4 bridge lemma carries
+      safety across it), and process restart is host-layer file/DB
+      machinery outside the sim's engine vocabulary. Evidence instead:
+      boot unit tests (gates, crash states, carry, idempotency), the
+      in-process single-node transition roundtrip (seal → exit signal
+      → transition → fresh engine → H+1 decides → rollback close →
+      epoch 2 seals itself again), and the two orchestrator scenarios
+      (regenesis-restart: full cycle over real containers incl. exit
+      75; regenesis-awaiting-upgrade: parked-alive + per-node swap +
+      the liveness gate observed — one upgraded node decides nothing
+      alone)
+    - app-layer heights were already u64 end-to-end (the RFC's i32
+      widening concern was discharged before S6 — verified, no work)
 - [ ] S7 — stragglers + rejoin: overlap verification, snapshot
       fetch, re-trust UI, fragment reconcile
   - orchestrator: housekeeping-regenesis, straggler-rejoin,
