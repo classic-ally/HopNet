@@ -138,12 +138,31 @@ pub struct PhotoEditContentEntry {
     /// Resources to upsert — the first entry is the primary edited
     /// resource (logged in photo_operations with prior/new); additional
     /// entries are thumbnails (upserted without individual logging).
+    /// May be empty iff `remove_resources` is not (a revert that only
+    /// drops the edited render).
     pub resources: Vec<PhotoResourceOp>,
     /// Optional metadata update (e.g. dimensions changed by crop).
     pub encrypted_metadata: Option<Vec<u8>>,
     pub metadata_nonce: Option<[u8; 12]>,
     /// UUIDv7 for the photo_operations row.
     pub operation_id: CustomUUID,
+    /// Re-wraps of the metadata key the new `encrypted_metadata` is under.
+    /// Required whenever metadata is present and the writer minted a fresh
+    /// key rather than reusing the photo's existing one — without them the
+    /// stored wraps would unwrap to the OLD key and the new ciphertext
+    /// would be undecryptable for every member, silently. Empty is legal
+    /// only for a writer that re-encrypted under the existing key (a member
+    /// client, which can unwrap its own `photo_metadata_access` row); the
+    /// ingress daemon holds no private key and always sends fresh wraps.
+    /// Appended pre-release — see the freeze convention on `cloud_fingerprint`.
+    pub metadata_access: Vec<MetadataAccessEntry>,
+    /// Resource types to drop entirely (wire values of `ResourceKind`). A
+    /// revert in Apple Photos removes the edited render rather than
+    /// replacing it, and no upsert can express an absence. The blob is not
+    /// decremented here — `photo_operations` still references it for the
+    /// undo window, and the orphan sweep collects it after.
+    /// Appended pre-release.
+    pub remove_resources: Vec<i32>,
 }
 
 // --- photo_edit_metadata ---
@@ -159,6 +178,9 @@ pub struct PhotoEditMetadataEntry {
     pub encrypted_metadata: Vec<u8>,
     pub metadata_nonce: [u8; 12],
     pub operation_id: CustomUUID,
+    /// Re-wraps of the metadata key — same contract as
+    /// [`PhotoEditContentEntry::metadata_access`]. Appended pre-release.
+    pub metadata_access: Vec<MetadataAccessEntry>,
 }
 
 // --- photo_undo ---
@@ -790,7 +812,16 @@ mod tests {
         });
     }
 
+    fn access_entry(user_id: i32) -> MetadataAccessEntry {
+        MetadataAccessEntry {
+            user_id,
+            ephemeral_pubkey: [0x5C; 32],
+            encrypted_metadata_key: vec![0x77; 48],
+        }
+    }
+
     /// Golden round-trip for photo_edit_metadata (batch of one).
+    // Should: round-trip the appended metadata_access wraps byte-identically.
     #[test]
     fn photo_edit_metadata_bincode_round_trip() {
         let payload = PhotoEditMetadataPayload {
@@ -799,13 +830,45 @@ mod tests {
                 encrypted_metadata: b"updated_meta".to_vec(),
                 metadata_nonce: [0xA1; 12],
                 operation_id: "00000000-0000-0000-0000-000000000002".parse().unwrap(),
+                metadata_access: vec![access_entry(1), access_entry(2)],
             }],
         };
         let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
         let (decoded, _): (PhotoEditMetadataPayload, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(decoded.entries[0].metadata_access.len(), 2);
         let encoded2 =
             bincode::serde::encode_to_vec(&decoded, bincode::config::standard()).unwrap();
+        assert_eq!(
+            encoded, encoded2,
+            "bincode round-trip must be byte-identical"
+        );
+    }
+
+    /// Golden round-trip for photo_edit_content — verifies field order is
+    /// frozen across the appended wraps and removal list.
+    // Should: round-trip a removal-only entry, whose resources vec is empty.
+    #[test]
+    fn photo_edit_content_bincode_round_trip() {
+        let payload = PhotoEditContentPayload {
+            entries: vec![PhotoEditContentEntry {
+                photo_id: "00000000-0000-0000-0000-000000000003".parse().unwrap(),
+                resources: Vec::new(),
+                encrypted_metadata: Some(b"reverted_meta".to_vec()),
+                metadata_nonce: Some([0xB2; 12]),
+                operation_id: "00000000-0000-0000-0000-000000000004".parse().unwrap(),
+                metadata_access: vec![access_entry(7)],
+                remove_resources: vec![1, 5, 6],
+            }],
+        };
+        let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+            .expect("photo_edit_content encode must succeed");
+        let (decoded, _len): (PhotoEditContentPayload, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                .expect("photo_edit_content decode must succeed");
+        assert_eq!(decoded.entries[0].remove_resources, vec![1, 5, 6]);
+        let encoded2 = bincode::serde::encode_to_vec(&decoded, bincode::config::standard())
+            .expect("re-encode must succeed");
         assert_eq!(
             encoded, encoded2,
             "bincode round-trip must be byte-identical"

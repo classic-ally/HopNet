@@ -408,7 +408,10 @@ impl TransactionHandler for PhotoEditContentHandler {
         let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
 
         for entry in &payload.entries {
-            if entry.resources.is_empty() {
+            // A revert drops the edited render without replacing anything,
+            // so an entry is legal with removals alone — but an entry that
+            // does neither is a no-op the log would still record.
+            if entry.resources.is_empty() && entry.remove_resources.is_empty() {
                 return Err(DatabaseError::InvalidPayload);
             }
             let (uploaded_by, deleted_at, library_id) =
@@ -1551,6 +1554,8 @@ mod tests {
                 encrypted_metadata: None,
                 metadata_nonce: None,
                 operation_id: "00000000-0000-0000-0000-000000000002".parse().unwrap(),
+                metadata_access: Vec::new(),
+                remove_resources: Vec::new(),
             }],
         };
         let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
@@ -1777,6 +1782,8 @@ mod tests {
                 encrypted_metadata: None,
                 metadata_nonce: None,
                 operation_id: CustomUUID::retention_cutoff(4),
+                metadata_access: Vec::new(),
+                remove_resources: Vec::new(),
             }],
         };
         let edit_bytes =
@@ -1846,6 +1853,8 @@ mod tests {
                 encrypted_metadata: None,
                 metadata_nonce: None,
                 operation_id: CustomUUID::retention_cutoff(7),
+                metadata_access: Vec::new(),
+                remove_resources: Vec::new(),
             }],
         };
         let edit_bytes =
@@ -1858,6 +1867,315 @@ mod tests {
             Some(1),
         );
         assert!(matches!(result, Err(DatabaseError::ConflictError)));
+    }
+
+    /// Encode one photo_edit_content entry.
+    fn edit_payload_bytes(
+        photo_id: CustomUUID,
+        resources: Vec<PhotoResourceOp>,
+        remove_resources: Vec<i32>,
+        metadata: Option<(Vec<u8>, Vec<MetadataAccessEntry>)>,
+        op_id: CustomUUID,
+    ) -> Vec<u8> {
+        let (encrypted_metadata, metadata_access) = match metadata {
+            Some((meta, access)) => (Some(meta), access),
+            None => (None, Vec::new()),
+        };
+        let payload = crate::envelopes::PhotoEditContentPayload {
+            entries: vec![PhotoEditContentEntry {
+                photo_id,
+                resources,
+                metadata_nonce: encrypted_metadata.as_ref().map(|_| [0x33; 12]),
+                encrypted_metadata,
+                operation_id: op_id,
+                metadata_access,
+                remove_resources,
+            }],
+        };
+        bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap()
+    }
+
+    // Impact: the ciphertext and the wraps are one atomic fact. An edit that
+    // replaced the metadata under a fresh key while leaving the uploader's
+    // wrap pointing at the old one would make the photo's metadata
+    // undecryptable for everyone, silently and permanently.
+    // Should: overwrite the existing wrap in place rather than conflicting.
+    // Should not: leave a second row for the same (photo, user).
+    #[test]
+    fn photo_edit_content_replaces_metadata_access_rows() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            CustomUUID::retention_cutoff(1),
+            CustomUUID::retention_cutoff(2),
+            None,
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+
+        let edit_bytes = edit_payload_bytes(
+            photo_id.clone(),
+            vec![PhotoResourceOp {
+                resource_type: 1,
+                op: make_blob_op(CustomUUID::retention_cutoff(3)),
+            }],
+            Vec::new(),
+            Some((
+                b"recropped_meta".to_vec(),
+                vec![MetadataAccessEntry {
+                    user_id: 1,
+                    ephemeral_pubkey: [0x99; 32],
+                    encrypted_metadata_key: vec![0xAB; 48],
+                }],
+            )),
+            CustomUUID::retention_cutoff(4),
+        );
+        apply(
+            &conn,
+            &PhotoEditContentHandler,
+            "photo_edit_content",
+            &edit_bytes,
+            Some(1),
+        );
+
+        let (rows, pubkey, meta): (i32, Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM photo_metadata_access WHERE photo_id = ?1), \
+                        a.ephemeral_pubkey, p.encrypted_metadata \
+                 FROM photo_metadata_access a JOIN photos p ON p.id = a.photo_id \
+                 WHERE a.photo_id = ?1 AND a.user_id = 1",
+                rusqlite::params![photo_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "the wrap is replaced, not duplicated");
+        assert_eq!(pubkey, vec![0x99; 32], "wrap re-minted for the fresh key");
+        assert_eq!(meta, b"recropped_meta".to_vec());
+    }
+
+    // Impact: a revert in Apple Photos removes the edited render; no upsert
+    // can express an absence, so the removal list is the only way the mesh
+    // ever stops serving pre-revert bytes.
+    // Should: drop the reverted row and log the operation against its kind.
+    // Should not: touch the original, or record a new data block.
+    #[test]
+    fn photo_edit_content_removal_only_reverts_the_edited_resource() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            CustomUUID::retention_cutoff(1),
+            CustomUUID::retention_cutoff(2),
+            None,
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+
+        // The edit being reverted.
+        let edited_blob = CustomUUID::retention_cutoff(3);
+        let edit_bytes = edit_payload_bytes(
+            photo_id.clone(),
+            vec![PhotoResourceOp {
+                resource_type: 1,
+                op: make_blob_op(edited_blob.clone()),
+            }],
+            Vec::new(),
+            None,
+            CustomUUID::retention_cutoff(4),
+        );
+        apply(
+            &conn,
+            &PhotoEditContentHandler,
+            "photo_edit_content",
+            &edit_bytes,
+            Some(1),
+        );
+
+        let revert_op = CustomUUID::retention_cutoff(5);
+        let revert_bytes = edit_payload_bytes(
+            photo_id.clone(),
+            Vec::new(),
+            vec![1],
+            None,
+            revert_op.clone(),
+        );
+        validate(
+            &conn,
+            &PhotoEditContentHandler,
+            "photo_edit_content",
+            &revert_bytes,
+            Some(1),
+        )
+        .expect("a removal-only edit is a legal entry");
+        apply(
+            &conn,
+            &PhotoEditContentHandler,
+            "photo_edit_content",
+            &revert_bytes,
+            Some(1),
+        );
+
+        let kinds: Vec<i32> = conn
+            .prepare("SELECT resource_type FROM photo_resources WHERE photo_id = ?1")
+            .unwrap()
+            .query_map(rusqlite::params![photo_id], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(kinds, vec![0], "only the original survives the revert");
+
+        let (kind, prior, new): (i32, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT resource_type, prior_data_block_id, new_data_block_id \
+                 FROM photo_operations WHERE id = ?1",
+                rusqlite::params![revert_op],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, 1, "logged against the removed kind");
+        assert_eq!(prior, Some(edited_blob.to_string()));
+        assert_eq!(new, None, "the absence has no new block");
+    }
+
+    // Impact: the removal deliberately skips a blob decrement — the undo
+    // window is what keeps the reverted render recoverable, and it is the
+    // operation log that pins it once the resource row is gone.
+    // Should: still report the reverted blob as referenced after removal.
+    #[test]
+    fn photo_edit_content_reverted_blob_stays_referenced_by_the_op_log() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            CustomUUID::retention_cutoff(1),
+            CustomUUID::retention_cutoff(2),
+            None,
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+
+        let edited_blob = CustomUUID::retention_cutoff(3);
+        let edit_bytes = edit_payload_bytes(
+            photo_id.clone(),
+            vec![PhotoResourceOp {
+                resource_type: 1,
+                op: make_blob_op(edited_blob.clone()),
+            }],
+            Vec::new(),
+            None,
+            CustomUUID::retention_cutoff(4),
+        );
+        apply(
+            &conn,
+            &PhotoEditContentHandler,
+            "photo_edit_content",
+            &edit_bytes,
+            Some(1),
+        );
+        let revert_bytes = edit_payload_bytes(
+            photo_id,
+            Vec::new(),
+            vec![1],
+            None,
+            CustomUUID::retention_cutoff(5),
+        );
+        apply(
+            &conn,
+            &PhotoEditContentHandler,
+            "photo_edit_content",
+            &revert_bytes,
+            Some(1),
+        );
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let referenced = hopnet_projection::DataBlockReferenceProvider::references_data_block(
+            &crate::reference_provider::PhotosReferenceProvider,
+            &tx,
+            &edited_blob.to_string(),
+        )
+        .unwrap();
+        assert!(referenced, "the op log pins the reverted render");
+    }
+
+    // Should not: accept an entry that neither upserts nor removes anything.
+    #[test]
+    fn photo_edit_content_rejects_an_empty_entry() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            CustomUUID::retention_cutoff(1),
+            CustomUUID::retention_cutoff(2),
+            None,
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+
+        let bytes = edit_payload_bytes(
+            photo_id,
+            Vec::new(),
+            Vec::new(),
+            None,
+            CustomUUID::retention_cutoff(6),
+        );
+        let result = validate(
+            &conn,
+            &PhotoEditContentHandler,
+            "photo_edit_content",
+            &bytes,
+            Some(1),
+        );
+        assert!(matches!(result, Err(DatabaseError::InvalidPayload)));
+    }
+
+    // Should: rewrap the metadata key on a metadata-only edit too.
+    #[test]
+    fn photo_edit_metadata_replaces_metadata_access_rows() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            CustomUUID::retention_cutoff(1),
+            CustomUUID::retention_cutoff(2),
+            None,
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+
+        let payload = crate::envelopes::PhotoEditMetadataPayload {
+            entries: vec![crate::envelopes::PhotoEditMetadataEntry {
+                photo_id: photo_id.clone(),
+                encrypted_metadata: b"refreshed_meta".to_vec(),
+                metadata_nonce: [0x44; 12],
+                operation_id: CustomUUID::retention_cutoff(7),
+                metadata_access: vec![MetadataAccessEntry {
+                    user_id: 1,
+                    ephemeral_pubkey: [0x77; 32],
+                    encrypted_metadata_key: vec![0xCD; 48],
+                }],
+            }],
+        };
+        let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
+        apply(
+            &conn,
+            &PhotoEditMetadataHandler,
+            "photo_edit_metadata",
+            &bytes,
+            Some(1),
+        );
+
+        let (rows, pubkey): (i32, Vec<u8>) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM photo_metadata_access WHERE photo_id = ?1), \
+                        ephemeral_pubkey \
+                 FROM photo_metadata_access WHERE photo_id = ?1 AND user_id = 1",
+                rusqlite::params![photo_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(pubkey, vec![0x77; 32]);
     }
 
     #[test]
