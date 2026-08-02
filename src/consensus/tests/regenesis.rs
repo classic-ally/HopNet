@@ -579,6 +579,39 @@ fn retrust_route_requires_a_known_peer() {
     assert_eq!(retrust(6).status(), axum::http::StatusCode::ACCEPTED);
 }
 
+// Impact: rollback DISCARDS an epoch's database while the window is
+// open, so the one thing the route must never do is act on a node that
+// has nothing to abandon. The destructive half is covered end to end by
+// the orchestrator scenario; this pins the guard.
+// Should: refuse with 409 on a node that is neither sealed nor holding
+// a retained database.
+// Should not: write the rollback marker on a refusal.
+#[test]
+fn rollback_route_refuses_when_there_is_no_boundary() {
+    use axum::response::IntoResponse as _;
+
+    let node = MockNode::new(7);
+    register_node(&node);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let resp = rt.block_on(async {
+        crate::regenesis::routes::post_regenesis_rollback(axum::extract::State(
+            node.app_state.clone(),
+        ))
+        .await
+        .into_response()
+    });
+    assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+    assert!(
+        !crate::regenesis::boot::rollback_marker_path(&crate::db::shared::get_database_path())
+            .exists(),
+        "a refused request must leave no marker behind"
+    );
+}
+
 // Impact: the (epoch, version) handshake is what turns silent cross-
 // epoch signature failures into diagnosable refusals — and the fetch
 // gate is the hook S7's epoch join extends into a lineage answer.

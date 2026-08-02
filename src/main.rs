@@ -674,6 +674,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     "/consensus/regenesis/retrust",
                     post(regenesis::routes::post_regenesis_retrust),
                 )
+                .route(
+                    "/consensus/regenesis/rollback",
+                    post(regenesis::routes::post_regenesis_rollback),
+                )
                 .route("/consensus/evidence", get(consensus::evidence::get_evidence))
                 .layer(middleware::from_fn_with_state(
                     app_state.clone(),

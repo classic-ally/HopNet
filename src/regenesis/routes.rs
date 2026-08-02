@@ -202,6 +202,47 @@ pub async fn post_regenesis_retrust(
         .into_response()
 }
 
+/// POST /consensus/regenesis/rollback
+///
+/// Abandon a pending or just-crossed epoch boundary (RFC-019 S8): write
+/// the rollback marker and restart, so the boot path restores the
+/// retained database (or clears the seal in place, for a node that
+/// parked without crossing) before anything else runs.
+///
+/// DESTRUCTIVE while the window is open — it discards the newer epoch's
+/// database. Refused up front when there is nothing to abandon, so
+/// invoking it on a healthy node is a no-op rather than an accident.
+///
+/// A valid rollback is MESH-WIDE. A node that rolls back beside peers
+/// still in the newer epoch is pulled straight back across by the epoch
+/// join, which is working as intended.
+pub async fn post_regenesis_rollback(State(app_state): State<AppState>) -> impl IntoResponse {
+    let db_path = crate::db::shared::get_database_path();
+    let available = {
+        let Ok(conn) = app_state.db_pool.get() else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "db unavailable").into_response();
+        };
+        crate::regenesis::boot::rollback_available(&db_path, &conn)
+    };
+    if !available {
+        return (
+            StatusCode::CONFLICT,
+            "no boundary to abandon: this node is not sealed and retains no previous \
+             epoch (the rollback window closes at the new epoch's first decide)",
+        )
+            .into_response();
+    }
+
+    crate::regenesis::boot::write_rollback_marker(&db_path);
+    tracing::warn!("rollback requested: restarting to abandon the epoch boundary");
+    app_state.restart_signal.notify_one();
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "rollback": "requested" })),
+    )
+        .into_response()
+}
+
 /// GET /views/regenesis-status
 pub async fn get_regenesis_status(
     State(app_state): State<AppState>,
