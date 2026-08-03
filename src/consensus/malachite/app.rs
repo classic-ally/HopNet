@@ -128,6 +128,22 @@ impl HopNetApplication {
                     commit.seal_height, block.data.height
                 ));
             }
+            // The target must be the one THIS node has committed from
+            // `regenesis_start`. Deterministic and safe at both origins:
+            // it reads committed state inside the same transaction, not a
+            // live recompute, so a replaying node reaches the same verdict.
+            // This is what makes the value quorum-bound rather than
+            // proposer-asserted, and it is the only reason a joiner can
+            // trust `required_version_code` in a peer-supplied record.
+            let committed_target = crate::db::regenesis::read_regenesis_state(db_tx)
+                .map_err(|e| format!("regenesis state: {e:?}"))?
+                .target_version_code;
+            if committed_target != Some(commit.target_version_code) {
+                return Err(format!(
+                    "regenesis commit target {} != committed target {:?}",
+                    commit.target_version_code, committed_target
+                ));
+            }
             if origin == ValidationOrigin::Live {
                 // Vote-iff-match (Rule-8, RFC-013 precedent): recompute
                 // the canonical snapshot ARTIFACT over OWN state at this

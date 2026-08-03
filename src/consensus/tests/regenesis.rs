@@ -293,11 +293,12 @@ fn queue_refuses_new_submissions_during_moratorium() {
     );
 }
 
-fn commit_payload(snapshot_hash: [u8; 32], seal_height: u64) -> Vec<u8> {
+fn commit_payload(snapshot_hash: [u8; 32], seal_height: u64, target_version_code: u32) -> Vec<u8> {
     bincode::serde::encode_to_vec(
         crate::regenesis::RegenesisCommit {
             snapshot_hash,
             seal_height,
+            target_version_code,
         },
         bincode::config::standard(),
     )
@@ -312,7 +313,12 @@ fn commit_refused_in_normal() {
     register_node(&node);
     seat_with_version(&node, 3, 20260800);
 
-    let err = apply(&node, "regenesis_commit", commit_payload([7u8; 32], 5)).unwrap_err();
+    let err = apply(
+        &node,
+        "regenesis_commit",
+        commit_payload([7u8; 32], 5, 20260800),
+    )
+    .unwrap_err();
     assert!(matches!(err, DatabaseError::ProcessingError));
     assert_eq!(committed_state(&node).phase, RegenesisPhase::Normal);
 }
@@ -327,7 +333,12 @@ fn commit_seals_and_closes_the_window() {
     seat_with_version(&node, 3, 20260800);
 
     apply(&node, "regenesis_start", start_payload(20260800)).unwrap();
-    apply(&node, "regenesis_commit", commit_payload([7u8; 32], 9)).unwrap();
+    apply(
+        &node,
+        "regenesis_commit",
+        commit_payload([7u8; 32], 9, 20260800),
+    )
+    .unwrap();
 
     let state = committed_state(&node);
     assert_eq!(state.phase, RegenesisPhase::Sealed);
@@ -336,7 +347,7 @@ fn commit_seals_and_closes_the_window() {
     assert_eq!(state.target_version_code, Some(20260800));
 
     for (function, payload) in [
-        ("regenesis_commit", commit_payload([7u8; 32], 10)),
+        ("regenesis_commit", commit_payload([7u8; 32], 10, 20260800)),
         ("regenesis_abort", abort_payload()),
         ("regenesis_start", start_payload(20260800)),
     ] {
@@ -383,7 +394,7 @@ fn commit_block_vote_iff_match_and_shape() {
     let commit_tx = |hash: [u8; 32], seal_height: u64| {
         Transaction::new(
             "regenesis_commit".to_string(),
-            commit_payload(hash, seal_height),
+            commit_payload(hash, seal_height, 20260800),
             node.node_id,
             &node.signing_key,
         )
@@ -470,7 +481,12 @@ fn seal_artifact_written_only_on_hash_match() {
         bytes.copy_from_slice(hash.as_bytes());
         bytes
     };
-    apply(&node, "regenesis_commit", commit_payload(honest, 9)).unwrap();
+    apply(
+        &node,
+        "regenesis_commit",
+        commit_payload(honest, 9, 20260800),
+    )
+    .unwrap();
 
     let dir = std::env::temp_dir().join(format!("hopnet-seal-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -536,7 +552,12 @@ fn status_view_reports_epoch_and_awaiting_upgrade() {
 
     // Seal at the version this binary runs: NOT awaiting an upgrade.
     apply(&node, "regenesis_start", start_payload(20260800)).unwrap();
-    apply(&node, "regenesis_commit", commit_payload([7u8; 32], 9)).unwrap();
+    apply(
+        &node,
+        "regenesis_commit",
+        commit_payload([7u8; 32], 9, 20260800),
+    )
+    .unwrap();
     let view = status(&node);
     assert_eq!(view.phase, "sealed");
     assert!(!view.awaiting_upgrade);

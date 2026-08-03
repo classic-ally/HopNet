@@ -315,6 +315,19 @@ fn verify_commit_binds_record(
             record.seal_height, payload.seal_height
         ));
     }
+    // The version gate the joiner will run at boot. Unbound, this is a
+    // field the serving peer picks: name a version the joiner is not
+    // running and it parks awaiting an upgrade that never arrives (a remote
+    // denial of service), or name one it is running and it boots a binary
+    // the mesh is not on. Every validator checked this against its own
+    // committed target before signing, so the block's copy is the quorum's.
+    if payload.target_version_code != record.required_version_code {
+        return Err(format!(
+            "record requires version {} but regenesis_commit decided {}",
+            crate::version::format_code(record.required_version_code),
+            crate::version::format_code(payload.target_version_code)
+        ));
+    }
     Ok(())
 }
 
@@ -678,6 +691,7 @@ pub(crate) mod tests {
             &crate::regenesis::RegenesisCommit {
                 snapshot_hash,
                 seal_height,
+                target_version_code: TARGET,
             },
             bincode::config::standard(),
         )
@@ -829,14 +843,16 @@ pub(crate) mod tests {
         let pool = sealed_pool(false);
         let g = build_epoch_genesis(&pool.get().unwrap()).unwrap();
         let digest = blake3::hash(&g.record.canonical_bytes().unwrap());
-        // Re-pinned when the fixture's boundary block gained the real
-        // `regenesis_commit` it always should have carried: the record
-        // embeds `final_block_hash`, so changing the block changes this
-        // digest. `format_version` is deliberately NOT bumped — the
-        // encoding is untouched, only the fixture's input.
+        // Re-pinned twice, both times because the FIXTURE's boundary block
+        // changed rather than the encoding: first when it gained the real
+        // `regenesis_commit` it always should have carried, then when that
+        // commit gained `target_version_code`. The record embeds
+        // `final_block_hash`, so any change to the block moves this digest.
+        // `format_version` is deliberately NOT bumped in either case —
+        // `EpochGenesisRecord`'s own layout is untouched.
         assert_eq!(
             digest.to_hex().as_str(),
-            "07799f2e5a8d6ba21b0f4a060567bc6331371f8fec9b2616a163a0314e6b2edd",
+            "f79f2fa809b073b7967f72df93aa01991e6f5fd7b09863d7e5f6d3ff94d0800c",
             "canonical genesis encoding changed — if intentional, bump \
              format_version and re-pin"
         );
@@ -945,6 +961,25 @@ pub(crate) mod tests {
         let err = verify_lineage(&points_at_padded, &padded, &padded_cert, &valset, &profile)
             .expect_err("more than one regenesis_commit must be refused");
         assert!(err.contains("more than one"), "unexpected refusal: {err}");
+
+        // The version gate the joiner runs at boot. Unbound, a serving peer
+        // could name a version the joiner is not running — parking it
+        // awaiting an upgrade that never arrives — or one it IS running, so
+        // it boots a binary the mesh is not on.
+        let mut wrong_version = g.record.clone();
+        wrong_version.required_version_code = TARGET + 1;
+        let err = verify_lineage(
+            &wrong_version,
+            &g.final_block,
+            &g.final_cert,
+            &valset,
+            &profile,
+        )
+        .expect_err("a version the commit did not decide must be refused");
+        assert!(
+            err.contains("requires version"),
+            "unexpected refusal: {err}"
+        );
     }
 
     // Should: refuse to construct from anything but a sealed database —

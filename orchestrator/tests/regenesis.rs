@@ -162,7 +162,11 @@ pub async fn recreate_node_with_env(
         removed = docker
             .remove_container(
                 &id,
-                None::<bollard::query_parameters::RemoveContainerOptions>,
+                Some(
+                    bollard::query_parameters::RemoveContainerOptionsBuilder::new()
+                        .force(true)
+                        .build(),
+                ),
             )
             .await;
         if removed.is_ok() {
@@ -172,13 +176,32 @@ pub async fn recreate_node_with_env(
     }
     removed?;
 
-    for (k, v) in extra_env {
-        unsafe { std::env::set_var(k, v) };
-    }
     // Go through `naming` rather than formatting the prefix here: resource
     // names are per-checkout, so a literal `hopnet-orchestrator-` recreates
     // the node onto a network this checkout never created.
     let container_name = crate::naming::container_name(mesh_id, node_id);
+
+    // Removal returning Ok is not the same as the NAME being free: podman
+    // reports the delete complete while its storage layer still holds the
+    // registration, and the create then fails with "container name ... is
+    // already in use". Wait for the name to actually stop resolving.
+    for _ in 0..40 {
+        if docker
+            .inspect_container(
+                &container_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .is_err()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    for (k, v) in extra_env {
+        unsafe { std::env::set_var(k, v) };
+    }
     let network_name = crate::naming::network_name(mesh_id);
     let created = crate::create_hopnet_container(
         docker,

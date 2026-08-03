@@ -42,6 +42,21 @@ pub struct RegenesisStart {
 pub struct RegenesisCommit {
     pub snapshot_hash: [u8; 32],
     pub seal_height: u64,
+    /// The version the next epoch requires, carried here so it lands INSIDE
+    /// the certified block.
+    ///
+    /// It originates from `regenesis_start` and is already committed state
+    /// by the time the commit is proposed, so this is a copy — but a copy
+    /// with a quorum behind it. Without it, `EpochGenesisRecord`'s
+    /// `required_version_code` is a field a serving peer chooses freely: a
+    /// joiner has no way to tell a real target from an invented one, and a
+    /// fabricated value parks it awaiting an upgrade that never comes, or
+    /// boots it on a binary the mesh is not running.
+    ///
+    /// Every validator checks this against its OWN committed target
+    /// (deterministically, at both origins), so a proposer that lies is
+    /// voted down rather than believed.
+    pub target_version_code: u32,
 }
 
 /// `regenesis_abort` payload — empty; the phase rule carries everything.

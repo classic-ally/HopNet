@@ -705,10 +705,18 @@ fn seal_candidate(
         artifact_hash = %artifact_hash.to_hex(),
         "regenesis commit candidate: artifact recomputed (OQ1 timing)"
     );
+    // The target is already committed (regenesis_start decided it); copying
+    // it into the commit is what puts it inside the certified block, where a
+    // joiner can bind the lineage record against it.
+    let target_version_code = crate::db::regenesis::read_regenesis_state(conn)
+        .map_err(|e| format!("regenesis state: {e:?}"))?
+        .target_version_code
+        .ok_or("proposing a commit with no committed target version")?;
     let payload = bincode::serde::encode_to_vec(
         &crate::regenesis::RegenesisCommit {
             snapshot_hash,
             seal_height,
+            target_version_code,
         },
         bincode::config::standard(),
     )
