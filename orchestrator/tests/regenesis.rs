@@ -111,27 +111,83 @@ pub async fn wait_for_exit_code(
 ) -> Result<Option<i64>> {
     let id = find_container_id(docker, mesh_id, node_id).await?;
     let start = Instant::now();
+    let mut last_err: Option<String> = None;
     loop {
-        // Inspect errors are tolerated inside the deadline: podman
-        // reports a transient "stopping" state bollard cannot parse —
-        // exactly while the process is exiting, i.e. exactly when this
-        // waits.
-        if let Ok(info) = docker
+        // Typed inspect first. Its errors are tolerated INSIDE the deadline
+        // because podman reports a transient "stopping" state bollard's
+        // enums do not know — exactly while the process is exiting, i.e.
+        // exactly when this waits.
+        match docker
             .inspect_container(
                 &id,
                 None::<bollard::query_parameters::InspectContainerOptions>,
             )
             .await
-            && let Some(state) = info.state
-            && state.status == Some(bollard::models::ContainerStateStatusEnum::EXITED)
         {
-            return Ok(Some(state.exit_code.unwrap_or(-1)));
+            Ok(info) => {
+                if let Some(state) = info.state
+                    && state.status == Some(bollard::models::ContainerStateStatusEnum::EXITED)
+                {
+                    return Ok(Some(state.exit_code.unwrap_or(-1)));
+                }
+            }
+            Err(e) => last_err = Some(e.to_string()),
         }
+
+        // Fallback that does not go through bollard's typed models at all.
+        // A whole `inspect_container` response fails to deserialize if ANY
+        // field carries a value the stubs reject, so a container can sit in
+        // `exited` for the entire window while the typed path keeps
+        // erroring — which is how a node that restarted correctly within
+        // seconds was reported as "did not restart" after 180s of silence.
+        if let Some(code) = raw_exit_code(&id).await {
+            return Ok(Some(code));
+        }
+
         if start.elapsed() > timeout {
-            return Ok(None); // still running
+            // Never return a bare None again: if the typed path was
+            // erroring, say so, or the next reader re-debugs this from
+            // scratch.
+            if let Some(e) = last_err {
+                anyhow::bail!(
+                    "mesh {mesh_id} node {node_id} never observed as exited within {timeout:?}; \
+                     the last container inspect FAILED: {e}"
+                );
+            }
+            return Ok(None); // genuinely still running
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Exit code straight from the container runtime's own formatter, bypassing
+/// bollard's models. None when the container has not exited (or the runtime
+/// CLI is unavailable, in which case the typed path above is authoritative).
+async fn raw_exit_code(id: &str) -> Option<i64> {
+    for runtime in ["podman", "docker"] {
+        let out = tokio::process::Command::new(runtime)
+            .args([
+                "inspect",
+                "--format",
+                "{{.State.Status}} {{.State.ExitCode}}",
+                id,
+            ])
+            .output()
+            .await;
+        let Ok(out) = out else { continue };
+        if !out.status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut parts = text.split_whitespace();
+        if parts.next() == Some("exited")
+            && let Some(code) = parts.next().and_then(|c| c.parse::<i64>().ok())
+        {
+            return Some(code);
+        }
+        return None; // reachable runtime, container simply not exited yet
+    }
+    None
 }
 
 fn is_running(state: &Option<bollard::models::ContainerState>) -> bool {
