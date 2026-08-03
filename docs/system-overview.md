@@ -125,7 +125,18 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       re-cross), and the orchestrator regenesis-rollback drill —
       abandon mesh-wide, prove the mesh RUNS again, then prove the
       window is refused once the next epoch decides.
-  - **RFC-019 is complete.**
+  - **RFC-019 is complete**, with one round of post-review remediation on
+    the joiner's trust boundary. A lineage record is PEER DATA and only
+    its certificate is evidence, so every record field a joiner acts on is
+    now cross-checked against the boundary block's `regenesis_commit`
+    (`snapshot_hash`, `seal_height`, `target_version_code` all live inside
+    the certified block for exactly this reason). Operator re-trust
+    SUBSTITUTES an out-of-band chain-id fingerprint for the overlap rule
+    instead of waiving it — waiving left each hop verified against the
+    validator set declared inside its own record, i.e. self-certifying.
+    And the sealed marker is derived from the committed phase, so a crash
+    between the decide and the seal work can no longer leave a node
+    running on a retired chain.
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

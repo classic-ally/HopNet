@@ -84,6 +84,35 @@ path at H+1 is S6's.
 > the new epoch with empty evidence. Clause 5 is unchanged: a rejoined
 > node gets no boundary-special seating grace.
 >
+> **Corrected (post-review).** What a joiner's verification actually
+> BINDS was narrower than clause 2's extension implied, and the gap
+> mattered. A lineage record is peer-supplied; only the certificate is
+> evidence. `verify_lineage` checked the block, the height and the
+> certificate — but nothing tied the record's `snapshot_hash`,
+> `seal_height` or `required_version_code` to what the quorum decided, so
+> a peer could pair a genuine block and a genuine certificate with a
+> substituted snapshot identity and have a joiner import bytes of the
+> peer's choosing. Those three fields now come out of the boundary
+> block's `regenesis_commit` (which carries the target version for exactly
+> this reason) and are cross-checked against the record. Since the
+> certificate binds the block hash, anything inside the block is
+> transitively quorum-bound; anything outside it is a claim.
+>
+> The operator re-trust path was worse: waiving the weak-subjectivity
+> overlap rule left each hop's certificate verified against the validator
+> set declared INSIDE that same record — self-certifying. It now
+> SUBSTITUTES an anchor rather than removing one: the operator supplies
+> the target epoch's chain id out of band and the chain must terminate in
+> exactly that.
+>
+> Also corrected: the sealed marker is `consensus_meta`, written after the
+> decide commits, so a crash in between left the phase durably Sealed with
+> no marker — read naively, indistinguishable from a healthy node, and the
+> engine would start on the retired chain and refuse everything forever.
+> H is now DERIVED from the committed row when the marker is absent, which
+> is what the "derived, idempotent recomputation" obligation below always
+> required of it.
+>
 > **Enforced (S8).** Clause 2's forward-only rule now has a mechanism
 > rather than prose behind it. Within the rollback window an operator may
 > abandon the boundary — `POST /consensus/regenesis/rollback` on every

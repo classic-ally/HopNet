@@ -1,6 +1,7 @@
 # RFC-019: Regenesis — Epoch Compression of Consensus History
 
-**Status**: Draft (2026-07-30)
+**Status**: Implemented (2026-08-03) — every slice S0-S8 ticked; the open
+questions below are follow-on work, not gaps in what shipped
 **Depends on**: RFC-013 (atomic decide, decided-value sync, trusted
 height-0 join bootstrap), RFC-016 (projection registry + host API),
 RFC-CONSENSUS-002 (membership machinery, evidence layer)
@@ -143,7 +144,13 @@ the existing pipeline:
       into subsequent blocks; accepted work completes consensus
     - the staged pool is finite once admission closes, so drain
       terminates; the on-demand engine then goes quiescent on its own
-- `regenesis_commit { snapshot_hash }`:
+- `regenesis_commit { snapshot_hash, seal_height, target_version_code }`:
+  - all three land INSIDE the certified block on purpose. The certificate
+    binds the block hash, so they are transitively quorum-bound, and a
+    joiner can cross-check a peer-supplied lineage record against them
+    (`verify_lineage`). `target_version_code` is a copy of committed state
+    — every validator compares it to its OWN committed target before
+    signing, so a lying proposer is voted down rather than believed
   - proposed as the SOLE transaction of the final block, once the
     proposer observes drain complete (empty pool, tip applied)
   - Rule-8-style validation before voting (RFC-013 precedent): each
@@ -818,6 +825,48 @@ protocol it checks.
     matters — the mesh accepts a write and decides again — before
     confirming rollback is refused once the next epoch decides.
 
+- [x] Post-review remediation — the joiner's trust boundary, tightened
+  - **What a peer-supplied record actually binds.** A lineage record is
+    peer data; only the certificate is evidence. `verify_lineage` checked
+    the block, the height and the certificate, but nothing tied the
+    record's `snapshot_hash`, `seal_height` or `required_version_code` to
+    what the quorum decided — so a peer could pair a GENUINE block and a
+    GENUINE certificate with a substituted snapshot identity and have a
+    joiner import bytes of its own choosing, since it then controlled both
+    sides of the artifact comparison. All three now come out of the
+    boundary block's `regenesis_commit`. The certificate binds the block
+    hash, so anything inside the block is transitively quorum-bound.
+  - **Re-trust substitutes an anchor; it never removes one.** Waiving the
+    overlap rule left each hop's certificate verified against the
+    validator set declared inside that same record — self-certifying, so
+    any holder of a registered node key could serve a fabricated epoch
+    signed by validators it invented. `retrust` now REQUIRES the target
+    epoch's chain id, supplied out of band from a node the operator
+    already trusts (the status view reports it), and the verified chain
+    must terminate in exactly that. `ChainTrust` makes the three roots
+    explicit — seated set, fingerprint, first contact — so "trust
+    anything" is no longer representable.
+  - **The sealed marker is derived, not just cached.** The phase commits
+    inside the decide transaction; the marker is written afterwards from a
+    detached thread. A crash (or a busy/pool timeout, both merely logged)
+    in between left the phase durably Sealed with no marker — which read
+    as a HEALTHY node, so the boot path took State A, deleted the `.next`
+    build, and started an engine on the retired chain that then refused
+    every block and every submission. A single victim self-heals via the
+    S7 join; a synchronised seal means a quorum can land there together,
+    with no peer ahead. H is now derived from the committed row, which
+    also heals nodes already stranded, and the marker is additionally
+    written inside the decide for future seals.
+  - **Authorization narrowed, not resolved** — see Open Question 2.
+  - Evidence: the attack stated directly as a test (genuine block,
+    genuine certificate, substituted hash — refused), a WRONG fingerprint
+    refused where the same input previously crossed, and a
+    phase-Sealed-without-marker fixture that no test in the tree had ever
+    produced. Four tests that could not fail were repaired rather than
+    deleted, including the rollback drill's negative half (its height
+    comparison had degenerated to `> 0`) and the `> genesis_height`
+    off-by-one, which nothing exercised.
+
 ## Evidence
 
 No new verification machinery — new scenarios for existing tools:
@@ -835,9 +884,16 @@ No new verification machinery — new scenarios for existing tools:
 1. Commit-round pacing: Rule-8 recompute of the snapshot inside the
    voting round is seconds-slow on large states — acceptable under
    on-demand heights, but timeout tuning needs measurement
-2. Authorization class for start/abort: "network admin" needs a
-   concrete definition (genesis user? explicit role?) — shared with
-   issue #21's remove_node authorization
+2. Authorization class for the boundary routes: "network admin" still
+   needs a concrete definition (genesis user? explicit role?) — shared
+   with issue #21's remove_node authorization. **Partially narrowed**,
+   not resolved. `start`/`abort` are gated by `require_seated` inside
+   consensus, and `rollback`/`retrust` now apply the same seat
+   requirement locally to the node-signature path. What remains open is
+   the JWT path: `users` is consensus-replicated and exported, so ANY
+   mesh user's passphrase authenticates on ANY node, and no admin or
+   operator role exists in the codebase to check instead. Closing it is
+   this question, not a bug fix.
 3. ~~Snapshot artifact transport~~ — RESOLVED in S7: a dedicated
    `regenesis` comms scope, chunked offset/length over plain RPC so
    retry and dedup make the fetch resumable. See the S7 ledger entry.
