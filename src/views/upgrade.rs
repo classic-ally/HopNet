@@ -66,6 +66,9 @@ mod tests {
     // arithmetic when a target exists.
     #[test]
     fn lists_all_nodes_and_flags_newer_releases() {
+        // Reads `effective_running_code()` via `newer_than_running`, which a
+        // leaked far-future override inverts — take the process-env lock.
+        let _env = crate::test_env::lock_env();
         let mesh = vec![
             MeshNodeVersions {
                 node_id: 1,

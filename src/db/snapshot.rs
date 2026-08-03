@@ -141,7 +141,7 @@ mod tests {
         pool
     }
 
-    /// One or two deterministic rows into a representative table of every
+    /// One or two deterministic rows into EVERY exported table of every
     /// section (all five crates, both roles, the REAL columns, and every
     /// FK chain) — fixed keys, no wall clock, so the artifact bytes are
     /// reproducible forever.
@@ -173,7 +173,30 @@ mod tests {
              INSERT INTO incoming_shares VALUES ('s1', 'blob1', 1, 1, X'AC', X'AD', X'AE');
              INSERT INTO shares VALUES ('blob1', 1);
              INSERT INTO takeouts VALUES ('t1', 1, 1, 0, '2026-01-02T00:00:00Z', 5);
-             INSERT INTO imports VALUES ('im1', 1, 1, 0);",
+             INSERT INTO imports VALUES ('im1', 1, 1, 0);
+             -- Photos: every one of the section's 14 tables, in FK order.
+             -- Seeded because the roundtrip gate re-IMPORTS this artifact,
+             -- and an empty section executes zero INSERTs — so the
+             -- `sections()` contract that section order is a valid insert
+             -- order would never be exercised for the unit with the deepest
+             -- FK chains. A mis-ordered table there aborts `build_next` on a
+             -- FOREIGN KEY violation and parks every node at a real
+             -- boundary, with every test still green.
+             INSERT INTO shared_libraries VALUES ('lib1', X'11', X'12');
+             INSERT INTO shared_library_members VALUES ('lib1', 1);
+             INSERT INTO shared_library_keys VALUES ('lib1', 1, X'13', X'14');
+             INSERT INTO shared_library_invites VALUES ('lib1', 1, 1, 'op1', X'15', X'16');
+             INSERT INTO photos VALUES ('ph1', 'lib1', 1, X'17', X'18', NULL, NULL, 'fp1');
+             INSERT INTO photo_metadata_access VALUES ('ph1', 1, X'19', X'1A');
+             INSERT INTO photo_resources VALUES ('ph1', 0, 'blob1');
+             INSERT INTO photo_operations
+                 VALUES ('pop1', 'lib1', 'ph1', 0, 0, NULL, 'blob1', X'1B', 1);
+             INSERT INTO photo_albums VALUES ('al1', 'lib1', X'1C', X'1D', 1);
+             INSERT INTO photo_album_entries VALUES ('al1', 'ph1', 0);
+             INSERT INTO photo_favorites VALUES ('ph1', 1);
+             INSERT INTO photo_changes VALUES ('ph1', 6);
+             INSERT INTO photo_view_changes VALUES (1, 'lib1', 6);
+             INSERT INTO photo_ingress_responsibility VALUES (1, 'lib1', 'dt1', 'op2');",
         )
         .unwrap();
     }
@@ -300,10 +323,10 @@ mod tests {
     }
 
     const SEEDED_TOP_HASH: &str =
-        "74a25fcc71019d733368d96f28303b894cd73934f69cae337886c61ae63a32e0";
+        "d0f6c889a0f4d4b9c948fa4543bc493b3b63b4830f27ff02a10cdf30613c0ed8";
     const SEEDED_ARTIFACT_HASH: &str =
-        "65260e409f60456e30302828bbb6ee5b1c9e5fa2ef8a0b1d554c6eeef5eed6b5";
-    const SEEDED_ARTIFACT_LEN: usize = 4559;
+        "102a43342034543420d6ef8164c0d81070d255faccedeb76ab7045d52d8d419f";
+    const SEEDED_ARTIFACT_LEN: usize = 5159;
 
     // Should: report identical manifests from the hash-only walk and the
     // full export, and byte-identical artifacts from two independently
@@ -464,8 +487,54 @@ mod tests {
             hopnet_common::snapshot::SkipReason::UnknownSection
         );
 
-        let manifest_partial =
-            hopnet_common::snapshot::compute_manifest(&tx, without_takeout).unwrap();
-        assert_ne!(manifest_partial.top_hash, manifest_src.top_hash);
+        // Compare over the FULL registry, not `without_takeout`. Computing
+        // the target manifest from the reduced list asserted nothing:
+        // `compute_top_hash` folds `sections.len()` into its preimage, so a
+        // 5-section and a 6-section manifest differ unconditionally — and
+        // the skipped section's rows were never even walked, so a skip path
+        // that silently INSERTED every row would have passed too.
+        let manifest_target = hopnet_common::snapshot::compute_manifest(&tx, &all).unwrap();
+
+        // The imported sections are byte-identical to the source's...
+        for (target, src) in manifest_target
+            .sections
+            .iter()
+            .zip(manifest_src.sections.iter())
+        {
+            assert_eq!(target.name, src.name, "section order must be stable");
+            if target.name != "takeout" {
+                assert_eq!(
+                    target.section_hash, src.section_hash,
+                    "section {} must import byte-identically",
+                    target.name
+                );
+            }
+        }
+
+        // ...and the skipped one is NOT, because its rows never landed.
+        let find = |m: &hopnet_common::snapshot::SnapshotManifest| {
+            m.sections
+                .iter()
+                .find(|s| s.name == "takeout")
+                .expect("takeout section present in both manifests")
+                .section_hash
+        };
+        assert_ne!(
+            find(&manifest_target),
+            find(&manifest_src),
+            "a skipped section must not match the source it was skipped from"
+        );
+        // The assertion a silently-inserting skip path cannot survive.
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM takeouts", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "the skipped section's rows must not have been inserted"
+        );
+
+        // And the property the test is named for: the divergence surfaces
+        // as a top-hash mismatch, which is what the S6 boot gate turns into
+        // a certificate refusal.
+        assert_ne!(manifest_target.top_hash, manifest_src.top_hash);
     }
 }

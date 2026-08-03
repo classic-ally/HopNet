@@ -759,9 +759,9 @@ async fn start_engine_production_with_chain(
     EngineNode { input_tx, decided }
 }
 
-/// XDG_DATA_HOME is process-global and both boundary e2es derive their
-/// artifact/database paths from it — serialize them.
-static DATA_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// XDG_DATA_HOME and the upgrade overrides are process-global, and these
+// e2es derive every artifact/database path from the first — serialized and
+// RESTORED through the shared guard (see `crate::test_env`).
 
 // Should: drive a real 3-node loopback mesh through the whole boundary
 // over the PRODUCTION driver stack — regenesis_start decides and the
@@ -778,10 +778,10 @@ fn regenesis_seal_halts_mesh_and_writes_artifact() {
     // The artifact path derives from XDG_DATA_HOME; isolate it for this
     // process (set_var is process-global — hence the lock shared with
     // the transition e2e).
-    let _guard = DATA_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = crate::test_env::lock_env();
     let data_dir = std::env::temp_dir().join(format!("hopnet-seal-e2e-{}", std::process::id()));
     std::fs::create_dir_all(data_dir.join("hopnet")).unwrap();
-    unsafe { std::env::set_var("XDG_DATA_HOME", &data_dir) };
+    crate::test_env::set(&_guard, "XDG_DATA_HOME", &data_dir);
 
     let network = MockNetwork::setup_with_validators(3);
     let rt = crate::consensus::tests::test_iroh_rt();
@@ -937,11 +937,11 @@ fn regenesis_seal_halts_mesh_and_writes_artifact() {
 // multi-node process restart is the orchestrator scenario's job.
 #[test]
 fn regenesis_transition_restarts_into_epoch_2() {
-    let _guard = DATA_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = crate::test_env::lock_env();
     let data_dir =
         std::env::temp_dir().join(format!("hopnet-transition-e2e-{}", std::process::id()));
     std::fs::create_dir_all(data_dir.join("hopnet")).unwrap();
-    unsafe { std::env::set_var("XDG_DATA_HOME", &data_dir) };
+    crate::test_env::set(&_guard, "XDG_DATA_HOME", &data_dir);
     let db_path = data_dir
         .join("hopnet")
         .join("database.db")
@@ -1134,6 +1134,21 @@ fn regenesis_transition_restarts_into_epoch_2() {
             // its own thread — resume-at-H, observed once it settles.
             wait_decided(&mut engine, seal_height, 30).await;
 
+            // The window must still be OPEN at the genesis height itself.
+            // `spawn_rollback_cleanup` deletes on `decided > genesis_height`
+            // and the decided watch is seeded to H at boot, so `>=` would
+            // delete the retained database immediately on boot — closing the
+            // window at exactly the moment it matters most, for a node that
+            // just crossed into a broken epoch and has decided nothing yet.
+            // Asserting only that the file eventually disappears (below)
+            // cannot catch that: `>=` satisfies it instantly.
+            let retained_path =
+                crate::regenesis::boot::sealed_path(&crate::db::shared::get_database_path());
+            assert!(
+                retained_path.exists(),
+                "the rollback window must stay open at the epoch genesis height itself"
+            );
+
             // New op in the new epoch: heights are continuous — the start
             // decides at H+1, and the epoch-2 boundary machinery then runs
             // the whole drain->commit->seal cycle again on its own.
@@ -1188,10 +1203,10 @@ fn regenesis_transition_restarts_into_epoch_2() {
 // Should not: lose the straggler's own node identity across the rebuild.
 #[test]
 fn straggler_rejoins_across_an_epoch_boundary() {
-    let _guard = DATA_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = crate::test_env::lock_env();
     let data_dir = std::env::temp_dir().join(format!("hopnet-rejoin-e2e-{}", std::process::id()));
     std::fs::create_dir_all(data_dir.join("hopnet")).unwrap();
-    unsafe { std::env::set_var("XDG_DATA_HOME", &data_dir) };
+    crate::test_env::set(&_guard, "XDG_DATA_HOME", &data_dir);
     let db_path = data_dir
         .join("hopnet")
         .join("database.db")

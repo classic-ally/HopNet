@@ -35,6 +35,8 @@ pub mod setup;
 pub mod shares;
 pub mod storage_host;
 pub mod takeout_host;
+#[cfg(test)]
+pub mod test_env;
 pub mod types;
 pub mod upgrade;
 pub mod users;

@@ -1320,9 +1320,21 @@ impl TestScenario for RegenesisRollback {
         // Negative half: recovery from a rollback is another regenesis,
         // FORWARD. Take the mesh across a same-version boundary, let it
         // decide past H, and the window is gone for good.
-        let Some(_) = attest_and_freeze(&mut result, &fresh, None).await? else {
+        // Capture H here, from a node that is still SEALED. Reading
+        // `seal_height` after the crossing instead (as this did) always
+        // yielded 0: the new epoch is deliberately born with no
+        // `regenesis_state` row, the field serializes as JSON null, and
+        // `unwrap_or(0)` swallowed it — so the height comparison below
+        // degenerated to `> 0`, which the epoch-2 genesis satisfies on the
+        // first loop iteration. The check passed on its sibling conjunct
+        // alone and proved nothing about deciding PAST the boundary.
+        let Some(h2) = attest_and_freeze(&mut result, &fresh, None).await? else {
             return Ok(result);
         };
+        let h2: u64 = h2
+            .parse()
+            .map_err(|_| anyhow::anyhow!("seal height is not a number: {h2}"))?;
+        anyhow::ensure!(h2 > 0, "seal height must be a real boundary, got {h2}");
         let mut exits = Vec::new();
         for node in &fresh {
             exits.push(
@@ -1340,10 +1352,6 @@ impl TestScenario for RegenesisRollback {
             reborn.push(reauth_node(&docker, mesh_id, node).await?);
         }
         upload_file(&reborn[0], "/", "epoch-two.txt", b"forward only".to_vec()).await?;
-        let h2 = regenesis_status(&reborn[0]).await?["seal_height"]
-            .as_str()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
         let mut closed = false;
         for _ in 0..90 {
             let v = regenesis_status(&reborn[0]).await?;

@@ -148,23 +148,27 @@ mod tests {
     // override (the v1 provider never stages).
     // Should not: let an override survive removal — the compile-time
     // identity is always the fallback.
-    // (One test fn on purpose: env vars are process-global and cargo
-    // runs tests in parallel; serializing the mutations inside a single
-    // fn keeps the reads race-free.)
+    // Collapsing into one fn serialized this test's OWN reads, which was
+    // never the exposure: other tests read `effective_running_code()`
+    // concurrently, and a far-future override inverts them outright — the
+    // status view's `awaiting_upgrade` and the upgrade view's
+    // `newer_than_running` both flip. Hence the shared process-env lock,
+    // which also RESTORES on drop.
     #[test]
     fn overrides_are_test_mode_seams() {
+        let guard = crate::test_env::lock_env();
         // Test builds have debug_assertions, so test_mode() is on here.
-        unsafe { std::env::set_var("HOPNET_UPGRADE_VERSION_OVERRIDE", "2031.4.2") };
+        crate::test_env::set(&guard, "HOPNET_UPGRADE_VERSION_OVERRIDE", "2031.4.2");
         assert_eq!(effective_running_code(), 20310402);
-        unsafe { std::env::set_var("HOPNET_UPGRADE_VERSION_OVERRIDE", "not-calver") };
+        crate::test_env::set(&guard, "HOPNET_UPGRADE_VERSION_OVERRIDE", "not-calver");
         assert_eq!(effective_running_code(), running_version_code());
-        unsafe { std::env::remove_var("HOPNET_UPGRADE_VERSION_OVERRIDE") };
+        crate::test_env::remove(&guard, "HOPNET_UPGRADE_VERSION_OVERRIDE");
         assert_eq!(effective_running_code(), running_version_code());
 
         assert_eq!(effective_staged_code(), None);
-        unsafe { std::env::set_var("HOPNET_UPGRADE_STAGED_OVERRIDE", "2031.4.3") };
+        crate::test_env::set(&guard, "HOPNET_UPGRADE_STAGED_OVERRIDE", "2031.4.3");
         assert_eq!(effective_staged_code(), Some(20310403));
-        unsafe { std::env::remove_var("HOPNET_UPGRADE_STAGED_OVERRIDE") };
+        crate::test_env::remove(&guard, "HOPNET_UPGRADE_STAGED_OVERRIDE");
         assert_eq!(effective_staged_code(), None);
     }
 

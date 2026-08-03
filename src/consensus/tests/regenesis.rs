@@ -506,6 +506,9 @@ fn seal_artifact_written_only_on_hash_match() {
 // binary already runs (that node restarts itself).
 #[test]
 fn status_view_reports_epoch_and_awaiting_upgrade() {
+    // Asserts on `awaiting_upgrade`, which compares the sealed target
+    // against `effective_running_code()` — a leaked override flips it.
+    let _env = crate::test_env::lock_env();
     let node = MockNode::new(4);
     register_node(&node);
     seat_with_version(&node, 4, 20260800);
@@ -629,6 +632,11 @@ fn retrust_route_requires_a_known_peer() {
 // Should not: write the rollback marker on a refusal.
 #[test]
 fn rollback_route_refuses_when_there_is_no_boundary() {
+    // This decides on `sealed_path()`, which resolves from the
+    // process-global XDG_DATA_HOME: unlocked, it could see a live boundary
+    // e2e's retained-epoch file, answer 202 instead of the asserted 409,
+    // and write a real rollback marker into that e2e's data directory.
+    let _env = crate::test_env::lock_env();
     use axum::response::IntoResponse as _;
 
     let node = MockNode::new(7);
@@ -667,6 +675,8 @@ fn rollback_route_refuses_when_there_is_no_boundary() {
 //   is how rollback is actually driven).
 #[test]
 fn local_boundary_routes_require_a_seated_signer() {
+    // `rollback_available` resolves `sealed_path()` from XDG_DATA_HOME.
+    let _env = crate::test_env::lock_env();
     use axum::response::IntoResponse as _;
 
     let node = MockNode::new(11);
@@ -727,6 +737,8 @@ fn local_boundary_routes_require_a_seated_signer() {
 // answer status pings with this node's (epoch, version).
 #[test]
 fn handshake_carries_epoch_and_refuses_mismatched_fetch() {
+    // Reads `effective_running_code()` for the handshake pong.
+    let _env = crate::test_env::lock_env();
     use crate::consensus::evidence::{StatusRequest, StatusResponse};
     use crate::consensus::malachite::gossip::{ConsensusNetRequest, ConsensusNetResponse};
 
