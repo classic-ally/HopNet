@@ -1607,6 +1607,56 @@ pub(crate) mod tests {
         assert!(!rollback_available(&db2, &open(&db2)));
     }
 
+    // Impact: the crash window between the decide commit and the seal
+    // work. `phase = Sealed` commits inside the decide transaction; the
+    // marker is written afterwards, on another connection, from a detached
+    // thread. A kill (or a busy/pool timeout, both merely logged) in
+    // between leaves the phase committed and the marker gone — and read
+    // naively that is indistinguishable from a healthy node, so the boot
+    // path took State A, deleted the `.next` build, and started an engine
+    // on the RETIRED chain that then refused every block and every
+    // submission forever. Nothing else in the tree writes the marker.
+    //
+    // The inverse was already guarded (marker without phase parks loudly);
+    // only this direction was silent. No fixture in the tree produced it —
+    // every test asserted the two together, and `join_fixture` clears
+    // both — which is precisely why it went unnoticed.
+    // Should: cross the boundary from the committed phase alone, deriving
+    //   H from `regenesis_state`, so a node stranded by the old ordering
+    //   heals on its next boot.
+    #[test]
+    fn a_committed_seal_crosses_without_its_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = sealed_db(dir.path());
+
+        // Exactly the crash: drop the node-local marker, keep the
+        // committed phase.
+        {
+            let conn = open(&db_path);
+            conn.execute(
+                "DELETE FROM consensus_meta WHERE key = ?",
+                [seal::META_SEALED_AT],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+            assert!(
+                seal::sealed_marker(&conn).is_some(),
+                "H must still be derivable from the committed row"
+            );
+        }
+
+        match boot_transition(&db_path, TARGET) {
+            BootOutcome::Transitioned { epoch: 2 } => {}
+            other => panic!("expected the boundary to still stand, got {other:?}"),
+        }
+        let conn = open(&db_path);
+        assert_eq!(genesis::current_epoch(&conn), 2);
+        assert_eq!(genesis::epoch_genesis_height(&conn), Some(H));
+        // The fresh epoch carries no seal, so the derivation cannot loop.
+        assert!(seal::sealed_marker(&conn).is_none());
+    }
+
     // Impact: this is the boundary itself — every assertion here is a
     // clause of the spec's Restart & Validity Gates section.
     // Should: cross the boundary on a version match — fresh database at

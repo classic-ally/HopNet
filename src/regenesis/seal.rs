@@ -15,10 +15,50 @@ pub const META_SEALED_AT: &str = "regenesis_sealed_at";
 /// The artifact next to the database (spec: Snapshot & Certificate).
 pub const SEAL_ARTIFACT_FILENAME: &str = "regenesis-snapshot.bin";
 
-/// Terminal height from the durable marker, if this node sealed.
+/// Terminal height H if this node sealed — from the node-local marker
+/// when present, otherwise DERIVED from committed state.
+///
+/// The derivation is not belt-and-braces; without it a crash window
+/// strands the node. `phase = Sealed` is committed inside the decide
+/// transaction, but the marker is written afterwards, on a different
+/// pooled connection, from a detached thread. Die in between — SIGKILL,
+/// power loss, `docker stop` — or merely fail that write (a busy timeout,
+/// or a pool checkout timeout, both of which are logged and stepped past)
+/// and the marker is absent while the phase is durably committed.
+///
+/// Read naively, that combination looks exactly like a healthy node:
+/// `boot_transition` takes its State A branch (and deletes the `.next`
+/// build), `spawn_engine` declines to park, and the engine starts on the
+/// RETIRED chain at H+1 — where `admissible_in_phase` refuses every
+/// submission and `validate_inner` refuses every block. Nothing else in
+/// the tree writes `META_SEALED_AT`, so nothing recovers it. A single
+/// victim is rescued by the S7 epoch join, but a synchronised seal means
+/// a whole quorum can land here together, and then no peer is ahead.
+///
+/// Note the inverse was already guarded: marker present with a
+/// non-Sealed phase parks loudly as corrupted. Only this direction was
+/// silent. The committed row holds `seal_height` beside the phase, so the
+/// meta key is a cache, and treating it as the source of truth is what
+/// broke — the module's own contract is that sealed artifacts are derived,
+/// idempotent recomputations from sealed local state.
+///
+/// Fresh and post-crossing databases still read None: the new epoch is
+/// born with no `regenesis_state` row at all, which decodes as Normal.
 pub fn sealed_marker(conn: &rusqlite::Connection) -> Option<u64> {
-    let bytes = hopnet_consensus::store::meta_get(conn, META_SEALED_AT).ok()??;
-    Some(u64::from_be_bytes(bytes.try_into().ok()?))
+    if let Ok(Some(bytes)) = hopnet_consensus::store::meta_get(conn, META_SEALED_AT)
+        && let Ok(be) = <[u8; 8]>::try_from(bytes.as_slice())
+    {
+        return Some(u64::from_be_bytes(be));
+    }
+    let state = crate::db::regenesis::read_regenesis_state(conn).ok()?;
+    if state.phase != RegenesisPhase::Sealed {
+        return None;
+    }
+    tracing::warn!(
+        "sealed marker absent but the committed phase is Sealed — deriving H from \
+         regenesis_state (the seal work did not finish; the boundary still stands)"
+    );
+    state.seal_height
 }
 
 /// Where the artifact lives: the database file's parent directory.

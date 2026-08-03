@@ -174,7 +174,30 @@ impl TransactionHandler for RegenesisCommitHandler {
         if !execute {
             return Ok(());
         }
-        set_sealed_tx(db_tx, &req.snapshot_hash, req.seal_height)
+        set_sealed_tx(db_tx, &req.snapshot_hash, req.seal_height)?;
+
+        // Write the node-local marker in the SAME transaction as the
+        // phase, so the two can never disagree. `consensus_meta` sits
+        // outside the snapshot universe, so this is node-local state and
+        // does not enter any exported or divergence hash — the same reason
+        // the seal work was allowed to write it from a separate connection.
+        //
+        // Belt, not braces: `sealed_marker` derives H from the committed
+        // row when this key is missing, which is what recovers nodes
+        // stranded by the old ordering. This closes the window for FUTURE
+        // seals rather than fixing past ones, and it is deliberately not
+        // the only line of defence — a failure here still aborts the whole
+        // decide (the handler's error rolls the block back), which is
+        // preferable to a half-sealed epoch.
+        hopnet_consensus::store::meta_put(
+            db_tx,
+            crate::regenesis::seal::META_SEALED_AT,
+            &req.seal_height.to_be_bytes(),
+        )
+        .map_err(|e| {
+            tracing::error!("sealing: marker write failed inside the decide: {e}");
+            DatabaseError::InsertError
+        })
     }
 }
 
