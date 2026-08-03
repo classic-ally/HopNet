@@ -136,6 +136,59 @@ fn hex_lower(bytes: Vec<u8>) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Seat gate for the two routes that act LOCALLY and IMMEDIATELY.
+///
+/// `start`/`abort` submit a node-signed transaction, so consensus refuses
+/// them unless the submitting node is seated (`require_seated` in
+/// `handlers.rs`). `rollback` and `retrust` submit nothing, so they had no
+/// equivalent — and `jwt_or_rpc_auth_middleware` accepts a signature from
+/// ANY row in `nodes`, which is append-only in production: a node that
+/// left voluntarily or was voted out still passed. This restores the same
+/// requirement the consensus path enforces.
+///
+/// Deliberately narrow, and the residual is worth stating plainly. Only
+/// the NODE-signature path is tightened; a mesh user's JWT still reaches
+/// these routes, because `users` is consensus-replicated and any user's
+/// passphrase authenticates on any node. That is a property of the whole
+/// `/consensus` block rather than of these two routes, no admin or
+/// operator role exists anywhere in the codebase to check instead, and it
+/// is how operators actually drive rollback today. Closing it needs the
+/// authorization class RFC-019 Open Question 2 still leaves open — not a
+/// unilateral change here.
+fn caller_seat_refusal(
+    app_state: &AppState,
+    caller: Option<&crate::consensus::routes::AuthenticatedNode>,
+) -> Option<axum::response::Response> {
+    let node_id = caller?.node_id;
+    let Ok(conn) = app_state.db_pool.get() else {
+        return Some((StatusCode::INTERNAL_SERVER_ERROR, "db unavailable").into_response());
+    };
+    let height = crate::db::consensus::get_current_consensus_height(&conn).unwrap_or(0);
+    // The crate-level wrapper takes a Transaction (it is called from apply
+    // paths); this is a plain read, so go to the consensus crate directly.
+    match hopnet_consensus::validators::is_node_active(&conn, node_id, height) {
+        Ok(true) => None,
+        Ok(false) => {
+            tracing::warn!(
+                node_id,
+                "refusing a local boundary op: signing node is not a seated validator"
+            );
+            Some(
+                (
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "node {node_id} is not a seated validator — a boundary operation that \
+                         acts on this node immediately requires the same seat consensus \
+                         requires of start/abort"
+                    ),
+                )
+                    .into_response(),
+            )
+        }
+        Err(_) => Some((StatusCode::INTERNAL_SERVER_ERROR, "seat lookup failed").into_response()),
+    }
+}
+
 /// Strict 32-byte hex. Deliberately unforgiving about length: a truncated
 /// fingerprint silently anchoring on a prefix would defeat the point.
 fn parse_chain_id(hex: &str) -> Option<[u8; 32]> {
@@ -185,8 +238,13 @@ pub struct RetrustRequest {
 /// Answers 202: the fetch runs in the background and can take minutes.
 pub async fn post_regenesis_retrust(
     State(app_state): State<AppState>,
+    caller: Option<axum::Extension<crate::consensus::routes::AuthenticatedNode>>,
     Json(body): Json<RetrustRequest>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = caller_seat_refusal(&app_state, caller.as_deref()) {
+        return refusal;
+    }
+
     // Parse the fingerprint FIRST: it is the trust anchor, so a request
     // without a well-formed one has no anchor at all and must not start a
     // fetch. 400, not 202 — the operator has to fix the request.
@@ -268,7 +326,14 @@ pub async fn post_regenesis_retrust(
 /// A valid rollback is MESH-WIDE. A node that rolls back beside peers
 /// still in the newer epoch is pulled straight back across by the epoch
 /// join, which is working as intended.
-pub async fn post_regenesis_rollback(State(app_state): State<AppState>) -> impl IntoResponse {
+pub async fn post_regenesis_rollback(
+    State(app_state): State<AppState>,
+    caller: Option<axum::Extension<crate::consensus::routes::AuthenticatedNode>>,
+) -> impl IntoResponse {
+    if let Some(refusal) = caller_seat_refusal(&app_state, caller.as_deref()) {
+        return refusal;
+    }
+
     let db_path = crate::db::shared::get_database_path();
     let available = {
         let Ok(conn) = app_state.db_pool.get() else {

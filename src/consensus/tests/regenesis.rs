@@ -576,6 +576,9 @@ fn retrust_route_requires_a_known_peer() {
         rt.block_on(async {
             crate::regenesis::routes::post_regenesis_retrust(
                 axum::extract::State(node.app_state.clone()),
+                // No signing node in the extensions: the operator/JWT path,
+                // which the seat gate deliberately leaves alone.
+                None,
                 axum::Json(crate::regenesis::routes::RetrustRequest {
                     node_id,
                     expect_chain_id,
@@ -636,9 +639,10 @@ fn rollback_route_refuses_when_there_is_no_boundary() {
         .unwrap();
 
     let resp = rt.block_on(async {
-        crate::regenesis::routes::post_regenesis_rollback(axum::extract::State(
-            node.app_state.clone(),
-        ))
+        crate::regenesis::routes::post_regenesis_rollback(
+            axum::extract::State(node.app_state.clone()),
+            None,
+        )
         .await
         .into_response()
     });
@@ -648,6 +652,71 @@ fn rollback_route_refuses_when_there_is_no_boundary() {
             .exists(),
         "a refused request must leave no marker behind"
     );
+}
+
+// Impact: `jwt_or_rpc_auth_middleware` accepts a signature from ANY row in
+// `nodes`, and `nodes` is append-only in production — no non-test path
+// deletes from it — so a node that left voluntarily or was voted out kept
+// a working credential. start/abort are safe because their handlers call
+// `require_seated` inside consensus; rollback and retrust submit nothing
+// and so had no equivalent. This is that gap, closed.
+// Should: refuse a signing node that is registered but NOT seated, on both
+//   locally-acting routes, before either does any work.
+// Should not: refuse when no signing node is present — the JWT/operator
+//   path is deliberately untouched (no admin role exists to check, and it
+//   is how rollback is actually driven).
+#[test]
+fn local_boundary_routes_require_a_seated_signer() {
+    use axum::response::IntoResponse as _;
+
+    let node = MockNode::new(11);
+    register_node(&node);
+    // Registered above, deliberately never seated.
+    let unseated = axum::Extension(crate::consensus::routes::AuthenticatedNode { node_id: 11 });
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let rollback = rt.block_on(async {
+        crate::regenesis::routes::post_regenesis_rollback(
+            axum::extract::State(node.app_state.clone()),
+            Some(unseated.clone()),
+        )
+        .await
+        .into_response()
+    });
+    assert_eq!(rollback.status(), axum::http::StatusCode::FORBIDDEN);
+
+    // Refused ahead of the fingerprint parse, so even a well-formed
+    // request from an unseated node never reaches the join.
+    let retrust = rt.block_on(async {
+        crate::regenesis::routes::post_regenesis_retrust(
+            axum::extract::State(node.app_state.clone()),
+            Some(unseated.clone()),
+            axum::Json(crate::regenesis::routes::RetrustRequest {
+                node_id: 11,
+                expect_chain_id: "a".repeat(64),
+            }),
+        )
+        .await
+        .into_response()
+    });
+    assert_eq!(retrust.status(), axum::http::StatusCode::FORBIDDEN);
+
+    // Seat it and the gate stops firing: rollback falls through to its own
+    // "nothing to abandon" refusal, which is the next check, not this one.
+    seat_with_version(&node, 11, 20260800);
+    let seated = rt.block_on(async {
+        crate::regenesis::routes::post_regenesis_rollback(
+            axum::extract::State(node.app_state.clone()),
+            Some(unseated),
+        )
+        .await
+        .into_response()
+    });
+    assert_eq!(seated.status(), axum::http::StatusCode::CONFLICT);
 }
 
 // Impact: the (epoch, version) handshake is what turns silent cross-

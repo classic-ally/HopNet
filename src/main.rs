@@ -681,13 +681,18 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .nest("/admin", admin::routes::admin_routes())
                 .nest("/views", views::routes::router())
                 .route("/logout", post(auth::sign_out))
+                // Registered BEFORE the auth layer on purpose: axum's
+                // `Router::layer` only wraps routes added before the call,
+                // so appending this after the layer (as it was) left the
+                // whole per-table state manifest unauthenticated on every
+                // headless node — which binds 0.0.0.0. Pre-existing rather
+                // than introduced here, but the variable is called
+                // `protected_routes` and this is where it becomes true.
+                .route("/debug/state", get(consensus::routes::get_state_snapshot))
                 .layer(middleware::from_fn_with_state(
                     app_state.clone(),
                     auth::auth_middleware,
                 ));
-
-            let protected_routes =
-                protected_routes.route("/debug/state", get(consensus::routes::get_state_snapshot));
 
             // Routes that accept either JWT (users) or RPC (nodes) authentication
             let jwt_or_rpc_routes = Router::new()
