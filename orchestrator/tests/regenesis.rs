@@ -69,6 +69,16 @@ async fn decided_height(node: &NodeInfo) -> Result<u64> {
 /// List/inspect calls can transiently FAIL TO PARSE under podman: a
 /// container mid-shutdown reports state "stopping", which bollard's
 /// typed enums do not know. Retry through those windows.
+///
+/// The checkout label is part of the match, not decoration. `mesh_id` and
+/// `node_id` are NOT unique across checkouts — resource NAMES are
+/// per-checkout (`naming::prefix`) but these labels are bare, so another
+/// worktree running its own mesh 0 carries `mesh_id=0, node_id=1` too.
+/// Matching on the pair alone could return that container: `is_running`
+/// then reads a healthy foreign node, and `wait_for_exit_code` waits out
+/// its whole deadline on a container that will never exit — reporting a
+/// node that restarted in seconds as "did not restart". Volumes were
+/// already filtered this way in `main.rs`; the container lookups were not.
 async fn find_container_id(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<String> {
     let mut last: Option<anyhow::Error> = None;
     for _ in 0..20 {
@@ -85,6 +95,10 @@ async fn find_container_id(docker: &Docker, mesh_id: u32, node_id: u32) -> Resul
                     if let Some(labels) = &container.labels
                         && labels.get("hopnet.mesh_id") == Some(&mesh_id.to_string())
                         && labels.get("hopnet.node_id") == Some(&node_id.to_string())
+                        && labels
+                            .get(crate::naming::CHECKOUT_LABEL)
+                            .map(String::as_str)
+                            == Some(crate::naming::checkout_hash())
                         && let Some(id) = &container.id
                     {
                         return Ok(id.clone());
@@ -1382,6 +1396,16 @@ impl TestScenario for RegenesisRollback {
                 detail: Some(format!("H was {seal_height}")),
             },
         );
+        // Wait for the write to reach EVERY replica before comparing state.
+        // `progressed` above only needs the node it was submitted through to
+        // advance, so comparing immediately caught a follower mid-apply and
+        // reported a divergence that was really a lag (heights 9/9/8, and of
+        // course differing hashes at differing heights).
+        let (converged, heights) = wait_for_convergence(&fresh, seal_height, 120).await;
+        anyhow::ensure!(
+            converged,
+            "rolled-back mesh never converged past H={seal_height}: {heights:?}"
+        );
         let snapshots = fetch_state_snapshots(&fresh).await?;
         let (coherent, detail) = coherence(&snapshots);
         print_and_add_check(
@@ -1399,21 +1423,12 @@ impl TestScenario for RegenesisRollback {
         // Negative half: recovery from a rollback is another regenesis,
         // FORWARD. Take the mesh across a same-version boundary, let it
         // decide past H, and the window is gone for good.
-        // Capture H here, from a node that is still SEALED. Reading
-        // `seal_height` after the crossing instead (as this did) always
-        // yielded 0: the new epoch is deliberately born with no
-        // `regenesis_state` row, the field serializes as JSON null, and
-        // `unwrap_or(0)` swallowed it — so the height comparison below
-        // degenerated to `> 0`, which the epoch-2 genesis satisfies on the
-        // first loop iteration. The check passed on its sibling conjunct
-        // alone and proved nothing about deciding PAST the boundary.
-        let Some(h2) = attest_and_freeze(&mut result, &fresh, None).await? else {
+        if attest_and_freeze(&mut result, &fresh, None)
+            .await?
+            .is_none()
+        {
             return Ok(result);
-        };
-        let h2: u64 = h2
-            .parse()
-            .map_err(|_| anyhow::anyhow!("seal height is not a number: {h2}"))?;
-        anyhow::ensure!(h2 > 0, "seal height must be a real boundary, got {h2}");
+        }
         let mut exits = Vec::new();
         for node in &fresh {
             exits.push(
@@ -1430,6 +1445,25 @@ impl TestScenario for RegenesisRollback {
             start_node(&docker, mesh_id, node.node_id).await?;
             reborn.push(reauth_node(&docker, mesh_id, node).await?);
         }
+
+        // H, read from the epoch-2 genesis BEFORE any new work is submitted.
+        // The new epoch's genesis sits AT the boundary height and is its
+        // last decided block, so this is exactly H — and unlike
+        // `seal_height` it is still present after the crossing.
+        //
+        // Two sources that look right and are not. `seal_height` from the
+        // status view is JSON null here: the new epoch is deliberately born
+        // with no `regenesis_state` row, so the original `unwrap_or(0)` made
+        // the comparison below `> 0`, which the genesis satisfies on the
+        // first iteration — the check rested entirely on its sibling
+        // conjunct and proved nothing about deciding PAST the boundary. And
+        // `attest_and_freeze` returns the attested running VERSION, not a
+        // height. Polling for phase "sealed" does not work either: this is a
+        // SAME-version boundary, so nodes seal and exit 75 immediately
+        // rather than lingering in that phase to be observed.
+        let h2 = decided_height(&reborn[0]).await?;
+        anyhow::ensure!(h2 > 0, "epoch-2 genesis height must be real, got {h2}");
+
         upload_file(&reborn[0], "/", "epoch-two.txt", b"forward only".to_vec()).await?;
         let mut closed = false;
         for _ in 0..90 {

@@ -27,6 +27,10 @@ pub async fn stop_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<()
         if let Some(labels) = &container.labels
             && labels.get("hopnet.mesh_id") == Some(&mesh_id.to_string())
             && labels.get("hopnet.node_id") == Some(&node_id.to_string())
+            && labels
+                .get(crate::naming::CHECKOUT_LABEL)
+                .map(String::as_str)
+                == Some(crate::naming::checkout_hash())
             && let Some(id) = &container.id
         {
             docker
@@ -57,6 +61,10 @@ pub async fn start_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<(
         if let Some(labels) = &container.labels
             && labels.get("hopnet.mesh_id") == Some(&mesh_id.to_string())
             && labels.get("hopnet.node_id") == Some(&node_id.to_string())
+            && labels
+                .get(crate::naming::CHECKOUT_LABEL)
+                .map(String::as_str)
+                == Some(crate::naming::checkout_hash())
             && let Some(id) = &container.id
         {
             docker
