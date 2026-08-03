@@ -569,7 +569,14 @@ async fn wait_for_formation(
         if let Ok(resp) = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
-            .json(&u64::MAX) // any height >= tip resolves to the latest set
+            // `i64::MAX`, not `u64::MAX`: heights map onto SQLite INTEGER
+            // by lossless bit-cast, so anything above i64::MAX lands
+            // NEGATIVE and the validator CTE's `effective_height <= ?`
+            // matches ZERO rows — every height is >= 0. With u64::MAX this
+            // probe never saw a validator, so it burned its full timeout on
+            // every mesh creation and reported 0 seated.
+            // `src/db/consensus.rs` pins i64::MAX as the safe ceiling.
+            .json(&(i64::MAX as u64)) // any height >= tip resolves to the latest set
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await

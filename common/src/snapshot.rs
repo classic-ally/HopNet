@@ -557,6 +557,17 @@ mod engine {
             columns.push(cur.read_name()?);
         }
         let row_count = cur.read_u64()?;
+        // A zero-column unit would make `walk_table_rows` advance the
+        // cursor by NOTHING per row, so `read_bytes` never reaches the end
+        // and never errors: a hostile `row_count` spins up to 2^64 times
+        // consuming no input. `import_section` compares columns against the
+        // canonical set before walking, but the parse-to-skip branch
+        // deliberately does not — skipping IS a full structural decode of
+        // bytes whose shape is not trusted. Rejected here, where every
+        // other structural impossibility is. No real table has no columns.
+        if columns.is_empty() && row_count != 0 {
+            return Err(cur.malformed("table unit declares rows but no columns"));
+        }
         Ok(TableUnit {
             name,
             columns,
@@ -1402,6 +1413,40 @@ mod tests {
             result.unwrap_err(),
             SnapshotError::Malformed { .. }
         ));
+    }
+
+    // Impact: a zero-column unit is the one shape that makes the row walk
+    // consume NO input per row, so `read_bytes` never reaches the end and
+    // never errors — a patched `row_count` would spin up to 2^64 times on a
+    // fixed buffer. `import_section` compares columns before walking, but
+    // the PARSE-TO-SKIP branch deliberately does not: skipping an unknown
+    // section IS a full structural decode of bytes whose shape is not
+    // trusted, which is exactly where a hostile artifact would aim.
+    // Not reachable in production (both importers verify the blake3 hash
+    // first, so triggering it needs a preimage) — this is the routine's own
+    // bounds check, not a defence that something else already provides.
+    // Should: reject a unit that declares rows but no columns, rather than
+    //   loop forever.
+    #[test]
+    fn import_rejects_a_zero_column_unit() {
+        let artifact = hex::decode(GOLDEN_ARTIFACT_HEX).unwrap();
+        // A table header is a length-prefixed name followed by u32
+        // col_count. Anchor on `items`' name so the patch site is unique,
+        // then zero its column count while leaving row_count intact — the
+        // shape that makes the row walk consume nothing per iteration.
+        let mut find = 5u32.to_le_bytes().to_vec();
+        find.extend_from_slice(b"items");
+        let cols = find.len();
+        find.extend_from_slice(&5u32.to_le_bytes());
+        let mut replace = find.clone();
+        replace[cols..].copy_from_slice(&0u32.to_le_bytes());
+
+        let patched = patch(&artifact, &find, &replace);
+        let (_, result) = import_into_fresh(&patched, &[&MAIN_SECTION, &EMPTY_SECTION]);
+        assert!(
+            matches!(result.unwrap_err(), SnapshotError::Malformed { .. }),
+            "a zero-column unit must be refused at the header"
+        );
     }
 
     // Should: fail Malformed with the offset on an unknown value tag.
