@@ -58,10 +58,16 @@ pub struct StagedJoinManifest {
     pub required_version_code: u32,
     pub snapshot_hash: [u8; 32],
     pub snapshot_len: u64,
-    /// Operator re-trust: the boot path skips the OVERLAP check only.
-    /// Chain-id linkage, per-hop quorum, and the snapshot hash are still
-    /// enforced — this waives weak subjectivity, not verification.
-    pub manual_anchor: bool,
+    /// Operator re-trust: the epoch identity the operator named out of
+    /// band. `Some` swaps the OVERLAP check for a fingerprint match on the
+    /// epoch actually reached; chain-id linkage, per-hop quorum and the
+    /// snapshot hash are enforced either way.
+    ///
+    /// Persisted rather than recomputed because the boot path re-verifies
+    /// the staged chain from scratch after a restart, and must reach the
+    /// same verdict — dropping the anchor to "trust anything" there would
+    /// reopen the hole the online side just closed.
+    pub manual_fingerprint: Option<[u8; 32]>,
 }
 
 /// One request/response against a peer's "regenesis" scope. Abstracted
@@ -103,9 +109,20 @@ impl JoinTransport for CommsTransport {
 pub enum JoinAnchor {
     /// This node's own last-trusted state (the ordinary straggler).
     OwnDb,
-    /// An operator named a peer they trust: fetch from it alone and
-    /// waive the overlap requirement (the join ceremony, re-invoked).
-    Manual { peer: PeerRef },
+    /// An operator named a peer AND the epoch identity they expect: fetch
+    /// from that peer alone, and root the chain in the fingerprint instead
+    /// of the overlap rule (the join ceremony, re-invoked).
+    ///
+    /// The fingerprint is required, not optional. Without it the record's
+    /// own declared validator set would be verifying the record's own
+    /// certificate, so any peer could serve a wholly fabricated epoch and
+    /// have it accepted — the overlap rule was the only thing making a
+    /// peer-supplied record trustworthy.
+    Manual {
+        peer: PeerRef,
+        /// Expected chain id of the target epoch, supplied out of band.
+        expect_chain_id: [u8; 32],
+    },
 }
 
 /// Progress/last-error for the status surface — latest wins, exactly
@@ -259,17 +276,23 @@ pub async fn run_epoch_join_with(
         return Err("no peers to join from".into());
     }
 
-    let manual_anchor = matches!(anchor, JoinAnchor::Manual { .. });
+    let manual_fingerprint = match anchor {
+        JoinAnchor::Manual {
+            expect_chain_id, ..
+        } => Some(expect_chain_id),
+        JoinAnchor::OwnDb => None,
+    };
     let chain_anchor = {
         let conn = app_state
             .db_pool
             .get()
             .map_err(|e| format!("db conn: {e}"))?;
         let mut a = ChainAnchor::from_db(&conn)?;
-        if manual_anchor {
-            // The operator vouches for the peer; weak subjectivity is
-            // exactly what they are overriding.
-            a.trusted = None;
+        if let Some(fp) = manual_fingerprint {
+            // The operator is overriding weak subjectivity, so their
+            // fingerprint takes its place as the root. NOT a waiver: the
+            // chain must terminate in exactly this identity.
+            a.trust = genesis::ChainTrust::Fingerprint(fp);
         }
         a
     };
@@ -307,7 +330,7 @@ pub async fn run_epoch_join_with(
             target_record,
             my_epoch,
             len,
-            manual_anchor,
+            manual_fingerprint,
         )?;
         set_state(format!(
             "staged for epoch {} — requesting restart",
@@ -332,7 +355,7 @@ pub async fn run_epoch_join_with(
             target_record,
             my_epoch,
             len,
-            manual_anchor,
+            manual_fingerprint,
         )?;
         set_state(format!(
             "staged for epoch {}, but it requires version {} (running {}) — awaiting upgrade",
@@ -351,7 +374,7 @@ fn stage_manifest(
     target: &genesis::EpochGenesisRecord,
     from_epoch: u64,
     snapshot_len: u64,
-    manual_anchor: bool,
+    manual_fingerprint: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let mut lineage_epochs = Vec::with_capacity(records.len());
     for lr in records {
@@ -368,7 +391,7 @@ fn stage_manifest(
         required_version_code: target.required_version_code,
         snapshot_hash: target.snapshot_hash,
         snapshot_len,
-        manual_anchor,
+        manual_fingerprint,
     };
     let bytes = bincode::serde::encode_to_vec(&manifest, bincode::config::standard())
         .map_err(|e| format!("manifest encode: {e}"))?;
@@ -895,13 +918,13 @@ mod tests {
 
         let staging = dir.path().join("staging-under-test");
         std::fs::create_dir_all(&staging).unwrap();
-        stage_manifest(&staging, &records, &records[0].record, 1, 4096, false).unwrap();
+        stage_manifest(&staging, &records, &records[0].record, 1, 4096, None).unwrap();
 
         let manifest = read_manifest(&staging).expect("manifest readable");
         assert_eq!(manifest.target_epoch, 2);
         assert_eq!(manifest.lineage_epochs, vec![2]);
         assert_eq!(manifest.snapshot_hash, records[0].record.snapshot_hash);
-        assert!(!manifest.manual_anchor);
+        assert!(manifest.manual_fingerprint.is_none());
 
         let back = read_staged_lineage(&staging, &manifest).unwrap();
         assert_eq!(back.len(), 1);
@@ -928,7 +951,7 @@ mod tests {
             required_version_code: TARGET,
             snapshot_hash: [0; 32],
             snapshot_len: 0,
-            manual_anchor: false,
+            manual_fingerprint: None,
         };
         let bytes = bincode::serde::encode_to_vec(&manifest, bincode::config::standard()).unwrap();
         write_atomic(&manifest_path(&staging), &bytes).unwrap();
@@ -1171,7 +1194,7 @@ mod tests {
         let manifest = read_manifest(&staging).expect("staging completed");
         assert_eq!(manifest.target_epoch, 2);
         assert_eq!(manifest.from_epoch, 1);
-        assert!(!manifest.manual_anchor);
+        assert!(manifest.manual_fingerprint.is_none());
 
         let snapshot = std::fs::read(staged_snapshot_path(&staging)).unwrap();
         assert_eq!(blake3::hash(&snapshot).as_bytes(), &manifest.snapshot_hash);

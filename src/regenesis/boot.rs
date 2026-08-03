@@ -589,11 +589,12 @@ fn staged_join_transition(
         Ok(a) => a,
         Err(e) => return Some(poison(&staging, format!("anchor: {e}"))),
     };
-    if manifest.manual_anchor {
-        // Operator re-trust: weak subjectivity is exactly what they
-        // overrode. Linkage, per-hop quorum and the snapshot hash below
-        // are all still enforced.
-        anchor.trusted = None;
+    if let Some(fp) = manifest.manual_fingerprint {
+        // Operator re-trust: the overlap rule is replaced by the operator's
+        // out-of-band fingerprint, NOT removed. Re-applied here because the
+        // boot path re-verifies from scratch and must reach the same
+        // verdict the online side did.
+        anchor.trust = genesis::ChainTrust::Fingerprint(fp);
     }
     let target = match genesis::verify_lineage_chain(&records, anchor) {
         Ok(t) => t,
@@ -1043,6 +1044,9 @@ pub(crate) mod tests {
         target_epoch: u64,
         snapshot: Vec<u8>,
         lineage: Vec<u8>,
+        /// Chain id of the target epoch — what an operator would read off a
+        /// node they trust and pass as the re-trust fingerprint.
+        target_chain_id: [u8; 32],
     }
 
     /// Build a straggler beside a transitioned peer: the straggler is the
@@ -1081,6 +1085,13 @@ pub(crate) mod tests {
                 .unwrap();
         }
 
+        let staged = genesis::decode_lineage(&lineage).unwrap();
+        let target_chain_id = *genesis::genesis_block_for(&staged.record)
+            .unwrap()
+            .block_hash
+            .0
+            .as_bytes();
+
         let staging = join::staging_path(&db_path);
         JoinFixture {
             db_path,
@@ -1088,17 +1099,23 @@ pub(crate) mod tests {
             target_epoch: 2,
             snapshot,
             lineage,
+            target_chain_id,
         }
     }
 
     impl JoinFixture {
         /// Write a complete staging (manifest last), as the online join
         /// would leave it.
-        fn stage(&self, manual_anchor: bool) {
-            self.stage_with(manual_anchor, &self.snapshot, &self.lineage);
+        fn stage(&self, manual_fingerprint: Option<[u8; 32]>) {
+            self.stage_with(manual_fingerprint, &self.snapshot, &self.lineage);
         }
 
-        fn stage_with(&self, manual_anchor: bool, snapshot: &[u8], lineage: &[u8]) {
+        fn stage_with(
+            &self,
+            manual_fingerprint: Option<[u8; 32]>,
+            snapshot: &[u8],
+            lineage: &[u8],
+        ) {
             std::fs::create_dir_all(&self.staging).unwrap();
             std::fs::write(self.staging.join("epoch-2.bin"), lineage).unwrap();
             std::fs::write(join::staged_snapshot_path(&self.staging), snapshot).unwrap();
@@ -1111,7 +1128,7 @@ pub(crate) mod tests {
                 required_version_code: record.required_version_code,
                 snapshot_hash: record.snapshot_hash,
                 snapshot_len: snapshot.len() as u64,
-                manual_anchor,
+                manual_fingerprint,
             };
             let bytes =
                 bincode::serde::encode_to_vec(&manifest, bincode::config::standard()).unwrap();
@@ -1130,7 +1147,7 @@ pub(crate) mod tests {
         let client = tempfile::tempdir().unwrap();
         let server = tempfile::tempdir().unwrap();
         let fx = join_fixture(client.path(), server.path());
-        fx.stage(false);
+        fx.stage(None);
 
         match boot_transition(&fx.db_path, TARGET) {
             BootOutcome::Transitioned { epoch: 2 } => {}
@@ -1172,7 +1189,7 @@ pub(crate) mod tests {
         let client = tempfile::tempdir().unwrap();
         let server = tempfile::tempdir().unwrap();
         let fx = join_fixture(client.path(), server.path());
-        fx.stage(false);
+        fx.stage(None);
         let before = std::fs::read(&fx.db_path).unwrap();
 
         match boot_transition(&fx.db_path, TARGET + 100) {
@@ -1210,13 +1227,13 @@ pub(crate) mod tests {
             if corrupt {
                 let mut bad = fx.snapshot.clone();
                 bad[0] ^= 0xFF;
-                fx.stage_with(false, &bad, &fx.lineage);
+                fx.stage_with(None, &bad, &fx.lineage);
             } else {
                 let mut bad = genesis::decode_lineage(&fx.lineage).unwrap();
                 bad.record.prev_chain_id = [0x5A; 32];
                 let bytes =
                     bincode::serde::encode_to_vec(&bad, bincode::config::standard()).unwrap();
-                fx.stage_with(false, &fx.snapshot, &bytes);
+                fx.stage_with(None, &fx.snapshot, &bytes);
             }
             let before = std::fs::read(&fx.db_path).unwrap();
 
@@ -1235,12 +1252,19 @@ pub(crate) mod tests {
         }
     }
 
-    // Impact: an operator re-trust is the escape hatch when churn moved
-    // past the overlap window — it must waive weak subjectivity and
-    // nothing else.
+    // Impact: re-trust is the escape hatch when churn moved past the
+    // overlap window, and it is the ONLY path that sets the seated-set
+    // check aside. It therefore has to substitute a different anchor
+    // rather than none: each hop's certificate is verified against the
+    // validator set declared inside that same record, so with no external
+    // root the chain is self-certifying and any peer could serve a
+    // fabricated epoch. The operator's out-of-band chain id is that root.
     // Should: cross when the staged chain overlaps nothing this node
-    // trusted, provided the manifest says an operator asked for it.
-    // Should not: cross on the same inputs without that flag.
+    //   trusted, PROVIDED the manifest names the epoch identity reached.
+    // Should not: cross with no fingerprint (the pre-fix behaviour).
+    // Should not: cross when the fingerprint names a different epoch —
+    //   this is the fabricated-chain refusal, and it is the assertion the
+    //   whole mechanism exists for.
     #[test]
     fn manual_anchor_waives_only_the_overlap() {
         let client = tempfile::tempdir().unwrap();
@@ -1269,7 +1293,8 @@ pub(crate) mod tests {
                 .unwrap();
         }
 
-        fx.stage(false);
+        // No operator involved: weak subjectivity refuses the churn.
+        fx.stage(None);
         match boot_transition(&fx.db_path, TARGET) {
             BootOutcome::Parked(ParkReason::GateFailed { gate, detail }) => {
                 assert_eq!(gate, "staged-join");
@@ -1278,7 +1303,20 @@ pub(crate) mod tests {
             other => panic!("expected an overlap refusal, got {other:?}"),
         }
 
-        fx.stage(true);
+        // An operator asked, but named an epoch this chain does not reach.
+        // Before the fingerprint existed, this input crossed.
+        fx.stage(Some([0xAB; 32]));
+        match boot_transition(&fx.db_path, TARGET) {
+            BootOutcome::Parked(ParkReason::GateFailed { gate, detail }) => {
+                assert_eq!(gate, "staged-join");
+                assert!(detail.contains("fingerprint"), "{detail}");
+            }
+            other => panic!("expected a fingerprint refusal, got {other:?}"),
+        }
+
+        // The real ceremony: the operator names the identity they read off
+        // a node they already trust.
+        fx.stage(Some(fx.target_chain_id));
         match boot_transition(&fx.db_path, TARGET) {
             BootOutcome::Transitioned { epoch: 2 } => {}
             other => panic!("expected the operator-anchored crossing, got {other:?}"),
@@ -1314,14 +1352,14 @@ pub(crate) mod tests {
         let client = tempfile::tempdir().unwrap();
         let server = tempfile::tempdir().unwrap();
         let fx = join_fixture(client.path(), server.path());
-        fx.stage(false);
+        fx.stage(None);
         assert!(matches!(
             boot_transition(&fx.db_path, TARGET),
             BootOutcome::Transitioned { epoch: 2 }
         ));
 
         // Re-stage the same (now redundant) inputs and boot again.
-        fx.stage(false);
+        fx.stage(None);
         match boot_transition(&fx.db_path, TARGET) {
             BootOutcome::NoBoundary => {}
             other => panic!("expected a normal boot, got {other:?}"),

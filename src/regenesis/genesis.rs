@@ -410,19 +410,43 @@ pub fn decode_lineage(bytes: &[u8]) -> Result<LineageRecord, String> {
 ///
 /// A straggler anchors at its own database (`from_db`): the chain id it
 /// last trusted and the seated set it last saw. A fresh joiner has no
-/// prior state and anchors TOFU at the chain's first record (`tofu`) —
-/// trust rooted in the authenticated join ceremony, with every other
-/// check still enforced. An operator re-trust is `from_db` with
-/// `trusted` cleared: linkage, per-hop quorum, and the snapshot hash
-/// still hold; only the overlap requirement is waived.
+/// prior state and anchors at first contact (`tofu`) — trust rooted in
+/// the authenticated join ceremony, with every other check enforced. An
+/// operator re-trust is `from_db` with the seated set swapped for a
+/// FINGERPRINT the operator supplies out of band; linkage, per-hop
+/// quorum and the snapshot hash still hold, and the chain must land on
+/// exactly the named epoch identity.
+/// What roots the first hop's trust. There is deliberately no "trust
+/// anything" variant: a record is peer-supplied, so with nothing to check
+/// the first hop against, the whole chain is self-certified — the peer
+/// declares the seated set that verifies its own certificate.
+#[derive(Debug, Clone)]
+pub enum ChainTrust {
+    /// The ordinary straggler: the seated set this node last saw, checked
+    /// by the weak-subjectivity overlap rule.
+    Seated(Vec<(i32, [u8; 32])>),
+    /// Operator re-trust (RFC-019 S7). Validator churn moved past the
+    /// overlap window, so the operator supplies the TARGET epoch's chain
+    /// id out of band and the verified chain must terminate in exactly
+    /// that. This REPLACES the overlap check; it does not remove it. A
+    /// fabricated chain cannot match without a blake3 preimage, since the
+    /// chain id is the hash of a genesis block embedding the record.
+    Fingerprint([u8; 32]),
+    /// FIRST CONTACT ONLY — a node with no history, no chain id and no
+    /// database to lose (the height-0 join ceremony). Trust is rooted in
+    /// the authenticated join instead. Never valid for a node that
+    /// already holds state: there, "trust anything" means "replace
+    /// everything on one peer's word".
+    FirstContact,
+}
+
 pub struct ChainAnchor {
     /// Epoch the anchor speaks for — the first record must be epoch + 1.
     pub epoch: u64,
     /// The chain id the anchor trusts (its own META_CHAIN_ID).
     pub chain_id: [u8; 32],
-    /// Last-trusted seated set for the first hop's overlap check.
-    /// None = overlap waived (TOFU or operator re-trust).
-    pub trusted: Option<Vec<(i32, [u8; 32])>>,
+    /// What roots the first hop.
+    pub trust: ChainTrust,
     /// Quorum profile the trusted set operated under (Byzantine-bound
     /// source for the overlap threshold).
     pub profile: String,
@@ -459,7 +483,7 @@ impl ChainAnchor {
         Ok(ChainAnchor {
             epoch: current_epoch(conn),
             chain_id,
-            trusted: Some(trusted),
+            trust: ChainTrust::Seated(trusted),
             profile,
         })
     }
@@ -472,7 +496,7 @@ impl ChainAnchor {
         ChainAnchor {
             epoch: first.record.epoch.saturating_sub(1),
             chain_id: first.record.prev_chain_id,
-            trusted: None,
+            trust: ChainTrust::FirstContact,
             profile: first.record.quorum_profile.clone(),
         }
     }
@@ -501,8 +525,14 @@ pub fn verify_lineage_chain(
     }
     let mut epoch = anchor.epoch;
     let mut chain_id = anchor.chain_id;
-    let mut trusted = anchor.trusted;
     let mut profile = anchor.profile;
+    // Only the FIRST hop can be rooted by the anchor; every later hop is
+    // checked against the set the hop before it carried.
+    let (mut trusted, expected_target) = match anchor.trust {
+        ChainTrust::Seated(set) => (Some(set), None),
+        ChainTrust::Fingerprint(fp) => (None, Some(fp)),
+        ChainTrust::FirstContact => (None, None),
+    };
 
     for lr in records {
         let record = &lr.record;
@@ -559,6 +589,22 @@ pub fn verify_lineage_chain(
         trusted = Some(record.seated.clone());
         profile = record.quorum_profile.clone();
         epoch = record.epoch;
+    }
+
+    // Operator re-trust: the overlap rule could not run, so the operator's
+    // out-of-band fingerprint is what roots the chain instead. Checked at
+    // the END, against the derived identity of the epoch actually reached
+    // — a chain that verifies internally but lands somewhere else is
+    // exactly the fabrication this is here to stop. `chain_id` is the hash
+    // of a genesis block embedding the record, so matching a named
+    // fingerprint without the real history needs a blake3 preimage.
+    if let Some(expected) = expected_target
+        && chain_id != expected
+    {
+        return Err(format!(
+            "re-trust fingerprint mismatch: the chain verifies to epoch {epoch} but its \
+             identity is not the one named in the request — refusing to import"
+        ));
     }
     Ok(records.last().expect("chain verified non-empty"))
 }
@@ -1008,7 +1054,10 @@ pub(crate) mod tests {
         ChainAnchor {
             epoch: 1,
             chain_id: PREV_CHAIN,
-            trusted: trusted.map(seated_of),
+            trust: match trusted {
+                Some(ids) => ChainTrust::Seated(seated_of(ids)),
+                None => ChainTrust::FirstContact,
+            },
             profile: profile.to_string(),
         }
     }

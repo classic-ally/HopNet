@@ -557,6 +557,9 @@ fn status_view_reports_epoch_and_awaiting_upgrade() {
 // did — but it must never accept a peer this node cannot even name.
 // Should: refuse an unknown peer, and accept a known one with 202 (the
 // fetch runs in the background and can take minutes).
+// Should not: start a fetch without a well-formed fingerprint — that is
+// the request's only trust anchor, so a malformed one has to be a 400
+// rather than a join that proceeds unanchored.
 #[test]
 fn retrust_route_requires_a_known_peer() {
     use axum::response::IntoResponse as _;
@@ -567,22 +570,51 @@ fn retrust_route_requires_a_known_peer() {
         .enable_all()
         .build()
         .unwrap();
-    let retrust = |node_id: i32| {
+    let good_fp = "a".repeat(64);
+    let retrust = |node_id: i32, expect_chain_id: &str| {
+        let expect_chain_id = expect_chain_id.to_string();
         rt.block_on(async {
             crate::regenesis::routes::post_regenesis_retrust(
                 axum::extract::State(node.app_state.clone()),
-                axum::Json(crate::regenesis::routes::RetrustRequest { node_id }),
+                axum::Json(crate::regenesis::routes::RetrustRequest {
+                    node_id,
+                    expect_chain_id,
+                }),
             )
             .await
             .into_response()
         })
     };
 
-    assert_eq!(retrust(999).status(), axum::http::StatusCode::NOT_FOUND);
-    // Node 6 is registered, so it can be named as a trust anchor. The
-    // join itself then fails in the background (no reachable peer),
-    // which is the spawn's business, not the route's.
-    assert_eq!(retrust(6).status(), axum::http::StatusCode::ACCEPTED);
+    // The fingerprint is checked before the peer even gets looked up: an
+    // unanchored request has nothing to verify against, so it never
+    // becomes a fetch.
+    for bad in [
+        "",
+        "not-hex",
+        &"a".repeat(63),
+        &"a".repeat(65),
+        &"z".repeat(64),
+    ] {
+        assert_eq!(
+            retrust(6, bad).status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "fingerprint {bad:?} must be refused"
+        );
+    }
+
+    assert_eq!(
+        retrust(999, &good_fp).status(),
+        axum::http::StatusCode::NOT_FOUND
+    );
+    // Node 6 is registered and the fingerprint parses, so the request is
+    // well formed. The join itself then fails in the background (no
+    // reachable peer, and the fingerprint would not match), which is the
+    // spawn's business, not the route's.
+    assert_eq!(
+        retrust(6, &good_fp).status(),
+        axum::http::StatusCode::ACCEPTED
+    );
 }
 
 // Impact: rollback DISCARDS an epoch's database while the window is

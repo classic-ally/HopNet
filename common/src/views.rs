@@ -199,6 +199,11 @@ pub struct RegenesisStatusView {
     pub drained: bool,
     /// This database's epoch (stringified u64; "1" for pre-regenesis meshes).
     pub epoch: String,
+    /// This epoch's chain id, hex. Operator-facing on purpose: it is the
+    /// fingerprint `POST /consensus/regenesis/retrust` requires, read off a
+    /// node already known good and passed to the node being recovered.
+    /// Public knowledge — every peer in the mesh signs against it.
+    pub chain_id: String,
     /// The version this binary effectively runs.
     pub running_version: String,
     /// Sealed for a version this binary does not run: the node is parked

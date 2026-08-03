@@ -132,28 +132,77 @@ pub async fn post_regenesis_abort(State(app_state): State<AppState>) -> impl Int
     .await
 }
 
+fn hex_lower(bytes: Vec<u8>) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Strict 32-byte hex. Deliberately unforgiving about length: a truncated
+/// fingerprint silently anchoring on a prefix would defeat the point.
+fn parse_chain_id(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 #[derive(Deserialize)]
 pub struct RetrustRequest {
     /// The peer the operator vouches for.
     pub node_id: i32,
+    /// Hex-encoded chain id of the epoch the operator expects to land on,
+    /// read out of band from a node they already trust
+    /// (`/views/regenesis-status` reports it). REQUIRED — see the route
+    /// docstring for why naming a peer is not on its own a trust anchor.
+    pub expect_chain_id: String,
 }
 
 /// POST /consensus/regenesis/retrust
 ///
 /// The escape hatch when validator churn moved past the overlap window
 /// (RFC-019 S7): the operator points this node at a peer they trust and
-/// it re-bootstraps from the current epoch, keeping its fragment store —
-/// the same trust-on-first-use ceremony as the original join, re-invoked.
+/// at the epoch identity they expect, and it re-bootstraps from there,
+/// keeping its fragment store.
 ///
-/// Waives the OVERLAP requirement only. Chain-id linkage, every hop's
-/// quorum proof, and the snapshot's certified hash are still enforced,
-/// so a peer named here still cannot serve arbitrary state.
+/// REPLACES the overlap requirement with a fingerprint; it does not waive
+/// it. That distinction is the whole security of this route. A lineage
+/// record is peer-supplied, and each hop's certificate is verified against
+/// the validator set declared INSIDE that same record — so with no
+/// external anchor the chain is self-certifying, and any peer holding a
+/// registered node key could serve a wholly fabricated epoch signed by
+/// validators it invented and have this node rebuild its entire database
+/// from it. The operator's out-of-band chain id is what makes the request
+/// meaningful: an operator who cannot obtain one from a node they already
+/// trust has no basis for the request in the first place.
+///
+/// Chain-id linkage, every hop's quorum proof, and the snapshot's
+/// certified hash are enforced on top, as before.
 ///
 /// Answers 202: the fetch runs in the background and can take minutes.
 pub async fn post_regenesis_retrust(
     State(app_state): State<AppState>,
     Json(body): Json<RetrustRequest>,
 ) -> impl IntoResponse {
+    // Parse the fingerprint FIRST: it is the trust anchor, so a request
+    // without a well-formed one has no anchor at all and must not start a
+    // fetch. 400, not 202 — the operator has to fix the request.
+    let expect_chain_id = match parse_chain_id(&body.expect_chain_id) {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "expect_chain_id must be 64 hex characters (32 bytes): the target epoch's \
+                 chain id, read from a node you already trust. It replaces the overlap \
+                 rule as this request's trust anchor and is not optional.",
+            )
+                .into_response();
+        }
+    };
+
     // The pubkey comes from our own (possibly stale) node table — it only
     // names a key to dial, and everything fetched is verified anyway.
     let peer = {
@@ -192,7 +241,10 @@ pub async fn post_regenesis_retrust(
 
     crate::regenesis::join::spawn_epoch_join(
         &app_state,
-        crate::regenesis::join::JoinAnchor::Manual { peer },
+        crate::regenesis::join::JoinAnchor::Manual {
+            peer,
+            expect_chain_id,
+        },
         vec![peer],
     );
     (
@@ -265,7 +317,7 @@ pub async fn get_regenesis_status(
 
     // One blocking hop for everything that touches the DB or the
     // filesystem (rollback-window file check).
-    let (state, rollback_retained) = {
+    let (state, rollback_retained, chain_id) = {
         let app_state = app_state.clone();
         tokio::task::spawn_blocking(move || {
             let conn = app_state
@@ -277,7 +329,15 @@ pub async fn get_regenesis_status(
             let retained =
                 crate::regenesis::boot::sealed_path(&crate::db::shared::get_database_path())
                     .exists();
-            Ok::<_, StatusCode>((state, retained))
+            // Empty rather than an error before genesis: the view is also
+            // the pre-setup health surface.
+            let chain_id =
+                hopnet_consensus::store::meta_get(&conn, hopnet_consensus::store::META_CHAIN_ID)
+                    .ok()
+                    .flatten()
+                    .map(hex_lower)
+                    .unwrap_or_default();
+            Ok::<_, StatusCode>((state, retained, chain_id))
         })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??
@@ -296,6 +356,7 @@ pub async fn get_regenesis_status(
             .epoch
             .load(std::sync::atomic::Ordering::Relaxed)
             .to_string(),
+        chain_id,
         running_version: crate::version::format_code(running_code),
         awaiting_upgrade,
         boundary_error: crate::regenesis::boot::boundary_error(),
