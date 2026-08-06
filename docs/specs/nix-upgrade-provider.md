@@ -136,7 +136,10 @@ env (deployment shape, not mesh policy — no DB settings, no schema):
   the two knobs, default on
 
 **`stage(X)`.** Derive the flake ref from the release tag —
-`<flake_ref>?ref=vX`, the release page as the single source of truth —
+`<flake_ref>?ref=refs/tags/vX`, the release page as the single source of
+truth (the `refs/tags/` prefix is load-bearing: nix resolves a bare
+`?ref=` under `refs/heads/`, so a tag asked for by name looks like a
+missing branch) —
 and `nix build --out-link <stage_dir>/vX` (the out-link doubles as the
 gcroot). Verify the built binary's own `--version` answers exactly X —
 wrong bytes for the tag are a PERMANENT refusal, never attested — then
