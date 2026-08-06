@@ -163,6 +163,29 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
             ),
             ("HOPNET_UPGRADE_STAGED_OVERRIDE", "2026.8.1"),
         ],
+        // The RFC-021 positive half: same upgrade-target boundary as
+        // awaiting-upgrade, PLUS the nix deployment contract — nodes
+        // activate a planted staged generation and exit 75 instead of
+        // parking. The staged claim still rides the override (attestation
+        // from provider reports has unit coverage); NIX_BIN is unused at
+        // activation (auto-stage never runs in containers: no release
+        // URL, so the provider never polls or builds).
+        "regenesis-nix-activation" => vec![
+            (
+                "HOPNET_GENESIS_CONSENSUS_POLICY",
+                "probe_base=2;grace=1;s_full=6;p_prove=6",
+            ),
+            ("HOPNET_UPGRADE_STAGED_OVERRIDE", "2026.8.1"),
+            ("HOPNET_UPGRADE_PROVIDER", "nix"),
+            (
+                "HOPNET_UPGRADE_PROFILE",
+                "/root/.local/share/hopnet/profile",
+            ),
+            (
+                "HOPNET_UPGRADE_STAGE_DIR",
+                "/root/.local/share/hopnet/staged",
+            ),
+        ],
         // REGRESSION FIX (S4): the S_min gate makes the BFT rejoin seat
         // EXPOSED (quorum(3)-quorum(2)=1) => req_span = s_full; the
         // default 30 min would refuse the rejoin inside the test window.
@@ -231,6 +254,7 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         // Boundary scenarios are written against a 3-node mesh.
         "regenesis-restart"
         | "regenesis-awaiting-upgrade"
+        | "regenesis-nix-activation"
         | "straggler-rejoin"
         | "diverged-node-rebuild"
         | "regenesis-rollback" => Some(3),
@@ -352,6 +376,11 @@ pub async fn run_test_by_name(
         "regenesis-restart" => regenesis::RegenesisRestart.run(mesh_id, nodes, flags).await,
         "regenesis-awaiting-upgrade" => {
             regenesis::RegenesisAwaitingUpgrade
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "regenesis-nix-activation" => {
+            regenesis::RegenesisNixActivation
                 .run(mesh_id, nodes, flags)
                 .await
         }
@@ -559,6 +588,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "vote-out-after-kill",
         "regenesis-restart",
         "regenesis-awaiting-upgrade",
+        "regenesis-nix-activation",
         "straggler-rejoin",
         "diverged-node-rebuild",
         "regenesis-rollback",

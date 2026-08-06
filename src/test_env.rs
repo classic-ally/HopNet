@@ -37,6 +37,14 @@ const GUARDED: &[&str] = &[
     "XDG_DATA_HOME",
     "HOPNET_UPGRADE_VERSION_OVERRIDE",
     "HOPNET_UPGRADE_STAGED_OVERRIDE",
+    // The RFC-021 nix-provider deployment contract (nix_provider.rs).
+    "HOPNET_UPGRADE_PROVIDER",
+    "HOPNET_UPGRADE_NIX_BIN",
+    "HOPNET_UPGRADE_PROFILE",
+    "HOPNET_UPGRADE_STAGE_DIR",
+    "HOPNET_UPGRADE_FLAKE_REF",
+    "HOPNET_UPGRADE_AUTO_STAGE",
+    "HOPNET_UPGRADE_AUTO_ACTIVATE",
 ];
 
 static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

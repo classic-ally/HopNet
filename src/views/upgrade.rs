@@ -3,11 +3,30 @@
 //! db::versions, provider state in upgrade::UpgradeState.
 
 use hopnet_common::views::{
-    AvailableReleaseView, NodeVersionsView, ProviderStatusView, UpgradeReadinessView,
+    ActivationView, AvailableReleaseView, NodeVersionsView, ProviderStatusView,
+    UpgradeReadinessView,
 };
 
 use crate::db::versions::MeshNodeVersions;
 use crate::upgrade::ProviderStatus;
+
+/// This deployment's boundary capabilities (RFC-021): resolved from the
+/// module-set env contract, so the operator learns "this node will park"
+/// from the advisory, not from a parked mesh.
+fn activation_view() -> ActivationView {
+    match crate::upgrade::nix_provider::NixEnv::from_env() {
+        Some(env) => ActivationView {
+            provider: "nix".into(),
+            can_stage: env.auto_stage,
+            auto_activate: env.auto_activate,
+        },
+        None => ActivationView {
+            provider: "git-release".into(),
+            can_stage: false,
+            auto_activate: false,
+        },
+    }
+}
 
 pub fn upgrade_view(
     mesh: Vec<MeshNodeVersions>,
@@ -50,6 +69,7 @@ pub fn upgrade_view(
             fetched_at: provider.map(|s| s.fetched_at.to_rfc3339()),
             error: provider.and_then(|s| s.result.as_ref().err().cloned()),
         },
+        activation: activation_view(),
     }
 }
 
@@ -69,6 +89,7 @@ mod tests {
         // Reads `effective_running_code()` via `newer_than_running`, which a
         // leaked far-future override inverts — take the process-env lock.
         let _env = crate::test_env::lock_env();
+        crate::test_env::remove(&_env, "HOPNET_UPGRADE_PROVIDER");
         let mesh = vec![
             MeshNodeVersions {
                 node_id: 1,
@@ -115,5 +136,10 @@ mod tests {
         assert!(!view.available[1].newer_than_running);
         assert_eq!(view.provider.name.as_deref(), Some("git-release"));
         assert_eq!(view.provider.error, None);
+        // Without the nix deployment contract this node advertises that it
+        // parks at an upgrade boundary.
+        assert_eq!(view.activation.provider, "git-release");
+        assert!(!view.activation.can_stage);
+        assert!(!view.activation.auto_activate);
     }
 }

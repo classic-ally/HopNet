@@ -205,6 +205,17 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 rebuild_from_peers =
                     matches!(reason, regenesis::boot::ParkReason::GateFailed { .. });
             }
+            regenesis::boot::BootOutcome::RestartIntoStaged { required } => {
+                // RFC-021: the nix provider flipped the profile to the
+                // epoch's required version — exit with the restart code so
+                // the supervisor re-execs through it. No grace needed:
+                // nothing is serving yet.
+                tracing::info!(
+                    required = %version::format_code(required),
+                    "restarting into the activated staged generation"
+                );
+                std::process::exit(EXIT_CODE_RESTART);
+            }
             regenesis::boot::BootOutcome::Fatal(detail) => {
                 panic!("epoch boot transition: {detail}");
             }
@@ -955,6 +966,18 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `hopnet --version` prints the COMPILE-TIME version and exits: this is
+    // how the RFC-021 upgrade machinery verifies BYTES (a staged binary, the
+    // profile's current generation), so it must never reflect the test-mode
+    // override env vars — those exist to lie about a running process, not
+    // about an artifact.
+    if let Some(arg) = std::env::args().nth(1)
+        && (arg == "--version" || arg == "-V")
+    {
+        println!("{}", hopnet::version::running_version_str());
+        return Ok(());
+    }
+
     #[cfg(feature = "gui")]
     {
         run_with_gui().await

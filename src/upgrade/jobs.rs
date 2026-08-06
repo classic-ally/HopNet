@@ -45,7 +45,17 @@ pub async fn poll_provider(app_state: &AppState) -> bool {
     let settings = {
         let app_state = app_state.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = app_state.db_pool.get().ok()?;
+            let conn = match app_state.db_pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    // A pool checkout timeout is TRANSIENT, and silently
+                    // classifying it as "pre-setup" made a skipped poll
+                    // indistinguishable from a disabled one. Say so; the
+                    // next tick (or a retried manual tick) recovers.
+                    tracing::warn!("upgrade poll skipped: db pool: {e}");
+                    return None;
+                }
+            };
             crate::db::shared::read_upgrade_node_settings(&conn).ok()
         })
         .await
@@ -53,7 +63,8 @@ pub async fn poll_provider(app_state: &AppState) -> bool {
         .flatten()
     };
     let Some(settings) = settings else {
-        return false; // pre-setup: this_node has no row yet
+        tracing::debug!("upgrade poll skipped: no this_node settings yet (pre-setup)");
+        return false;
     };
     if !settings.check_enabled {
         return false;
@@ -62,12 +73,49 @@ pub async fn poll_provider(app_state: &AppState) -> bool {
     let url = env_url
         .or(settings.release_url)
         .unwrap_or_else(crate::upgrade::git_release::GitReleaseProvider::default_releases_url);
-    let provider = crate::upgrade::git_release::GitReleaseProvider::new(url);
+    // Provider selection (RFC-021): a deployment that declares the nix
+    // contract gets staging + activation; everything else keeps the
+    // report-only v1 baseline.
+    let nix_env = crate::upgrade::nix_provider::NixEnv::from_env();
+    let provider: Box<dyn UpgradeProvider> = match &nix_env {
+        Some(env) => Box::new(crate::upgrade::nix_provider::NixUpgradeProvider::new(
+            env.clone(),
+            url,
+        )),
+        None => Box::new(crate::upgrade::git_release::GitReleaseProvider::new(url)),
+    };
 
-    let result = provider.report().await;
+    let mut result = provider.report().await;
     if let Err(e) = &result {
         tracing::warn!("upgrade provider poll failed: {e}");
     }
+
+    // Auto-stage (RFC-021): the newest STABLE release strictly newer than
+    // running, not already staged — one attempt per tick, so a failing
+    // build retries on the cron cadence rather than looping. On success,
+    // re-report so THIS tick's attestation already carries the staged
+    // claim instead of waiting six hours.
+    if let (Some(env), Ok(report)) = (&nix_env, &result)
+        && env.auto_stage
+    {
+        let running = crate::version::effective_running_code();
+        let candidate = report
+            .available
+            .iter()
+            .filter(|v| !v.prerelease && !v.staged)
+            .filter(|v| crate::version::parse_code(&v.version).is_some_and(|code| code > running))
+            .max_by_key(|v| crate::version::parse_code(&v.version));
+        if let Some(candidate) = candidate {
+            match provider.stage(&candidate.version).await {
+                Ok(()) => {
+                    tracing::info!(version = %candidate.version, "auto-staged release");
+                    result = provider.report().await;
+                }
+                Err(e) => tracing::warn!(version = %candidate.version, "auto-stage failed: {e}"),
+            }
+        }
+    }
+
     let status = ProviderStatus {
         provider: provider.name(),
         fetched_at: Utc::now(),

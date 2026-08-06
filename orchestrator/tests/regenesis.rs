@@ -805,6 +805,214 @@ impl TestScenario for RegenesisAwaitingUpgrade {
     }
 }
 
+/// RFC-021 nix activation: with the nix deployment contract declared and
+/// a verified staged generation planted in each node's volume, the sealed
+/// upgrade boundary does NOT park — every node flips its profile symlink
+/// to the staged generation and exits 75. The "restart into the new
+/// binary" half is simulated by recreating with the running-version
+/// override (the REAL profile-exec restart is the NixOS module's job,
+/// covered by the upgrade-vm-test flake check); the mesh then crosses and
+/// decides past H. The awaiting-upgrade scenario is this one's negative
+/// half: the same boundary with no provider contract parks.
+pub struct RegenesisNixActivation;
+
+/// Run a script in the container via busybox sh, returning
+/// (exit_code, output) — mount.rs's exec_capture, shared shape.
+async fn exec_sh(docker: &Docker, container: &str, script: &str) -> Result<(i64, String)> {
+    use bollard::exec::{CreateExecOptions, StartExecResults};
+    use tokio_stream::StreamExt;
+    let exec = docker
+        .create_exec(
+            container,
+            CreateExecOptions {
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                cmd: Some(vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    script.to_string(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let mut collected = String::new();
+    if let StartExecResults::Attached { mut output, .. } = docker.start_exec(&exec.id, None).await?
+    {
+        while let Some(chunk) = output.next().await {
+            collected.push_str(&chunk?.to_string());
+        }
+    }
+    let inspect = docker.inspect_exec(&exec.id).await?;
+    Ok((inspect.exit_code.unwrap_or(-1), collected))
+}
+
+impl TestScenario for RegenesisNixActivation {
+    fn name(&self) -> &'static str {
+        "regenesis-nix-activation"
+    }
+
+    fn description(&self) -> &'static str {
+        "Upgrade boundary with a staged nix generation: flip + exit 75 instead of parking (RFC-021)"
+    }
+
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
+        let mut result = TestResult::new();
+        anyhow::ensure!(
+            nodes.len() == 3,
+            "regenesis-nix-activation expects a 3-node mesh"
+        );
+        let docker = Docker::connect_with_local_defaults()?;
+        const TARGET: &str = "2026.8.1";
+        const DATA: &str = "/root/.local/share/hopnet";
+
+        println!("\nRunning regenesis-nix-activation checks:");
+
+        // 1. Plant a verified staged generation in every node's data
+        //    volume: a fake store dir whose bin/hopnet answers --version
+        //    with the target, the out-link, and the provenance record —
+        //    the exact disk state stage() leaves behind. The volume
+        //    survives the exit and the recreate.
+        let plant = format!(
+            "set -e\n\
+             mkdir -p {DATA}/staged {DATA}/staged-store/bin\n\
+             printf '#!/bin/sh\\necho {TARGET}\\n' > {DATA}/staged-store/bin/hopnet\n\
+             chmod +x {DATA}/staged-store/bin/hopnet\n\
+             ln -sfn {DATA}/staged-store {DATA}/staged/v{TARGET}\n\
+             printf '{{\"version\":\"{TARGET}\",\"flake_ref\":\"git+https://test.invalid/HopNet.git?ref=v{TARGET}\",\"out_path\":\"{DATA}/staged-store\"}}' > {DATA}/staged/v{TARGET}.json\n"
+        );
+        let mut planted = true;
+        for node in nodes {
+            let id = find_container_id(&docker, mesh_id, node.node_id).await?;
+            let (code, out) = exec_sh(&docker, &id, &plant).await?;
+            if code != 0 {
+                planted = false;
+                println!("  planting failed on node {}: {out}", node.node_id);
+            }
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Staged generation planted in every node's volume".to_string(),
+                passed: planted,
+                detail: None,
+            },
+        );
+        if !planted {
+            return Ok(result);
+        }
+
+        // 2. Attestations + the upgrade-target start (the staged claim
+        //    comes from the test-gated override, same as the awaiting
+        //    scenario — attestation-from-report has its own unit tests).
+        let tip_at_freeze = decided_height(&nodes[0]).await.unwrap_or(0);
+        if attest_and_freeze(&mut result, nodes, Some(TARGET))
+            .await?
+            .is_none()
+        {
+            return Ok(result);
+        }
+
+        // 3. THE RFC-021 assertion: instead of parking awaiting-upgrade
+        //    (the negative half, regenesis-awaiting-upgrade), every node
+        //    activates its staged generation and exits with the restart
+        //    code.
+        let mut exit_codes = Vec::new();
+        for node in nodes {
+            exit_codes.push(
+                wait_for_exit_code(&docker, mesh_id, node.node_id, Duration::from_secs(300))
+                    .await?,
+            );
+        }
+        let all_exited_75 = exit_codes.iter().all(|c| *c == Some(75));
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Sealed upgrade boundary activates instead of parking: every node exits 75"
+                    .to_string(),
+                passed: all_exited_75,
+                detail: Some(format!("exit codes: {exit_codes:?}")),
+            },
+        );
+        if !all_exited_75 {
+            return Ok(result);
+        }
+
+        // 4. The supervisor restart into the new binary, simulated with
+        //    the running-version override (containers exec the image's
+        //    store binary, not the profile — the profile-exec restart is
+        //    the module's job, proven in the VM test).
+        let mut fresh_nodes = Vec::new();
+        for node in nodes {
+            recreate_node_with_env(
+                &docker,
+                mesh_id,
+                node.node_id,
+                &[("HOPNET_UPGRADE_VERSION_OVERRIDE", TARGET)],
+            )
+            .await?;
+            fresh_nodes.push(reauth_node(&docker, mesh_id, node).await?);
+        }
+
+        // 5. The volume carries the evidence of the flip: the profile
+        //    symlink points at the staged generation, and no
+        //    awaiting-upgrade marker was ever written on the activation
+        //    path.
+        let mut flipped = true;
+        let mut detail = String::new();
+        for node in &fresh_nodes {
+            let id = find_container_id(&docker, mesh_id, node.node_id).await?;
+            let (_, out) = exec_sh(
+                &docker,
+                &id,
+                &format!(
+                    "readlink {DATA}/profile; test -e {DATA}/awaiting-upgrade && echo MARKER || echo no-marker"
+                ),
+            )
+            .await?;
+            let ok = out.contains("staged-store") && out.contains("no-marker");
+            if !ok {
+                flipped = false;
+            }
+            detail = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Profile symlink flipped to the staged generation; no park marker"
+                    .to_string(),
+                passed: flipped,
+                detail: Some(detail),
+            },
+        );
+
+        // 6. The upgraded mesh crosses and decides past H.
+        let mut epochs = Vec::new();
+        for node in &fresh_nodes {
+            let v = regenesis_status(node).await?;
+            epochs.push(v["epoch"].as_str().unwrap_or("?").to_string());
+        }
+        upload_file(
+            &fresh_nodes[0],
+            "/",
+            "post-upgrade.txt",
+            b"decided by the upgraded epoch".to_vec(),
+        )
+        .await?;
+        let (progressed, heights) = wait_for_convergence(&fresh_nodes, tip_at_freeze, 120).await;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Upgraded mesh completes epoch 2 and decides past H".to_string(),
+                passed: progressed && epochs.iter().all(|e| e == "2"),
+                detail: Some(format!("epochs: {epochs:?}, heights: {heights:?}")),
+            },
+        );
+
+        Ok(result)
+    }
+}
+
 /// Straggler rejoin (RFC-019 S7): one node is stopped BEFORE the freeze
 /// and stays down through the whole boundary. When it comes back it is
 /// alone on a sealed epoch with peers that refuse its history — it must

@@ -134,6 +134,24 @@ pub struct UpgradeReadinessView {
     /// Upstream releases per the provider's last poll, newest first.
     pub available: Vec<AvailableReleaseView>,
     pub provider: ProviderStatusView,
+    /// What THIS deployment can do at an upgrade boundary (RFC-021).
+    pub activation: ActivationView,
+}
+
+/// This node's deployment-declared upgrade capabilities. Currently only
+/// nix deployments can stage and activate; every other class parks at an
+/// upgrade boundary for its operator — advertised here so the operator
+/// learns it before the boundary, not from a parked mesh.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct ActivationView {
+    /// Provider kind ("nix", "git-release").
+    pub provider: String,
+    /// Whether this deployment can stage bytes (make an upgrade epoch
+    /// decidable without running the target first).
+    pub can_stage: bool,
+    /// Whether it will cross an upgrade boundary unattended.
+    pub auto_activate: bool,
 }
 
 /// One node's committed version claims.

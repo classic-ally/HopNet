@@ -9,6 +9,7 @@
 pub mod git_release;
 pub mod handlers;
 pub mod jobs;
+pub mod nix_provider;
 pub mod routes;
 
 use std::future::Future;

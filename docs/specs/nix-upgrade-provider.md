@@ -98,49 +98,94 @@ the unsafe side.
 ## The nix provider
 
 **The indirection.** The service unit execs hopnet through a
-service-owned nix profile — `ExecStart=/var/lib/hopnet/profile/bin/hopnet`
-— instead of a pinned store path. The system flake seeds the profile's
-first generation; across hopnet upgrades the unit file never changes,
-so `nixos-rebuild` and self-upgrade stop competing over `ExecStart`.
+service-owned profile symlink —
+`ExecStart=/var/lib/hopnet/profile/bin/hopnet` — instead of a pinned
+store path. NOT a `nix-env` profile: a plain symlink the service user
+owns, moved only by atomic temp-link + rename. This is what keeps
+activation a small synchronous filesystem operation callable from
+every hook site; only `stage` ever shells out to nix. The system flake
+seeds the profile (below); across hopnet upgrades the unit file never
+changes, so `nixos-rebuild` and self-upgrade stop competing over
+`ExecStart`.
+
+**Seeding, newest-wins.** The module's `ExecStartPre` compares the
+flake-pinned package's version against `profile/bin/hopnet --version`:
+profile missing → seed it; flake strictly newer → the operator
+deliberately bumped the pin, re-seed; profile newer or equal → a
+self-upgrade happened, leave it. A rebuild can therefore never regress
+a mesh-coordinated upgrade, and a deliberate flake bump still works.
+(Interpolating the package into the seed script also keeps the seed
+generation rooted in the system closure.) `hopnet --version` prints
+the COMPILE-TIME version precisely so these comparisons verify bytes,
+never a running process's test-mode overrides.
+
+**The module ships in HopNet** (`nix/hopnet-module.nix`, exported as
+`nixosModules.hopnet`): the module and the provider form one contract
+and must not drift. Deployments import it; their own service modules
+reduce to option values. The contract between module and provider is
+env (deployment shape, not mesh policy — no DB settings, no schema):
+
+- `HOPNET_UPGRADE_PROVIDER=nix` — selects the provider
+- `HOPNET_UPGRADE_NIX_BIN` — the nix binary `stage` invokes (tests
+  point it at a fake)
+- `HOPNET_UPGRADE_PROFILE` — the exec symlink
+- `HOPNET_UPGRADE_STAGE_DIR` — out-links + provenance records
+- `HOPNET_UPGRADE_FLAKE_REF` — base ref; default derived from the
+  crate's repository field
+- `HOPNET_UPGRADE_AUTO_STAGE` / `HOPNET_UPGRADE_AUTO_ACTIVATE` —
+  the two knobs, default on
 
 **`stage(X)`.** Derive the flake ref from the release tag —
-`git+<repo>?ref=vX`, the release page as the single source of truth —
-and realize the closure into the store, rooting it as a pending profile
-generation with the resolved rev and narHash recorded beside the root.
+`<flake_ref>?ref=vX`, the release page as the single source of truth —
+and `nix build --out-link <stage_dir>/vX` (the out-link doubles as the
+gcroot). Verify the built binary's own `--version` answers exactly X —
+wrong bytes for the tag are a PERMANENT refusal, never attested — then
+record provenance (version, full ref, out path) beside the link.
 Nodes build the code themselves for now: a binary cache, when one
 exists, turns the same step into a substitution, but no build
 infrastructure is required by this RFC. Nothing running changes, and
-staging can happen days before the boundary, retried on the existing
-6-hourly tick.
+staging happens proactively on the existing ~6-hourly tick
+(`auto_stage`): newest stable release strictly newer than running, one
+attempt per tick.
 
-**`report()`.** `staged: X` iff a rooted closure for X is present and
-its recorded provenance parses — the honest-bytes rule made mechanical.
+**`report()`.** `staged: X` iff the out-link resolves, the provenance
+record matches it, and the staged binary itself answers `--version`
+with X — the honest-bytes rule made mechanical. The attestation
+pipeline consumes this unchanged.
 
 **Activate.** Verify committed `target_version_code == X` and that the
-staged provenance matches what `stage()` recorded; atomically flip the
-profile symlink to the staged generation; exit 75. Any failure before
-the flip parks (contract rule 3). The flip itself is atomic — there is
-no half-state to land in.
+staged bytes still verify; atomically flip the profile symlink; exit
+75. Any failure before the flip parks (contract rule 3). One guard is
+load-bearing: **if the profile already points at the staged generation
+and the running version is still wrong, refuse** — a previous flip
+failed to produce the required binary, and re-flipping would exit-75
+into the same state forever. The crash-loop guard is what makes
+"never crash-looping" in rule 3 mechanical rather than aspirational.
+Activation hooks all three places RFC-019 branches on
+`running != target`: the seal-work restart derivation, boot Gate 1,
+and the staged-join version gate.
 
-**Supervision.** systemd's existing `Restart=` policy already covers
-exit 75 — it is how same-version regenesis restarts work today.
-nix-darwin/launchd: `KeepAlive` restarts unconditionally or gates via
-`SuccessfulExit`; either satisfies the contract. Darwin signing is a
-non-issue in practice: nix's linker ad-hoc signs, and substituted
-paths carry no quarantine xattr.
+**Supervision.** systemd's existing `Restart=on-failure` already
+covers exit 75 — it is how same-version regenesis restarts work today.
+nix-darwin/launchd is DEFERRED with the other deployment classes; the
+notes stand: `KeepAlive` restarts unconditionally or gates via
+`SuccessfulExit`, nix's linker ad-hoc signs, substituted paths carry
+no quarantine xattr.
 
-**Privileges.** The profile lives under the service's own state
-directory, owned by the service user. No root, no nix-daemon write
-ceremony: staging needs store read/build rights, activation is a
-rename in a directory the service owns.
+**Privileges.** The profile and stage dir live under the service's own
+state directory, owned by the service user. No root, no nix-daemon
+write ceremony: staging needs the daemon socket (connect requires
+write — one `ReadWritePaths` entry) and store read/build rights;
+activation is a rename in a directory the service owns.
 
 **`auto_activate`: on by default.** A nix-deployed node that staged
 the target and holds the quorum decision crosses unattended — that is
 the point of this RFC. The option exists to opt OUT (park for a
-human). To be advertised plainly wherever upgrades surface: nix is
-currently the ONLY deployment class with an activation wrapper; every
-other deployment parks at an upgrade boundary and is resolved by its
-operator.
+human). Advertised in the upgrade-readiness view (`activation` block):
+nix is currently the ONLY deployment class with an activation wrapper;
+every other deployment parks at an upgrade boundary and is resolved by
+its operator. An activation that was attempted and failed surfaces its
+reason through the boundary-error status alongside the park.
 
 ## Release publishing (prerequisite, not a slice)
 
@@ -154,26 +199,32 @@ triggers the app build on its runner.
 
 ## Slices
 
-- P1 — publish a release: tag the next CalVer, publish the Forgejo
-  release, watch the advisory fire on the live mesh. Proves the S3
-  pipeline end to end; zero code.
-- P2 — profile indirection: the nix-config module change
-  (service-owned profile, flake seeds the first generation, `ExecStart`
-  via the profile). Deployable and testable before any provider code —
-  behavior is identical until something flips the profile.
-- P3 — the provider: `stage()`/`report()`/activation hook +
-  `auto_activate`; orchestrator scenario driving stage → decide →
-  activate → cross with a file-based fake release.
+Resequenced after the fresh-start decision: the live fleet runs a
+pre-S3 binary, so nothing polls the release feed until the branch
+deploys — publishing first would advertise into a void, and the
+branch's wire breaks force a re-formation anyway.
+
+- P1 — module + provider (this RFC's implementation): the
+  HopNet-shipped `nixosModules.hopnet` with the profile indirection
+  and newest-wins seeding; the provider
+  (`stage()`/`report()`/activation + both knobs); the three activation
+  hook sites; orchestrator scenario (stage → decide → seal → flip +
+  exit 75 → cross) and the NixOS VM test (a declarative relay +
+  3-node mesh crossing a REAL upgrade boundary through the module's
+  profile flip — the restart path no container can exercise).
+- P2 — land and re-form: everything ships in one PR; existing
+  deployments are nuked and set up fresh with the wrapper from the
+  first boot (no migration surface — the wire breaks already forced
+  re-formation).
+- P3 — the first coordinated upgrade: tag and publish the next CalVer
+  release. The advisory fires, nodes auto-stage and attest, the
+  operator submits `regenesis_start`, and the mesh crosses unattended
+  — the release publication IS the end-to-end validation.
 
 ## Open questions
 
-1. **Flake-vs-profile ownership.** After a self-upgrade the profile
-   and the system flake disagree about the hopnet version; rebuilds
-   must not regress the profile. Position: the flake pin is the seed
-   generation only — but this is nix-config policy and gets decided
-   there.
-2. **Release provenance.** Stage-time rev/narHash pinning is
-   specified; whether releases should also carry a detached signature
-   (e.g. minisign) that `stage()` verifies before building is open —
-   the difference between trusting the forge's TLS and trusting a key
-   you hold.
+1. **Release provenance.** Stage-time provenance pinning is specified;
+   whether releases should also carry a detached signature (e.g.
+   minisign) that `stage()` verifies before building is open — the
+   difference between trusting the forge's TLS and trusting a key you
+   hold.

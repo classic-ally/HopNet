@@ -57,6 +57,12 @@ pub enum BootOutcome {
     /// A gate refused; the node stays up on the OLD sealed database
     /// (HTTP + status served, engine parked by the sealed marker).
     Parked(ParkReason),
+    /// Gate 1 mismatch, but the nix provider activated the staged
+    /// generation for `required` (RFC-021): the caller must exit with the
+    /// restart code so the supervisor re-execs through the flipped
+    /// profile. A variant instead of an exit deep in the library, so the
+    /// gate stays testable.
+    RestartIntoStaged { required: u32 },
     /// The on-disk state is unrecoverable without an operator (e.g. the
     /// live database is missing but a retained one exists). The caller
     /// must NOT continue booting — continuing would initialize an empty
@@ -156,10 +162,62 @@ fn park(gate: &'static str, detail: String) -> BootOutcome {
     BootOutcome::Parked(ParkReason::GateFailed { gate, detail })
 }
 
+/// Gate 1's outcome for a version mismatch: one activation attempt when
+/// the deployment has a nix provider (RFC-021), the awaiting-upgrade park
+/// otherwise or on any failure. ALWAYS returns an outcome — a mismatch
+/// must never fall through to the later gates with the wrong binary.
+fn activate_or_park(
+    db_path: &str,
+    nix: Option<&crate::upgrade::nix_provider::NixEnv>,
+    required: u32,
+    running: u32,
+) -> BootOutcome {
+    match nix.map(|env| crate::upgrade::nix_provider::try_activate_with(env, required)) {
+        Some(Ok(())) => {
+            tracing::info!(
+                required = %crate::version::format_code(required),
+                "activated staged generation: requesting restart into it"
+            );
+            BootOutcome::RestartIntoStaged { required }
+        }
+        attempt => {
+            if let Some(Err(reason)) = &attempt {
+                // Attempted and failed is status-worthy (the operator
+                // needs to know WHY the automatic path parked); absent
+                // provider is just the ordinary RFC-019 park.
+                tracing::warn!(%reason, "staged-generation activation failed; parking");
+                if let Ok(mut slot) = BOUNDARY_ERROR.lock() {
+                    *slot = Some(format!("activation: {reason}"));
+                }
+            }
+            tracing::warn!(
+                required = %crate::version::format_code(required),
+                running = %crate::version::format_code(running),
+                "epoch requires a different version: parking awaiting upgrade"
+            );
+            write_awaiting_marker(db_path, required);
+            BootOutcome::Parked(ParkReason::AwaitingUpgrade { required, running })
+        }
+    }
+}
+
 /// The boot transition. `running_code` is injected by the caller
 /// (`version::effective_running_code()` in production) so gate tests
-/// never touch process env.
+/// never touch process env; the production wrapper also resolves the
+/// RFC-021 nix deployment contract from env.
 pub fn boot_transition(db_path: &str, running_code: u32) -> BootOutcome {
+    let nix = crate::upgrade::nix_provider::NixEnv::from_env();
+    boot_transition_with(db_path, running_code, nix.as_ref())
+}
+
+/// `boot_transition` with the nix activation contract injected (None =
+/// no provider; tests construct a `NixEnv` directly instead of touching
+/// process env).
+pub fn boot_transition_with(
+    db_path: &str,
+    running_code: u32,
+    nix: Option<&crate::upgrade::nix_provider::NixEnv>,
+) -> BootOutcome {
     let db = Path::new(db_path);
     let next = next_path(db_path);
     let sealed = sealed_path(db_path);
@@ -231,7 +289,7 @@ pub fn boot_transition(db_path: &str, running_code: u32) -> BootOutcome {
     // sealed, so state A would return NoBoundary and it would never
     // cross; and a node parked by a failed gate must be able to rebuild
     // from peers rather than fail the same local gate forever.
-    if let Some(outcome) = staged_join_transition(db_path, running_code, &mut conn) {
+    if let Some(outcome) = staged_join_transition(db_path, running_code, nix, &mut conn) {
         return outcome;
     }
 
@@ -261,22 +319,16 @@ pub fn boot_transition(db_path: &str, running_code: u32) -> BootOutcome {
     }
 
     // Gate 1: VERSION, exact. Refusal parks the node; the old database
-    // stays live, the engine stays parked on the sealed marker.
+    // stays live, the engine stays parked on the sealed marker. A nix
+    // deployment gets one chance to activate its staged generation first
+    // (RFC-021) — success re-execs through the flipped profile, and every
+    // failure lands in the park exactly as before.
     let required = match state.target_version_code {
         Some(t) => t,
         None => return park("lineage", "sealed row missing target_version_code".into()),
     };
     if running_code != required {
-        tracing::warn!(
-            required = %crate::version::format_code(required),
-            running = %crate::version::format_code(running_code),
-            "epoch requires a different version: parking awaiting upgrade"
-        );
-        write_awaiting_marker(db_path, required);
-        return BootOutcome::Parked(ParkReason::AwaitingUpgrade {
-            required,
-            running: running_code,
-        });
+        return activate_or_park(db_path, nix, required, running_code);
     }
 
     // Gate 2: LINEAGE — construct the genesis and verify our own
@@ -534,6 +586,7 @@ fn checkpoint_and_swap(db_path: &str, conn: rusqlite::Connection) -> Result<(), 
 fn staged_join_transition(
     db_path: &str,
     running_code: u32,
+    nix: Option<&crate::upgrade::nix_provider::NixEnv>,
     conn: &mut rusqlite::Connection,
 ) -> Option<BootOutcome> {
     use crate::regenesis::join;
@@ -562,19 +615,15 @@ fn staged_join_transition(
     // Gate 1: VERSION, before anything touches schema — a straggler
     // coming back across an UPGRADE boundary must not build the new
     // epoch's database with the old binary. Staging is kept: the
-    // download is certified and the upgraded binary boots into it.
+    // download is certified and the (possibly nix-activated, RFC-021)
+    // upgraded binary boots into it.
     if running_code != manifest.required_version_code {
-        let required = manifest.required_version_code;
-        tracing::warn!(
-            required = %crate::version::format_code(required),
-            running = %crate::version::format_code(running_code),
-            "staged epoch join requires a different version: parking awaiting upgrade"
-        );
-        write_awaiting_marker(db_path, required);
-        return Some(BootOutcome::Parked(ParkReason::AwaitingUpgrade {
-            required,
-            running: running_code,
-        }));
+        return Some(activate_or_park(
+            db_path,
+            nix,
+            manifest.required_version_code,
+            running_code,
+        ));
     }
 
     let records = match join::read_staged_lineage(&staging, &manifest) {
@@ -1767,6 +1816,81 @@ pub(crate) mod tests {
         let outcome = boot_transition(&db_path, TARGET);
         assert!(matches!(outcome, BootOutcome::Transitioned { epoch: 2 }));
         assert!(!marker.exists());
+    }
+
+    // Impact: RFC-021's unattended crossing — the one step that used to
+    // need a human (swap the binary while parked) is the provider's
+    // profile flip plus a supervisor restart; a regression here silently
+    // reverts every nix deployment to hand-upgrades.
+    // Should: on a version mismatch with a verified staged generation,
+    // flip the profile and request a restart instead of parking; the
+    // sealed database is untouched and the next boot (as the target
+    // version) crosses normally.
+    // Should not: write the awaiting-upgrade marker on the activation
+    // path — the node is restarting, not waiting for anyone.
+    #[test]
+    fn version_mismatch_activates_staged_generation_and_requests_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = sealed_db(dir.path());
+
+        let nix_dir = dir.path().join("nix");
+        std::fs::create_dir_all(&nix_dir).unwrap();
+        let env = crate::upgrade::nix_provider::tests::test_env(&nix_dir);
+        let target_version = crate::version::format_code(TARGET);
+        let store = crate::upgrade::nix_provider::tests::plant_staged(
+            &nix_dir,
+            &env,
+            &target_version,
+            true,
+        );
+
+        let outcome = boot_transition_with(&db_path, TARGET + 1, Some(&env));
+        assert!(
+            matches!(outcome, BootOutcome::RestartIntoStaged { required: TARGET }),
+            "got {outcome:?}"
+        );
+        assert_eq!(std::fs::read_link(&env.profile).unwrap(), store);
+        assert!(!awaiting_upgrade_path(&db_path).exists());
+        // Sealed database untouched — the cross happens on the next boot,
+        // as the right binary.
+        let conn = open(&db_path);
+        assert_eq!(seal::sealed_marker(&conn), Some(H));
+        assert_eq!(genesis::current_epoch(&conn), 1);
+        drop(conn);
+
+        // The supervisor restart, simulated: the target version crosses.
+        let outcome = boot_transition(&db_path, TARGET);
+        assert!(matches!(outcome, BootOutcome::Transitioned { epoch: 2 }));
+    }
+
+    // Should: park (marker written) when activation is configured but the
+    // staged generation fails verification, and surface the refusal
+    // through the boundary-error status — attempted-and-failed is
+    // status-worthy in a way the plain park is not.
+    #[test]
+    fn failed_activation_parks_with_the_reason_surfaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = sealed_db(dir.path());
+
+        let nix_dir = dir.path().join("nix");
+        std::fs::create_dir_all(&nix_dir).unwrap();
+        // Configured provider, but nothing staged at all.
+        let env = crate::upgrade::nix_provider::tests::test_env(&nix_dir);
+
+        let outcome = boot_transition_with(&db_path, TARGET + 1, Some(&env));
+        assert!(
+            matches!(
+                outcome,
+                BootOutcome::Parked(ParkReason::AwaitingUpgrade {
+                    required: TARGET,
+                    ..
+                })
+            ),
+            "got {outcome:?}"
+        );
+        assert!(awaiting_upgrade_path(&db_path).exists());
+        let err = boundary_error().expect("activation failure recorded");
+        assert!(err.starts_with("activation:"), "{err}");
     }
 
     // Impact: "nothing is ever lost by a failed gate" — a refused

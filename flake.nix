@@ -128,6 +128,8 @@
               mkdir -p frontend/dist
               cp -r ${frontend}/* frontend/dist/
             '';
+
+            meta.mainProgram = "hopnet";
           });
 
           # Linux-only FUSE daemon (RFC-018). Its own deps-only artifact:
@@ -287,9 +289,13 @@
           };
         in {
           default = hopnet;
-          inherit ingress-server;
+          # Named alias so modules can say `packages.<system>.hopnet`
+          # (mount-module convention) instead of leaning on `default`.
+          inherit hopnet ingress-server;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-          inherit hopnet-mount;
+          # iroh-relay exported for the upgrade VM test's relay node (the
+          # docker image already embedded it).
+          inherit hopnet-mount iroh-relay;
 
           dockerImage = pkgs.dockerTools.buildLayeredImage {
             name = "hopnet";
@@ -371,8 +377,23 @@
           inherit self;
           flavor = "nixos";
         };
+        # The headless node with the RFC-021 profile indirection: the
+        # unit execs through a service-owned symlink the upgrade
+        # provider can flip, and the flake pin only seeds it.
+        hopnet = import ./nix/hopnet-module.nix { inherit self; };
         default = hopnet-mount;
       };
+
+      # RFC-021 end-to-end: a declarative relay + 3-node mesh crossing a
+      # real upgrade boundary through the module's profile flip. Heavy
+      # (builds hopnet twice, boots 4 VMs) — run on demand:
+      #   nix build .#checks.x86_64-linux.upgrade-vm-test
+      checks = forAllSystems (pkgs:
+        pkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
+          upgrade-vm-test = pkgs.testers.runNixOSTest (
+            import ./nix/upgrade-vm-test.nix { inherit self; }
+          );
+        });
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
