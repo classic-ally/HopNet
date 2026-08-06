@@ -6,6 +6,7 @@
 //! reference are atomic, so mark-and-sweep never observes a zero-ref blob
 //! (drive precedent: hopnet-drive/src/db/files.rs:210-227).
 
+use crate::db::libraries;
 use crate::envelopes::{MetadataAccessEntry, PhotoAddEntry};
 use hopnet_common::CustomUUID;
 use hopnet_projection::DatabaseError;
@@ -93,7 +94,7 @@ pub fn insert_photo_entry(
 
     // photo_metadata_access — per-user metadata key wraps.
     for access in &entry.metadata_access {
-        insert_metadata_access_row(db_tx, &entry.photo_id, access)?;
+        upsert_metadata_access_row(db_tx, &entry.photo_id, access)?;
     }
 
     // photo_operations — add entry (operation_type = 0).
@@ -452,16 +453,81 @@ pub fn device_belongs_to_user(
         })
 }
 
+/// Users who hold a metadata wrap for this photo, are still entitled to
+/// one, and are NOT covered by `supplied` — the set a re-key would strand.
+///
+/// An edit that replaces `encrypted_metadata` under a fresh key must
+/// re-wrap that key for everyone: [`upsert_metadata_access_row`] overwrites
+/// only the rows a payload names, so anyone omitted keeps a row that
+/// unwraps to the SUPERSEDED key. Their metadata then fails to decrypt,
+/// silently and permanently, and the convergence worker cannot see it —
+/// `missing_metadata_grants` looks for an absent row, not a stale one.
+///
+/// The comparison is against current HOLDERS, not against membership:
+///
+/// - a member with no wrap yet is not required, because the writer cannot
+///   mint one for them and `missing_metadata_grants` already owns the gap;
+/// - a holder who has left the library is not required, because their row
+///   is stale either way and `stale_access_users` reaps it through
+///   `library_access_revoke`.
+///
+/// Entitled is members ∪ pending invitees ([`libraries::assertion_targets`])
+/// for a shared photo, and the uploader alone for a personal one — the same
+/// sets the `/membership` route hands writers, so a writer working from a
+/// live roster always satisfies this.
+pub fn uncovered_wrap_holders(
+    db_tx: &rusqlite::Transaction,
+    photo_id: &CustomUUID,
+    library_id: Option<&CustomUUID>,
+    uploaded_by: i32,
+    supplied: &[MetadataAccessEntry],
+) -> Result<Vec<i32>, DatabaseError> {
+    let mut stmt = db_tx
+        .prepare("SELECT user_id FROM photo_metadata_access WHERE photo_id = ?1")
+        .map_err(|e| {
+            tracing::error!("uncovered_wrap_holders: prepare for {photo_id} failed: {e}");
+            DatabaseError::RecallError
+        })?;
+    let holders: Vec<i32> = stmt
+        .query_map(params![photo_id], |r| r.get(0))
+        .and_then(|rows| rows.collect())
+        .map_err(|e| {
+            tracing::error!("uncovered_wrap_holders: read holders for {photo_id} failed: {e}");
+            DatabaseError::RecallError
+        })?;
+
+    let entitled: Vec<i32> = match library_id {
+        Some(library) => libraries::assertion_targets(db_tx, library)?
+            .into_iter()
+            .map(|(user_id, _pubkey)| user_id)
+            .collect(),
+        None => vec![uploaded_by],
+    };
+
+    Ok(holders
+        .into_iter()
+        .filter(|user_id| {
+            entitled.contains(user_id) && !supplied.iter().any(|a| a.user_id == *user_id)
+        })
+        .collect())
+}
+
 // --- Private helpers ---
 
-fn insert_metadata_access_row(
+/// Upsert one member's metadata key wrap. An edit re-mints the metadata
+/// key and re-wraps, so the `(photo_id, user_id)` row written by
+/// `photo_add` is overwritten rather than conflicting; on the add path
+/// there is nothing to conflict with and the clause never fires.
+fn upsert_metadata_access_row(
     db_tx: &rusqlite::Transaction,
     photo_id: &CustomUUID,
     entry: &MetadataAccessEntry,
 ) -> Result<(), DatabaseError> {
     db_tx.execute(
         "INSERT INTO photo_metadata_access (photo_id, user_id, ephemeral_pubkey, encrypted_metadata_key)
-         VALUES (?1, ?2, ?3, ?4)",
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(photo_id, user_id) DO UPDATE SET
+             ephemeral_pubkey = ?3, encrypted_metadata_key = ?4",
         params![
             photo_id,
             entry.user_id,
@@ -471,7 +537,7 @@ fn insert_metadata_access_row(
     )
     .map_err(|e| {
         tracing::error!(
-            "photo_add: insert photo_metadata_access ({}, user {}) failed: {e}",
+            "upsert photo_metadata_access ({}, user {}) failed: {e}",
             photo_id,
             entry.user_id,
         );
@@ -646,10 +712,10 @@ pub fn get_blob_access_for_user(
         .map_err(|_| DatabaseError::RecallError)
 }
 
-/// Content edit: replace a resource's blob + optionally update metadata.
-/// Looks up the current data_block_id as prior (LWW contract). Returns
-/// NotFound if the photo doesn't exist; the handler rejects tombstoned
-/// photos before calling this.
+/// Content edit: replace a resource's blob, drop reverted resources, and
+/// optionally update metadata. Looks up the current data_block_id as prior
+/// (LWW contract). Returns NotFound if the photo doesn't exist; the handler
+/// rejects tombstoned photos before calling this.
 pub fn edit_photo_content(
     db_tx: &rusqlite::Transaction,
     entry: &crate::envelopes::PhotoEditContentEntry,
@@ -672,14 +738,27 @@ pub fn edit_photo_content(
         })?;
     }
 
+    // The operation this edit is logged against. Normally the first
+    // upserted resource; a revert that only drops the edited render logs
+    // against the removed kind instead, with the absence as its "new".
+    let (primary_type, primary_new): (i32, Option<&CustomUUID>) = match entry.resources.first() {
+        Some(resource) => (resource.resource_type, Some(&resource.op.blob_id)),
+        None => (
+            *entry
+                .remove_resources
+                .first()
+                .ok_or(DatabaseError::InvalidPayload)?,
+            None,
+        ),
+    };
+
     // LWW: read current data_block_id from photo_resources. The resource
     // may not exist yet (first edit for a photo that only had original).
-    let primary = &entry.resources[0];
     let prior: Option<CustomUUID> = db_tx
         .query_row(
             "SELECT data_block_id FROM photo_resources
              WHERE photo_id = ?1 AND resource_type = ?2",
-            rusqlite::params![entry.photo_id, primary.resource_type],
+            rusqlite::params![entry.photo_id, primary_type],
             |r| r.get(0),
         )
         .or_else(|e| match e {
@@ -712,7 +791,29 @@ pub fn edit_photo_content(
             })?;
     }
 
-    // Optional metadata update.
+    // Reverted resources: drop the row. The blob is deliberately NOT
+    // decremented — photo_operations still references it for the undo
+    // window (reference_provider surface 2), and the orphan sweep collects
+    // it once that expires.
+    for resource_type in &entry.remove_resources {
+        db_tx
+            .execute(
+                "DELETE FROM photo_resources WHERE photo_id = ?1 AND resource_type = ?2",
+                params![entry.photo_id, resource_type],
+            )
+            .map_err(|e| {
+                tracing::error!(
+                    "photo_edit_content: remove resource ({}, {}) failed: {e}",
+                    entry.photo_id,
+                    resource_type,
+                );
+                DatabaseError::InsertError
+            })?;
+    }
+
+    // Optional metadata update. The wraps ride the same transaction as the
+    // ciphertext: a committed state where one landed and the other did not
+    // would leave the metadata undecryptable for every member.
     if let (Some(meta), Some(nonce)) = (&entry.encrypted_metadata, &entry.metadata_nonce) {
         db_tx
             .execute(
@@ -726,6 +827,9 @@ pub fn edit_photo_content(
                 );
                 DatabaseError::InsertError
             })?;
+        for access in &entry.metadata_access {
+            upsert_metadata_access_row(db_tx, &entry.photo_id, access)?;
+        }
     }
 
     upsert_photo_changes(db_tx, &entry.photo_id)?;
@@ -738,9 +842,9 @@ pub fn edit_photo_content(
         &entry.photo_id,
         1, // content_edit
         performed_by,
-        Some(primary.resource_type),
+        Some(primary_type),
         prior.as_ref(),
-        Some(&primary.op.blob_id),
+        primary_new,
         None,
     )?;
 
@@ -780,6 +884,11 @@ pub fn edit_photo_metadata(
             tracing::error!("edit_metadata update {} failed: {e}", entry.photo_id);
             DatabaseError::InsertError
         })?;
+
+    // Same transaction as the ciphertext — see edit_photo_content.
+    for access in &entry.metadata_access {
+        upsert_metadata_access_row(db_tx, &entry.photo_id, access)?;
+    }
 
     upsert_photo_changes(db_tx, &entry.photo_id)?;
 

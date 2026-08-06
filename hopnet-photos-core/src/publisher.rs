@@ -35,7 +35,11 @@ use crate::crypto::{
 };
 use crate::dispatch::{LibraryMembership, PhotoDispatch, UploadedFragment};
 use crate::error::{PhotosCoreError, PublishValidationError};
-use crate::payloads::{PhotoAddDraft, build_photo_add, encode_payload};
+use crate::metadata::PhotoMetadata;
+use crate::payloads::{
+    PhotoAddDraft, PhotoEditContentDraft, PhotoEditMetadataDraft, build_photo_add,
+    build_photo_edit_content, build_photo_edit_metadata, encode_payload,
+};
 
 pub enum ByteSource {
     Stream(Box<dyn tokio::io::AsyncRead + Unpin + Send>),
@@ -94,9 +98,6 @@ fn validate_request(
     membership: &LibraryMembership,
     library_id: Option<&CustomUUID>,
 ) -> Result<(), PublishValidationError> {
-    let uploaded_by = membership.uploaded_by;
-    let members = &membership.members;
-
     let mut declared = 0u16;
     for resource in &asset.resources {
         declared |= 1u16 << resource.kind.as_wire();
@@ -134,6 +135,19 @@ fn validate_request(
             }
         })?;
     }
+
+    validate_recipients(membership, library_id)
+}
+
+/// The recipient half of publish validation, shared with the edit path —
+/// every key wrap an edit mints is aimed at this same member set, so a
+/// membership the add path would refuse must not be usable for an edit.
+fn validate_recipients(
+    membership: &LibraryMembership,
+    library_id: Option<&CustomUUID>,
+) -> Result<(), PublishValidationError> {
+    let uploaded_by = membership.uploaded_by;
+    let members = &membership.members;
 
     if members.is_empty() {
         return Err(PublishValidationError::NoRecipients);
@@ -289,6 +303,58 @@ fn partial_publish(
     }
 }
 
+/// Upload one resource's bytes and mint its wire op: fresh blob id, fresh
+/// blob key, length-enforced stream, key wrapped to every recipient.
+///
+/// `uploaded` gains the blob id as soon as the bytes reach the substrate —
+/// BEFORE the key wrap — so a wrap failure still reports what landed. The
+/// caller decides whether that makes the failure a partial publish.
+async fn upload_resource(
+    dispatch: &dyn PhotoDispatch,
+    kind: ResourceKind,
+    byte_len: u64,
+    source: ByteSource,
+    recipients: &[hopnet_storage::x25519_dalek::PublicKey],
+    uploaded: &mut Vec<(ResourceKind, hopnet_storage::BlobId)>,
+) -> Result<PhotoResourceOp, PhotosCoreError> {
+    let ByteSource::Stream(reader) = source;
+    let upload_len = byte_len as usize;
+    let wrapped = Box::new(ExactLen {
+        inner: reader,
+        kind,
+        expected: byte_len,
+        consumed: 0,
+    });
+
+    let blob_id = CustomUUID::new(None);
+    let blob_key = generate_blob_key();
+
+    let outcome = dispatch
+        .upload_data_block(blob_id.clone(), wrapped, upload_len, blob_key)
+        .await
+        .map_err(map_exact_len_error)?;
+    uploaded.push((kind, blob_id.clone()));
+
+    let access = wrap_blob_key_for_recipients(&blob_id, recipients, &blob_key)?;
+    let fragments: Vec<hopnet_storage::store::FragmentMeta> = outcome
+        .fragments
+        .iter()
+        .map(|f| fragment_to_meta(blob_id.clone(), f))
+        .collect();
+
+    Ok(PhotoResourceOp {
+        resource_type: kind.as_wire(),
+        op: BlobInsertOp {
+            blob_id,
+            integrity_hash: outcome.integrity_hash,
+            added_bytes: outcome.added_bytes,
+            file_size: byte_len,
+            fragments,
+            access,
+        },
+    })
+}
+
 pub async fn publish_photo_add(
     dispatch: &dyn PhotoDispatch,
     mut req: PublishRequest<'_>,
@@ -323,56 +389,28 @@ pub async fn publish_photo_add(
             &mut req.byte_sources[i].1,
             ByteSource::Stream(Box::new(tokio::io::empty())),
         );
-        let ByteSource::Stream(reader) = source;
-
-        let content = req
+        let byte_len = req
             .asset
             .resource(kind)
-            .expect("byte source kinds validated against asset resources");
-        let upload_len = content.content.byte_len as usize;
-        let wrapped = Box::new(ExactLen {
-            inner: reader,
+            .expect("byte source kinds validated against asset resources")
+            .content
+            .byte_len;
+
+        let op = match upload_resource(
+            dispatch,
             kind,
-            expected: content.content.byte_len,
-            consumed: 0,
-        });
-
-        let blob_id = CustomUUID::new(None);
-        let blob_key = generate_blob_key();
-
-        let outcome = match dispatch
-            .upload_data_block(blob_id.clone(), wrapped, upload_len, blob_key)
-            .await
-            .map_err(map_exact_len_error)
+            byte_len,
+            source,
+            &recipient_pubkeys,
+            &mut blob_ids,
+        )
+        .await
         {
-            Ok(outcome) => outcome,
+            Ok(op) => op,
             Err(error) if blob_ids.is_empty() => return Err(error),
-            Err(error) => {
-                return Err(partial_publish(photo_id, &blob_ids, error));
-            }
+            Err(error) => return Err(partial_publish(photo_id, &blob_ids, error)),
         };
-        blob_ids.push((kind, blob_id.clone()));
-
-        let access = wrap_blob_key_for_recipients(&blob_id, &recipient_pubkeys, &blob_key)
-            .map_err(|e| partial_publish(photo_id.clone(), &blob_ids, e))?;
-
-        let fragments: Vec<hopnet_storage::store::FragmentMeta> = outcome
-            .fragments
-            .iter()
-            .map(|f| fragment_to_meta(blob_id.clone(), f))
-            .collect();
-
-        resource_ops.push(PhotoResourceOp {
-            resource_type: kind.as_wire(),
-            op: BlobInsertOp {
-                blob_id: blob_id.clone(),
-                integrity_hash: outcome.integrity_hash,
-                added_bytes: outcome.added_bytes,
-                file_size: content.content.byte_len,
-                fragments,
-                access,
-            },
-        });
+        resource_ops.push(op);
     }
 
     let metadata_access: Vec<MetadataAccessEntry> = membership
@@ -420,6 +458,209 @@ pub async fn publish_photo_add(
 fn build_photo_add_and_encode(draft: PhotoAddDraft) -> Result<Vec<u8>, PhotosCoreError> {
     let payload = build_photo_add(vec![draft]);
     encode_payload(&payload)
+}
+
+/// One resource whose bytes an edit replaces.
+pub struct EditResource {
+    pub kind: ResourceKind,
+    pub byte_len: u64,
+    pub source: ByteSource,
+}
+
+impl std::fmt::Debug for EditResource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EditResource")
+            .field("kind", &self.kind)
+            .field("byte_len", &self.byte_len)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A re-edit, revert, or metadata refresh of an ALREADY published photo.
+///
+/// Unlike [`PublishRequest`] this carries no [`PhotoAsset`]: an edit names
+/// only what changed, and a photo's `Original` is exactly what an edit never
+/// touches — so the asset's own validation, which requires one, does not
+/// apply here.
+pub struct EditRequest<'a> {
+    pub photo_id: CustomUUID,
+    pub library_id: Option<CustomUUID>,
+    /// Resources whose bytes changed. The first becomes the primary in the
+    /// operation log (prior → new); the rest ride alongside it.
+    pub resources: Vec<EditResource>,
+    /// Kinds a revert dropped. The mesh has no way to express an absence
+    /// through an upsert, so removals travel as their own list.
+    pub remove_resources: Vec<ResourceKind>,
+    /// New metadata, when it changed with the pixels (a crop's dimensions)
+    /// or on its own. Always re-encrypted under a FRESH key and re-wrapped:
+    /// the publisher holds no member private key, so it can never recover
+    /// the key the photo was published under.
+    pub metadata: Option<&'a PhotoMetadata>,
+}
+
+fn validate_edit(
+    req: &EditRequest<'_>,
+    membership: &LibraryMembership,
+    library_id: Option<&CustomUUID>,
+) -> Result<(), PublishValidationError> {
+    if req.resources.is_empty() && req.remove_resources.is_empty() && req.metadata.is_none() {
+        return Err(PublishValidationError::EmptyEdit);
+    }
+
+    let mut supplied = 0u16;
+    for resource in &req.resources {
+        let bit = 1u16 << resource.kind.as_wire();
+        if supplied & bit != 0 {
+            return Err(PublishValidationError::DuplicateByteSource(resource.kind));
+        }
+        supplied |= bit;
+
+        let _ = usize::try_from(resource.byte_len).map_err(|_| {
+            PublishValidationError::ResourceTooLarge {
+                kind: resource.kind,
+                byte_len: resource.byte_len,
+            }
+        })?;
+        let _ = i64::try_from(resource.byte_len).map_err(|_| {
+            PublishValidationError::ResourceTooLarge {
+                kind: resource.kind,
+                byte_len: resource.byte_len,
+            }
+        })?;
+    }
+
+    let mut removed = 0u16;
+    for kind in &req.remove_resources {
+        let bit = 1u16 << kind.as_wire();
+        if removed & bit != 0 {
+            return Err(PublishValidationError::DuplicateRemoval(*kind));
+        }
+        if supplied & bit != 0 {
+            return Err(PublishValidationError::EditedAndRemoved(*kind));
+        }
+        removed |= bit;
+    }
+
+    validate_recipients(membership, library_id)
+}
+
+/// Tell the mesh what Photos did to an already-published photo: new bytes
+/// for edited resources, removals for a revert, and refreshed metadata.
+///
+/// The photo id is the one consensus already holds (for an adopted photo,
+/// the first publisher's id — not the local one). Both transactions are
+/// idempotent replacements, so a retry after an ambiguous submit is safe
+/// without a confirm probe; unlike `photo_add` there is no unique id to
+/// collide with.
+pub async fn publish_photo_edit(
+    dispatch: &dyn PhotoDispatch,
+    req: EditRequest<'_>,
+) -> Result<IngestOutcome, PhotosCoreError> {
+    let photo_id = req.photo_id.clone();
+    let library_id = req.library_id.clone();
+
+    let membership = dispatch.fetch_library_members(library_id.clone()).await?;
+    validate_edit(&req, &membership, library_id.as_ref())?;
+    let recipient_pubkeys: Vec<_> = membership.members.iter().map(|m| m.pubkey).collect();
+
+    // Fresh key + fresh wraps, or neither. Replacing the ciphertext while
+    // leaving the stored wraps pointing at the old key would make the
+    // metadata undecryptable for every member, silently.
+    let metadata = match req.metadata {
+        Some(metadata) => {
+            let key = generate_metadata_key();
+            let (ciphertext, nonce) = encrypt_metadata(&key, &metadata.to_json()?)?;
+            let access: Vec<MetadataAccessEntry> = membership
+                .members
+                .iter()
+                .map(|m| {
+                    let (eph, wrapped) = wrap_metadata_key(&photo_id, &m.pubkey, &key)?;
+                    Ok(MetadataAccessEntry {
+                        user_id: m.user_id,
+                        ephemeral_pubkey: eph,
+                        encrypted_metadata_key: wrapped,
+                    })
+                })
+                .collect::<Result<_, PhotosCoreError>>()?;
+            Some((ciphertext, nonce, access))
+        }
+        None => None,
+    };
+
+    let mut blob_ids: Vec<(ResourceKind, hopnet_storage::BlobId)> =
+        Vec::with_capacity(req.resources.len());
+    let mut resource_ops: Vec<PhotoResourceOp> = Vec::with_capacity(req.resources.len());
+    for resource in req.resources {
+        let EditResource {
+            kind,
+            byte_len,
+            source,
+        } = resource;
+        let op = match upload_resource(
+            dispatch,
+            kind,
+            byte_len,
+            source,
+            &recipient_pubkeys,
+            &mut blob_ids,
+        )
+        .await
+        {
+            Ok(op) => op,
+            Err(error) if blob_ids.is_empty() => return Err(error),
+            Err(error) => return Err(partial_publish(photo_id, &blob_ids, error)),
+        };
+        resource_ops.push(op);
+    }
+
+    let operation_id = CustomUUID::new(None);
+    let touches_content = !resource_ops.is_empty() || !req.remove_resources.is_empty();
+    let (function, encoded) = if touches_content {
+        let (encrypted_metadata, metadata_nonce, metadata_access) = match metadata {
+            Some((ciphertext, nonce, access)) => (Some(ciphertext), Some(nonce), access),
+            None => (None, None, Vec::new()),
+        };
+        let payload = build_photo_edit_content(vec![PhotoEditContentDraft {
+            photo_id: photo_id.clone(),
+            resources: resource_ops,
+            encrypted_metadata,
+            metadata_nonce,
+            metadata_access,
+            remove_resources: req
+                .remove_resources
+                .iter()
+                .map(|kind| kind.as_wire())
+                .collect(),
+            operation_id: operation_id.clone(),
+        }]);
+        ("photo_edit_content", encode_payload(&payload))
+    } else {
+        let (encrypted_metadata, metadata_nonce, metadata_access) =
+            metadata.expect("validate_edit rejects an edit that changes nothing");
+        let payload = build_photo_edit_metadata(vec![PhotoEditMetadataDraft {
+            photo_id: photo_id.clone(),
+            encrypted_metadata,
+            metadata_nonce,
+            metadata_access,
+            operation_id: operation_id.clone(),
+        }]);
+        ("photo_edit_metadata", encode_payload(&payload))
+    };
+    let encoded = match encoded {
+        Ok(bytes) => bytes,
+        Err(e) if blob_ids.is_empty() => return Err(e),
+        Err(e) => return Err(partial_publish(photo_id, &blob_ids, e)),
+    };
+
+    if let Err(e) = dispatch.submit_transaction(function, encoded).await {
+        return Err(partial_publish(photo_id, &blob_ids, e));
+    }
+
+    Ok(IngestOutcome {
+        photo_id,
+        operation_id,
+        resources: blob_ids,
+    })
 }
 
 #[cfg(test)]
@@ -847,6 +1088,221 @@ mod tests {
         assert_eq!(round.date_taken, "2025-01-01T00:00:00Z");
         assert_eq!(round.width, Some(640));
         assert_eq!(round.height, Some(480));
+    }
+
+    // --- edits ---
+
+    fn edit_metadata() -> PhotoMetadata {
+        PhotoMetadata {
+            date_taken: "2025-01-01T00:00:00Z".into(),
+            media_type: 0,
+            width: Some(480),
+            height: Some(480),
+            ..Default::default()
+        }
+    }
+
+    fn edit_req<'a>(
+        resources: Vec<EditResource>,
+        remove_resources: Vec<ResourceKind>,
+        metadata: Option<&'a PhotoMetadata>,
+    ) -> EditRequest<'a> {
+        EditRequest {
+            photo_id: CustomUUID::new(None),
+            library_id: None,
+            resources,
+            remove_resources,
+            metadata,
+        }
+    }
+
+    fn edited_resource(kind: ResourceKind, data: &'static [u8]) -> EditResource {
+        EditResource {
+            kind,
+            byte_len: data.len() as u64,
+            source: test_stream(data),
+        }
+    }
+
+    fn decode_edit_content(bytes: &[u8]) -> hopnet_photos::envelopes::PhotoEditContentPayload {
+        bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+            .unwrap()
+            .0
+    }
+
+    // Impact: this is the failure the metadata_access field exists to
+    // prevent, and it is silent at write time — a member's stored wrap
+    // would unwrap to the OLD key, and the AEAD only fails on read, long
+    // after the transaction committed.
+    // Should: encrypt the new metadata under a fresh key and ship wraps that
+    // actually open it.
+    #[tokio::test]
+    async fn edit_metadata_round_trips_under_the_fresh_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatch = MockDispatch::new(dir);
+        let metadata = edit_metadata();
+        let data: &'static [u8] = &[0x77; 100_000];
+        let req = edit_req(
+            vec![edited_resource(ResourceKind::Edited, data)],
+            Vec::new(),
+            Some(&metadata),
+        );
+        publish_photo_edit(&dispatch, req).await.unwrap();
+
+        let log = dispatch.log.lock().unwrap();
+        let (function, payload_bytes) = &log.submits[0];
+        assert_eq!(function, "photo_edit_content");
+        let decoded = decode_edit_content(payload_bytes);
+        let entry = &decoded.entries[0];
+        assert_eq!(entry.metadata_access.len(), 1, "one member, one wrap");
+
+        let secret = hopnet_storage::x25519_dalek::StaticSecret::from([0xAB; 32]);
+        let recipient = StaticRecipient(secret);
+        let key = unwrap_metadata_key(
+            &entry.photo_id,
+            &entry.metadata_access[0].ephemeral_pubkey,
+            &entry.metadata_access[0].encrypted_metadata_key,
+            &recipient,
+        )
+        .unwrap();
+        let decrypted = decrypt_metadata(
+            &key,
+            entry.metadata_nonce.as_ref().unwrap(),
+            entry.encrypted_metadata.as_ref().unwrap(),
+        )
+        .unwrap();
+        let round = PhotoMetadata::from_json(&decrypted).unwrap();
+        assert_eq!(round.width, Some(480), "the crop's new dimensions");
+    }
+
+    // Should: upload only the resources the edit names.
+    // Should not: touch the original, which an edit never replaces.
+    #[tokio::test]
+    async fn edit_uploads_only_the_resources_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatch = MockDispatch::new(dir);
+        let edited: &'static [u8] = &[0x11; 100_000];
+        let thumb: &'static [u8] = &[0x22; 4_096];
+        let req = edit_req(
+            vec![
+                edited_resource(ResourceKind::Edited, edited),
+                edited_resource(ResourceKind::ThumbnailSmall, thumb),
+            ],
+            Vec::new(),
+            None,
+        );
+        publish_photo_edit(&dispatch, req).await.unwrap();
+
+        let log = dispatch.log.lock().unwrap();
+        assert_eq!(log.uploads.len(), 2);
+        let decoded = decode_edit_content(&log.submits[0].1);
+        let kinds: Vec<i32> = decoded.entries[0]
+            .resources
+            .iter()
+            .map(|r| r.resource_type)
+            .collect();
+        assert_eq!(kinds, vec![1, 5]);
+        assert!(
+            decoded.entries[0].encrypted_metadata.is_none(),
+            "no metadata change, no ciphertext"
+        );
+        assert!(decoded.entries[0].metadata_access.is_empty());
+    }
+
+    // Impact: after a photo publishes, its blobs are evicted from the local
+    // spool — a revert that had to re-upload the original could not, because
+    // those bytes are gone. Removal is the only expressible answer.
+    // Should: submit a removal with no upload at all.
+    #[tokio::test]
+    async fn removal_only_edit_uploads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatch = MockDispatch::new(dir);
+        let req = edit_req(Vec::new(), vec![ResourceKind::Edited], None);
+        publish_photo_edit(&dispatch, req).await.unwrap();
+
+        let log = dispatch.log.lock().unwrap();
+        assert_eq!(log.uploads.len(), 0);
+        assert_eq!(log.submits[0].0, "photo_edit_content");
+        let decoded = decode_edit_content(&log.submits[0].1);
+        assert!(decoded.entries[0].resources.is_empty());
+        assert_eq!(decoded.entries[0].remove_resources, vec![1]);
+    }
+
+    // Should: route a metadata-only refresh to photo_edit_metadata.
+    #[tokio::test]
+    async fn metadata_only_edit_submits_photo_edit_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatch = MockDispatch::new(dir);
+        let metadata = edit_metadata();
+        let req = edit_req(Vec::new(), Vec::new(), Some(&metadata));
+        publish_photo_edit(&dispatch, req).await.unwrap();
+
+        let log = dispatch.log.lock().unwrap();
+        assert_eq!(log.uploads.len(), 0);
+        let (function, payload_bytes) = &log.submits[0];
+        assert_eq!(function, "photo_edit_metadata");
+        let (decoded, _): (hopnet_photos::envelopes::PhotoEditMetadataPayload, _) =
+            bincode::serde::decode_from_slice(payload_bytes, bincode::config::standard()).unwrap();
+        assert_eq!(decoded.entries[0].metadata_access.len(), 1);
+    }
+
+    // Should not: reach the network for an edit that changes nothing.
+    #[tokio::test]
+    async fn rejects_an_edit_that_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatch = MockDispatch::new(dir);
+        let req = edit_req(Vec::new(), Vec::new(), None);
+        let err = publish_photo_edit(&dispatch, req).await.unwrap_err();
+        assert!(matches!(
+            err,
+            PhotosCoreError::InvalidPublishRequest(PublishValidationError::EmptyEdit)
+        ));
+        assert_eq!(dispatch.log.lock().unwrap().submits.len(), 0);
+    }
+
+    // Should not: accept a kind that is both replaced and removed — the
+    // handler's upsert and delete would race on execution order.
+    #[tokio::test]
+    async fn rejects_a_kind_that_is_both_edited_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatch = MockDispatch::new(dir);
+        let data: &'static [u8] = &[0x33; 100_000];
+        let req = edit_req(
+            vec![edited_resource(ResourceKind::Edited, data)],
+            vec![ResourceKind::Edited],
+            None,
+        );
+        let err = publish_photo_edit(&dispatch, req).await.unwrap_err();
+        assert!(matches!(
+            err,
+            PhotosCoreError::InvalidPublishRequest(PublishValidationError::EditedAndRemoved(
+                ResourceKind::Edited
+            ))
+        ));
+        assert_eq!(dispatch.log.lock().unwrap().uploads.len(), 0);
+    }
+
+    // Impact: the uploaded ids are reconciliation candidates the caller owns
+    // — losing them on a mid-edit failure strands bytes in the substrate
+    // with nothing pointing at them.
+    // Should: report every blob that landed before the submit failed.
+    #[tokio::test]
+    async fn partial_edit_reports_uploaded_blob_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatch = MockDispatch::new(dir).with_submit_fail();
+        let data: &'static [u8] = &[0x44; 100_000];
+        let req = edit_req(
+            vec![edited_resource(ResourceKind::Edited, data)],
+            Vec::new(),
+            None,
+        );
+        let err = publish_photo_edit(&dispatch, req).await.unwrap_err();
+        match err {
+            PhotosCoreError::PartialPublish {
+                uploaded_blob_ids, ..
+            } => assert_eq!(uploaded_blob_ids.len(), 1),
+            other => panic!("expected PartialPublish, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -156,8 +156,11 @@ pub struct PhotoRecord {
     /// metadata source. NULL until materialization first writes it.
     pub descriptor_json: Option<String>,
 
-    /// NULL = not yet published into HopNet; set once, never reset (a
-    /// re-edit must NOT re-enqueue — consensus rejects duplicate photo ids).
+    /// NULL = not yet published into HopNet; set once, never reset —
+    /// consensus rejects duplicate photo ids, so a re-edit must never
+    /// re-enqueue here. Edits propagate through their own markers
+    /// (`published_asset_modified_at` and the per-resource
+    /// `published_content_hash`) rather than by re-publishing.
     pub published_at: Option<DateTime<Utc>>,
     pub publish_attempts: i64,
     pub publish_next_retry_at: Option<DateTime<Utc>>,
@@ -180,6 +183,17 @@ pub struct PhotoRecord {
     pub tombstone_publish_attempts: i64,
     pub tombstone_publish_next_retry_at: Option<DateTime<Utc>>,
     pub tombstone_publish_last_error: Option<String>,
+
+    /// The `asset_modified_at` value the mesh's metadata ciphertext was
+    /// composed from. Disagreement with the live column is the metadata
+    /// half of the edit queue (see §Propagation of edits).
+    pub published_asset_modified_at: Option<DateTime<Utc>>,
+    /// Retry ledger for edit propagation. Per photo, not per resource:
+    /// one transaction carries every diverged resource, so the failure is
+    /// the photo's.
+    pub edit_publish_attempts: i64,
+    pub edit_publish_next_retry_at: Option<DateTime<Utc>>,
+    pub edit_publish_last_error: Option<String>,
 }
 
 /// A `photo_resources` row.
@@ -194,9 +208,22 @@ pub struct ResourceRecord {
     pub size_bytes: Option<i64>,
 
     pub written_at: Option<DateTime<Utc>>,
+    /// The FETCH path's retry state (PhotoKit download failures) — never
+    /// the publish path's; see `photos.edit_publish_*`.
     pub retry_count: i64,
     pub next_retry_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+
+    /// The `content_hash` the mesh holds for this resource. Disagreement
+    /// with the live hash is the content half of the edit queue; NULL on a
+    /// published photo means the row was minted after publish (a first
+    /// edit) and the mesh has never seen it.
+    pub published_content_hash: Option<ContentHash>,
+    /// Soft delete for a revert. The row outlives the local resource until
+    /// the removal reaches the mesh — a hard delete would take
+    /// `published_content_hash` with it, and divergence-as-absence is
+    /// invisible to every predicate.
+    pub removed_at: Option<DateTime<Utc>>,
 }
 
 /// A `libraries` row.

@@ -39,15 +39,111 @@ async fn fresh_migrate_creates_schema() {
         names,
         vec![
             "idx_ingest_log_photo",
+            "idx_photo_resources_edit_pending",
             "idx_photo_resources_hash",
             "idx_photos_deleted",
             "idx_photos_group",
             "idx_photos_library",
+            "idx_photos_metadata_pending",
             "idx_photos_pending",
             "idx_photos_tombstone_pending",
             "idx_photos_unpublished",
         ]
     );
+}
+
+// Impact: an archive published by an older daemon has NULL edit markers, and
+// NULL is how "the mesh has never seen these bytes" is spelled. Without the
+// backfill the first tick after upgrade would queue a re-edit of the entire
+// archive — and fail every one of them, because those blobs were evicted
+// from the spool the moment they published.
+// Should: read as converged for a photo that was already published.
+// Should not: touch an unpublished photo's markers.
+#[tokio::test]
+async fn edit_markers_backfill_only_published_photos() {
+    let dir = std::env::temp_dir().join(format!("ingress-core-backfill-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.db");
+    let now = chrono::Utc::now();
+
+    // A database as an older daemon left it: rows written through the
+    // pre-migration schema, then re-opened so the new migration runs.
+    {
+        let store = StateStore::open(&path).await.expect("first open");
+        sqlx::query("INSERT INTO libraries (library_id, display_name, retention_days, created_at) VALUES ('personal', 'Personal', 30, ?)")
+            .bind(now)
+            .execute(store.raw_pool())
+            .await
+            .unwrap();
+        for (id, published) in [("done", true), ("pending", false)] {
+            sqlx::query(
+                "INSERT INTO photos (photo_id, library_id, discovered_at, asset_modified_at, \
+                 materialized_at, published_at) VALUES (?, 'personal', ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .bind(if published { Some(now) } else { None })
+            .execute(store.raw_pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO photo_resources (photo_id, resource_type, content_hash, ext, \
+                 size_bytes, written_at) VALUES (?, 0, 'abc123', 'jpg', 10, ?)",
+            )
+            .bind(id)
+            .bind(now)
+            .execute(store.raw_pool())
+            .await
+            .unwrap();
+        }
+        // Clear what the fresh-schema migration already stamped, so the
+        // rows genuinely look pre-backfill.
+        sqlx::query("UPDATE photos SET published_asset_modified_at = NULL")
+            .execute(store.raw_pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE photo_resources SET published_content_hash = NULL")
+            .execute(store.raw_pool())
+            .await
+            .unwrap();
+
+        // Replay the migration's backfill verbatim (the ALTERs around it
+        // have already run), so this test breaks if the shipped SQL stops
+        // doing it. Twice, for idempotence.
+        const SQL: &str = include_str!("../migrations/1786464000_edit_propagation.sql");
+        let start = SQL
+            .find("UPDATE photos SET published_asset_modified_at")
+            .expect("backfill present");
+        let end = SQL.find("-- Resource-side half").expect("backfill delimited");
+        for _ in 0..2 {
+            sqlx::raw_sql(&SQL[start..end])
+                .execute(store.raw_pool())
+                .await
+                .unwrap();
+        }
+
+        let markers: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT p.photo_id, p.published_asset_modified_at, r.published_content_hash \
+             FROM photos p JOIN photo_resources r ON r.photo_id = p.photo_id \
+             ORDER BY p.photo_id",
+        )
+        .fetch_all(store.raw_pool())
+        .await
+        .unwrap();
+        assert_eq!(markers.len(), 2);
+        let (id, modified, hash) = &markers[0];
+        assert_eq!(id, "done");
+        assert!(modified.is_some(), "published photo reads as converged");
+        assert_eq!(hash.as_deref(), Some("abc123"));
+        let (id, modified, hash) = &markers[1];
+        assert_eq!(id, "pending");
+        assert!(modified.is_none(), "unpublished photo is untouched");
+        assert!(hash.is_none());
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 // Should: carry the consensus_photo_id adoption column on a migrated photos
@@ -86,7 +182,7 @@ async fn migrate_is_idempotent() {
         .fetch_one(second.raw_pool())
         .await
         .unwrap();
-    assert_eq!(n, 9);
+    assert_eq!(n, 10);
 
     std::fs::remove_dir_all(&dir).ok();
 }

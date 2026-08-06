@@ -447,12 +447,22 @@ async fn cleanup_sweep_evicts_decided_blobs() {
     let pending = seed_one(&store, &pending_desc).await;
     materialize_all(&store, &data_dir, &pending_desc, &pending).await;
 
+    // Stand in for mark_published, which stamps the edit baseline in the
+    // same transaction — without it the eviction guard would (correctly)
+    // read these bytes as owed to the mesh and hold them.
     sqlx::query("UPDATE photos SET published_at = ? WHERE photo_id = ?")
         .bind(Utc::now())
         .bind(published.to_string())
         .execute(store.raw_pool())
         .await
         .unwrap();
+    sqlx::query(
+        "UPDATE photo_resources SET published_content_hash = content_hash WHERE photo_id = ?",
+    )
+    .bind(published.to_string())
+    .execute(store.raw_pool())
+    .await
+    .unwrap();
 
     let hash_of = |rows: &[ingress_core::model::ResourceRecord]| {
         rows[0].content_hash.clone().unwrap()
@@ -558,4 +568,68 @@ async fn standalone_cleanup_respects_drain_lock() {
         .unwrap();
     assert_eq!(cleanup.photos_hard_deleted, 0);
     assert!(!lock_path.exists(), "lock released after the run");
+}
+
+// Impact: eviction rides the end of every publish pass, so a refetched edit
+// whose propagation parked (node unreachable, responsibility lost) would
+// have its new bytes deleted before the next pass could send them — and
+// PhotoKit will not re-deliver an unchanged asset, so the mesh would be
+// stuck on the pre-edit render permanently.
+// Should: retain a published photo's blob while its resource marker
+// disagrees with the live hash.
+// Should: evict it once the marker catches up.
+#[tokio::test]
+async fn eviction_spares_bytes_the_mesh_has_not_been_told_about() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, data_dir, lib, _) = rig(tmp.path()).await;
+
+    let desc = AssetDescriptorBuilder::simple_image()
+        .modified_at(Utc::now())
+        .build();
+    let photo = seed_one(&store, &desc).await;
+    materialize_all(&store, &data_dir, &desc, &photo).await;
+
+    // Published, but the edit marker still names the previous version —
+    // exactly the state a refetched re-edit leaves behind.
+    sqlx::query("UPDATE photos SET published_at = ? WHERE photo_id = ?")
+        .bind(Utc::now())
+        .bind(photo.to_string())
+        .execute(store.raw_pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE photo_resources SET published_content_hash = 'stale' WHERE photo_id = ?",
+    )
+    .bind(photo.to_string())
+    .execute(store.raw_pool())
+    .await
+    .unwrap();
+
+    let hash = store.resources_for_photo(&photo).await.unwrap()[0]
+        .content_hash
+        .clone()
+        .unwrap();
+    let file = data_dir.spool().blob_path(&hash, "bin");
+
+    let report = run_cleanup(&store, &data_dir, &cfg(), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(report.spool_evicted, 0, "un-propagated bytes are held");
+    assert!(file.is_file());
+
+    // The edit reaches the mesh; the bytes are ordinary again.
+    sqlx::query(
+        "UPDATE photo_resources SET published_content_hash = content_hash WHERE photo_id = ?",
+    )
+    .bind(photo.to_string())
+    .execute(store.raw_pool())
+    .await
+    .unwrap();
+    let report = run_cleanup(&store, &data_dir, &cfg(), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(report.spool_evicted, 1);
+    assert!(!file.exists());
+    let blob = store.blob(&lib, &hash).await.unwrap().unwrap();
+    assert!(blob.evicted_at.is_some());
 }

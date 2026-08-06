@@ -306,6 +306,31 @@ apply functions inside consensus handlers.
       byte-exact reads → second member's daemon ADOPTS instead of
       re-uploading → per-library eviction, e2e. Cutover ops (wipe,
       re-pull, bind, claim) can now cover both partitions.
+- [x] Ingress edit + metadata propagation (2026-08-02): editing a photo in
+      Apple Photos now reaches the mesh — crops, adjustments, reverts, and
+      metadata-only refreshes alike. Same vocabulary as tombstones, keyed
+      on a VALUE rather than existence: `photo_resources.published_content_hash`
+      is the bytes consensus holds and `photos.published_asset_modified_at`
+      the metadata it was composed from, each disagreeing with its live
+      counterpart forming half the queue. A revert has no upsert that can
+      express an absence, so the envelope gained a removal list and the
+      local row is retired to a marker until it propagates — a hard delete
+      would take the marker with it and make the divergence invisible.
+      Both edit envelopes also gained `metadata_access`: they carried a
+      ciphertext with no way to ship the wraps of its key, which assumed a
+      writer holding a member private key — true of a browser client, false
+      of the daemon, and replacing the ciphertext without new wraps makes a
+      photo's metadata undecryptable for everyone, silently. Publish and
+      adoption now stamp the markers in the same transaction (and the
+      migration backfills them), or "the mesh has it" and "the mesh has
+      never been told" would be the same state and every pass would
+      re-upload the archive. Spool eviction spares bytes an edit still
+      owes the mesh (`edits_unpropagated` per library), since PhotoKit
+      will not re-deliver an unchanged asset. The scope pass now runs
+      publish → restore → edit → delete, because both edit handlers reject
+      a photo the mesh believes is tombstoned. `photos-ingress-edit` proves
+      edit, revert and metadata refresh across a 3-node mesh with zero
+      divergence; `photos-ingress-shared` covers the cross-member case.
 - [x] Ingress tombstone + restore propagation (2026-08-02): deleting a
       photo in Apple Photos now reaches the mesh, and pulling it back out
       of Recently Deleted does too. `photos.tombstone_published_at` (with

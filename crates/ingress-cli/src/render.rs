@@ -63,6 +63,14 @@ pub fn print_status(report: &StatusReport) {
                 l.stats.photos_active.to_string(),
                 l.stats.photos_pending.to_string(),
                 l.stats.tombstones.to_string(),
+                // What the mesh has not been told. Both are held back from
+                // reclamation until they propagate — tombstones from hard
+                // delete, edits from spool eviction — so a number that
+                // stops falling is the operator-visible symptom of a
+                // daemon that cannot reach its node or no longer holds
+                // responsibility for the scope.
+                l.stats.tombstones_unpropagated.to_string(),
+                l.stats.edits_unpropagated.to_string(),
                 l.stats.blob_count.to_string(),
                 human_bytes(l.stats.blob_bytes),
             ]
@@ -70,7 +78,7 @@ pub fn print_status(report: &StatusReport) {
         .collect();
     table(
         &[
-            "ID", "NAME", "ACTIVE", "PENDING", "TOMB", "BLOBS", "SIZE",
+            "ID", "NAME", "ACTIVE", "PENDING", "TOMB", "UNSENT-T", "UNSENT-E", "BLOBS", "SIZE",
         ],
         &rows,
     );

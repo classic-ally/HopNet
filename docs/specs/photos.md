@@ -658,6 +658,36 @@ The photos module registers its own transaction handlers via the existing `inven
 
 **Concurrent edit policy**: Last writer wins via consensus ordering. The `photo_edit_content` handler logs `prior_data_block_id` as the **current** value at execution time (looked up from `photo_resources` for the targeted `resource_type`), not the value claimed in the payload. This ensures the operation chain is contiguous even when edits race: if A's edit lands first (X → A_version) and B's lands second, B's log entry records (prior=A_version, new=B_version) regardless of what B's payload claimed. All versions are reachable by walking the operation log, and any superseded edit can be manually restored.
 
+**Edit payload validation** (both edit handlers): the handler is the trust
+boundary — every node applies it, and the publishing client's own checks are
+advisory by comparison. Enforced there, not only client-side:
+
+- *Shape* (`photo_edit_content`, `InvalidPayload`): an entry must upsert or
+  remove something; no kind may repeat within either list or appear in both
+  (the upsert loop runs first, so a kind in both would register a blob and
+  write its row only to delete it, stranding a data block reachable solely
+  from the operation log); and `remove_resources` may not name the original.
+  `photo_add` treats "every asset has an original" as an invariant, and an
+  edit must not be able to retire it — the operation log records only the
+  first removed kind's prior blob, so undo could not restore it either.
+- *Re-key coverage* (both, `ConflictError`): when an entry supplies a
+  non-empty `metadata_access`, it must carry a wrap for every user who
+  currently holds one for that photo **and is still entitled to one**
+  (members ∪ pending invitees, or the uploader for a personal photo).
+  Upserting only the supplied rows leaves anyone omitted holding a wrap of
+  the *superseded* key: their metadata stops decrypting, silently, at read
+  time, and the convergence worker cannot repair it — `missing_metadata_grants`
+  looks for an absent row, not a stale one. Coverage is measured against
+  current *holders* rather than membership so that a member with no wrap yet
+  (the worker's own job) and a holder who has left the library (the revoke
+  sweep's) neither block an edit. Every production writer of
+  `photo_metadata_access` mints rows only for members, invitees, or the
+  uploader, so that set is currently complete — **album sharing to a
+  non-library-member (above) must extend it**, or a re-key would strand
+  exactly those recipients. An empty `metadata_access` remains legal:
+  it declares a re-encrypt under the existing key, which the node cannot
+  verify either way since it never sees the key.
+
 ### Shared Library: Add Photo Flow
 
 When a member adds a photo to a shared library:
@@ -964,6 +994,7 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 - [x] Sidecar rematerialization: membership-diff pre-phase, `photo_view_changes`-triggered paged backfill, purge on leave/kick (`sidecar_libraries` state)
 - [x] Ingress daemon shared publish (2026-08-02 — **closes the iCloud shared-library cutover gate**): `mesh_library_id` binding on the ingress `libraries` table (`library set-mesh-id`, scope-bound-only invariant), has-publish-target claim predicate, scope-partitioned publish pass (per-scope resolve/responsibility/parking/attempt-burn; unreachable still parks whole pass), per-(user, library) ingress responsibility with membership-checked claims and kick dissolution, library-scoped fingerprint key on `POST /api/photos/client/resolve` (derived from the library key — cross-member dedup, `photos-ingress-shared` scenario proves adopt-not-reupload e2e)
 - [x] Ingress tombstone + restore propagation (2026-08-02): iCloud deletes and Recently-Deleted restores now reach the mesh. `photos.tombstone_published_at` (plus its own retry ledger) records what consensus has been told; disagreeing with `deleted_at` IS the queue, and the marker is deliberately resettable so a delete → restore → delete cycle converges. Rides the same scope-partitioned pass under the same holder gate, after publishing (a photo added and deleted between passes must reach consensus before it is tombstoned there); adopted photos propagate under `consensus_photo_id`. Hard delete holds a published tombstone past its cutoff until the mesh knows, so an offline daemon cannot strand a photo in HopNet forever. `photos-ingress-tombstone` proves both directions e2e with zero divergence
+- [x] Ingress edit + metadata propagation (2026-08-02): iCloud edits, reverts and metadata refreshes now reach the mesh. Value-keyed markers — `photo_resources.published_content_hash` for the bytes, `photos.published_asset_modified_at` for the metadata — each disagreeing with its live counterpart forming half the queue; per-photo edit ledger, since one transaction carries every diverged resource. A revert travels as a removal (no upsert expresses an absence) and the local row is retired to a marker until it propagates. **Both edit envelopes amended (pre-release, dev meshes wiped)** to carry `metadata_access`: they previously carried a ciphertext with no way to ship the wraps of its key, which only a writer holding a member private key could satisfy — the ingress daemon holds none, and replacing the ciphertext without new wraps makes a photo's metadata undecryptable for every member, silently. `photo_edit_content` also gained `remove_resources`, and its entry may now be removal-only. Publish and adoption stamp the markers in the same transaction; spool eviction spares bytes an edit still owes the mesh; the scope pass runs publish → restore → edit → delete because both edit handlers reject a tombstoned photo. `photos-ingress-edit` proves all three shapes e2e with zero divergence
 - [ ] `Keys` rotation lane (cryptographic revocation after kick) — designed into the convergence contract, not built
 - [ ] Empty-library GC (last leaver strands the library row)
 
