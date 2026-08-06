@@ -9,7 +9,9 @@ RFC-CONSENSUS-002 (membership machinery, evidence layer)
 export/import seam)
 **Subsumes**: issue #10 (consensus history compression)
 **Related**: RFC-020 (module versioning — the upgrade policy that rides
-this mechanism); RFC-010 (takeout: export/import precedent)
+this mechanism); RFC-021 (nix upgrade provider — staging and unattended
+activation behind the S3 provider seam); RFC-010 (takeout:
+export/import precedent)
 
 ## Motivation
 
