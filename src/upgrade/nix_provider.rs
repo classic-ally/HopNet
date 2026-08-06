@@ -24,7 +24,8 @@ pub const ENV_NIX_BIN: &str = "HOPNET_UPGRADE_NIX_BIN";
 pub const ENV_PROFILE: &str = "HOPNET_UPGRADE_PROFILE";
 /// Directory holding staged out-links and their provenance records.
 pub const ENV_STAGE_DIR: &str = "HOPNET_UPGRADE_STAGE_DIR";
-/// Base flake ref to stage from; `?ref=v<version>` is appended. Defaults
+/// Base flake ref to stage from; `?ref=refs/tags/v<version>` is appended
+/// (see `tag_ref`). Defaults
 /// to the crate's repository field.
 pub const ENV_FLAKE_REF: &str = "HOPNET_UPGRADE_FLAKE_REF";
 /// `0` disables proactive staging on the tick (default on).
@@ -95,6 +96,15 @@ pub fn default_flake_ref() -> String {
     }
 }
 
+/// The flake ref for a release tag. `refs/tags/` is NOT decoration: nix
+/// resolves a bare `?ref=X` under `refs/heads/`, so a release tag asked
+/// for by name fails with "couldn't find remote ref refs/heads/vX" — which
+/// is exactly how the first real staging attempt died, on all three nodes
+/// at once, with the fake `nix` in every test happily ignoring the ref.
+pub fn tag_ref(flake_ref: &str, version: &str) -> String {
+    format!("{flake_ref}?ref=refs/tags/v{version}")
+}
+
 /// What `stage` records beside the out-link: enough to re-verify at
 /// activation time that the bytes being activated are the ones THIS node
 /// staged, from where (contract rule 2).
@@ -158,7 +168,7 @@ impl UpgradeProvider for NixUpgradeProvider {
             std::fs::create_dir_all(&self.env.stage_dir)
                 .map_err(|e| ProviderError::Permanent(format!("stage dir: {e}")))?;
 
-            let full_ref = format!("{}?ref=v{version}", self.env.flake_ref);
+            let full_ref = tag_ref(&self.env.flake_ref, version);
             let link = self.env.out_link(version);
             tracing::info!(%full_ref, "staging release via nix build (may take a while)");
             let out = tokio::process::Command::new(&self.env.nix_bin)
@@ -348,7 +358,7 @@ pub(crate) mod tests {
         if with_provenance {
             let prov = Provenance {
                 version: version.into(),
-                flake_ref: format!("{}?ref=v{version}", env.flake_ref),
+                flake_ref: tag_ref(&env.flake_ref, version),
                 out_path: store.to_string_lossy().into_owned(),
             };
             std::fs::write(
@@ -525,7 +535,7 @@ pub(crate) mod tests {
         // Corrupt the provenance to claim a different out path.
         let prov = Provenance {
             version: "2026.9.0".into(),
-            flake_ref: "git+https://example.invalid/HopNet.git?ref=v2026.9.0".into(),
+            flake_ref: tag_ref("git+https://example.invalid/HopNet.git", "2026.9.0"),
             out_path: "/nix/store/somewhere-else".into(),
         };
         std::fs::write(
@@ -549,6 +559,22 @@ pub(crate) mod tests {
 
         let err = try_activate_with(&env, 20260900).unwrap_err();
         assert!(err.contains("disabled"), "{err}");
+    }
+
+    // Impact: the tag ref is the one string in the provider that only a
+    // real nix and a real forge can validate — every test here and the VM
+    // test stub the nix binary, so a wrong ref namespace sails through all
+    // of them and dies on the first genuine release. It did: nix resolves a
+    // bare `?ref=X` under refs/heads, so `?ref=v2026.8.1` asked for a
+    // BRANCH and all three nodes failed with "couldn't find remote ref
+    // refs/heads/v2026.8.1".
+    // Should: address a release tag under refs/tags.
+    #[test]
+    fn tag_ref_addresses_the_tag_namespace() {
+        assert_eq!(
+            tag_ref("git+https://example.invalid/HopNet.git", "2026.8.1"),
+            "git+https://example.invalid/HopNet.git?ref=refs/tags/v2026.8.1"
+        );
     }
 
     // Should: resolve the deployment contract from env only when the

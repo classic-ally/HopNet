@@ -155,6 +155,13 @@ in
         HOPNET_UPGRADE_RELEASE_URL = cfg.upgrade.releaseUrl;
       };
 
+      # nix shells out to git to fetch a `git+https` flake ref, and a
+      # systemd unit gets systemd's minimal PATH — without this, staging
+      # dies on `executing "git": No such file or directory`, which is
+      # exactly how the first real release attempt failed on every node
+      # (every test stubs the nix binary, so none of them can catch it).
+      path = [ pkgs.git ];
+
       serviceConfig = {
         User = "hopnet";
         Group = "hopnet";
