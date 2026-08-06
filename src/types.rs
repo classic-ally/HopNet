@@ -263,4 +263,10 @@ pub struct JoinInfo {
     pub bootstrap_validators: Vec<Node>, // Full node info for catch-up
     /// The mesh's genesis-fixed quorum profile (`QuorumProfile::as_str`).
     pub quorum_profile: String,
+    /// The epoch the joiner is entering (RFC-019 S7). Epoch 1 takes the
+    /// trusted height-0 bootstrap; anything later takes the epoch-join
+    /// path, which fetches and verifies the lineage chain and imports the
+    /// boundary snapshot. Nothing else is needed as an anchor: the first
+    /// record's back-pointer IS epoch 1's chain id.
+    pub epoch: u64,
 }

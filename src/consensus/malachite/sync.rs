@@ -22,7 +22,7 @@ use hopnet_consensus::types::Block;
 use super::gossip::{ConsensusNetRequest, ConsensusNetResponse};
 
 /// Heights fetched per request (server caps at 100).
-const CHUNK: i64 = 50;
+const CHUNK: u64 = 50;
 /// Stream-level timeout per fetch.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long we wait for the shell to apply a fed chunk before suspecting a
@@ -35,6 +35,31 @@ pub enum SyncError {
     Exhausted { reached: u64, target: u64 },
     /// The consensus shell is gone.
     ShellStopped,
+    /// A peer refused with a NEWER epoch (RFC-019 S7): this node's decided
+    /// history is from a sealed epoch and no amount of block sync helps —
+    /// the caller must pivot into the epoch-join path. Surfaced on the
+    /// FIRST such refusal: one claim suffices because the join verifies
+    /// everything cryptographically before acting on it.
+    EpochAhead { peer: i32, peer_epoch: u64 },
+}
+
+/// A single fetch's failure, classified: transport/malformed strikes count
+/// against the peer; an epoch-ahead refusal is a signpost, not a strike.
+#[derive(Debug)]
+enum FetchError {
+    Transport(String),
+    EpochMismatch { peer_epoch: u64 },
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Transport(m) => write!(f, "{m}"),
+            FetchError::EpochMismatch { peer_epoch } => {
+                write!(f, "epoch mismatch: peer is on epoch {peer_epoch}")
+            }
+        }
+    }
 }
 
 /// Sync until `decided` reaches `target`. Tries `hint_peer` first, then
@@ -45,6 +70,7 @@ pub enum SyncError {
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_to_target(
     comms: &IrohComms,
+    epoch: u64,
     db_pool: &Pool<SqliteConnectionManager>,
     my_node_id: i32,
     input_tx: &mpsc::Sender<HostInput>,
@@ -54,7 +80,16 @@ pub async fn sync_to_target(
     evidence: Option<std::sync::Arc<crate::consensus::evidence::EvidenceMap>>,
 ) -> Result<(), SyncError> {
     let peers = peer_list(db_pool, my_node_id, hint_peer);
-    sync_loop(comms, input_tx, decided, Some(target), &peers, evidence).await?;
+    sync_loop(
+        comms,
+        epoch,
+        input_tx,
+        decided,
+        Some(target),
+        &peers,
+        evidence,
+    )
+    .await?;
     Ok(())
 }
 
@@ -64,12 +99,13 @@ pub async fn sync_to_target(
 /// fills as blocks apply, so callers pass JoinInfo's bootstrap validators.
 pub async fn sync_to_tip(
     comms: &IrohComms,
+    epoch: u64,
     input_tx: &mpsc::Sender<HostInput>,
     decided: &mut watch::Receiver<u64>,
     peers: &[PeerRef],
     evidence: Option<std::sync::Arc<crate::consensus::evidence::EvidenceMap>>,
 ) -> Result<u64, SyncError> {
-    sync_loop(comms, input_tx, decided, None, peers, evidence).await
+    sync_loop(comms, epoch, input_tx, decided, None, peers, evidence).await
 }
 
 /// Shared fetch/feed/apply loop. With `target = Some(h)`: sync until decided
@@ -78,6 +114,7 @@ pub async fn sync_to_tip(
 /// is success; transport failures never count as tip evidence.
 async fn sync_loop(
     comms: &IrohComms,
+    epoch: u64,
     input_tx: &mpsc::Sender<HostInput>,
     decided: &mut watch::Receiver<u64>,
     target: Option<u64>,
@@ -118,12 +155,12 @@ async fn sync_loop(
         let peer = peers[cursor % peers.len()];
         cursor += 1;
 
-        let from = (*decided.borrow() as i64) + 1;
+        let from = *decided.borrow() + 1;
         let to = match target {
-            Some(t) => (from + CHUNK - 1).min(t as i64),
+            Some(t) => (from + CHUNK - 1).min(t),
             None => from + CHUNK - 1,
         };
-        match fetch_chunk(comms, &peer, from, to).await {
+        match fetch_chunk(comms, epoch, &peer, from, to).await {
             Ok(pairs) if !pairs.is_empty() => {
                 // Reachability evidence (RFC-CONSENSUS-002): the peer served
                 // us an authenticated chunk.
@@ -131,10 +168,12 @@ async fn sync_loop(
                     ev.record_contact(peer.node_id);
                 }
                 let mut last_fed = *decided.borrow();
-                for (i, (block, cert)) in pairs.into_iter().enumerate() {
+                // Heights must arrive contiguous from `from` — a gap means
+                // the peer served a chunk we cannot apply in order.
+                for (expected, (block, cert)) in (from..).zip(pairs) {
                     // Structural checks; certificate verification is the
                     // engine's job.
-                    if block.data.height != from as u64 + i as u64
+                    if block.data.height != expected
                         || block.verify().is_err()
                         || block.block_hash != cert.value_id
                     {
@@ -186,6 +225,22 @@ async fn sync_loop(
                 tracing::debug!("sync: node {} has nothing for [{from}, {to}]", peer.node_id);
                 empty_answers += 1;
             }
+            // A peer on a NEWER epoch: block sync is over — the caller
+            // pivots into the epoch-join path (RFC-019 S7).
+            Err(FetchError::EpochMismatch { peer_epoch }) if peer_epoch > epoch => {
+                tracing::info!(
+                    peer = peer.node_id,
+                    peer_epoch,
+                    local_epoch = epoch,
+                    "sync: peer answered from a newer epoch (epoch join needed)"
+                );
+                return Err(SyncError::EpochAhead {
+                    peer: peer.node_id,
+                    peer_epoch,
+                });
+            }
+            // A peer BEHIND us (it is the straggler) counts like any
+            // other unusable answer.
             Err(e) => {
                 tracing::debug!("sync: fetch from node {} failed: {e}", peer.node_id);
                 failures += 1;
@@ -201,11 +256,12 @@ async fn sync_loop(
 /// engine-verified against the validator sets genesis establishes.
 pub async fn fetch_genesis(
     comms: &IrohComms,
+    epoch: u64,
     peers: &[PeerRef],
 ) -> Result<(Block, WireCommitCertificate), String> {
     let mut last_err = "no bootstrap peers".to_string();
     for peer in peers {
-        match fetch_chunk(comms, peer, 0, 0).await {
+        match fetch_chunk(comms, epoch, peer, 0, 0).await {
             Ok(pairs) => {
                 let Some((block, cert)) = pairs.into_iter().next() else {
                     last_err = format!("node {} has no genesis", peer.node_id);
@@ -260,33 +316,79 @@ pub(crate) fn peer_list(
 
 async fn fetch_chunk(
     comms: &IrohComms,
+    epoch: u64,
     peer: &PeerRef,
-    from: i64,
-    to: i64,
-) -> Result<Vec<(Block, WireCommitCertificate)>, String> {
+    from: u64,
+    to: u64,
+) -> Result<Vec<(Block, WireCommitCertificate)>, FetchError> {
     let payload = crate::net::encode_payload(&ConsensusNetRequest::DecidedFetch {
         from_height: from,
         to_height: to,
+        epoch,
     });
     let reply = comms
         .rpc(peer, "consensus", payload, FETCH_TIMEOUT)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| FetchError::Transport(e.to_string()))?;
+    parse_fetch_reply(&reply)
+}
+
+/// Decode and classify a decided-fetch reply. Split from the transport so
+/// the classification — the epoch-join signpost vs an ordinary strike —
+/// is testable without a mesh.
+fn parse_fetch_reply(reply: &[u8]) -> Result<Vec<(Block, WireCommitCertificate)>, FetchError> {
     let response: ConsensusNetResponse =
-        crate::net::decode_payload(&reply).map_err(|e| e.to_string())?;
+        crate::net::decode_payload(reply).map_err(|e| FetchError::Transport(e.to_string()))?;
 
     match response {
         ConsensusNetResponse::Decided { items } => {
             let mut out = Vec::with_capacity(items.len());
             for (block_bytes, cert_bytes) in &items {
-                let block: Block = codec::decode(block_bytes).map_err(|e| e.to_string())?;
+                let block: Block =
+                    codec::decode(block_bytes).map_err(|e| FetchError::Transport(e.to_string()))?;
                 let cert: WireCommitCertificate =
-                    codec::decode(cert_bytes).map_err(|e| e.to_string())?;
+                    codec::decode(cert_bytes).map_err(|e| FetchError::Transport(e.to_string()))?;
                 out.push((block, cert));
             }
             Ok(out)
         }
-        ConsensusNetResponse::Error { message } => Err(message),
-        other => Err(format!("unexpected response: {other:?}")),
+        ConsensusNetResponse::EpochMismatch { local_epoch } => Err(FetchError::EpochMismatch {
+            peer_epoch: local_epoch,
+        }),
+        ConsensusNetResponse::Error { message } => Err(FetchError::Transport(message)),
+        other => Err(FetchError::Transport(format!(
+            "unexpected response: {other:?}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Impact: the classification is the whole point of the structured
+    // refusal — an epoch-ahead peer must read as "pivot to epoch join",
+    // never as one more transport strike that exhausts the peer list.
+    // Should: classify an EpochMismatch reply as the epoch signpost and
+    // a bare Error reply as a transport failure.
+    #[test]
+    fn fetch_reply_classification() {
+        let mismatch =
+            crate::net::encode_payload(&ConsensusNetResponse::EpochMismatch { local_epoch: 3 });
+        match parse_fetch_reply(&mismatch) {
+            Err(FetchError::EpochMismatch { peer_epoch: 3 }) => {}
+            other => panic!("expected epoch signpost, got {other:?}"),
+        }
+
+        let error = crate::net::encode_payload(&ConsensusNetResponse::Error {
+            message: "db pool exhausted".into(),
+        });
+        match parse_fetch_reply(&error) {
+            Err(FetchError::Transport(m)) => assert!(m.contains("db pool")),
+            other => panic!("expected transport strike, got {other:?}"),
+        }
+
+        let empty = crate::net::encode_payload(&ConsensusNetResponse::Decided { items: vec![] });
+        assert!(matches!(parse_fetch_reply(&empty), Ok(ref v) if v.is_empty()));
     }
 }

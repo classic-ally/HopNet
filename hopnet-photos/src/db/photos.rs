@@ -598,7 +598,7 @@ pub fn upsert_photo_changes(
         .execute(
             "INSERT OR REPLACE INTO photo_changes (photo_id, changed_at_height)
          VALUES (?1, ?2)",
-            params![photo_id, height],
+            params![photo_id, hopnet_common::height::height_to_db(height)],
         )
         .map_err(|e| {
             tracing::error!("upsert photo_changes for {} failed: {e}", photo_id);
@@ -1235,10 +1235,9 @@ pub fn query_resources(
     Ok(map)
 }
 
-/// Current decided consensus height, cast to u64. Pre-genesis reads as 0.
+/// Current decided consensus height. Pre-genesis reads as 0.
 pub fn read_current_height(conn: &rusqlite::Connection) -> Result<u64, DatabaseError> {
-    let h: i32 = hopnet_projection::current_height(conn)?;
-    Ok(if h > 0 { h as u64 } else { 0 })
+    hopnet_projection::current_height(conn)
 }
 
 #[cfg(test)]

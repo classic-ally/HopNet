@@ -17,7 +17,7 @@ jobs:
   cargo:
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: x86_64-linux
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -37,6 +37,11 @@ jobs:
       - name: cargo test (unit only — skips orchestrator)
         run: nix develop --command cargo test --workspace --lib --bins
 
+      - name: cargo test (consensus integration binaries — sim corpus, seam, regenesis)
+        # --lib --bins above skips hopnet-consensus/tests/* entirely; the
+        # seeded fuzz corpus and the RFC-019 drain/seal scenarios live
+        # there and must gate merges. ~15 min, dominated by the corpus.
+        run: nix develop --command cargo test -p hopnet-consensus --tests
       # The mount stack suite boots the real node binary over localhost HTTP
       # (no /dev/fuse needed — the two kernel smokes stay #[ignore]d).
       - name: hopnet-mount stack suite

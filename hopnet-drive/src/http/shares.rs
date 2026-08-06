@@ -241,6 +241,7 @@ pub async fn post_share(
             tracing::warn!("Share rejected: {}", r);
             StatusCode::CONFLICT.into_response()
         }
+        Err(TxSubmitError::Unavailable(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -370,6 +371,7 @@ pub async fn post_accept_share(
             tracing::warn!("Accept share rejected: {}", r);
             StatusCode::CONFLICT.into_response()
         }
+        Err(TxSubmitError::Unavailable(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -410,6 +412,7 @@ pub async fn delete_incoming_share(
             tracing::warn!("Decline share rejected: {}", r);
             StatusCode::CONFLICT.into_response()
         }
+        Err(TxSubmitError::Unavailable(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -497,6 +500,7 @@ pub async fn delete_unshare(
             tracing::warn!("Unshare rejected: {}", r);
             StatusCode::CONFLICT.into_response()
         }
+        Err(TxSubmitError::Unavailable(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

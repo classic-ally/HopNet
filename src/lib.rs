@@ -30,12 +30,17 @@ pub mod photos;
 pub mod photos_host;
 pub mod projections;
 pub mod reference_providers;
+pub mod regenesis;
 pub mod setup;
 pub mod shares;
 pub mod storage_host;
 pub mod takeout_host;
+#[cfg(test)]
+pub mod test_env;
 pub mod types;
+pub mod upgrade;
 pub mod users;
+pub mod version;
 pub mod views;
 
 #[derive(Clone, Debug)]
@@ -70,6 +75,9 @@ pub struct AppState {
     /// every on-the-fly `takeout_host::takeout_state` construction.
     pub takeout_runtime: Arc<hopnet_takeout::TakeoutRuntime>,
     pub consensus_queue: consensus::queue::ConsensusQueue,
+    /// Upgrade-provider runtime state (RFC-019 S3): last poll result,
+    /// feeding the upgrade-readiness advisory.
+    pub upgrade: Arc<upgrade::UpgradeState>,
     pub write_gate: Arc<db::write_gate::WriteGate>,
     pub local_state_tx: tokio::sync::mpsc::Sender<db::write_gate::LocalStateUpdate>,
     /// Malachite engine handle — set by `spawn_engine` (startup restart path,
@@ -85,6 +93,19 @@ pub struct AppState {
     /// Per-peer liveness evidence (RFC-CONSENSUS-002 S3). One writer lock
     /// per authenticated exchange; classification is pure over snapshots.
     pub evidence: Arc<consensus::evidence::EvidenceMap>,
+    /// Restart request (RFC-019 S6): fired by the seal work when the
+    /// epoch is sealed and this binary already runs the target version.
+    /// The BINARY (main.rs) listens and exits with the documented
+    /// restart code; library code only ever notifies — never exits —
+    /// so in-process tests observe the signal instead of dying.
+    pub restart_signal: Arc<tokio::sync::Notify>,
+    /// This database's epoch (RFC-019 S6), loaded from consensus_meta
+    /// at startup (1 when absent). Carried in the peer handshake.
+    pub epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// One epoch join at a time (RFC-019 S7). Per-AppState rather than a
+    /// static: several in-process nodes share one process in tests, and
+    /// each must be able to rejoin independently.
+    pub epoch_join_inflight: Arc<std::sync::atomic::AtomicBool>,
     pub photos_host: Arc<photos::PhotosHost>,
     /// The MAIN multi-thread runtime's handle, captured at startup.
     /// Host-side background work scheduled from consensus apply

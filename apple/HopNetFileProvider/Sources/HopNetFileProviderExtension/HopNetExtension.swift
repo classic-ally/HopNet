@@ -892,10 +892,10 @@ class HopNetEnumerator: NSObject, NSFileProviderEnumerator {
     }
     
     /// Parse consensus height from sync anchor data
-    private func parseConsensusHeight(from anchor: NSFileProviderSyncAnchor) -> Int32 {
+    private func parseConsensusHeight(from anchor: NSFileProviderSyncAnchor) -> UInt64 {
         let data = anchor.rawValue
         guard let heightString = String(data: data, encoding: .utf8),
-              let height = Int32(heightString) else {
+              let height = UInt64(heightString) else {
             // Return 0 for first run or invalid anchor
             logger.debug("🎯 Using default consensus height 0 (first run or invalid anchor)")
             return 0
@@ -904,7 +904,7 @@ class HopNetEnumerator: NSObject, NSFileProviderEnumerator {
     }
     
     /// Create sync anchor from consensus height
-    private func createSyncAnchor(from height: Int32) -> NSFileProviderSyncAnchor {
+    private func createSyncAnchor(from height: UInt64) -> NSFileProviderSyncAnchor {
         let heightString = String(height)
         let heightData = heightString.data(using: .utf8)!
         return NSFileProviderSyncAnchor(heightData)

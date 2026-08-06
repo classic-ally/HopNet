@@ -332,7 +332,11 @@ pub fn upsert_view_change(
         .execute(
             "INSERT OR REPLACE INTO photo_view_changes (user_id, library_id, changed_at_height)
              VALUES (?1, ?2, ?3)",
-            params![user_id, library_id, height],
+            params![
+                user_id,
+                library_id,
+                hopnet_common::height::height_to_db(height)
+            ],
         )
         .map_err(|e| {
             tracing::error!("upsert view change ({user_id}, {library_id}) failed: {e}");

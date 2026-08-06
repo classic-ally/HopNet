@@ -70,7 +70,7 @@ impl TxGateway for NoTx {
     fn submit_batch_decided(
         &self,
         txs: Vec<TxSpec>,
-    ) -> BoxFuture<'_, Vec<Result<i32, TxSubmitError>>> {
+    ) -> BoxFuture<'_, Vec<Result<u64, TxSubmitError>>> {
         Box::pin(async move { txs.iter().map(|_| Err(TxSubmitError::Submit)).collect() })
     }
 }
@@ -82,7 +82,7 @@ impl TxGateway for NoTx {
 struct ApplyTx {
     pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     fragments_dir: String,
-    height: std::sync::atomic::AtomicI32,
+    height: std::sync::atomic::AtomicU64,
 }
 
 impl TxGateway for ApplyTx {
@@ -93,7 +93,7 @@ impl TxGateway for ApplyTx {
     fn submit_batch_decided(
         &self,
         txs: Vec<TxSpec>,
-    ) -> BoxFuture<'_, Vec<Result<i32, TxSubmitError>>> {
+    ) -> BoxFuture<'_, Vec<Result<u64, TxSubmitError>>> {
         Box::pin(async move {
             let height = self
                 .height
@@ -151,7 +151,7 @@ impl TxGateway for TimeoutTx {
     fn submit_batch_decided(
         &self,
         txs: Vec<TxSpec>,
-    ) -> BoxFuture<'_, Vec<Result<i32, TxSubmitError>>> {
+    ) -> BoxFuture<'_, Vec<Result<u64, TxSubmitError>>> {
         Box::pin(async move { txs.iter().map(|_| Err(TxSubmitError::Timeout)).collect() })
     }
 }
@@ -385,12 +385,16 @@ impl TestEnv {
         (inode_id, blob_id)
     }
 
-    fn log_modification(&self, inode_id: &CustomUUID, height: i32) {
+    fn log_modification(&self, inode_id: &CustomUUID, height: u64) {
         let conn = self.state.db_pool.get().unwrap();
         conn.execute(
             "INSERT INTO modification_log (inode_id, owner_id, old_parent_id, modified_at_height)
              VALUES (?, ?, NULL, ?)",
-            rusqlite::params![inode_id, USER_ID, height],
+            rusqlite::params![
+                inode_id,
+                USER_ID,
+                hopnet_common::height::height_to_db(height)
+            ],
         )
         .unwrap();
     }
@@ -456,7 +460,7 @@ fn setup_env_apply(blob_bytes: Vec<u8>) -> TestEnv {
     env.state.txs = Arc::new(ApplyTx {
         pool: env.state.db_pool.clone(),
         fragments_dir: env.state.fragments_dir.clone(),
-        height: std::sync::atomic::AtomicI32::new(10),
+        height: std::sync::atomic::AtomicU64::new(10),
     });
     // No node id → the create route skips attestation (best-effort by
     // design); its self_check_fragments handler is host-registered and

@@ -22,12 +22,11 @@ pub struct MeshKeyGrant {
 /// One blob's placement commit: records the consensus height whose
 /// validator/metrics snapshot the placement was computed against. Batched —
 /// the engine submits `Vec<PlacementUpdate>` as ONE `update_placement_heights`
-/// transaction per flush window. (Storage-owned tx payload, decision #0;
-/// bincode-compatible with the legacy PlacementHeightUpdate shape.)
+/// transaction per flush window. (Storage-owned tx payload, decision #0.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlacementUpdate {
     pub blob_id: BlobId,
-    pub placement_height: i32,
+    pub placement_height: u64,
 }
 
 /// Batch of orphaned blob ids for consensus deletion (storage-owned tx
@@ -45,7 +44,7 @@ pub struct SelfCheckFragments {
     pub node_id: i32,
 
     /// Consensus height when this check was performed
-    pub self_verified_height: i32,
+    pub self_verified_height: u64,
 
     /// Previous fragment count for state sync verification
     /// Other nodes verify this matches their view of the inventory

@@ -6,7 +6,9 @@ use rand::rngs::SysRng;
 mod authorization;
 mod byzantine;
 mod malachite_integration;
+mod regenesis;
 mod signatures;
+mod upgrade;
 
 #[derive(Clone)]
 pub struct MockNode {
@@ -394,23 +396,53 @@ pub fn create_test_app_state_with_keys(
     signing_key: crate::db::PrivKey,
     verifying_key: crate::db::PubKey,
 ) -> AppState {
+    create_test_app_state_on_manager(
+        signing_key,
+        verifying_key,
+        r2d2_sqlite::SqliteConnectionManager::memory(),
+    )
+}
+
+/// File-backed variant: the epoch-transition e2e restarts a node over the
+/// same on-disk database — a memory pool has nothing to restart. Skips
+/// schema install when the file already carries one (the restart leg).
+pub fn create_test_app_state_file_backed(
+    signing_key: crate::db::PrivKey,
+    verifying_key: crate::db::PubKey,
+    db_path: &str,
+) -> AppState {
+    create_test_app_state_on_manager(
+        signing_key,
+        verifying_key,
+        r2d2_sqlite::SqliteConnectionManager::file(db_path),
+    )
+}
+
+fn create_test_app_state_on_manager(
+    signing_key: crate::db::PrivKey,
+    verifying_key: crate::db::PubKey,
+    manager: r2d2_sqlite::SqliteConnectionManager,
+) -> AppState {
     use jsonwebtoken::{DecodingKey, EncodingKey};
     use once_cell::sync::OnceCell;
     use r2d2::Pool;
-    use r2d2_sqlite::SqliteConnectionManager;
     use std::sync::Arc;
 
     // RFC-015 boot tripwire (mirrors server startup): tests must see the
     // same cross-crate handler registrations as production.
     crate::assert_projection_registrations();
 
-    let manager = SqliteConnectionManager::memory();
     let pool = Pool::builder()
         .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
         .build(manager)
         .unwrap();
 
-    crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+    {
+        let conn = pool.get().unwrap();
+        if !crate::db::shared::is_schema_initialized(&conn).unwrap_or(false) {
+            crate::db::shared::initialize(&conn).unwrap();
+        }
+    }
 
     let jwt_secret = b"test_jwt_secret_key_for_testing_only";
     let encoding_key = EncodingKey::from_secret(jwt_secret);
@@ -453,11 +485,15 @@ pub fn create_test_app_state_with_keys(
         session_store: Arc::new(crate::auth::SessionStore::default()),
         takeout_runtime: Arc::new(hopnet_takeout::TakeoutRuntime::default()),
         consensus_queue,
+        upgrade: Arc::new(crate::upgrade::UpgradeState::default()),
         write_gate: Arc::new(crate::db::write_gate::WriteGate::new()),
         local_state_tx: tokio::sync::mpsc::channel(1).0,
         malachite: Arc::new(once_cell::sync::OnceCell::new()),
         evidence: std::sync::Arc::new(crate::consensus::evidence::EvidenceMap::new()),
         storage: Arc::new(once_cell::sync::OnceCell::new()),
+        restart_signal: Arc::new(tokio::sync::Notify::new()),
+        epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        epoch_join_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // Tests run sync (no ambient runtime) — reuse the shared test
         // runtime so scheduled work has somewhere real to land.
         runtime: test_iroh_rt().handle().clone(),

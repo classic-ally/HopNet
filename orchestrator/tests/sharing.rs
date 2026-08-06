@@ -1371,10 +1371,10 @@ impl TestScenario for MultiUserSharing {
                                 name: "Zero divergence".to_string(),
                                 passed: true,
                                 detail: Some(format!(
-                                    "{} tables, views {}-{}",
+                                    "{} tables, heights {}-{}",
                                     report.table_reports.len(),
-                                    report.view_range.0,
-                                    report.view_range.1,
+                                    report.height_range.0,
+                                    report.height_range.1,
                                 )),
                             },
                         );
@@ -2569,10 +2569,10 @@ impl TestScenario for MultiUserSharingLiveLink {
                                 name: "Zero divergence".to_string(),
                                 passed: true,
                                 detail: Some(format!(
-                                    "{} tables, views {}-{}",
+                                    "{} tables, heights {}-{}",
                                     report.table_reports.len(),
-                                    report.view_range.0,
-                                    report.view_range.1,
+                                    report.height_range.0,
+                                    report.height_range.1,
                                 )),
                             },
                         );

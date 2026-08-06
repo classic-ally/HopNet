@@ -62,7 +62,9 @@ fn row_to_item(
     let data_id: Option<CustomUUID> = row.get(4)?;
     let created: CustomDateTime = row.get(5)?;
     let modified: CustomDateTime = row.get(6)?;
-    let height: Option<i32> = row.get(7)?;
+    let height: Option<u64> = row
+        .get::<_, Option<i64>>(7)?
+        .map(hopnet_common::height::height_from_db);
     let parent_id: Option<CustomUUID> = row.get(8)?;
 
     let decrypted_path = decrypt_path(encrypted_path, siv_key, siv_nonce).map_err(|_| {
@@ -189,7 +191,7 @@ pub fn item_by_exact_path(
 pub fn changes_since(
     db_lock: &PooledConnection<SqliteConnectionManager>,
     user_id: i32,
-    since_height: i32,
+    since_height: u64,
     siv_key: &Key<Aes256Siv>,
     siv_nonce: &Nonce,
 ) -> Result<(Vec<MountItem>, Vec<CustomUUID>), DatabaseError> {
@@ -229,52 +231,57 @@ pub fn changes_since(
     let mut deleted = Vec::new();
 
     let rows = stmt
-        .query_map(params![user_id, since_height], |row| {
-            let logged_id: CustomUUID = row.get(0)?;
-            let live_id: Option<CustomUUID> = row.get(1)?;
-            if live_id.is_none() {
-                return Ok(Err(logged_id));
-            }
-            let item_type: InodeType = row.get(2)?;
-            let encrypted_path: String = row.get(3)?;
-            let file_size: Option<i64> = row.get(4)?;
-            let data_id: Option<CustomUUID> = row.get(5)?;
-            let created: Option<CustomDateTime> = row.get(6)?;
-            let modified: Option<CustomDateTime> = row.get(7)?;
-            let height: Option<i32> = row.get(8)?;
-            let parent_id: Option<CustomUUID> = row.get(9)?;
+        .query_map(
+            params![user_id, hopnet_common::height::height_to_db(since_height)],
+            |row| {
+                let logged_id: CustomUUID = row.get(0)?;
+                let live_id: Option<CustomUUID> = row.get(1)?;
+                if live_id.is_none() {
+                    return Ok(Err(logged_id));
+                }
+                let item_type: InodeType = row.get(2)?;
+                let encrypted_path: String = row.get(3)?;
+                let file_size: Option<i64> = row.get(4)?;
+                let data_id: Option<CustomUUID> = row.get(5)?;
+                let created: Option<CustomDateTime> = row.get(6)?;
+                let modified: Option<CustomDateTime> = row.get(7)?;
+                let height: Option<u64> = row
+                    .get::<_, Option<i64>>(8)?
+                    .map(hopnet_common::height::height_from_db);
+                let parent_id: Option<CustomUUID> = row.get(9)?;
 
-            let decrypted_path =
-                decrypt_path(encrypted_path, siv_key, siv_nonce).map_err(|_| {
-                    rusqlite::Error::InvalidColumnType(
-                        3,
-                        "path_decryption".to_string(),
-                        rusqlite::types::Type::Text,
-                    )
-                })?;
-            let name = decrypted_path
-                .split('/')
-                .next_back()
-                .unwrap_or(&decrypted_path)
-                .to_string();
+                let decrypted_path =
+                    decrypt_path(encrypted_path, siv_key, siv_nonce).map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            3,
+                            "path_decryption".to_string(),
+                            rusqlite::types::Type::Text,
+                        )
+                    })?;
+                let name = decrypted_path
+                    .split('/')
+                    .next_back()
+                    .unwrap_or(&decrypted_path)
+                    .to_string();
 
-            let size = match item_type {
-                InodeType::File => Some(file_size.unwrap_or(0) as u64),
-                InodeType::Folder => None,
-            };
+                let size = match item_type {
+                    InodeType::File => Some(file_size.unwrap_or(0) as u64),
+                    InodeType::Folder => None,
+                };
 
-            Ok(Ok(MountItem {
-                id: live_id,
-                parent_id,
-                name,
-                item_type,
-                size,
-                blob_id: data_id,
-                created_ms: created.map(|c| c.timestamp_millis()).unwrap_or_default(),
-                modified_ms: modified.map(|m| m.timestamp_millis()),
-                height,
-            }))
-        })
+                Ok(Ok(MountItem {
+                    id: live_id,
+                    parent_id,
+                    name,
+                    item_type,
+                    size,
+                    blob_id: data_id,
+                    created_ms: created.map(|c| c.timestamp_millis()).unwrap_or_default(),
+                    modified_ms: modified.map(|m| m.timestamp_millis()),
+                    height,
+                }))
+            },
+        )
         .map_err(|e| {
             tracing::error!("changes_since query failed: {e:?}");
             DatabaseError::RecallError

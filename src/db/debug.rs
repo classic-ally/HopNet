@@ -1,283 +1,6 @@
 use super::*;
-use blake3::Hasher;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
-/// Tables to skip entirely (local-only state)
-const LOCAL_ONLY_TABLES: &[&str] = &[
-    "this_node",
-    "modification_log",
-    "pending_fragment_requests",
-    "hopnet_storage_pins",
-];
-
-/// Columns to exclude from consensus-tracked tables
-const EXCLUDED_COLUMNS: &[(&str, &[&str])] = &[
-    ("fragment_hashes", &["stored_locally"]),
-    ("fragment_inventory", &["self_verified_height"]),
-    ("quorum_certificates", &["voter_signatures"]),
-    ("timeout_certificates", &["signatures"]),
-];
-
-/// All consensus-tracked tables (order matters for deterministic hashing).
-/// Host/consensus/storage-owned tables live here; projection-owned tables
-/// flow from `manifests().iter().flat_map(|m| m.tables())` so the schema
-/// and the divergence coverage cannot drift (RFC-016: ONE source of truth
-/// per projection's `db::TABLES` const).
-const CONSENSUS_TABLES: &[&str] = &[
-    "sequences",
-    "users",
-    "nodes",
-    "validators",
-    // Malachite decided chain. Deliberately EXCLUDED: consensus_wal
-    // (per-node ephemeral), consensus_meta (per-node cursor), and
-    // decided_certificates (a certificate is a node-local quorum proof —
-    // different vote subsets are legitimate). decided_blocks IS the
-    // agreement invariant.
-    "decided_blocks",
-    "data_blocks",
-    "blob_access",
-    "fragment_hashes",
-    "inodes",
-    "takeouts",
-    "fragment_request_metrics",
-    "metrics",
-    "fragment_inventory",
-    "device_tokens",
-    "hopnet_storage_policy",
-    "hopnet_consensus_policy",
-];
-
-/// Internal state snapshot with rich types (Blake3Hash)
-#[derive(Debug)]
-pub struct StateSnapshot {
-    pub consensus_height: i32,
-    pub committed_view: i32,
-    pub table_hashes: HashMap<String, TableHashInfo>,
-}
-
-/// Internal table hash info with rich types (Blake3Hash)
-#[derive(Debug)]
-pub struct TableHashInfo {
-    pub hash: Blake3Hash,
-    pub row_count: usize,
-    pub excluded_columns: Vec<String>,
-}
-
-/// Convert internal snapshot to wire format (String hashes)
-impl From<StateSnapshot> for hopnet_common::StateSnapshot {
-    fn from(internal: StateSnapshot) -> Self {
-        hopnet_common::StateSnapshot {
-            consensus_height: internal.consensus_height,
-            committed_view: internal.committed_view,
-            table_hashes: internal
-                .table_hashes
-                .into_iter()
-                .map(|(table_name, info)| {
-                    (
-                        table_name,
-                        hopnet_common::TableHashInfo {
-                            hash: info.hash.to_hex(),
-                            row_count: info.row_count,
-                            excluded_columns: info.excluded_columns,
-                        },
-                    )
-                })
-                .collect(),
-        }
-    }
-}
-
-/// Get excluded columns for a table
-fn get_excluded_columns(table_name: &str) -> Vec<&'static str> {
-    EXCLUDED_COLUMNS
-        .iter()
-        .find(|(name, _)| *name == table_name)
-        .map(|(_, cols)| cols.to_vec())
-        .unwrap_or_default()
-}
-
-/// Get primary key columns dynamically from schema
-fn get_primary_key_columns(
-    tx: &rusqlite::Transaction,
-    table_name: &str,
-) -> Result<Vec<String>, DatabaseError> {
-    let mut stmt = tx
-        .prepare(&format!("PRAGMA table_info({})", table_name))
-        .map_err(|_| DatabaseError::RecallError)?;
-
-    let mut pk_columns: Vec<String> = Vec::new();
-
-    let rows = stmt
-        .query_map([], |row| {
-            let name: String = row.get(1)?; // Column name
-            let is_pk: bool = row.get(5)?; // Part of primary key?
-            Ok((name, is_pk))
-        })
-        .map_err(|_| DatabaseError::RecallError)?;
-
-    for row in rows {
-        let (col_name, is_pk) = row.map_err(|_| DatabaseError::RecallError)?;
-        if is_pk {
-            pk_columns.push(col_name);
-        }
-    }
-
-    if pk_columns.is_empty() {
-        tracing::error!("No primary key found for table: {}", table_name);
-        return Err(DatabaseError::ProcessingError);
-    }
-
-    // Sort alphabetically for deterministic order across all nodes
-    pk_columns.sort();
-
-    Ok(pk_columns)
-}
-
-/// Build SQL query for a table with appropriate exclusions
-/// Uses PRAGMA table_info for dynamic column listing (SQLite has no json_object(*) or EXCLUDE)
-fn build_table_query(
-    tx: &rusqlite::Transaction,
-    table_name: &str,
-    excluded_cols: &[&str],
-) -> Result<String, DatabaseError> {
-    let pk_cols = get_primary_key_columns(tx, table_name)?;
-
-    // Get all column names and types from PRAGMA table_info
-    let mut stmt = tx
-        .prepare(&format!("PRAGMA table_info({})", table_name))
-        .map_err(|_| DatabaseError::RecallError)?;
-
-    let all_columns: Vec<(String, String)> = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-        })
-        .map_err(|_| DatabaseError::RecallError)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| DatabaseError::RecallError)?;
-
-    // Filter out excluded columns
-    let columns: Vec<&(String, String)> = all_columns
-        .iter()
-        .filter(|(col, _)| !excluded_cols.contains(&col.as_str()))
-        .collect();
-
-    // Build json_object arguments: 'col1', col1, 'col2', col2, ...
-    // BLOB columns must be hex-encoded (SQLite json_object cannot hold BLOBs)
-    let json_args: Vec<String> = columns
-        .iter()
-        .map(|(col, col_type)| {
-            if col_type.eq_ignore_ascii_case("BLOB") {
-                format!("'{}', hex({})", col, col)
-            } else {
-                format!("'{}', {}", col, col)
-            }
-        })
-        .collect();
-    let json_object_expr = format!("json_object({})", json_args.join(", "));
-
-    // Build explicit column list for SELECT
-    let column_list = columns
-        .iter()
-        .map(|(c, _)| c.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let query = format!(
-        "SELECT COALESCE(json_group_array({}), '[]') FROM (SELECT {} FROM {} ORDER BY {})",
-        json_object_expr,
-        column_list,
-        table_name,
-        pk_cols.join(", ")
-    );
-
-    Ok(query)
-}
-
-/// Compute hash for a single table within a transaction
-fn compute_table_hash_tx(
-    tx: &rusqlite::Transaction,
-    table_name: &str,
-) -> Result<TableHashInfo, DatabaseError> {
-    // Build query with EXCLUDE clause if needed
-    let excluded_cols = get_excluded_columns(table_name);
-    let query = build_table_query(tx, table_name, &excluded_cols)?;
-
-    // Get row count
-    let row_count: usize = tx
-        .query_row(&format!("SELECT COUNT(*) FROM {}", table_name), [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map_err(|_| DatabaseError::RecallError)? as usize;
-
-    // Execute query and hash the JSON result
-    let rows_json: String = tx.query_row(&query, [], |row| row.get(0)).map_err(|e| {
-        tracing::error!("Failed to query table {}: {:?}", table_name, e);
-        DatabaseError::RecallError
-    })?;
-
-    let mut hasher = Hasher::new();
-    hasher.update(rows_json.as_bytes());
-    let hash = Blake3Hash::new(hasher.finalize());
-
-    Ok(TableHashInfo {
-        hash,
-        row_count,
-        excluded_columns: excluded_cols.iter().map(|s| s.to_string()).collect(),
-    })
-}
-
-/// Compute hash-based snapshot within a transaction for atomicity
-/// This ensures consensus_height, committed_view, and all table data
-/// are read from the same database snapshot
-pub fn compute_state_snapshot_tx(
-    tx: &rusqlite::Transaction,
-) -> Result<StateSnapshot, DatabaseError> {
-    // Get consensus metadata from same transaction snapshot. Views died with
-    // the bespoke engine — the decided height is the only progress marker.
-    let consensus_height = crate::db::consensus::get_current_consensus_height(tx)?;
-    let committed_view = consensus_height;
-
-    let mut table_hashes = HashMap::new();
-
-    // Compute hash for each consensus-tracked table. Iterate the host's
-    // static list, then each projection's `tables()` manifest, deduped by
-    // name (the host list still names `inodes` and `takeouts` for legacy
-    // reasons — duplicates are benign because the HashMap insert overwrites
-    // with an identical hash, but the dedup gate avoids the redundant
-    // compute).
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let projection_tables = crate::projections::manifests()
-        .iter()
-        .flat_map(|m| m.tables().iter().copied());
-    for table_name in CONSENSUS_TABLES.iter().copied().chain(projection_tables) {
-        if !seen.insert(table_name) {
-            continue;
-        }
-        let hash_info = compute_table_hash_tx(tx, table_name)?;
-        table_hashes.insert(table_name.to_string(), hash_info);
-    }
-
-    Ok(StateSnapshot {
-        consensus_height,
-        committed_view,
-        table_hashes,
-    })
-}
-
-/// Convenience wrapper that manages transaction creation
-pub fn compute_state_snapshot(
-    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
-) -> Result<StateSnapshot, DatabaseError> {
-    match db_connection {
-        Ok(mut conn) => {
-            let tx = conn.transaction().map_err(|_| DatabaseError::LockError)?;
-            compute_state_snapshot_tx(&tx)
-        }
-        Err(_) => Err(DatabaseError::LockError),
-    }
-}
 
 /// Fragment information for distribution diagnostic
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,7 +19,7 @@ pub struct FileFragmentDistribution {
     pub inode_id: CustomUUID,
     pub data_block_id: CustomUUID,
     pub file_size: u64,
-    pub placement_height: Option<i64>,
+    pub placement_height: Option<u64>,
     pub fragment_count: u32,
     pub original_count: u32,
     pub recovery_count: u32,
@@ -462,7 +185,7 @@ pub fn get_file_fragment_distribution(
     match db_connection {
         Ok(db_lock) => {
             // First, get the file's inode_id, data_block_id, and basic metadata
-            let file_metadata: Option<(CustomUUID, CustomUUID, u64, Option<i32>, i32)> = db_lock
+            let file_metadata: Option<(CustomUUID, CustomUUID, u64, Option<u64>, i32)> = db_lock
                 .query_row(
                     "SELECT i.id, db.id, db.file_size, db.placement_height, db.fragment_count
                  FROM inodes i
@@ -474,7 +197,8 @@ pub fn get_file_fragment_distribution(
                             row.get(0)?,                  // inode_id
                             row.get(1)?,                  // data_block_id
                             row.get::<_, i64>(2)? as u64, // file_size
-                            row.get(3)?,                  // placement_height
+                            row.get::<_, Option<i64>>(3)?
+                                .map(hopnet_common::height::height_from_db), // placement_height
                             row.get(4)?,                  // fragment_count
                         ))
                     },
@@ -552,7 +276,7 @@ pub fn get_file_fragment_distribution(
                 inode_id,
                 data_block_id,
                 file_size,
-                placement_height: placement_height.map(|h| h as i64),
+                placement_height,
                 fragment_count: fragment_count as u32,
                 original_count,
                 recovery_count,

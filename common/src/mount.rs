@@ -28,7 +28,7 @@ pub struct MountItem {
     pub created_ms: i64,
     pub modified_ms: Option<i64>,
     /// Consensus height of the last modification, when known.
-    pub height: Option<i32>,
+    pub height: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,14 +36,14 @@ pub struct MountEnumerateResponse {
     pub items: Vec<MountItem>,
     /// Present when another page exists; opaque, thread it back verbatim.
     pub next_cursor: Option<String>,
-    pub height: i32,
+    pub height: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MountChangesResponse {
     pub items: Vec<MountItem>,
     pub deleted_ids: Vec<CustomUUID>,
-    pub height: i32,
+    pub height: u64,
 }
 
 /// Response to every mount mutation (RFC-018 S6). Sent only after the
@@ -53,7 +53,7 @@ pub struct MountChangesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MountMutationResponse {
     pub item: Option<MountItem>,
-    pub height: i32,
+    pub height: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -90,7 +90,8 @@ impl HopNetApplication {
             ));
         }
 
-        // Solo-block rule (RFC-CONSENSUS-002): structural, both origins.
+        // Solo-block rule (RFC-CONSENSUS-002 membership transitions;
+        // RFC-019 S5 regenesis commit): structural, both origins.
         check_solo_membership(
             block
                 .data
@@ -99,6 +100,86 @@ impl HopNetApplication {
                 .map(|t| t.rpc.function.as_str()),
             block.data.transactions.len(),
         )?;
+
+        // Regenesis boundary checks (RFC-019 S5).
+        let regenesis = crate::db::regenesis::read_regenesis_state(db_tx)
+            .map_err(|e| format!("regenesis state: {e:?}"))?;
+        // Nothing decides past the seal — the vote-time belt to the
+        // engine-halt suspenders (seal contract item 1).
+        if regenesis.phase == crate::db::regenesis::RegenesisPhase::Sealed {
+            return Err("epoch is sealed: no further block may decide".into());
+        }
+        for tx in block.data.transactions.iter() {
+            if tx.rpc.function != "regenesis_commit" {
+                continue;
+            }
+            let Ok((commit, _)) = bincode::serde::decode_from_slice::<
+                crate::regenesis::RegenesisCommit,
+                _,
+            >(&tx.rpc.payload, bincode::config::standard()) else {
+                return Err("undecodable regenesis_commit payload".into());
+            };
+            // The payload's terminal height binds to the actual block
+            // height — deterministic, both origins (no in-apply height
+            // read anywhere).
+            if commit.seal_height != block.data.height {
+                return Err(format!(
+                    "regenesis commit seal_height {} != block height {}",
+                    commit.seal_height, block.data.height
+                ));
+            }
+            // The target must be the one THIS node has committed from
+            // `regenesis_start`. Deterministic and safe at both origins:
+            // it reads committed state inside the same transaction, not a
+            // live recompute, so a replaying node reaches the same verdict.
+            // This is what makes the value quorum-bound rather than
+            // proposer-asserted, and it is the only reason a joiner can
+            // trust `required_version_code` in a peer-supplied record.
+            let committed_target = crate::db::regenesis::read_regenesis_state(db_tx)
+                .map_err(|e| format!("regenesis state: {e:?}"))?
+                .target_version_code;
+            if committed_target != Some(commit.target_version_code) {
+                return Err(format!(
+                    "regenesis commit target {} != committed target {:?}",
+                    commit.target_version_code, committed_target
+                ));
+            }
+            if origin == ValidationOrigin::Live {
+                // Vote-iff-match (Rule-8, RFC-013 precedent): recompute
+                // the canonical snapshot ARTIFACT over OWN state at this
+                // height and vote only on a byte-identity match. A quorum
+                // deciding despite our mismatch means our replica is the
+                // anomaly (divergence surfacing, not being caused). Never
+                // at Sync — decided is decided, and the certificate
+                // carries the quorum's word.
+                let started = std::time::Instant::now();
+                let local = crate::db::snapshot::compute_artifact_hash_tx(db_tx)
+                    .map_err(|e| format!("vote-iff-match snapshot: {e:?}"))?;
+                tracing::info!(
+                    height = height.0,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "vote-iff-match: artifact recomputed inside the round (OQ1 timing)"
+                );
+                if local.as_bytes() != commit.snapshot_hash.as_slice() {
+                    return Err(format!(
+                        "vote-iff-match: local artifact {} != proposed {}",
+                        local.to_hex(),
+                        hopnet_common::Blake3Hash::from_bytes(commit.snapshot_hash).to_hex()
+                    ));
+                }
+                // Own-drain check: refuse to seal past work this node has
+                // accepted but not yet seen decided (one dissenting vote,
+                // not a veto — protects the drain promise).
+                let pool = self.app_state.consensus_queue.pending_pool();
+                if pool.staged_len() > 0 || pool.inflight_len() > 0 {
+                    return Err(format!(
+                        "own pool not drained (staged {}, inflight {}): refusing to seal",
+                        pool.staged_len(),
+                        pool.inflight_len()
+                    ));
+                }
+            }
+        }
 
         // Parent linkage: must extend the last decided block exactly.
         let last: Option<Vec<u8>> = db_tx
@@ -172,7 +253,7 @@ impl HopNetApplication {
         }
 
         // Handler dry-run (execute=false) — deterministic, both origins.
-        let candidate_height = i32::try_from(height.as_db()).unwrap_or(i32::MAX);
+        let candidate_height = height.0;
         for tx in old_txs.0.iter() {
             process_transaction(tx, &self.app_state, false, candidate_height, db_tx)
                 .map_err(|e| format!("handler validation ({}): {e:?}", tx.rpc.function))?;
@@ -221,20 +302,29 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         // execute=true: dispatch-table application + nonce insertion, in the
         // host's decide transaction. Staleness/dedup checks are validation-
         // time only (execute skips them so sync can replay old blocks).
-        let decided_height = i32::try_from(height.as_db()).unwrap_or(i32::MAX);
+        let decided_height = height.0;
         process_transactions(&Some(old_txs), &self.app_state, true, decided_height, tx)
             .map_err(|e| ApplyError(format!("apply at height {}: {e:?}", height.0)))
     }
 
     fn validator_set(&mut self, height: Height) -> HopNetValidatorSet {
-        let h = i32::try_from(height.as_db()).unwrap_or(i32::MAX);
-        let nodes = db::get_validators_with_conn(&self.conn, h).expect("validator query");
+        let nodes = db::get_validators_with_conn(&self.conn, height.0).expect("validator query");
         HopNetValidatorSet::new(
             nodes
                 .into_iter()
                 .map(|n| Validator::new(n.node_id, engine::PubKey(n.pubkey.0)))
                 .collect(),
         )
+    }
+
+    fn sealed_after(&mut self, _height: Height, block: &engine::Block) -> bool {
+        // A decided commit block applied successfully, so the epoch IS
+        // sealed — the engine parks at the terminal height (RFC-019).
+        block
+            .data
+            .transactions
+            .iter()
+            .any(|t| t.rpc.function == "regenesis_commit")
     }
 
     fn on_decided(&mut self, height: Height, block: &engine::Block, cert: &WireCommitCertificate) {
@@ -248,7 +338,25 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         for (node_id, _sig) in cert.signatures.iter() {
             self.app_state
                 .evidence
-                .record_contact_with_height(*node_id, cert.height as i64);
+                .record_contact_with_height(*node_id, cert.height);
+        }
+
+        // RFC-019 S5: the commit block seals the epoch — run the
+        // node-local seal work (durable marker + snapshot artifact) OFF
+        // the shell thread (this hook is non-blocking only). Idempotent
+        // by construction: a crash before completion recomputes from
+        // sealed local state on the next boot.
+        if block
+            .data
+            .transactions
+            .iter()
+            .any(|t| t.rpc.function == "regenesis_commit")
+        {
+            let app_state = self.app_state.clone();
+            let seal_height = height.0;
+            std::thread::spawn(move || {
+                crate::regenesis::seal::run_seal_work(&app_state, seal_height);
+            });
         }
 
         // Distribution kick (RFC-014/017): every registered projection
@@ -274,15 +382,17 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
 // Value builder (proposer path)
 
 /// Result of building a proposal value.
-/// Solo-block selection (proposer side): if any membership transition is
-/// among the candidates, keep the FIRST one alone; every other candidate
-/// (membership or not) is deferred to a later height — restaged, not
-/// rejected (RFC-CONSENSUS-002: joint constraints are invisible to per-tx
-/// validation, so the block shape carries them).
+/// Solo-block selection (proposer side): if any solo-riding transaction
+/// (membership transition, regenesis commit) is among the candidates,
+/// keep the FIRST one alone; every other candidate is deferred to a
+/// later height — restaged, not rejected (RFC-CONSENSUS-002: joint
+/// constraints are invisible to per-tx validation, so the block shape
+/// carries them; RFC-019 S5: the final block's certificate IS the
+/// snapshot certificate).
 pub fn solo_block_deferrals(functions: &[&str]) -> Vec<usize> {
     match functions
         .iter()
-        .position(|f| crate::consensus::handlers::is_membership_tx(f))
+        .position(|f| crate::consensus::handlers::requires_solo_block(f))
     {
         Some(keep) => (0..functions.len()).filter(|&i| i != keep).collect(),
         None => Vec::new(),
@@ -290,20 +400,20 @@ pub fn solo_block_deferrals(functions: &[&str]) -> Vec<usize> {
 }
 
 /// Solo-block shape check (validation side): structural and deterministic —
-/// BOTH origins. A proposer that packs a membership transition with anything
-/// else (or two of them) is rejected outright.
+/// BOTH origins. A proposer that packs a solo-riding transaction with
+/// anything else (or two of them) is rejected outright.
 pub fn check_solo_membership<'a>(
     functions: impl Iterator<Item = &'a str>,
     total: usize,
 ) -> Result<(), String> {
     let n = functions
-        .filter(|f| crate::consensus::handlers::is_membership_tx(f))
+        .filter(|f| crate::consensus::handlers::requires_solo_block(f))
         .count();
     if n > 1 {
-        return Err("more than one membership transition in block".into());
+        return Err("more than one solo-riding transaction in block".into());
     }
     if n == 1 && total > 1 {
-        return Err("membership transition must ride alone".into());
+        return Err("solo-riding transaction must ride alone".into());
     }
     Ok(())
 }

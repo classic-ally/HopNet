@@ -42,8 +42,12 @@ impl hopnet_projection::Projection for DriveProjection {
         db::install_schema(conn)
     }
 
-    fn tables(&self) -> &'static [&'static str] {
-        db::TABLES
+    fn snapshot_section(&self) -> Option<&'static hopnet_common::SectionSpec> {
+        Some(&db::SNAPSHOT_SECTION)
+    }
+
+    fn node_local_tables(&self) -> &'static [&'static str] {
+        db::NODE_LOCAL_TABLES
     }
 
     fn exporter(

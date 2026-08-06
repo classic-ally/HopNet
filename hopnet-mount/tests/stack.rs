@@ -295,7 +295,7 @@ async fn watch_pokes_flow_end_to_end() {
     let transport = HttpTransport::new(&node.base(), &api_key).unwrap();
 
     let anchor = transport
-        .changes(i32::MAX as i64)
+        .changes(hopnet_mount::watch::ANCHOR_INIT)
         .await
         .expect("anchor init")
         .height;

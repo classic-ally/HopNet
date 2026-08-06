@@ -13,4 +13,4 @@ pub mod rpc;
 pub mod types;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

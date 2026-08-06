@@ -202,7 +202,7 @@ async fn cleanup_orphaned_data_blocks(
 pub async fn run_network_rebalancing(
     app_state: &AppState,
     max_data_blocks: i32,
-    min_age_heights: i32,
+    min_age_heights: u64,
 ) -> Result<NetworkRebalancingResult, Error> {
     tracing::info!(
         "Starting network rebalancing (max {} data blocks, min age {} heights)",
@@ -226,7 +226,7 @@ pub async fn run_network_rebalancing(
         }
     };
 
-    let max_placement_height = consensus_height - min_age_heights;
+    let max_placement_height = consensus_height.saturating_sub(min_age_heights);
     tracing::info!(
         "Rebalancing at height {}, looking for data blocks placed before height {}",
         consensus_height,
@@ -295,7 +295,7 @@ pub async fn run_network_rebalancing(
 
 #[derive(Debug, Default, serde::Serialize)]
 pub struct NetworkRebalancingResult {
-    pub consensus_height: i32,
+    pub consensus_height: u64,
     pub data_blocks_checked: usize,
     pub data_blocks_rebalanced: usize,
     pub data_blocks_failed: usize,

@@ -15,3 +15,4 @@ scripts/macos/.env
 android/HopNetStorageProvider/.idea/
 yaak/
 _apalache-out/
+result-*

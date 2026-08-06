@@ -72,6 +72,9 @@ fn tx_error_status(e: &TxSubmitError) -> StatusCode {
         TxSubmitError::Rejected(_) => StatusCode::CONFLICT,
         TxSubmitError::Signing => StatusCode::INTERNAL_SERVER_ERROR,
         TxSubmitError::Submit => StatusCode::SERVICE_UNAVAILABLE,
+        // Admission closed at a regenesis boundary (RFC-019 S5) — the
+        // freeze is temporary, so this is a back-off, not a failure.
+        TxSubmitError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -150,7 +153,7 @@ async fn resolve_parent_path(
     }
 }
 
-fn current_height_or_500(state: &DriveState) -> Result<i32, StatusCode> {
+fn current_height_or_500(state: &DriveState) -> Result<u64, StatusCode> {
     let db_lock = state
         .db_pool
         .get()
@@ -303,7 +306,7 @@ pub async fn get_item(
 #[derive(Debug, Deserialize)]
 pub struct MountChangesQuery {
     /// Height anchor; only strictly-newer modifications are returned.
-    pub since_height: Option<i32>,
+    pub since_height: Option<u64>,
 }
 
 /// GET /integrations/mount/changes?since_height= — whole tree.

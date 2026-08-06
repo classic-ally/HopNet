@@ -88,7 +88,7 @@ pub trait Transport: Send + Sync {
 /// never hold a pool conn across the data plane).
 #[derive(Debug, Clone)]
 pub struct PlacementInputs {
-    pub height: i32,
+    pub height: u64,
     pub validators: Vec<PeerRef>,
     pub metrics: Vec<MetricsRow>,
 }
@@ -99,7 +99,7 @@ pub struct PlacementInputs {
 /// node derives the same view from the same replicated rows.
 #[derive(Debug, Clone)]
 pub struct StorageView {
-    pub height: i32,
+    pub height: u64,
     pub members: Vec<PeerRef>,
     /// node_id → decay tier (seconds).
     pub tiers: std::collections::HashMap<i32, i64>,
@@ -152,7 +152,7 @@ pub trait StateReader: Send + Sync {
     /// Snapshot of placement inputs at a HISTORICAL height — the get path's
     /// placement-directed discovery rung reads the validator set the blob's
     /// placement commit was computed against.
-    fn placement_inputs_at(&self, height: i32) -> Result<PlacementInputs, StorageError>;
+    fn placement_inputs_at(&self, height: u64) -> Result<PlacementInputs, StorageError>;
 
     /// Top verified holders per fragment, from the replicated inventory
     /// attestations (self-check txs). Discovery's primary rung.

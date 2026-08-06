@@ -6,6 +6,7 @@
 //! materialization task.
 
 use chrono::{DateTime, Utc};
+use hopnet_common::height::{height_from_db, height_to_db};
 use hopnet_common::{CustomUUID, TakeoutRecord, TakeoutStatus};
 use hopnet_projection::DatabaseError;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -24,7 +25,7 @@ pub struct TakeoutPayload {
     pub owner_node_id: i32,
     pub status: TakeoutStatus,
     pub expires_at: CustomDateTime,
-    pub consensus_height: i32,
+    pub consensus_height: u64,
 }
 
 /// Payload for takeout status updates (consensus-tracked)
@@ -94,7 +95,7 @@ pub fn apply_takeout_creation(
             payload.owner_node_id,
             payload.status,
             payload.expires_at,
-            payload.consensus_height
+            height_to_db(payload.consensus_height)
         ]
     ).map_err(|e| {
         tracing::error!("Failed to insert takeout record: {:?}", e);
@@ -178,7 +179,7 @@ pub fn get_takeout_by_id(
                         owner_node_id: row.get(2)?,
                         status: row.get(3)?,
                         expires_at: row.get(4)?,
-                        consensus_height: row.get(5)?,
+                        consensus_height: row.get::<_, i64>(5).map(height_from_db)?,
                     })
                 },
             );
@@ -228,7 +229,7 @@ pub fn get_takeouts_by_user(
                         status: row.get(3)?,
                         created_at,
                         expires_at: *expires_at_custom,
-                        consensus_height: row.get(5)?,
+                        consensus_height: row.get::<_, i64>(5).map(height_from_db)?,
                     })
                 })
                 .map_err(|_| DatabaseError::RecallError)?;

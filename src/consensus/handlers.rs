@@ -119,6 +119,15 @@ pub fn is_membership_tx(function: &str) -> bool {
     MEMBERSHIP_TX_FUNCTIONS.contains(&function)
 }
 
+/// Block-shape registry: functions that must ride ALONE in a block —
+/// membership transitions (joint constraints are invisible to per-tx
+/// validation) and the regenesis commit (RFC-019 S5: the decide
+/// certificate of the final block IS the snapshot certificate; nothing
+/// else may share it).
+pub fn requires_solo_block(function: &str) -> bool {
+    is_membership_tx(function) || function == "regenesis_commit"
+}
+
 // ============================================================================
 // Voluntary leave (RFC-CONSENSUS-002 S1) — the departure twin of activation
 // ============================================================================
@@ -512,7 +521,7 @@ mod leave_tests {
             .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
             .build(manager)
             .unwrap();
-        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
 
         let conn = pool.get().unwrap();
         conn.execute(
@@ -750,7 +759,7 @@ mod genesis_tests {
             .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
             .build(manager)
             .unwrap();
-        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
 
         // Real user key material (the handler inserts the user + node).
         let signing_key = crate::types::PrivKey(SigningKey::from_bytes(&[7u8; 32]));
@@ -848,7 +857,7 @@ mod vote_out_tests {
             .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
             .build(manager)
             .unwrap();
-        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
         let conn = pool.get().unwrap();
         conn.execute(
             "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
@@ -984,7 +993,7 @@ mod activation_batch_tests {
             .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
             .build(manager)
             .unwrap();
-        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
         let conn = pool.get().unwrap();
         conn.execute(
             "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)

@@ -21,13 +21,16 @@ pub mod inventory;
 pub mod mesh;
 pub mod metrics;
 pub mod nodes;
+pub mod regenesis;
 pub mod resilience;
 pub mod setup;
 pub mod shared;
 pub mod shares;
+pub mod snapshot;
 pub mod takeout;
 pub mod types;
 pub mod users;
+pub mod versions;
 pub mod write_gate;
 
 /// Maximum r2d2 connections checked out simultaneously across the process.

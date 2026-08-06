@@ -62,7 +62,7 @@ impl TxGateway for CapabilityHost {
     fn submit_batch_decided(
         &self,
         txs: Vec<TxSpec>,
-    ) -> BoxFuture<'_, Vec<Result<i32, TxSubmitError>>> {
+    ) -> BoxFuture<'_, Vec<Result<u64, TxSubmitError>>> {
         self.submit_batch_decided_inner(txs)
     }
 }
@@ -71,7 +71,7 @@ impl CapabilityHost {
     fn submit_batch_decided_inner(
         &self,
         txs: Vec<TxSpec>,
-    ) -> BoxFuture<'_, Vec<Result<i32, TxSubmitError>>> {
+    ) -> BoxFuture<'_, Vec<Result<u64, TxSubmitError>>> {
         Box::pin(async move {
             let n = txs.len();
 
@@ -110,13 +110,23 @@ impl CapabilityHost {
                 .await
                 .into_iter()
                 .map(|r| match r {
-                    Ok(height) => Ok(i32::try_from(height).unwrap_or(i32::MAX)),
+                    Ok(height) => Ok(height),
                     Err(crate::consensus::queue::ConsensusSubmitError::Rejected(reason)) => {
                         Err(TxSubmitError::Rejected(reason))
                     }
                     Err(crate::consensus::queue::ConsensusSubmitError::Timeout) => {
                         Err(TxSubmitError::Timeout)
                     }
+                    Err(crate::consensus::queue::ConsensusSubmitError::Moratorium {
+                        phase,
+                        target_version_code,
+                    }) => Err(TxSubmitError::Unavailable(
+                        serde_json::to_string(&crate::regenesis::routes::refusal_view(
+                            phase,
+                            target_version_code,
+                        ))
+                        .unwrap_or_else(|_| "regenesis in progress".to_string()),
+                    )),
                     Err(_) => Err(TxSubmitError::Submit),
                 })
                 .collect()

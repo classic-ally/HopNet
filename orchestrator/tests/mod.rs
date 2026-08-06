@@ -48,6 +48,7 @@ mod post_files_shape;
 mod range_download;
 mod recents;
 pub(crate) mod reencode;
+pub(crate) mod regenesis;
 mod sharing;
 mod takeout;
 mod three_timescales;
@@ -139,6 +140,52 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
             // AUTO (default): majority at v=3, so the kill leaves a live
             // quorum — no forcing needed.
         ],
+        // Same seeding as vote-out: the 3-seat formation batch needs the
+        // shortened spans. No grace override: the scenario detects the
+        // seal by the exit code, never by racing HTTP against the exit.
+        // Same seeding for the S7 rejoin scenarios: they drive the same
+        // boundary, with one node absent across it.
+        "regenesis-restart" | "straggler-rejoin" | "diverged-node-rebuild" => vec![(
+            "HOPNET_GENESIS_CONSENSUS_POLICY",
+            "probe_base=2;grace=1;s_full=6;p_prove=6",
+        )],
+        // Upgrade-target boundary: the staged override lets the mesh claim
+        // 2026.8.1 staged (the start precondition) without a second image;
+        // nodes then park awaiting-upgrade and are recreated one by one
+        // with the running-version override — the "binary swap".
+        // The rollback drill drives the same upgrade-target boundary:
+        // it needs a staged claim to seal for, and the crossed node is
+        // where the window opens.
+        "regenesis-awaiting-upgrade" | "regenesis-rollback" => vec![
+            (
+                "HOPNET_GENESIS_CONSENSUS_POLICY",
+                "probe_base=2;grace=1;s_full=6;p_prove=6",
+            ),
+            ("HOPNET_UPGRADE_STAGED_OVERRIDE", "2026.8.1"),
+        ],
+        // The RFC-021 positive half: same upgrade-target boundary as
+        // awaiting-upgrade, PLUS the nix deployment contract — nodes
+        // activate a planted staged generation and exit 75 instead of
+        // parking. The staged claim still rides the override (attestation
+        // from provider reports has unit coverage); NIX_BIN is unused at
+        // activation (auto-stage never runs in containers: no release
+        // URL, so the provider never polls or builds).
+        "regenesis-nix-activation" => vec![
+            (
+                "HOPNET_GENESIS_CONSENSUS_POLICY",
+                "probe_base=2;grace=1;s_full=6;p_prove=6",
+            ),
+            ("HOPNET_UPGRADE_STAGED_OVERRIDE", "2026.8.1"),
+            ("HOPNET_UPGRADE_PROVIDER", "nix"),
+            (
+                "HOPNET_UPGRADE_PROFILE",
+                "/root/.local/share/hopnet/profile",
+            ),
+            (
+                "HOPNET_UPGRADE_STAGE_DIR",
+                "/root/.local/share/hopnet/staged",
+            ),
+        ],
         // REGRESSION FIX (S4): the S_min gate makes the BFT rejoin seat
         // EXPOSED (quorum(3)-quorum(2)=1) => req_span = s_full; the
         // default 30 min would refuse the rejoin inside the test window.
@@ -204,6 +251,13 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         // 6 nodes: forms in the majority region (seats 5 + pooled spare, or
         // 6); the test adds the 7th itself to watch the seam get crossed.
         "auto-seam" => Some(6),
+        // Boundary scenarios are written against a 3-node mesh.
+        "regenesis-restart"
+        | "regenesis-awaiting-upgrade"
+        | "regenesis-nix-activation"
+        | "straggler-rejoin"
+        | "diverged-node-rebuild"
+        | "regenesis-rollback" => Some(3),
         _ => None,
     }
 }
@@ -319,6 +373,28 @@ pub async fn run_test_by_name(
                 .await
         }
         "vote-out-after-kill" => vote_out::VoteOutAfterKill.run(mesh_id, nodes, flags).await,
+        "regenesis-restart" => regenesis::RegenesisRestart.run(mesh_id, nodes, flags).await,
+        "regenesis-awaiting-upgrade" => {
+            regenesis::RegenesisAwaitingUpgrade
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "regenesis-nix-activation" => {
+            regenesis::RegenesisNixActivation
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "straggler-rejoin" => regenesis::StragglerRejoin.run(mesh_id, nodes, flags).await,
+        "diverged-node-rebuild" => {
+            regenesis::DivergedNodeRebuild
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "regenesis-rollback" => {
+            regenesis::RegenesisRollback
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "evidence-observe" => {
             evidence_observe::EvidenceObserve
                 .run(mesh_id, nodes, flags)
@@ -510,6 +586,12 @@ pub fn list_test_names() -> Vec<&'static str> {
         "graceful-leave",
         "evidence-observe",
         "vote-out-after-kill",
+        "regenesis-restart",
+        "regenesis-awaiting-upgrade",
+        "regenesis-nix-activation",
+        "straggler-rejoin",
+        "diverged-node-rebuild",
+        "regenesis-rollback",
         "mesh-growth",
         "auto-seam",
         "three-timescales",

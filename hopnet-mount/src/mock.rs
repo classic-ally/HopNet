@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use hopnet_common::CustomUUID;
 
 use crate::transport::{
-    BoxFuture, Cursor, Health, Item, ItemId, ItemKind, NodeTransport, Page, StatfsInfo,
+    BoxFuture, Cursor, Health, Height, Item, ItemId, ItemKind, NodeTransport, Page, StatfsInfo,
     TransportError,
 };
 
@@ -30,7 +30,7 @@ pub enum CallRecord {
         cursor: Option<String>,
     },
     Changes {
-        since: i64,
+        since: Height,
     },
     Watch,
     ReadBlob {
@@ -70,10 +70,10 @@ struct MockState {
     children: HashMap<ItemId, Vec<ItemId>>,
     calls: Vec<CallRecord>,
     page_size: usize,
-    height: i64,
+    height: Height,
     /// Mutation journal — (height, id, latest state | None=deleted); the
     /// mock's modification_log, driving changes(since).
-    journal: Vec<(i64, ItemId, Option<Item>)>,
+    journal: Vec<(Height, ItemId, Option<Item>)>,
     /// Live watch connection, if any; dropping it (drop_watch) is the
     /// scripted-disconnect failure mode.
     watch_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::transport::WatchEvent>>,
@@ -483,7 +483,7 @@ impl NodeTransport for MockTransport {
 
             // Latest journal entry per id, strictly after `since` — the
             // same semantics as the node's modification_log query.
-            let mut latest: HashMap<ItemId, (i64, Option<Item>)> = HashMap::new();
+            let mut latest: HashMap<ItemId, (Height, Option<Item>)> = HashMap::new();
             for (height, id, item) in state.journal.iter().filter(|(h, _, _)| *h > since) {
                 let entry = latest.entry(id.clone()).or_insert((*height, item.clone()));
                 if *height >= entry.0 {

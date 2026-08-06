@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::transport::Height;
 use hopnet_common::CustomUUID;
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +21,7 @@ pub struct StagedMeta {
     pub inode_id: CustomUUID,
     /// The item height the write session was based on — conflict
     /// detection compares this against the item at upload time.
-    pub base_height: i64,
+    pub base_height: Height,
 }
 
 pub struct Staging {

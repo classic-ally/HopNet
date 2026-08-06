@@ -192,7 +192,7 @@ pub async fn post_nodes(
 
     // Get current consensus height, quorum profile, and bootstrap validators
     // on a single connection checkout.
-    let (current_height, quorum_profile, bootstrap_validators) = {
+    let (current_height, quorum_profile, bootstrap_validators, epoch) = {
         let mut conn = match app_state.db_pool.get() {
             Ok(c) => c,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
@@ -223,7 +223,8 @@ pub async fn post_nodes(
                 return StatusCode::INTERNAL_SERVER_ERROR;
             }
         };
-        (height, profile, validators)
+        let epoch = crate::regenesis::genesis::current_epoch(&conn);
+        (height, profile, validators, epoch)
     };
 
     // Create JoinInfo structure
@@ -232,6 +233,7 @@ pub async fn post_nodes(
         user_id: uid,
         bootstrap_validators,
         quorum_profile,
+        epoch,
     };
 
     ///////////////

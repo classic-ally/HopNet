@@ -16,6 +16,7 @@
 use crate::error::StorageError;
 use crate::fragstore;
 use crate::types::{BlobAccess, BlobId, SelfCheckFragments};
+use hopnet_common::height::{height_from_db, height_to_db};
 use hopnet_common::Blake3Hash;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -138,8 +139,8 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
         -- Mesh policy config (RFC-STORAGE-002 Configuration):
         -- consensus-replicated key/value, seeded through the genesis
         -- payload; membership::StoragePolicy::from_rows resolves it with
-        -- code defaults for absent keys. Consensus-tracked (host lists it
-        -- in CONSENSUS_TABLES).
+        -- code defaults for absent keys. Consensus-tracked (covered by
+        -- this crate's SNAPSHOT_SECTION).
         CREATE TABLE hopnet_storage_policy (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -147,7 +148,7 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
 
         -- Pins (RFC-STORAGE-001 Copy classes): substrate state, projection
         -- meaning — owner is an opaque projection tag. NODE-LOCAL, never
-        -- replicated (host lists it in LOCAL_ONLY_TABLES). Deliberately no
+        -- replicated (this crate's NODE_LOCAL_TABLES). Deliberately no
         -- FK to data_blocks: a pin may outlive a raced delete; eviction
         -- ignores pins on deleted blobs.
         CREATE TABLE hopnet_storage_pins (
@@ -160,6 +161,37 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
         ",
     )
 }
+
+/// This substrate's section of the canonical state snapshot (RFC-019 S1).
+///
+/// mesh_key/mesh_key_access are public replicated state — losing them
+/// across an epoch boundary would strand every all-users blob, so they
+/// are covered. stored_locally and self_verified_height are node-local
+/// columns of otherwise-replicated tables, excluded from canonical bytes.
+pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionSpec {
+    name: "storage",
+    format_version: 1,
+    tables: &[
+        hopnet_common::TableSpec::exported("data_blocks"),
+        hopnet_common::TableSpec::exported("blob_access"),
+        hopnet_common::TableSpec::exported("mesh_key"),
+        hopnet_common::TableSpec::exported("mesh_key_access"),
+        hopnet_common::TableSpec {
+            name: "fragment_hashes",
+            role: hopnet_common::TableRole::Exported,
+            excluded_columns: &["stored_locally"],
+        },
+        hopnet_common::TableSpec {
+            name: "fragment_inventory",
+            role: hopnet_common::TableRole::Exported,
+            excluded_columns: &["self_verified_height"],
+        },
+        hopnet_common::TableSpec::exported("hopnet_storage_policy"),
+    ],
+};
+
+/// Node-local tables — outside the snapshot universe entirely.
+pub const NODE_LOCAL_TABLES: &[&str] = &["hopnet_storage_pins"];
 
 /// Seed/overwrite mesh policy rows (genesis apply; later a settings tx).
 pub fn apply_policy_rows(
@@ -254,14 +286,14 @@ pub fn apply_blob_access_add(
 /// distribution engine's settling-window flush; one tx per window).
 pub fn apply_placement_commit(
     db_tx: &rusqlite::Transaction,
-    updates: &[(BlobId, i32)],
+    updates: &[(BlobId, u64)],
 ) -> Result<usize, StorageError> {
     let mut applied = 0;
     for (blob_id, height) in updates {
         applied += db_tx
             .execute(
                 "UPDATE data_blocks SET placement_height = ? WHERE id = ?",
-                params![height, blob_id],
+                params![height_to_db(*height), blob_id],
             )
             .map_err(db_err("update placement_height"))?;
     }
@@ -276,7 +308,7 @@ pub fn apply_self_check(
     db_tx: &rusqlite::Transaction,
     node_id: i32,
     previous_count: u32,
-    self_verified_height: i32,
+    self_verified_height: u64,
     added: &[Blake3Hash],
     removed: &[Blake3Hash],
 ) -> Result<(), StorageError> {
@@ -315,7 +347,7 @@ pub fn apply_self_check(
     db_tx
         .execute(
             "UPDATE fragment_inventory SET self_verified_height = ? WHERE node_id = ?",
-            params![self_verified_height, node_id],
+            params![height_to_db(self_verified_height), node_id],
         )
         .map_err(db_err("update inventory verified height"))?;
 
@@ -323,7 +355,7 @@ pub fn apply_self_check(
         db_tx
             .execute(
                 "INSERT INTO fragment_inventory (fragment_hash, node_id, self_verified_height) VALUES (?, ?, ?)",
-                params![hash, node_id, self_verified_height],
+                params![hash, node_id, height_to_db(self_verified_height)],
             )
             .map_err(db_err("insert inventory fragment"))?;
     }
@@ -392,7 +424,7 @@ fn get_node_fragment_count_tx(
 pub fn compute_inventory_differential(
     tx: &rusqlite::Transaction<'_>,
     node_id: i32,
-    self_verified_height: i32,
+    self_verified_height: u64,
 ) -> Result<SelfCheckFragments, rusqlite::Error> {
     // Get current inventory count
     let previous_count = get_node_fragment_count_tx(tx, node_id)?;
@@ -536,7 +568,7 @@ pub struct BlobManifest {
     pub added_bytes: u8,
     pub file_size: u64,
     /// Height the placement commit was computed against; None = unplaced.
-    pub placement_height: Option<i32>,
+    pub placement_height: Option<u64>,
     /// chunk_number → (originals_by_index, recovery_by_index).
     pub chunks: std::collections::HashMap<u32, ChunkFragmentMaps>,
 }
@@ -559,7 +591,7 @@ pub fn blob_manifest(
         )
         .map_err(db_err("prepare blob manifest query"))?;
 
-    let mut header: Option<(Blake3Hash, u8, Option<i32>, u64)> = None;
+    let mut header: Option<(Blake3Hash, u8, Option<u64>, u64)> = None;
     let mut chunks: std::collections::HashMap<u32, ChunkFragmentMaps> =
         std::collections::HashMap::new();
 
@@ -568,7 +600,7 @@ pub fn blob_manifest(
             Ok((
                 row.get::<_, Blake3Hash>(0)?,
                 row.get::<_, u8>(1)?,
-                row.get::<_, Option<i32>>(2)?,
+                row.get::<_, Option<i64>>(2)?.map(height_from_db),
                 row.get::<_, i64>(3).unwrap_or(0) as u64,
                 row.get::<_, u32>(4)?,
                 row.get::<_, u32>(5)?,
@@ -714,7 +746,7 @@ pub fn get_distributable_blob(
 #[derive(Debug, Clone)]
 pub struct DataBlockRebalanceInfo {
     pub data_block_id: BlobId,
-    pub placement_height: i32,
+    pub placement_height: u64,
     pub fragments: Vec<FragmentInfo>,
 }
 
@@ -731,20 +763,20 @@ pub struct FragmentInfo {
 /// are skipped.
 pub fn get_data_blocks_for_rebalancing(
     conn: &rusqlite::Connection,
-    max_placement_height: i32,
+    max_placement_height: u64,
     limit: i32,
 ) -> Result<Vec<DataBlockRebalanceInfo>, rusqlite::Error> {
     // Get data blocks that were placed before the specified height
     let query = "SELECT DISTINCT db.id, db.placement_height, db.fragment_count
          FROM data_blocks db
-         WHERE db.placement_height IS NOT NULL 
+         WHERE db.placement_height IS NOT NULL
            AND db.placement_height < ?
          ORDER BY db.placement_height ASC
          LIMIT ?";
     let mut stmt = conn.prepare(query)?;
-    let data_blocks: Vec<(BlobId, i32, i32)> = stmt
-        .query_map(params![max_placement_height, limit], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    let data_blocks: Vec<(BlobId, u64, i32)> = stmt
+        .query_map(params![height_to_db(max_placement_height), limit], |row| {
+            Ok((row.get(0)?, row.get(1).map(height_from_db)?, row.get(2)?))
         })?
         .collect::<Result<_, _>>()?;
 

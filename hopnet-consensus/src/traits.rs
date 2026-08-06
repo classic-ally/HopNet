@@ -116,6 +116,14 @@ pub trait Application<S: Storage> {
     /// Post-commit hook, outside the transaction: notify submitters, kick
     /// replication, submit follow-up transactions.
     fn on_decided(&mut self, height: Height, block: &Block, cert: &WireCommitCertificate);
+
+    /// RFC-019 seal contract: return true when applying `block` sealed the
+    /// epoch at `height`. The engine then treats H as TERMINAL — it neither
+    /// defers nor starts H+1; in on-demand mode the quiescent park IS the
+    /// halt (regenesis-seal-contract.md, items 1–2). Default: never.
+    fn sealed_after(&mut self, _height: Height, _block: &Block) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]

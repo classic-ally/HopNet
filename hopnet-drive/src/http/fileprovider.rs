@@ -366,6 +366,7 @@ pub async fn delete_item(
             StatusCode::OK
         }
         Err(crate::host::TxSubmitError::Signing) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(crate::host::TxSubmitError::Unavailable(_)) => StatusCode::SERVICE_UNAVAILABLE,
         Err(e) => {
             tracing::error!("Failed to submit deletion to consensus: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR

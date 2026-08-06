@@ -33,6 +33,46 @@ pub const TABLES: &[&str] = &[
     "photo_ingress_responsibility",
 ];
 
+/// This projection's snapshot section (RFC-019 S1) — declared next to the
+/// DDL so the schema and the exported set cannot drift.
+///
+/// Every table here exports. All fourteen are written only by consensus
+/// handlers inside the decide transaction, so each is a deterministic
+/// function of applied blocks and carries across an epoch boundary
+/// verbatim. That includes the two change-feeds: `photo_changes` and
+/// `photo_view_changes` are derived, but derived IDENTICALLY on every
+/// node (upsert-to-latest-height, keyed by photo / by (user, library)),
+/// which is what exportability turns on — not whether a row is primary.
+///
+/// Contrast `hopnet-drive`'s `modification_log`, which is node-local: it
+/// is an append-only local index the FileProvider prunes on its own
+/// schedule, so two honest nodes legitimately hold different rows.
+/// Nothing here has that property, so `node_local_tables` stays empty
+/// and the trait default is left in place.
+///
+/// Table order matches `TABLES` (dependency order) and is load-bearing:
+/// the section hash rolls up per table in declaration order.
+pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionSpec {
+    name: "photos",
+    format_version: 1,
+    tables: &[
+        hopnet_common::TableSpec::exported("shared_libraries"),
+        hopnet_common::TableSpec::exported("shared_library_members"),
+        hopnet_common::TableSpec::exported("shared_library_keys"),
+        hopnet_common::TableSpec::exported("shared_library_invites"),
+        hopnet_common::TableSpec::exported("photos"),
+        hopnet_common::TableSpec::exported("photo_metadata_access"),
+        hopnet_common::TableSpec::exported("photo_resources"),
+        hopnet_common::TableSpec::exported("photo_operations"),
+        hopnet_common::TableSpec::exported("photo_albums"),
+        hopnet_common::TableSpec::exported("photo_album_entries"),
+        hopnet_common::TableSpec::exported("photo_favorites"),
+        hopnet_common::TableSpec::exported("photo_changes"),
+        hopnet_common::TableSpec::exported("photo_view_changes"),
+        hopnet_common::TableSpec::exported("photo_ingress_responsibility"),
+    ],
+};
+
 pub mod libraries;
 pub mod photos;
 
@@ -655,5 +695,67 @@ mod tests {
             "second row for one (user, library) must be rejected"
         );
         insert(2, Some("lib1"), "d9").expect("two members hold the same library independently");
+    }
+
+    // Impact: this index is load-bearing for CONSENSUS, not just for
+    // business uniqueness, and that is easy to miss when reading it as
+    // "redundant with the PRIMARY KEY".
+    //
+    // `photo_ingress_responsibility` is exported in this projection's
+    // RFC-019 snapshot section, and the canonical serializer orders rows by
+    // the declared primary key — here `(library_id, user_id)`, sorted
+    // lexicographically. SQLite treats NULLs as distinct even inside a
+    // PRIMARY KEY, so without the partial index a user could hold two
+    // personal-scope rows, both with `library_id IS NULL`, and the ORDER BY
+    // would no longer be a TOTAL order. Two honest replicas could then
+    // serialize the same state in different row orders and compute
+    // different section hashes.
+    //
+    // That is a divergence at the seal, where every validator recomputes
+    // the artifact hash to vote on `regenesis_commit` — so the failure mode
+    // is a boundary no quorum can agree on, not a query returning rows in a
+    // surprising order.
+    // Should: keep a UNIQUE index that makes the NULL-library case unique
+    //   per user, so the exported order stays total.
+    #[test]
+    fn personal_scope_index_keeps_the_exported_row_order_total() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        install_schema(&conn).unwrap();
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'photo_ingress_responsibility'
+                   AND sql LIKE '%UNIQUE%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect(
+                "photo_ingress_responsibility needs a UNIQUE index over the NULL-library case: \
+                 the composite PK admits duplicate NULLs, which would make the snapshot's \
+                 canonical ORDER BY non-total and the certified hash node-dependent",
+            );
+        assert!(
+            sql.contains("user_id") && sql.contains("library_id IS NULL"),
+            "the index must be the one that uniquifies personal scope, got: {sql}"
+        );
+
+        // And the property it buys, stated directly.
+        conn.execute(
+            "INSERT INTO photo_ingress_responsibility (user_id, library_id, device_id, operation_id)
+             VALUES (1, NULL, 'd1', 'op')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO photo_ingress_responsibility (user_id, library_id, device_id, operation_id)
+                 VALUES (1, NULL, 'd2', 'op')",
+                [],
+            )
+            .is_err(),
+            "two NULL-library rows for one user would make the exported order ambiguous"
+        );
     }
 }

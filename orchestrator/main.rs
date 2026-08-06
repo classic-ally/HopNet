@@ -569,7 +569,14 @@ async fn wait_for_formation(
         if let Ok(resp) = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
-            .json(&i32::MAX) // any height >= tip resolves to the latest set
+            // `i64::MAX`, not `u64::MAX`: heights map onto SQLite INTEGER
+            // by lossless bit-cast, so anything above i64::MAX lands
+            // NEGATIVE and the validator CTE's `effective_height <= ?`
+            // matches ZERO rows — every height is >= 0. With u64::MAX this
+            // probe never saw a validator, so it burned its full timeout on
+            // every mesh creation and reported 0 seated.
+            // `src/db/consensus.rs` pins i64::MAX as the safe ceiling.
+            .json(&(i64::MAX as u64)) // any height >= tip resolves to the latest set
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -1005,7 +1012,7 @@ async fn create_relay_container(
     Ok(response.id)
 }
 
-async fn create_hopnet_container(
+pub(crate) async fn create_hopnet_container(
     docker: &Docker,
     mesh_id: u32,
     node_id: u32,
@@ -1091,19 +1098,29 @@ async fn create_hopnet_container(
         env: Some({
             let mut e = vec![
                 "HOPNET_TEST_MODE=1".to_string(),
+                // The image leaves HOME unset, so the node would derive its
+                // data dir as /.local/share/hopnet — OUTSIDE the named
+                // volume mounted at /root/.local/share/hopnet. Container
+                // stop/start masked this (writable-layer persistence); a
+                // remove+recreate (the S6 "binary swap") must find the data
+                // in the volume.
+                "HOME=/root".to_string(),
                 // Self-hosted relay: no n0 public relay/discovery dependency.
                 format!("HOPNET_RELAY_URL={}", naming::relay_url(mesh_id)),
             ];
             // Forward HOPNET_DB_* (pragma tuning), HOPNET_CONSENSUS_*/
-            // HOPNET_QUORUM_* (timeouts, quorum profile), and
+            // HOPNET_QUORUM_* (timeouts, quorum profile),
             // HOPNET_GENESIS_* (mesh-creation inputs, e.g. the storage
-            // policy seed) from the orchestrator process so tests can
+            // policy seed), and HOPNET_UPGRADE_* (upgrade-provider
+            // overrides) from the orchestrator process so tests can
             // configure meshes without rebuilding the image.
             for (k, v) in std::env::vars() {
                 if k.starts_with("HOPNET_DB_")
                     || k.starts_with("HOPNET_CONSENSUS_")
                     || k.starts_with("HOPNET_QUORUM_")
                     || k.starts_with("HOPNET_GENESIS_")
+                    || k.starts_with("HOPNET_UPGRADE_")
+                    || k.starts_with("HOPNET_RESTART_")
                 {
                     e.push(format!("{}={}", k, v));
                 }

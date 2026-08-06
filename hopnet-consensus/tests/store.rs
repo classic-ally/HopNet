@@ -87,6 +87,25 @@ fn wal_persists_in_seq_order_across_reopen() {
     let _ = std::fs::remove_file(&path);
 }
 
+// Should: persist and read back WAL entries at heights above i64::MAX
+// (stored as negative INTEGERs by the bit-cast mapping), across a reopen.
+// Impact: RFC-019 S0 full-range contract — no height value may be
+// unrepresentable or silently wrapped at the SQLite boundary.
+#[test]
+fn wal_roundtrips_extreme_heights_across_reopen() {
+    let path = temp_db("wal-extreme-heights");
+    for h in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+        {
+            let mut s = open_storage(&path);
+            s.wal_append(Height(h), 0, &wal_entry(7)).unwrap();
+        }
+        let mut s = open_storage(&path);
+        assert_eq!(s.wal_fetch(Height(h)).unwrap().len(), 1);
+        s.wal_reset().unwrap();
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 // Should: roll the ENTIRE decide back when the closure fails — app write,
 // decided rows, WAL truncation, meta.
 // Should not: leave any partial state.

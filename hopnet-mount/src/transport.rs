@@ -16,7 +16,7 @@ use hopnet_common::CustomUUID;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Consensus height an item state was read at — the sync/version anchor.
-pub type Height = i64;
+pub type Height = u64;
 
 /// Identity of a drive item. The root is modelled explicitly so node-side
 /// sentinel strings never leak into the daemon.

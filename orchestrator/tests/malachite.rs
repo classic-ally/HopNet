@@ -60,7 +60,7 @@ async fn refresh_jwt(node: &mut NodeInfo, mesh_id: u32) -> Result<()> {
         &docker,
         mesh_id,
         node.node_id,
-        crate::sys::ContainerRuntime::Docker,
+        crate::sys::detect_runtime(&docker).await?,
     )
     .await?;
     Ok(())

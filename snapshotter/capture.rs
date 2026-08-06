@@ -42,7 +42,7 @@ pub fn run_capture(output: &Path) {
     println!("Initializing schema...");
     {
         let conn = pool.get().expect("Failed to get connection");
-        hopnet::db::shared::initialize(conn).expect("Failed to initialize schema");
+        hopnet::db::shared::initialize(&conn).expect("Failed to initialize schema");
     }
 
     println!("Seeding fixtures...");

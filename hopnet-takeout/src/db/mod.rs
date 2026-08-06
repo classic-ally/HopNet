@@ -14,6 +14,21 @@ pub mod takeout;
 /// The static tables this service owns. Work tables are per-id and excluded.
 pub const TABLES: &[&str] = &["takeouts", "imports"];
 
+/// This service's section of the canonical state snapshot (RFC-019 S1).
+/// Per-id work tables are runtime-created and node-local by construction;
+/// they never exist in a fresh schema and are outside the universe.
+pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionSpec {
+    name: "takeout",
+    format_version: 1,
+    tables: &[
+        hopnet_common::TableSpec::exported("takeouts"),
+        hopnet_common::TableSpec::exported("imports"),
+    ],
+};
+
+/// Node-local tables — none static; see SNAPSHOT_SECTION note.
+pub const NODE_LOCAL_TABLES: &[&str] = &[];
+
 /// Current decided consensus height — the projection layer's canonical
 /// reader (RFC-017 Stage 3; this crate's verbatim SQL copy died with it,
 /// same 0-pre-genesis / RecallError semantics).

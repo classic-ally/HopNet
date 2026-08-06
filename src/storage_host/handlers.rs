@@ -37,7 +37,7 @@ impl TransactionHandler for UpdatePlacementHeightsHandler {
             bincode::config::standard(),
         ) {
             Ok((updates, _)) => {
-                let crate_updates: Vec<(hopnet_storage::BlobId, i32)> = updates
+                let crate_updates: Vec<(hopnet_storage::BlobId, u64)> = updates
                     .into_iter()
                     .map(|u| (u.blob_id, u.placement_height))
                     .collect();

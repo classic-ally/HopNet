@@ -1,11 +1,46 @@
 use axum::{Router, extract::State, http::StatusCode, response::Json, routing::get};
 
-use hopnet_common::views::ResiliencePaneView;
+use hopnet_common::views::{ResiliencePaneView, UpgradeReadinessView};
 
 use crate::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/network-resilience", get(get_network_resilience))
+    Router::new()
+        .route("/network-resilience", get(get_network_resilience))
+        .route("/upgrade-readiness", get(get_upgrade_readiness))
+        .route(
+            "/regenesis-status",
+            get(crate::regenesis::routes::get_regenesis_status),
+        )
+}
+
+/// GET /views/upgrade-readiness (RFC-019 S3)
+///
+/// Committed per-node version attestations + the provider's last poll.
+/// Facts only — the readiness rollup is the S5 precondition's job.
+async fn get_upgrade_readiness(
+    State(app_state): State<AppState>,
+) -> Result<Json<UpgradeReadinessView>, StatusCode> {
+    let provider_status = app_state.upgrade.last.read().await.clone();
+
+    let mesh = {
+        let app_state = app_state.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = app_state
+                .db_pool
+                .get()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            crate::db::versions::read_mesh_versions(&conn)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??
+    };
+
+    Ok(Json(crate::views::upgrade::upgrade_view(
+        mesh,
+        provider_status.as_ref(),
+    )))
 }
 
 /// GET /views/network-resilience

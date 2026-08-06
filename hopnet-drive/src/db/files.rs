@@ -7,6 +7,7 @@
 use crate::model::{CustomDateTime, FileAccessData, Inode};
 use crate::paths::decrypt_path;
 use aes_siv::{siv::Aes256Siv, Key, Nonce};
+use hopnet_common::height::height_to_db;
 use hopnet_common::{CustomUUID, FileItem};
 use hopnet_projection::DatabaseError;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -19,13 +20,13 @@ fn log_ancestor_modifications(
     tx: &Transaction,
     path: &str,
     owner_id: i32,
-    modification_height: i32,
+    modification_height: u64,
 ) -> Result<(), DatabaseError> {
     let ancestors = get_all_ancestor_folders(tx, path, owner_id)?;
     for ancestor_id in &ancestors {
         tx.execute(
             "INSERT OR IGNORE INTO modification_log (inode_id, owner_id, old_parent_id, modified_at_height) VALUES (?, ?, ?, ?)",
-            params![ancestor_id, owner_id, None::<CustomUUID>, modification_height]
+            params![ancestor_id, owner_id, None::<CustomUUID>, height_to_db(modification_height)]
         ).map_err(|e| {
             tracing::error!("Failed to log ancestor modification for path {} ancestor {}: {:?}",
                            path, ancestor_id, e);
@@ -212,7 +213,7 @@ pub fn insert_files(
     blob_ops: &[hopnet_storage::store::BlobInsertOp],
     inodes: Vec<Inode>,
     fragments_dir: &str,
-    block_height: i32,
+    block_height: u64,
 ) -> Result<(), DatabaseError> {
     // Substrate half first: blobs must exist before inodes reference them.
     for op in blob_ops {
@@ -371,7 +372,7 @@ pub fn delete_files(
     db_tx: &rusqlite::Transaction,
     path: String,
     user_id: i32,
-    block_height: i32,
+    block_height: u64,
 ) -> Result<(), DatabaseError> {
     let current_height = block_height;
 
@@ -410,7 +411,7 @@ pub fn delete_files(
         )
         WHERE (i.path = ? OR i.path LIKE ?) AND i.owner_id = ?
         "#,
-        params![current_height, path, format!("{}/%", path), user_id]
+        params![height_to_db(current_height), path, format!("{}/%", path), user_id]
     ).map_err(|e| {
         tracing::error!("Failed to log modifications for deletion: {:?}", e);
         DatabaseError::ProcessingError
@@ -470,7 +471,7 @@ pub fn modify_item(
     content_update: Option<Option<hopnet_storage::store::BlobInsertOp>>,
     incoming_share_updates: Option<Vec<crate::envelopes::IncomingShareUpdate>>,
     fragments_dir: &str,
-    block_height: i32,
+    block_height: u64,
 ) -> Result<(), DatabaseError> {
     // Check if the item exists and get its type and current path using inode_id
     tracing::debug!(
@@ -883,12 +884,12 @@ pub fn log_modification(
     old_parent_id: Option<CustomUUID>, // Parent BEFORE modification (None for new items)
     old_path: Option<&str>,            // Path BEFORE modification (for moves/deletes)
     new_path: Option<&str>,            // Path AFTER modification (for inserts/moves)
-    modification_height: i32,
+    modification_height: u64,
 ) -> Result<(), DatabaseError> {
     // Log the primary item modification
     tx.execute(
         "INSERT OR IGNORE INTO modification_log (inode_id, owner_id, old_parent_id, modified_at_height) VALUES (?, ?, ?, ?)",
-        params![inode_id, owner_id, old_parent_id, modification_height]
+        params![inode_id, owner_id, old_parent_id, height_to_db(modification_height)]
     ).map_err(|e| {
         tracing::error!("Failed to log modification for inode_id {} at height {}: {:?}",
                        inode_id, modification_height, e);

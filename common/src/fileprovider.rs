@@ -30,7 +30,8 @@ pub struct FileProviderItem {
     pub file_size: Option<String>, // File size in bytes as string (None for folders) - String for typeshare compatibility
     pub creation_date: Option<String>, // ISO 8601 timestamp extracted from UUIDv7 or folder creation
     pub content_modification_date: Option<String>, // ISO 8601 timestamp from modified_at column
-    pub modification_height: Option<i32>, // Consensus height when item was last modified
+    #[typeshare(serialized_as = "Option<U64Height>")]
+    pub modification_height: Option<u64>, // Consensus height when item was last modified
 }
 
 /// Directory enumeration response
@@ -39,7 +40,8 @@ pub struct FileProviderItem {
 pub struct EnumerateResponse {
     pub items: Vec<FileProviderItem>,
     pub next_page: Option<String>,
-    pub current_consensus_height: i32,
+    #[typeshare(serialized_as = "U64Height")]
+    pub current_consensus_height: u64,
 }
 
 /// Changes response for incremental sync
@@ -48,7 +50,8 @@ pub struct EnumerateResponse {
 pub struct ChangesResponse {
     pub items: Vec<FileProviderItem>,
     pub deleted_identifiers: Vec<String>, // List of identifiers for deleted items
-    pub current_consensus_height: i32,
+    #[typeshare(serialized_as = "U64Height")]
+    pub current_consensus_height: u64,
 }
 
 /// Query parameters for changes endpoint
@@ -56,7 +59,8 @@ pub struct ChangesResponse {
 #[typeshare]
 pub struct ChangesQuery {
     pub parent_path: Option<String>,
-    pub since_height: Option<i32>,
+    #[typeshare(serialized_as = "Option<U64Height>")]
+    pub since_height: Option<u64>,
 }
 
 /// Delete request for FileProvider

@@ -36,7 +36,8 @@ pub struct TakeoutRecord {
     pub created_at: DateTime<Utc>,
     #[typeshare(serialized_as = "String")]
     pub expires_at: DateTime<Utc>,
-    pub consensus_height: i32,
+    #[typeshare(serialized_as = "U64Height")]
+    pub consensus_height: u64,
 }
 
 /// Import status — tracks progress of user data ingest
@@ -125,6 +126,16 @@ impl CustomUUID {
 
     pub fn as_bytes(&self) -> &[u8; 16] {
         self.0.as_bytes()
+    }
+
+    /// Deterministic UUID from fixed bytes — for synthetic protocol
+    /// transactions whose identity must be a pure function of their
+    /// content (the epoch genesis tx, RFC-019 S6: every node must build
+    /// a byte-identical genesis block independently). Deliberately not
+    /// v7: no timestamp semantics, so retention scans ignore it — such
+    /// transactions never enter the pending pool anyway.
+    pub fn from_fixed_bytes(bytes: [u8; 16]) -> CustomUUID {
+        CustomUUID(Uuid::from_bytes(bytes))
     }
 
     /// UUIDv7 cutoff for retention scans: `days` before now.

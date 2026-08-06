@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::attrs::AttrCache;
 use crate::idmap::{IdMap, ROOT_INO};
-use crate::transport::{Item, ItemId, ItemKind, NodeTransport, TransportError};
+use crate::transport::{Height, Item, ItemId, ItemKind, NodeTransport, TransportError};
 
 /// statfs numbers refresh at most this often (node-side full-table scan).
 const STATFS_TTL: Duration = Duration::from_secs(15);
@@ -96,7 +96,7 @@ struct OpenFile {
     size: u64,
     /// Height of the item state this session is based on (conflict
     /// detection at upload).
-    base_height: i64,
+    base_height: Height,
     /// Write-back state (S7): staging appears on first mutation
     /// (copy-up); `dirty` tracks unuploaded bytes.
     write: tokio::sync::Mutex<Option<crate::staging::StagedFile>>,

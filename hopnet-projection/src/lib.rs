@@ -161,7 +161,7 @@ pub struct HandlerCtx<'a> {
     /// and rows stamped with a lagging height fall behind anchors already
     /// handed to /changes clients (silent divergence; caught by the
     /// RFC-018 S4 stack test).
-    pub height: i32,
+    pub height: u64,
     /// Post-apply change signal (host impl owns test_mode/platform gating).
     pub notifier: &'a dyn ChangeNotifier,
     /// Named background-work scheduler (host impl owns spawning/routing).
@@ -406,6 +406,28 @@ pub trait Projection: Send + Sync {
     ) -> host::BoxFuture<'static, Result<u64, String>> {
         Box::pin(std::future::ready(Ok(0)))
     }
+
+    // RFC-019 additions:
+
+    /// This projection's section of the canonical state snapshot: the
+    /// covered tables the divergence manifest hashes and the epoch
+    /// artifact exports (the mesh-scoped sibling of [`ProjectionExporter`],
+    /// which is per-user). The host assembles sections after the
+    /// substrate's, in registration order. The `'static` return is
+    /// deliberate — the host builds a `'static` section list from unit
+    /// structs. Default: no covered tables.
+    fn snapshot_section(&self) -> Option<&'static hopnet_common::SectionSpec> {
+        None
+    }
+
+    /// This projection's node-local tables — outside the snapshot
+    /// universe entirely; the host's registry test pins
+    /// covered ∪ node-local == sqlite_master, so every table this
+    /// projection installs must appear in exactly one of the two.
+    /// Default: none.
+    fn node_local_tables(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// Current decided consensus height off any connection to the shared DB
@@ -416,8 +438,8 @@ pub trait Projection: Send + Sync {
 /// read-your-writes and the sync context. Pre-genesis (missing row) reads
 /// as 0; errors map to `RecallError` — the previous copies' semantics, with
 /// hopnet-consensus's SQL as the single source of truth.
-pub fn current_height(conn: &rusqlite::Connection) -> Result<i32, DatabaseError> {
+pub fn current_height(conn: &rusqlite::Connection) -> Result<u64, DatabaseError> {
     hopnet_consensus::store::last_decided_height(conn)
-        .map(|h| h.map_or(0, |h| h.as_db() as i32))
+        .map(|h| h.map_or(0, |h| h.0))
         .map_err(|_| DatabaseError::RecallError)
 }

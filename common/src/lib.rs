@@ -1,15 +1,16 @@
 // HopNet Common Types Library
 pub mod db;
-pub mod debug;
 pub mod devices;
 pub mod documentprovider;
 pub mod fileprovider;
 pub mod hash;
+pub mod height;
 pub mod mount;
 pub mod photo_ingress;
 pub mod quorum;
 pub mod setup;
 pub mod shares;
+pub mod snapshot;
 pub mod users;
 pub mod views;
 
@@ -22,7 +23,6 @@ pub use db::{
     CustomUUID, FileItem, ImportPathCounts, ImportPathRow, ImportPathStatus, ImportRecord,
     ImportStatus, InodeType, TakeoutRecord, TakeoutStatus,
 };
-pub use debug::{StateSnapshot, TableHashInfo};
 pub use devices::{DeviceInfo, RegisterDeviceRequest, RegisterDeviceResponse};
 pub use fileprovider::{
     ChangesQuery, ChangesResponse, DeleteItemRequest, EnumerateResponse, FileProviderItem,
@@ -33,5 +33,9 @@ pub use photo_ingress::{AgentRegistration, DisableRequest, DisableResponse, Phot
 pub use shares::{
     AcceptShareRequest, IncomingShareResponse, ShareCountResponse, ShareDetailResponse,
     ShareParticipant, ShareRequest,
+};
+pub use snapshot::{
+    NodeStateReport, SectionManifest, SectionSpec, SnapshotManifest, TableManifest, TableRole,
+    TableSpec,
 };
 pub use users::{OnboardingFlag, OnboardingFlags, PublicUserInfo, SelfUserInfo};

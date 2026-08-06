@@ -134,7 +134,7 @@ pub(crate) fn item_from_wire(wire: MountItem) -> Item {
         kind,
         created,
         modified: wire.modified_ms.map(ms_to_system_time).unwrap_or(created),
-        height: wire.height.map(i64::from).unwrap_or(0),
+        height: wire.height.unwrap_or(0),
         blob: wire.blob_id,
     }
 }
@@ -168,7 +168,7 @@ async fn parse_mutation(response: reqwest::Response) -> Result<Mutated, Transpor
         .map_err(|e| TransportError::Protocol(e.to_string()))?;
     Ok(Mutated {
         item: wire.item.map(item_from_wire),
-        height: Height::from(wire.height),
+        height: wire.height,
     })
 }
 
@@ -248,15 +248,13 @@ impl NodeTransport for HttpTransport {
 
     fn changes(&self, since: Height) -> BoxFuture<'_, Result<Changes, TransportError>> {
         Box::pin(async move {
-            // Wire heights are i32; clamp the anchor-init sentinel.
-            let since_wire = since.clamp(0, i32::MAX as Height) as i32;
-            let query = vec![("since_height", since_wire.to_string())];
+            let query = vec![("since_height", since.to_string())];
             let response = self.get_authed("changes", &query).await?;
             let wire = parse_json::<MountChangesResponse>(response).await?;
             Ok(Changes {
                 items: wire.items.into_iter().map(item_from_wire).collect(),
                 deleted: wire.deleted_ids,
-                height: Height::from(wire.height),
+                height: wire.height,
             })
         })
     }

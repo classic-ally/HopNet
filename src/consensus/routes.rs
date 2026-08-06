@@ -76,7 +76,7 @@ fn node_row(app_state: &AppState, node_id: i32) -> Option<crate::types::Node> {
 // route to get acceptable validators for a given height
 pub async fn get_validators(
     State(app_state): State<AppState>,
-    Json(height): Json<i32>,
+    Json(height): Json<u64>,
 ) -> impl IntoResponse {
     match db::get_validators(app_state.db_pool.get(), height) {
         Ok(nodes) => (StatusCode::OK, Json(nodes)).into_response(),
@@ -94,8 +94,8 @@ pub async fn get_validators(
 #[derive(Serialize, Debug)]
 pub struct DebugViewState {
     pub node_id: i32,
-    pub queried_view: i32,
-    pub height_at_view: i32,
+    pub queried_view: u64,
+    pub height_at_view: u64,
     pub is_active_at_height: bool,
     /// This node's own latest departure kind at the queried height
     /// (height-scoped: stays "voted_out" at pre-readmission heights even
@@ -107,7 +107,7 @@ pub struct DebugViewState {
 
 pub async fn debug_view_state(
     State(app_state): State<AppState>,
-    Json(view): Json<i32>,
+    Json(view): Json<u64>,
 ) -> impl IntoResponse {
     let (node_id, is_active, last_departure_kind) = {
         let mut conn = match app_state.db_pool.get() {
@@ -167,7 +167,7 @@ pub async fn debug_view_state(
     } else {
         let mut ids: Vec<i32> = validators.iter().map(|n| n.node_id).collect();
         ids.sort_unstable();
-        let idx = (view.max(0) as usize) % ids.len();
+        let idx = (view as usize) % ids.len();
         node_row(&app_state, ids[idx])
     };
 
@@ -187,8 +187,8 @@ pub async fn debug_view_state(
 // View history entry for debugging/monitoring
 #[derive(Serialize, Debug)]
 pub struct ViewHistoryEntry {
-    pub view: i32,
-    pub height: i32,
+    pub view: u64,
+    pub height: u64,
     pub has_propose_qc: bool,
     pub has_lock_qc: bool,
     pub has_tc: bool,
@@ -229,8 +229,8 @@ pub async fn get_consensus_history(State(app_state): State<AppState>) -> impl In
         let hash: Vec<u8> = row.get(1)?;
         let has_cert: bool = row.get(2)?;
         Ok(ViewHistoryEntry {
-            view: height as i32,
-            height: height as i32,
+            view: hopnet_common::height::height_from_db(height),
+            height: hopnet_common::height::height_from_db(height),
             has_propose_qc: has_cert,
             has_lock_qc: has_cert,
             has_tc: false,
@@ -301,6 +301,18 @@ pub async fn post_leave(State(app_state): State<AppState>) -> impl IntoResponse 
         Ok(Err(ConsensusSubmitError::Rejected(r))) => {
             (StatusCode::CONFLICT, format!("leave refused: {r}")).into_response()
         }
+        Ok(Err(ConsensusSubmitError::Moratorium {
+            phase,
+            target_version_code,
+        })) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "5")],
+            Json(crate::regenesis::routes::refusal_view(
+                phase,
+                target_version_code,
+            )),
+        )
+            .into_response(),
         Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("leave failed: {e:?}"),
@@ -417,14 +429,13 @@ pub async fn rpc_auth_middleware(
     }
 }
 
-/// GET /debug/state-snapshot — full-table content hashes for divergence checks
+/// GET /debug/state — the canonical snapshot manifest (per-table,
+/// per-section, and top hashes) plus the height it was computed at. The
+/// top hash is the one-line cross-node equality check; the same walk
+/// produces the epoch snapshot artifact (RFC-019).
 pub async fn get_state_snapshot(State(app_state): State<AppState>) -> impl IntoResponse {
-    match crate::db::debug::compute_state_snapshot(app_state.db_pool.get()) {
-        Ok(internal_snapshot) => {
-            // Convert internal (Blake3Hash) to wire format (String)
-            let wire_snapshot: hopnet_common::StateSnapshot = internal_snapshot.into();
-            (axum::http::StatusCode::OK, Json(wire_snapshot)).into_response()
-        }
+    match crate::db::snapshot::compute_node_state(app_state.db_pool.get()) {
+        Ok(report) => (axum::http::StatusCode::OK, Json(report)).into_response(),
         Err(e) => {
             tracing::error!("Failed to compute state snapshot: {:?}", e);
             (

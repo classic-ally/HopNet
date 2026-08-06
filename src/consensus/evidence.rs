@@ -41,7 +41,7 @@ pub struct PeerEvidence {
     pub last_probe_at: Option<Instant>,
     pub probes_since_contact: u32,
     pub bright_since: Option<Instant>,
-    pub last_known_height: Option<i64>,
+    pub last_known_height: Option<u64>,
 }
 
 /// Copy-out view — snapshots never alias the live map.
@@ -53,7 +53,7 @@ pub struct EvidenceMap {
     origin: Instant,
     /// Decided height when the evidence began (first scheduler pass wins);
     /// the proven-quorum ceiling's pre-boot arm.
-    boot_height: once_cell::sync::OnceCell<i64>,
+    boot_height: once_cell::sync::OnceCell<u64>,
     /// bright_since reset gap in millis: the band-independent upper bound
     /// t_unresponsive(Lazy). Initialized from the default policy; the
     /// probe scheduler refreshes it from the replicated policy each scan.
@@ -83,11 +83,11 @@ impl EvidenceMap {
     }
 
     /// Set once by the probe scheduler's first pass (idempotent).
-    pub fn set_boot_height(&self, h: i64) {
+    pub fn set_boot_height(&self, h: u64) {
         let _ = self.boot_height.set(h);
     }
 
-    pub fn boot_height(&self) -> Option<i64> {
+    pub fn boot_height(&self) -> Option<u64> {
         self.boot_height.get().copied()
     }
 
@@ -106,7 +106,7 @@ impl EvidenceMap {
 
     /// Contact that also proved a decided height (status-probe response,
     /// certificate signature at its height).
-    pub fn record_contact_with_height(&self, node_id: i32, height: i64) {
+    pub fn record_contact_with_height(&self, node_id: i32, height: u64) {
         self.record_at(node_id, Some(height), Instant::now());
     }
 
@@ -124,7 +124,7 @@ impl EvidenceMap {
         out
     }
 
-    pub(crate) fn record_at(&self, node_id: i32, height: Option<i64>, now: Instant) {
+    pub(crate) fn record_at(&self, node_id: i32, height: Option<u64>, now: Instant) {
         let reset_gap = Duration::from_millis(self.reset_gap_ms.load(Ordering::Relaxed));
         let mut map = self.inner.lock();
         let entry = map.entry(node_id).or_insert(PeerEvidence {
@@ -267,14 +267,30 @@ pub enum StatusRequest {
     /// circularity (each side's probes keeping the other's view fresh)
     /// leaves exactly one probe direction per pair and the responder
     /// heightless.
-    Ping { decided_height: u64 },
+    ///
+    /// Also the hello of the (epoch, version) handshake (RFC-019 S6):
+    /// both sides learn each other's identity and log a structured
+    /// refusal on mismatch — turning the silent signature-domain failure
+    /// (chain_id is mixed into every vote) into a diagnosable one. The
+    /// responder still answers and records contact: reachability is a
+    /// transport fact, orthogonal to epoch membership.
+    Ping {
+        decided_height: u64,
+        epoch: u64,
+        version_code: u32,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum StatusResponse {
     /// Current decided height (0 pre-genesis/pre-engine — reachability is
-    /// a transport property; a zero height just fails catch-up gates).
-    Pong { decided_height: u64 },
+    /// a transport property; a zero height just fails catch-up gates),
+    /// plus the responder's (epoch, version) — see Ping.
+    Pong {
+        decided_height: u64,
+        epoch: u64,
+        version_code: u32,
+    },
 }
 
 /// Inbound status scope: mesh plane, inline on the net runtime — one
@@ -293,14 +309,31 @@ impl hopnet_comms::RpcHandler for StatusScope {
         Box::pin(async move {
             // An inbound probe is itself an authenticated exchange — and it
             // carries the prober's height (see StatusRequest::Ping).
+            let my_epoch = app_state.epoch.load(std::sync::atomic::Ordering::Relaxed);
             match bincode::serde::decode_from_slice::<StatusRequest, _>(
                 &_payload,
                 bincode::config::standard(),
             ) {
-                Ok((StatusRequest::Ping { decided_height }, _)) => {
+                Ok((
+                    StatusRequest::Ping {
+                        decided_height,
+                        epoch,
+                        version_code,
+                    },
+                    _,
+                )) => {
                     app_state
                         .evidence
-                        .record_contact_with_height(peer.node_id, decided_height as i64);
+                        .record_contact_with_height(peer.node_id, decided_height);
+                    if epoch != my_epoch {
+                        tracing::warn!(
+                            peer = peer.node_id,
+                            peer_epoch = epoch,
+                            peer_version = %crate::version::format_code(version_code),
+                            local_epoch = my_epoch,
+                            "handshake: peer is in a different epoch (needs epoch join / upgrade)"
+                        );
+                    }
                 }
                 Err(_) => app_state.evidence.record_contact(peer.node_id),
             }
@@ -310,7 +343,11 @@ impl hopnet_comms::RpcHandler for StatusScope {
                 .map(|e| *e.decided.borrow())
                 .unwrap_or(0);
             bincode::serde::encode_to_vec(
-                &StatusResponse::Pong { decided_height },
+                &StatusResponse::Pong {
+                    decided_height,
+                    epoch: my_epoch,
+                    version_code: crate::version::effective_running_code(),
+                },
                 bincode::config::standard(),
             )
             .unwrap_or_default()
@@ -324,11 +361,14 @@ pub async fn status_probe(
     comms: &hopnet_comms::IrohComms,
     peer: &hopnet_comms::PeerRef,
     my_decided_height: u64,
+    my_epoch: u64,
     timeout: Duration,
-) -> Result<u64, String> {
+) -> Result<(u64, u64), String> {
     let payload = bincode::serde::encode_to_vec(
         &StatusRequest::Ping {
             decided_height: my_decided_height,
+            epoch: my_epoch,
+            version_code: crate::version::effective_running_code(),
         },
         bincode::config::standard(),
     )
@@ -340,8 +380,64 @@ pub async fn status_probe(
     let (resp, _) =
         bincode::serde::decode_from_slice::<StatusResponse, _>(&raw, bincode::config::standard())
             .map_err(|e| format!("decode: {e}"))?;
-    let StatusResponse::Pong { decided_height } = resp;
-    Ok(decided_height)
+    let StatusResponse::Pong {
+        decided_height,
+        epoch,
+        version_code,
+    } = resp;
+    if epoch != my_epoch {
+        tracing::warn!(
+            peer = peer.node_id,
+            peer_epoch = epoch,
+            peer_version = %crate::version::format_code(version_code),
+            local_epoch = my_epoch,
+            "handshake: peer answered from a different epoch"
+        );
+    }
+    // The peer's epoch escapes to the caller (RFC-019 S7): a node that
+    // slept through a boundary while the mesh stayed quiet has nothing
+    // else to learn from — no sync to fail, no gossip to arrive. The
+    // pong is its only signal that it must rejoin.
+    Ok((decided_height, epoch))
+}
+
+/// What a pong obliges the PROBER to do about its own state.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PongAction {
+    /// The responder is in a NEWER epoch: no amount of block sync crosses
+    /// a boundary — rejoin via the epoch-join path (RFC-019 S7).
+    EpochJoin,
+    /// Same epoch, responder decided past us: kick decided-value sync.
+    KickSync,
+    /// The responder is level, behind, or in an OLDER epoch: nothing to
+    /// learn from it.
+    Nothing,
+}
+
+/// Classify a pong against the prober's own (epoch, decided). Epoch
+/// comparison dominates height — heights from another epoch don't compare.
+///
+/// The KickSync arm is the prober's only SELF-lag signal that still works
+/// once the mesh has unseated it: gossip is valset-only, a
+/// TransactionForward only reaches whoever the forwarder believes is
+/// proposer, and the tip-poll's is_node_active gate reads the node's own
+/// valset view — which cannot contain an eviction it hasn't synced yet.
+/// Observed in production: a validator that stalled at height h and was
+/// voted out effective h+1 sat for days rebroadcasting a stale Prevote
+/// with zero sync attempts, every other trigger structurally dead.
+pub(crate) fn classify_pong(
+    my_epoch: u64,
+    peer_epoch: u64,
+    my_decided: u64,
+    pong_height: u64,
+) -> PongAction {
+    if peer_epoch > my_epoch {
+        return PongAction::EpochJoin;
+    }
+    if peer_epoch == my_epoch && pong_height > my_decided {
+        return PongAction::KickSync;
+    }
+    PongAction::Nothing
 }
 
 // ============================================================================
@@ -377,7 +473,7 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 continue;
             };
             let decided = *engine.decided.borrow();
-            app_state.evidence.set_boot_height(decided as i64);
+            app_state.evidence.set_boot_height(decided);
 
             let (policy, profile, seated, seat_starts, pool) = {
                 let Ok(conn) = app_state.db_pool.get() else {
@@ -396,14 +492,14 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 .and_then(|b| String::from_utf8(b).ok())
                 .and_then(|s| QuorumProfile::parse(&s))
                 .unwrap_or(QuorumProfile::Auto);
-                let pending = i32::try_from(decided.saturating_add(1)).unwrap_or(i32::MAX);
+                let pending = decided.saturating_add(1);
                 let seated: Vec<i32> =
                     crate::db::consensus::get_validators_with_conn(&conn, pending)
                         .map(|v| v.into_iter().map(|n| n.node_id).collect())
                         .unwrap_or_default();
                 // Seat starts (proven pre-boot arm) + the candidate pool
                 // (registered minus seated, with each one's last departure).
-                let mut seat_starts: Vec<(i32, i32)> = Vec::with_capacity(seated.len());
+                let mut seat_starts: Vec<(i32, u64)> = Vec::with_capacity(seated.len());
                 for id in &seated {
                     if let Ok(Some(h)) =
                         hopnet_consensus::validators::activation_height(&conn, *id, pending)
@@ -447,6 +543,7 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 now,
             );
             let t_probe = policy.t_probe(est.band);
+            let my_epoch = app_state.epoch.load(Ordering::Relaxed);
 
             // Targets = every registered node except self (pool nodes are
             // probed too — reputation for candidates, spec Decisions).
@@ -477,9 +574,38 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 let comms = app_state.comms.clone();
                 let evidence = app_state.evidence.clone();
                 let g = policy.grace;
+                let probe_state = app_state.clone();
                 tokio::spawn(async move {
-                    if let Ok(h) = status_probe(&comms, &peer, decided, g).await {
-                        evidence.record_contact_with_height(peer.node_id, h as i64);
+                    if let Ok((h, peer_epoch)) =
+                        status_probe(&comms, &peer, decided, my_epoch, g).await
+                    {
+                        evidence.record_contact_with_height(peer.node_id, h);
+                        match classify_pong(my_epoch, peer_epoch, decided, h) {
+                            // The offline-through-regenesis case (RFC-019
+                            // S7): this node woke in a sealed epoch with a
+                            // quiet mesh around it. Nothing will sync and
+                            // nothing will gossip — the pong is the only
+                            // thing that tells it to rejoin.
+                            PongAction::EpochJoin => {
+                                crate::regenesis::join::spawn_epoch_join(
+                                    &probe_state,
+                                    crate::regenesis::join::JoinAnchor::OwnDb,
+                                    vec![peer],
+                                );
+                            }
+                            // Same-epoch lag discovery (see classify_pong):
+                            // `decided` is the scan-start snapshot, and the
+                            // kick re-checks against the live watch before
+                            // spawning a sync.
+                            PongAction::KickSync => {
+                                crate::consensus::malachite::engine::kick_sync_if_behind(
+                                    &probe_state,
+                                    h,
+                                    peer.node_id,
+                                );
+                            }
+                            PongAction::Nothing => {}
+                        }
                     }
                     // Failure: the silence is already recorded as the
                     // unanswered probe.
@@ -565,7 +691,7 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                         my_id,
                         boot_height: app_state.evidence.boot_height(),
                         seat_starts: &seat_starts,
-                        pending_height: decided.saturating_add(1) as i64,
+                        pending_height: decided.saturating_add(1),
                     };
                     if let Some(batch) =
                         crate::consensus::membership_guards::plan_seating_batch(&inp, &pool)
@@ -636,7 +762,7 @@ pub fn evidence_inputs(
             .and_then(|b| String::from_utf8(b).ok())
             .and_then(|s| QuorumProfile::parse(&s))
             .unwrap_or(QuorumProfile::Auto);
-    let pending = i32::try_from(decided.saturating_add(1)).unwrap_or(i32::MAX);
+    let pending = decided.saturating_add(1);
     let seated: Vec<i32> = crate::db::consensus::get_validators_with_conn(conn, pending)
         .map(|v| v.into_iter().map(|n| n.node_id).collect())
         .unwrap_or_default();
@@ -748,6 +874,44 @@ mod tests {
             bright_since: Some(last_contact),
             last_known_height: None,
         }
+    }
+
+    // Impact: this row WAS the production rejoin deadlock — a voted-out
+    // node's pongs said "the mesh is 33k heights ahead" on every probe
+    // cycle and the scheduler discarded the comparison, so an evicted
+    // node could never discover its own lag (every other trigger is
+    // structurally dead for it: gossip is valset-only, TransactionForward
+    // targets the proposer, the tip-poll gate reads the node's own stale
+    // valset view).
+    // Should: kick decided-value sync when a same-epoch peer's pong is
+    // ahead of our decided height.
+    #[test]
+    fn classify_pong_kicks_sync_when_a_same_epoch_peer_is_ahead() {
+        assert_eq!(classify_pong(1, 1, 2430, 35740), PongAction::KickSync);
+        assert_eq!(classify_pong(1, 1, 0, 1), PongAction::KickSync);
+    }
+
+    // Should: do nothing when a same-epoch peer is level with us or
+    // behind us — the pong carries nothing we lack.
+    #[test]
+    fn classify_pong_ignores_a_level_or_lagging_peer() {
+        assert_eq!(classify_pong(1, 1, 10, 10), PongAction::Nothing);
+        assert_eq!(classify_pong(1, 1, 10, 3), PongAction::Nothing);
+    }
+
+    // Should: route a newer-epoch pong to epoch join regardless of the
+    // relative heights — block sync never crosses a boundary.
+    #[test]
+    fn classify_pong_joins_a_newer_epoch_at_any_height() {
+        assert_eq!(classify_pong(1, 2, 10, 999), PongAction::EpochJoin);
+        assert_eq!(classify_pong(1, 2, 999, 10), PongAction::EpochJoin);
+    }
+
+    // Should not: let a height from an OLDER epoch drag us into a sync —
+    // heights don't compare across epochs.
+    #[test]
+    fn classify_pong_never_syncs_toward_a_retired_epoch() {
+        assert_eq!(classify_pong(2, 1, 10, 999), PongAction::Nothing);
     }
 
     // Should: classification be a pure function of the snapshot — same

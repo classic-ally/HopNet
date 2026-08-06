@@ -44,6 +44,99 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       (graceful-leave, evidence-observe, vote-out-after-kill,
       mesh-growth, auto-seam, consensus-bft-quorum-loss), divergence
       clean.
+- [~] Regenesis: epoch compression + coordinated upgrades — SPECIFIED
+      ([RFC-019](specs/regenesis.md), 2026-07-30): operator-initiated
+      epoch boundaries (drain → seal → certified snapshot → fresh
+      genesis at a CONTINUOUS height) discharging catchup cost and
+      history storage; the decide certificate of the final block IS
+      the snapshot certificate. Landed: S0 app-layer u64 heights
+      (lossless SQLite bit-cast mapping); S1 canonical snapshot
+      serializer (domain-tagged binary encoding, per-module
+      SNAPSHOT_SECTION registry pinned against sqlite_master,
+      decided_blocks divergence-checked but never exported, golden
+      tests) with the orchestrator divergence check rebuilt on the
+      manifest's top hash — and now a real gate that fails the run on
+      divergence; S2 Projection snapshot seam (RFC-016 amendment:
+      projections declare their own sections) + fresh-DB artifact
+      import, byte-identical roundtrip gate green; S3 staged versions
+      (CalVer integer codes, Cargo.toml authoritative; per-node
+      running/staged attestation columns via the node_staged_version
+      tx) + v1 git-release upgrade provider (reports
+      available-but-unstaged from the Forgejo releases API) +
+      /api/views/upgrade-readiness advisory; S4 epoch-boundary model
+      (`epoch_policy` in validator_membership.qnt: the restart lands
+      inside the membership machine's inductive invariant, so the
+      whole safety matrix transfers across the boundary depth-free;
+      seal safety via inductively-checked ghost) + the seal contract
+      note (hopnet-consensus/spec/regenesis-seal-contract.md); S5
+      boundary protocol — regenesis_start/commit/abort txs over the
+      regenesis_state singleton (seated-validator authz, staged-target
+      precondition), the layered freeze (503 + structured refusal →
+      queue-chokepoint admissibility seam → vote-time solo/binding/
+      vote-iff-match/sealed checks → engine halt at terminal H),
+      drain watcher + proposer commit injection (snapshot_hash =
+      blake3 of the artifact bytes), durable seal marker + byte-
+      certified artifact next to the database; evidence at four
+      layers (handler/vote-time units, seeded sim drain+seal
+      scenarios, real-engine loopback e2e, orchestrator scenario);
+      S6 genesis construction + restart — deterministic
+      EpochGenesisRecord in a genesis Block at boundary height H
+      (chain_id(N+1) = its hash; the node-local decide certificate
+      rides BESIDE the genesis in the forever-kept lineage record),
+      pre-pool boot transition (`regenesis::boot`: VERSION/LINEAGE/
+      IMPORT/CARRY gates, one-transaction fresh-DB build, atomic
+      swap, rollback window until the first epoch-2 decide), derived
+      restart (exit 75 at version match; awaiting-upgrade parked
+      ALIVE otherwise, surfaced on the status view), (epoch, version)
+      handshake on the status probe + DecidedFetch, test-gated
+      version-override seams; evidence: boot/genesis units incl. a
+      canonical-bytes golden, in-process single-node transition
+      roundtrip (epoch 2 decides H+1 and seals itself again),
+      orchestrator regenesis-restart (full cycle, exit 75, epoch-2
+      coherence) + regenesis-awaiting-upgrade (parked-alive, per-node
+      swap, liveness gate).
+  - S7 — stragglers + rejoin: a `regenesis` comms scope serving
+      lineage records and the boundary snapshot in resumable 4MiB
+      chunks (engineless, so parked and sealed nodes rescue
+      stragglers); hop-by-hop lineage-chain verification with the
+      weak-subjectivity overlap rule (thresholds from the active
+      quorum profile, never hardcoded); stage-then-restart for a
+      straggler, reusing the S6 boot rebuild, with the version gate
+      ahead of anything schema-touching; in-process epoch join for
+      fresh nodes, which subsumes the height-0 bootstrap; a manual
+      re-trust route for churn past the overlap window; post-import
+      fragment reconcile. Evidence: overlap/chain units, staged-boot
+      gate battery, an in-process straggler rejoin over real comms
+      ending in byte-identical state, and the orchestrator
+      straggler-rejoin / diverged-node-rebuild scenarios.
+  - S8 — upgrade epoch end-to-end: the version-bump flow was already
+      covered by S6's awaiting-upgrade scenario, and a second real
+      image was rejected as theatre for a no-op bump (identical
+      schemas — nothing for it to catch). The substance was the
+      rollback window, which had never been exercised and whose
+      documented procedure did not work: restoring the retained
+      database by hand leaves the sealed marker and committed phase
+      in place, so the next boot either re-crosses the boundary or
+      parks with no consensus. Rollback is now a marker the boot path
+      honours ahead of every other path, covering the crossed and the
+      never-crossed node alike, resumable across a crash, and exposed
+      as an authenticated route. Evidence: boot units per arrangement
+      and per crash point (incl. a regression pinning the old
+      re-cross), and the orchestrator regenesis-rollback drill —
+      abandon mesh-wide, prove the mesh RUNS again, then prove the
+      window is refused once the next epoch decides.
+  - **RFC-019 is complete**, with one round of post-review remediation on
+    the joiner's trust boundary. A lineage record is PEER DATA and only
+    its certificate is evidence, so every record field a joiner acts on is
+    now cross-checked against the boundary block's `regenesis_commit`
+    (`snapshot_hash`, `seal_height`, `target_version_code` all live inside
+    the certified block for exactly this reason). Operator re-trust
+    SUBSTITUTES an out-of-band chain-id fingerprint for the overlap rule
+    instead of waiving it — waiving left each hop verified against the
+    validator set declared inside its own record, i.e. self-certifying.
+    And the sealed marker is derived from the committed phase, so a crash
+    between the decide and the seal work can no longer leave a node
+    running on a retired chain.
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

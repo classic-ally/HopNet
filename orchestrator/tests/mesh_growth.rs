@@ -19,7 +19,7 @@ pub struct MeshGrowth;
 
 pub(crate) async fn rebuild_nodes(docker: &Docker, mesh_id: u32) -> Result<Vec<NodeInfo>> {
     let addresses =
-        crate::get_external_addresses(docker, mesh_id, crate::sys::ContainerRuntime::Docker)
+        crate::get_external_addresses(docker, mesh_id, crate::sys::detect_runtime(docker).await?)
             .await?;
     let mut nodes = Vec::new();
     for (node_id, ip_address, port) in addresses {
@@ -27,7 +27,7 @@ pub(crate) async fn rebuild_nodes(docker: &Docker, mesh_id: u32) -> Result<Vec<N
             docker,
             mesh_id,
             node_id,
-            crate::sys::ContainerRuntime::Docker,
+            crate::sys::detect_runtime(docker).await?,
         )
         .await?;
         nodes.push(NodeInfo {
@@ -49,7 +49,7 @@ async fn seated_count(client: &Client, node: &NodeInfo, height: i64) -> usize {
     let Ok(resp) = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
-        .json(&(height as i32))
+        .json(&height)
         .timeout(Duration::from_secs(10))
         .send()
         .await
@@ -93,7 +93,13 @@ impl TestScenario for MeshGrowth {
         );
 
         // 2. Add one node — it is a lateral candidate.
-        crate::add_nodes_to_mesh(&docker, mesh_id, 1, crate::sys::ContainerRuntime::Docker).await?;
+        crate::add_nodes_to_mesh(
+            &docker,
+            mesh_id,
+            1,
+            crate::sys::detect_runtime(&docker).await?,
+        )
+        .await?;
         let after1 = rebuild_nodes(&docker, mesh_id).await?;
         let newcomer = after1.last().cloned().unwrap();
 
@@ -130,7 +136,13 @@ impl TestScenario for MeshGrowth {
         );
 
         // 4. Add a second node — now a gaining batch of 2 (3->5).
-        crate::add_nodes_to_mesh(&docker, mesh_id, 1, crate::sys::ContainerRuntime::Docker).await?;
+        crate::add_nodes_to_mesh(
+            &docker,
+            mesh_id,
+            1,
+            crate::sys::detect_runtime(&docker).await?,
+        )
+        .await?;
         let after2 = rebuild_nodes(&docker, mesh_id).await?;
 
         // 5. MONEY: v reaches 5, and no height ever reports exactly 4 —

@@ -107,11 +107,7 @@ pub fn proposal_target(app_state: &AppState) -> Option<(u64, u32, i32)> {
     }
     let pending = decided + 1;
     let conn = app_state.db_pool.get().ok()?;
-    let validators = crate::db::consensus::get_validators_with_conn(
-        &conn,
-        i32::try_from(pending).unwrap_or(i32::MAX),
-    )
-    .ok()?;
+    let validators = crate::db::consensus::get_validators_with_conn(&conn, pending).ok()?;
     if validators.is_empty() {
         return None;
     }
@@ -141,6 +137,28 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         let last_decided = store::last_decided_height(&conn)
             .map_err(|e| format!("spawn_engine: {e}"))?
             .ok_or("spawn_engine: no consensus genesis installed")?;
+        // RFC-019 seal contract: a sealed epoch never restarts its engine —
+        // the node parks awaiting the S6 restart path. The artifact is
+        // recomputed on wake if a crash interrupted the seal work
+        // (idempotent from sealed local state).
+        if let Some(sealed_at) = crate::regenesis::seal::sealed_marker(&conn) {
+            tracing::warn!(
+                sealed_at,
+                "epoch is sealed: consensus engine will not start (awaiting restart)"
+            );
+            let recompute_state = app_state.clone();
+            std::thread::spawn(move || {
+                if !crate::regenesis::seal::artifact_path().exists()
+                    && let Err(e) = crate::regenesis::seal::write_seal_artifact_to(
+                        &recompute_state,
+                        &crate::regenesis::seal::artifact_path(),
+                    )
+                {
+                    tracing::error!("seal artifact recompute failed: {e}");
+                }
+            });
+            return Ok(());
+        }
         let chain_bytes = store::meta_get(&conn, store::META_CHAIN_ID)
             .map_err(|e| format!("spawn_engine: {e}"))?
             .ok_or("spawn_engine: no chain id in consensus_meta")?;
@@ -318,6 +336,19 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
     // plane on the caller's (main) runtime; placement batcher on queue_rt.
     crate::storage_host::substrate_host::spawn_storage_engine(app_state);
 
+    // Regenesis drain watcher (RFC-019 S5): wakes the on-demand engine to
+    // propose the commit once a moratorium drains — including after a
+    // crash mid-moratorium, since this spawns on every engine start.
+    spawn_drain_watcher(
+        app_state.clone(),
+        input_tx.clone(),
+        app_state.consensus_queue.pending_pool(),
+    );
+
+    // Rollback-window cleanup (RFC-019 S6): a freshly transitioned epoch
+    // retains the sealed epoch-N database until its own first decide.
+    spawn_rollback_cleanup(app_state.clone(), decided.clone());
+
     let engine = EngineHandle {
         input_tx,
         decided,
@@ -332,7 +363,10 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
     // Non-validator tip-poll (RFC-CONSENSUS-002 S1): a node outside the
     // valset receives no consensus gossip (gossip::peers is valset-only),
     // so it polls peers' decided tips and feeds sync. Cheap when seated:
-    // one indexed validators lookup per tick, then sleep.
+    // one indexed validators lookup per tick, then sleep. CAVEAT: its
+    // gate is the node's OWN valset view, so it cannot cover a node that
+    // hasn't yet synced its own eviction — that discovery belongs to the
+    // probe scheduler's pong path (evidence::classify_pong).
     spawn_tip_poll(app_state.clone());
 
     // Evidence probe scheduler (RFC-CONSENSUS-002 S3): the deadline scan
@@ -351,7 +385,33 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
 /// cohort doesn't poll in lockstep.
 const TIP_POLL_BASE: Duration = Duration::from_secs(5);
 
-fn spawn_tip_poll(app_state: AppState) {
+/// True when a sync ended because the mesh is in a NEWER epoch. There is
+/// nothing to retry in that case — no amount of block sync crosses a
+/// boundary — so this starts the epoch join instead (RFC-019 S7) and the
+/// caller skips its usual failure logging.
+fn pivot_on_epoch_ahead(app_state: &AppState, e: &sync::SyncError) -> bool {
+    let sync::SyncError::EpochAhead { peer, peer_epoch } = e else {
+        return false;
+    };
+    tracing::info!(
+        peer,
+        peer_epoch,
+        "sync refused: the mesh crossed an epoch boundary this node missed — starting epoch join"
+    );
+    let Ok(node_id) = app_state.get_node_id() else {
+        return true;
+    };
+    // Hint the peer that answered: it demonstrably holds the new epoch.
+    let peers = sync::peer_list(&app_state.db_pool, node_id, Some(*peer));
+    crate::regenesis::join::spawn_epoch_join(
+        app_state,
+        crate::regenesis::join::JoinAnchor::OwnDb,
+        peers,
+    );
+    true
+}
+
+pub(crate) fn spawn_tip_poll(app_state: AppState) {
     crate::consensus::queue::queue_rt().spawn(async move {
         loop {
             let jitter_ns = (std::time::SystemTime::now()
@@ -377,15 +437,27 @@ fn spawn_tip_poll(app_state: AppState) {
                 // Fail closed: on a query error assume seated and skip —
                 // gossip is then feeding us anyway or the node is broken
                 // in ways a poll won't fix.
-                hopnet_consensus::validators::is_node_active(
-                    &conn,
-                    node_id,
-                    i32::try_from(pending).unwrap_or(i32::MAX),
-                )
-                .unwrap_or(true)
+                hopnet_consensus::validators::is_node_active(&conn, node_id, pending)
+                    .unwrap_or(true)
             };
             if am_active {
-                continue;
+                // Seated nodes normally skip: live gossip feeds them. ONE
+                // exception (RFC-019 S5): during a regenesis boundary the
+                // mesh may have already sealed and gone SILENT — a seated
+                // straggler that missed the final block would otherwise
+                // churn rounds at the boundary height forever, with nothing
+                // pushing the seal to it. Poll while the committed phase is
+                // not normal; the pulled commit block seals this node too
+                // (Sync-origin validation skips vote-iff-match by design).
+                let boundary_in_flight = app_state
+                    .db_pool
+                    .get()
+                    .ok()
+                    .and_then(|c| crate::db::regenesis::read_regenesis_state(&c).ok())
+                    .is_some_and(|s| s.phase != crate::db::regenesis::RegenesisPhase::Normal);
+                if !boundary_in_flight {
+                    continue;
+                }
             }
             if engine.sync_inflight.swap(true, Ordering::SeqCst) {
                 continue; // one sync at a time
@@ -394,12 +466,14 @@ fn spawn_tip_poll(app_state: AppState) {
             let mut decided = engine.decided.clone();
             if let Err(e) = sync::sync_to_tip(
                 &app_state.comms,
+                app_state.epoch.load(Ordering::Relaxed),
                 &engine.input_tx,
                 &mut decided,
                 &peers,
                 Some(app_state.evidence.clone()),
             )
             .await
+                && !pivot_on_epoch_ahead(&app_state, &e)
             {
                 tracing::debug!("tip-poll sync: {e:?}");
             }
@@ -440,13 +514,36 @@ pub async fn bootstrap_join(
             .is_some()
     };
 
-    if !already_installed {
+    if !already_installed && join_info.epoch >= 2 {
+        // The mesh is past its first epoch: the trusted height-0 genesis
+        // no longer exists to fetch. Verify the lineage chain and import
+        // the boundary snapshot instead — epoch join SUBSUMES the
+        // height-0 bootstrap (RFC-019 S7). In process: the database holds
+        // only this_node, so there is nothing to swap.
+        let data_dir = std::path::Path::new(&crate::db::shared::get_database_path())
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or("database path has no parent directory")?;
+        crate::regenesis::join::epoch_join_bootstrap(
+            app_state,
+            &data_dir,
+            join_info.epoch,
+            &peers,
+            crate::version::effective_running_code(),
+        )
+        .await
+        .map_err(|e| format!("epoch join: {e}"))?;
+    } else if !already_installed {
         let profile = QuorumProfile::parse(&join_info.quorum_profile)
             .ok_or_else(|| format!("unknown quorum profile {:?}", join_info.quorum_profile))?;
 
-        let (block, cert) = sync::fetch_genesis(&app_state.comms, &peers)
-            .await
-            .map_err(|e| format!("genesis fetch: {e}"))?;
+        let (block, cert) = sync::fetch_genesis(
+            &app_state.comms,
+            app_state.epoch.load(std::sync::atomic::Ordering::Relaxed),
+            &peers,
+        )
+        .await
+        .map_err(|e| format!("genesis fetch: {e}"))?;
 
         let old_txs = super::app::to_old_transactions(&block.data.transactions)
             .map_err(|e| format!("genesis bridge: {e}"))?;
@@ -489,6 +586,7 @@ pub async fn bootstrap_join(
     let mut decided = engine.decided.clone();
     let reached = sync::sync_to_tip(
         &app_state.comms,
+        app_state.epoch.load(std::sync::atomic::Ordering::Relaxed),
         &engine.input_tx,
         &mut decided,
         &peers,
@@ -504,7 +602,7 @@ pub async fn bootstrap_join(
 /// The app-side event loop: answers NeedValue with built proposals, kicks the
 /// sync client on SyncNeeded, and forwards the PendingPool's work signal as
 /// a Resume (on-demand wake rule 1).
-fn spawn_driver(
+pub(crate) fn spawn_driver(
     app_state: AppState,
     node_id: i32,
     input_tx: mpsc::Sender<HostInput>,
@@ -538,6 +636,7 @@ fn spawn_driver(
                             tokio::spawn(async move {
                                 if let Err(e) = sync::sync_to_target(
                                     &app_state.comms,
+                                    app_state.epoch.load(std::sync::atomic::Ordering::Relaxed),
                                     &app_state.db_pool,
                                     node_id,
                                     &input_tx,
@@ -547,6 +646,7 @@ fn spawn_driver(
                                     Some(app_state.evidence.clone()),
                                 )
                                 .await
+                                    && !pivot_on_epoch_ahead(&app_state, &e)
                                 {
                                     tracing::warn!("decided-value sync failed: {e:?}");
                                 }
@@ -572,6 +672,143 @@ fn spawn_driver(
             }
         }
         tracing::info!("malachite engine driver stopped");
+    });
+}
+
+/// Committed regenesis phase, or None on any read failure (treated as
+/// "don't act" by every caller — hygiene skips, seal proposal skips).
+fn committed_regenesis_phase(app_state: &AppState) -> Option<crate::db::regenesis::RegenesisPhase> {
+    let conn = app_state.db_pool.get().ok()?;
+    crate::db::regenesis::read_regenesis_state(&conn)
+        .ok()
+        .map(|s| s.phase)
+}
+
+/// Build the proposer-injected `regenesis_commit` (RFC-019 S5): recompute
+/// the canonical snapshot over ONE transaction snapshot of the build
+/// connection, bind it to the pending height, node-sign. Solo by
+/// construction — only called when no other candidate exists.
+fn seal_candidate(
+    app_state: &AppState,
+    conn: &mut r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>,
+    seal_height: u64,
+) -> Result<crate::consensus::types::Transaction, String> {
+    let started = std::time::Instant::now();
+    let tx_snapshot = conn
+        .transaction()
+        .map_err(|e| format!("snapshot tx: {e}"))?;
+    let artifact_hash = crate::db::snapshot::compute_artifact_hash_tx(&tx_snapshot)
+        .map_err(|e| format!("snapshot compute: {e:?}"))?;
+    drop(tx_snapshot);
+    let mut snapshot_hash = [0u8; 32];
+    snapshot_hash.copy_from_slice(artifact_hash.as_bytes());
+    tracing::info!(
+        seal_height,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        artifact_hash = %artifact_hash.to_hex(),
+        "regenesis commit candidate: artifact recomputed (OQ1 timing)"
+    );
+    // The target is already committed (regenesis_start decided it); copying
+    // it into the commit is what puts it inside the certified block, where a
+    // joiner can bind the lineage record against it.
+    let target_version_code = crate::db::regenesis::read_regenesis_state(conn)
+        .map_err(|e| format!("regenesis state: {e:?}"))?
+        .target_version_code
+        .ok_or("proposing a commit with no committed target version")?;
+    let payload = bincode::serde::encode_to_vec(
+        &crate::regenesis::RegenesisCommit {
+            snapshot_hash,
+            seal_height,
+            target_version_code,
+        },
+        bincode::config::standard(),
+    )
+    .map_err(|e| format!("encode: {e}"))?;
+    crate::consensus::dispatch::create_signed_transaction(
+        app_state,
+        "regenesis_commit".to_string(),
+        payload,
+    )
+    .map_err(|e| format!("sign: {e:?}"))
+}
+
+/// RFC-019 S5 (OQ4): an empty pool never fires the work signal, so a
+/// drained moratorium would leave the on-demand engine paused with nobody
+/// to propose the regenesis commit. This watcher nudges the engine while
+/// (and only while) the committed phase is MORATORIUM and this node's
+/// pool is drained — `Resume` is idempotent, and the nudge stops on its
+/// own once the commit decides (phase leaves MORATORIUM). Lives for the
+/// engine's lifetime; outside a moratorium it is one cheap singleton
+/// read per second.
+/// RFC-019 S6 rollback window: delete the retained epoch-N database
+/// (`database.db.sealed`) once this epoch decides its first height past
+/// the genesis. Exits immediately when nothing is retained — i.e. on
+/// every boot except the first after a boundary. Crash-safe: a decide
+/// followed by a crash before deletion is caught by the initial check on
+/// the next boot's spawn.
+pub(crate) fn spawn_rollback_cleanup(
+    app_state: crate::AppState,
+    mut decided: tokio::sync::watch::Receiver<u64>,
+) {
+    let retained = crate::regenesis::boot::sealed_path(&crate::db::shared::get_database_path());
+    if !retained.exists() {
+        return;
+    }
+    tokio::spawn(async move {
+        let genesis_height = {
+            let Ok(conn) = app_state.db_pool.get() else {
+                tracing::warn!("rollback cleanup: no db conn; retained database kept");
+                return;
+            };
+            match crate::regenesis::genesis::epoch_genesis_height(&conn) {
+                Some(h) => h,
+                None => {
+                    tracing::warn!(
+                        retained = %retained.display(),
+                        "retained database exists but this epoch has no genesis height meta; kept"
+                    );
+                    return;
+                }
+            }
+        };
+        loop {
+            if *decided.borrow() > genesis_height {
+                match std::fs::remove_file(&retained) {
+                    Ok(()) => tracing::info!(
+                        retained = %retained.display(),
+                        "rollback window closed: retained epoch database deleted"
+                    ),
+                    Err(e) => tracing::warn!(
+                        retained = %retained.display(),
+                        "rollback window cleanup failed: {e}"
+                    ),
+                }
+                return;
+            }
+            if decided.changed().await.is_err() {
+                return;
+            }
+        }
+    });
+}
+
+pub(crate) fn spawn_drain_watcher(
+    app_state: AppState,
+    input_tx: mpsc::Sender<HostInput>,
+    pool: Arc<crate::consensus::queue::PendingPool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            if committed_regenesis_phase(&app_state)
+                == Some(crate::db::regenesis::RegenesisPhase::Moratorium)
+                && pool.staged_len() == 0
+                && pool.inflight_len() == 0
+                && input_tx.send(HostInput::Resume).await.is_err()
+            {
+                return; // engine gone
+            }
+        }
     });
 }
 
@@ -612,9 +849,17 @@ async fn handle_need_value(
     let mut candidates: Vec<crate::consensus::types::Transaction> =
         entries.iter().map(|e| e.transaction().clone()).collect();
 
+    let regenesis_phase = committed_regenesis_phase(app_state);
+
     // Periodic nonce-table hygiene, appended AFTER the queue entries so
-    // candidate indices still line up with `entries`.
-    if height.0.is_multiple_of(NONCE_CLEANUP_INTERVAL) {
+    // candidate indices still line up with `entries`. Suppressed outside
+    // the normal phase (RFC-019 S5): this injection bypasses the queue's
+    // admission gate, and hygiene must neither dilute the drain nor break
+    // the regenesis commit's solo block. On a read error we skip — a
+    // missed cleanup is harmless; the next interval retries.
+    if height.0.is_multiple_of(NONCE_CLEANUP_INTERVAL)
+        && regenesis_phase == Some(crate::db::regenesis::RegenesisPhase::Normal)
+    {
         let cutoff_ts = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as u64;
         let cutoff = hopnet_common::CustomUUID::new(Some(&uuid::Timestamp::from_unix(
             uuid::NoContext,
@@ -632,6 +877,16 @@ async fn handle_need_value(
         }
     }
 
+    // RFC-019 S5: once the moratorium holds and this node's pool has fully
+    // drained (nothing staged, nothing inflight, no candidate this round),
+    // the proposer's next block is the regenesis commit — the SOLE
+    // transaction of the final block, carrying the snapshot hash it
+    // recomputes over the build connection (proposer-injected, queue-
+    // bypassing: the cleanup_nonces precedent).
+    let propose_seal = regenesis_phase == Some(crate::db::regenesis::RegenesisPhase::Moratorium)
+        && candidates.is_empty()
+        && pool.inflight_len() == 0;
+
     // Dedicated build connection: proposal building must never lose a pool
     // checkout race under load (a failed build wastes the whole round — the
     // image-14 finding: "build conn: timed out" → empty heights). The conn is
@@ -647,6 +902,15 @@ async fn handle_need_value(
                 .get()
                 .map_err(|e| format!("build conn: {e}"))?,
         };
+        let mut candidates = candidates;
+        if propose_seal {
+            match seal_candidate(&build_state, &mut conn, height.0) {
+                Ok(tx) => candidates.push(tx),
+                // A failed recompute wastes this round only — the drain
+                // watcher keeps nudging and the next NeedValue retries.
+                Err(e) => tracing::warn!("regenesis commit candidate failed: {e}"),
+            }
+        }
         let result = build_value(&build_state, &mut conn, height, round, candidates);
         Ok::<_, String>((conn, result))
     })
@@ -744,14 +1008,17 @@ pub fn kick_sync_if_behind(app_state: &AppState, target: u64, hint_peer: i32) {
         }
     };
     let comms = app_state.comms.clone();
+    let epoch = app_state.epoch.load(Ordering::Relaxed);
     let db_pool = app_state.db_pool.clone();
     let input_tx = engine.input_tx.clone();
     let mut decided = engine.decided.clone();
     let flag = engine.sync_inflight.clone();
     let evidence = app_state.evidence.clone();
+    let kick_state = app_state.clone();
     crate::consensus::queue::queue_rt().spawn(async move {
         if let Err(e) = sync::sync_to_target(
             &comms,
+            epoch,
             &db_pool,
             node_id,
             &input_tx,
@@ -761,6 +1028,7 @@ pub fn kick_sync_if_behind(app_state: &AppState, target: u64, hint_peer: i32) {
             Some(evidence),
         )
         .await
+            && !pivot_on_epoch_ahead(&kick_state, &e)
         {
             tracing::debug!("lag-kick sync toward {target} did not complete: {e:?}");
         }

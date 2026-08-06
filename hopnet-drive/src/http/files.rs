@@ -651,6 +651,7 @@ pub async fn delete_files(
                     Ok(())
                 }
                 Err(TxSubmitError::Signing) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+                Err(TxSubmitError::Unavailable(_)) => Err(StatusCode::SERVICE_UNAVAILABLE),
                 Err(e) => {
                     tracing::error!("Failed to submit file deletion to consensus: {:?}", e);
                     Err(StatusCode::INTERNAL_SERVER_ERROR)

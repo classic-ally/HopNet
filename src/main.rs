@@ -38,6 +38,14 @@ static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dis
 /// GUI mode binds an ephemeral loopback port — see `run_server`.
 const HEADLESS_BACKEND_PORT: u16 = 34632;
 
+/// Exit code requesting a process restart (BSD EX_TEMPFAIL): the epoch
+/// sealed and this binary already runs the required version, so a fresh
+/// boot crosses the boundary (RFC-019 S6). Service managers should
+/// restart on it — systemd: `RestartForceExitStatus=75` (or plain
+/// `Restart=always`); the test orchestrator restarts containers
+/// explicitly after observing this code.
+const EXIT_CODE_RESTART: i32 = 75;
+
 /// Actual bound port. Populated by `run_server` after `TcpListener::bind`
 /// returns — needed in GUI mode because we bind `127.0.0.1:0` and let the
 /// kernel pick a free port, so two HopNet processes never clash.
@@ -142,6 +150,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Check if ephemeral database mode is requested (for testing)
     let use_ephemeral_db = std::env::var("HOPNET_EPHEMERAL_DB").is_ok();
 
+    // Set by a boundary gate refusal below; consumed once comms exist.
+    let mut rebuild_from_peers = false;
     let pool = if use_ephemeral_db {
         tracing::info!("Using ephemeral in-memory database (HOPNET_EPHEMERAL_DB set)");
         // Use shared-cache URI so all pool connections see the same in-memory DB
@@ -168,6 +178,47 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             db::shared::ensure_database_dir(&db_path).expect("Failed to create database directory");
         } else {
             tracing::info!("Found existing database file at {}", db_path);
+        }
+
+        // Epoch boot transition (RFC-019 S6): must run BEFORE the pool
+        // opens — it may swap the database file. Parked outcomes continue
+        // booting on the old sealed database (HTTP + status up, engine
+        // parked by the sealed marker); Fatal means continuing would
+        // destroy a mesh member's state.
+        // A gate refusal is remembered: once comms exist, the node tries
+        // to rebuild from peers rather than fail the same local gate on
+        // every boot (RFC-019 S7).
+        match regenesis::boot::boot_transition(&db_path, version::effective_running_code()) {
+            regenesis::boot::BootOutcome::NoBoundary => {}
+            regenesis::boot::BootOutcome::Transitioned { epoch } => {
+                tracing::info!(epoch, "epoch boundary crossed at boot");
+            }
+            regenesis::boot::BootOutcome::RolledBack { epoch } => {
+                tracing::warn!(
+                    epoch,
+                    "epoch boundary ABANDONED on operator request: running on the \
+                     retained database; the newer epoch's database is gone"
+                );
+            }
+            regenesis::boot::BootOutcome::Parked(reason) => {
+                tracing::warn!(?reason, "epoch boundary parked — engine will not start");
+                rebuild_from_peers =
+                    matches!(reason, regenesis::boot::ParkReason::GateFailed { .. });
+            }
+            regenesis::boot::BootOutcome::RestartIntoStaged { required } => {
+                // RFC-021: the nix provider flipped the profile to the
+                // epoch's required version — exit with the restart code so
+                // the supervisor re-execs through it. No grace needed:
+                // nothing is serving yet.
+                tracing::info!(
+                    required = %version::format_code(required),
+                    "restarting into the activated staged generation"
+                );
+                std::process::exit(EXIT_CODE_RESTART);
+            }
+            regenesis::boot::BootOutcome::Fatal(detail) => {
+                panic!("epoch boot transition: {detail}");
+            }
         }
 
         let manager = SqliteConnectionManager::file(&db_path);
@@ -198,7 +249,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else {
         tracing::info!("Initializing new database schema");
-        db::shared::initialize(conn)
+        db::shared::initialize(&conn)
     };
 
     match init_result {
@@ -284,15 +335,41 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 session_store: Arc::new(auth::SessionStore::default()),
                 takeout_runtime: Arc::new(hopnet_takeout::TakeoutRuntime::default()),
                 consensus_queue,
+                upgrade: Arc::new(upgrade::UpgradeState::default()),
                 write_gate: write_gate.clone(),
                 local_state_tx,
                 malachite: Arc::new(OnceCell::new()),
                 evidence: std::sync::Arc::new(consensus::evidence::EvidenceMap::new()),
                 storage: Arc::new(OnceCell::new()),
+                restart_signal: Arc::new(tokio::sync::Notify::new()),
+                epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                epoch_join_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 runtime: tokio::runtime::Handle::current(),
                 change_tx: tokio::sync::broadcast::channel(16).0,
                 photos_host: Arc::new(photos::PhotosHost::new()),
             };
+
+            // Epoch identity + restart listener (RFC-019 S6). The pool
+            // already points at the post-transition database, so this is
+            // the new epoch on a freshly crossed boundary.
+            if let Ok(conn) = app_state.db_pool.get() {
+                app_state.epoch.store(
+                    regenesis::genesis::current_epoch(&conn),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            let restart_signal = app_state.restart_signal.clone();
+
+            // A node parked by a boot gate (a diverged replica, a
+            // corrupted boundary) has no engine, so neither the tip poll
+            // nor the probe scheduler will ever run — this retry loop is
+            // its only path back to the mesh (RFC-019 S7).
+            if rebuild_from_peers {
+                tracing::warn!(
+                    "boundary gate refused from local state: attempting to rebuild from peers"
+                );
+                regenesis::join::spawn_parked_epoch_join(&app_state);
+            }
 
             // If we loaded state from database, populate the OnceCell fields
             if let Some(state) = startup_state_opt {
@@ -471,6 +548,28 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 policy_tick_worker.run().await;
             });
 
+            // Upgrade tick (RFC-019 S3): provider poll + version
+            // attestation reconcile, ~6-hourly with randomization. The
+            // boot task below covers the first attestation.
+            let random_second = rand::rng().random_range(5..55);
+            let random_minute = rand::rng().random_range(0..60);
+            let upgrade_cron_expression = format!("{} {} */6 * * *", random_second, random_minute);
+            let upgrade_schedule =
+                apalis_cron::Schedule::from_str(&upgrade_cron_expression).unwrap();
+            let upgrade_cron_stream = apalis_cron::CronStream::new(upgrade_schedule);
+
+            let upgrade_worker = WorkerBuilder::new("upgrade-tick")
+                .data(app_state.clone())
+                .backend(upgrade_cron_stream)
+                .build_fn(upgrade::jobs::handle_upgrade_tick);
+
+            tokio::spawn(async move {
+                upgrade_worker.run().await;
+            });
+
+            // Boot attestation: converge the committed version claim as
+            // soon as the node is set up and the engine is live.
+            tokio::spawn(upgrade::jobs::attest_until_converged(app_state.clone()));
             // Photo tombstone cleanup — randomized daily scan, 30-day
             // recovery window. Every node runs independently.
             photos_host::spawn_tombstone_cleanup_worker(app_state.clone());
@@ -561,6 +660,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     post(storage_host::routes::post_policy_tick),
                 )
                 .route(
+                    "/maintenance/upgrade-tick",
+                    post(upgrade::routes::post_upgrade_tick),
+                )
+                .route(
                     "/diagnostics/fragment-inventory-differential",
                     get(storage_host::routes::get_fragment_inventory_differential),
                 )
@@ -589,15 +692,18 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .nest("/admin", admin::routes::admin_routes())
                 .nest("/views", views::routes::router())
                 .route("/logout", post(auth::sign_out))
+                // Registered BEFORE the auth layer on purpose: axum's
+                // `Router::layer` only wraps routes added before the call,
+                // so appending this after the layer (as it was) left the
+                // whole per-table state manifest unauthenticated on every
+                // headless node — which binds 0.0.0.0. Pre-existing rather
+                // than introduced here, but the variable is called
+                // `protected_routes` and this is where it becomes true.
+                .route("/debug/state", get(consensus::routes::get_state_snapshot))
                 .layer(middleware::from_fn_with_state(
                     app_state.clone(),
                     auth::auth_middleware,
                 ));
-
-            // State snapshot endpoint requires DuckDB JSON extension (not codesigned for macOS release)
-            #[cfg(any(not(target_os = "macos"), debug_assertions))]
-            let protected_routes =
-                protected_routes.route("/debug/state", get(consensus::routes::get_state_snapshot));
 
             // Routes that accept either JWT (users) or RPC (nodes) authentication
             let jwt_or_rpc_routes = Router::new()
@@ -608,6 +714,22 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .route("/consensus/view", post(consensus::routes::debug_view_state))
                 .route("/consensus/leave", post(consensus::routes::post_leave))
+                .route(
+                    "/consensus/regenesis/start",
+                    post(regenesis::routes::post_regenesis_start),
+                )
+                .route(
+                    "/consensus/regenesis/abort",
+                    post(regenesis::routes::post_regenesis_abort),
+                )
+                .route(
+                    "/consensus/regenesis/retrust",
+                    post(regenesis::routes::post_regenesis_retrust),
+                )
+                .route(
+                    "/consensus/regenesis/rollback",
+                    post(regenesis::routes::post_regenesis_rollback),
+                )
                 .route(
                     "/consensus/evidence",
                     get(consensus::evidence::get_evidence),
@@ -812,7 +934,29 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     .layer(trace_layer)
             };
 
-            serve(listener, app).await?;
+            // Serve until either the server dies or the seal work
+            // requests a restart (RFC-019 S6). The exit belongs to the
+            // BINARY: library code only fires the Notify, so in-process
+            // tests observe the signal instead of dying. The grace delay
+            // lets final-block gossip and in-flight serves settle before
+            // the whole mesh drops at once.
+            let restart_requested = restart_signal.notified();
+            tokio::select! {
+                r = serve(listener, app) => { r?; }
+                _ = restart_requested => {
+                    let grace_ms = std::env::var("HOPNET_RESTART_GRACE_MS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(3000);
+                    tracing::info!(
+                        grace_ms,
+                        code = EXIT_CODE_RESTART,
+                        "restart requested (epoch sealed at target version): exiting for the service manager"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
+                    std::process::exit(EXIT_CODE_RESTART);
+                }
+            }
         }
         Err(error) => return Err(error.into()),
     }
@@ -822,6 +966,18 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `hopnet --version` prints the COMPILE-TIME version and exits: this is
+    // how the RFC-021 upgrade machinery verifies BYTES (a staged binary, the
+    // profile's current generation), so it must never reflect the test-mode
+    // override env vars — those exist to lie about a running process, not
+    // about an artifact.
+    if let Some(arg) = std::env::args().nth(1)
+        && (arg == "--version" || arg == "-V")
+    {
+        println!("{}", hopnet::version::running_version_str());
+        return Ok(());
+    }
+
     #[cfg(feature = "gui")]
     {
         run_with_gui().await

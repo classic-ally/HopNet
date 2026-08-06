@@ -237,7 +237,7 @@ mod tests {
             .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
             .build(manager)
             .unwrap();
-        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
         let conn = pool.get().unwrap();
 
         let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);

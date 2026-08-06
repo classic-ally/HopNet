@@ -2744,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet"
-version = "0.1.0"
+version = "2026.8.0"
 dependencies = [
  "aes-siv",
  "anyhow",
@@ -2831,6 +2831,7 @@ dependencies = [
  "hex",
  "rusqlite",
  "serde",
+ "serde_json",
  "typeshare",
  "uuid",
 ]

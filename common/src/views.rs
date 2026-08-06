@@ -120,3 +120,120 @@ pub enum UnplacedSeverity {
     Warn,
     Stale,
 }
+
+/// RFC-019 S3 upgrade-readiness advisory. FACTS ONLY — no rollup: the
+/// readiness precondition (every seated validator has the target staged)
+/// is the S5 regenesis_start handler's arithmetic, once a target exists.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct UpgradeReadinessView {
+    /// This node's running version (Cargo.toml, CalVer).
+    pub running: String,
+    /// Committed attestations for every registered node.
+    pub mesh: Vec<NodeVersionsView>,
+    /// Upstream releases per the provider's last poll, newest first.
+    pub available: Vec<AvailableReleaseView>,
+    pub provider: ProviderStatusView,
+    /// What THIS deployment can do at an upgrade boundary (RFC-021).
+    pub activation: ActivationView,
+}
+
+/// This node's deployment-declared upgrade capabilities. Currently only
+/// nix deployments can stage and activate; every other class parks at an
+/// upgrade boundary for its operator — advertised here so the operator
+/// learns it before the boundary, not from a parked mesh.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct ActivationView {
+    /// Provider kind ("nix", "git-release").
+    pub provider: String,
+    /// Whether this deployment can stage bytes (make an upgrade epoch
+    /// decidable without running the target first).
+    pub can_stage: bool,
+    /// Whether it will cross an upgrade boundary unattended.
+    pub auto_activate: bool,
+}
+
+/// One node's committed version claims.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct NodeVersionsView {
+    pub node_id: i32,
+    pub name: String,
+    /// None = the node has never attested.
+    pub running: Option<String>,
+    /// Staged-but-not-running; None until a staging-capable provider
+    /// exists.
+    pub staged: Option<String>,
+}
+
+/// One upstream release the provider reported.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct AvailableReleaseView {
+    pub version: String,
+    pub prerelease: bool,
+    /// Both this and the running version parse as CalVer and this is
+    /// strictly newer — integer compare of the codes, computed by the
+    /// version primitive so the view owns no arithmetic.
+    pub newer_than_running: bool,
+}
+
+/// Outcome of the provider's most recent poll.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct ProviderStatusView {
+    /// None = no poll has run (disabled, pre-setup, or test mode).
+    pub name: Option<String>,
+    /// ISO-8601.
+    pub fetched_at: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 503 body when the regenesis moratorium refuses a new submission
+/// (RFC-019 S5) — the structured "regenesis in progress" contract, so
+/// callers know to retry rather than treat the refusal as an error.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct RegenesisRefusalView {
+    /// "moratorium" | "sealed".
+    pub phase: String,
+    /// The version the next epoch requires, formatted CalVer.
+    pub target_version: Option<String>,
+    pub message: String,
+}
+
+/// GET /views/regenesis-status (RFC-019 S5): the committed boundary
+/// phase plus this node's drain observation. Facts only.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct RegenesisStatusView {
+    /// "normal" | "moratorium" | "sealed".
+    pub phase: String,
+    pub target_version: Option<String>,
+    /// Terminal height H once sealed (stringified u64).
+    pub seal_height: Option<String>,
+    /// This node's pool observation: nothing staged, nothing inflight.
+    pub drained: bool,
+    /// This database's epoch (stringified u64; "1" for pre-regenesis meshes).
+    pub epoch: String,
+    /// This epoch's chain id, hex. Operator-facing on purpose: it is the
+    /// fingerprint `POST /consensus/regenesis/retrust` requires, read off a
+    /// node already known good and passed to the node being recovered.
+    /// Public knowledge — every peer in the mesh signs against it.
+    pub chain_id: String,
+    /// The version this binary effectively runs.
+    pub running_version: String,
+    /// Sealed for a version this binary does not run: the node is parked
+    /// until its operator swaps the binary (RFC-019 S6 boot gate 1).
+    pub awaiting_upgrade: bool,
+    /// The retained previous-epoch database still exists (rollback
+    /// window: until this epoch's first decide).
+    pub rollback_retained: bool,
+    /// Last boot-gate refusal, if the boundary could not be crossed.
+    pub boundary_error: Option<String>,
+    /// Epoch-join progress or last failure (RFC-019 S7), while this node
+    /// is rebuilding from peers: fetching lineage, downloading the
+    /// snapshot, staged and awaiting restart.
+    pub epoch_join: Option<String>,
+}

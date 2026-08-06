@@ -19,7 +19,9 @@ use crate::types::{Blake3Hash, Block, PubKey};
 // ---------------------------------------------------------------------------
 // Height
 
-/// Consensus height. Stored in SQLite as i64 (`Height::from_db`/`as_db`).
+/// Consensus height. Stored in SQLite as i64 via the lossless bit-cast
+/// mapping (`hopnet_common::height`) — full u64 range roundtrips;
+/// `from_db`/`as_db` never panic.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Height(pub u64);
 
@@ -31,11 +33,11 @@ impl Height {
     pub const INITIAL: Self = Height(1);
 
     pub fn from_db(v: i64) -> Self {
-        Height(u64::try_from(v).expect("negative height in database"))
+        Height(hopnet_common::height::height_from_db(v))
     }
 
     pub fn as_db(&self) -> i64 {
-        i64::try_from(self.0).expect("height exceeds i64")
+        hopnet_common::height::height_to_db(self.0)
     }
 }
 

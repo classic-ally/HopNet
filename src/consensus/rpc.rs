@@ -16,7 +16,7 @@ use std::time::Duration;
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TransactionForwardRequest {
     pub transactions: Vec<super::types::Transaction>,
-    pub height: i64, // Forwarder's target height — diagnostic hint, not a gate
+    pub height: u64, // Forwarder's target height — diagnostic hint, not a gate
 }
 
 /// Per-transaction result returned by the leader after forwarding.
@@ -43,7 +43,7 @@ pub enum ForwardReply {
     /// Rejection: this node is not the proposer for its current (height,
     /// round). Includes the handler's position so the forwarder can retarget.
     NotProposer {
-        height: i64,
+        height: u64,
         round: u32,
     },
     /// Immediate ACK before processing (phase 1).
@@ -122,7 +122,7 @@ pub enum ForwardAckResult {
     AckedNoResult,
     /// Rejection: handler is not the proposer (includes its position so the
     /// forwarder can retarget)
-    NotProposer { height: i64, round: u32 },
+    NotProposer { height: u64, round: u32 },
 }
 
 /// ACK timeout: how long to wait for the immediate ACK from the leader.
@@ -152,7 +152,7 @@ pub async fn forward_transactions_with_ack(
     comms: &IrohComms,
     peer: &PeerRef,
     transactions: Vec<super::types::Transaction>,
-    height: i64,
+    height: u64,
     decided: &mut tokio::sync::watch::Receiver<u64>,
 ) -> Result<ForwardAckResult, CommsError> {
     // Mark the watch as seen BEFORE any network I/O so only NEW decides win

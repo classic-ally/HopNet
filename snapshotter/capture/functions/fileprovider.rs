@@ -42,12 +42,12 @@ pub fn capture(
                             filename: String,
                             parent_item_identifier: String,
                             file_size: Option<u64>,
-                            modification_height: Option<i32>,
+                            modification_height: Option<u64>,
                         }
                         #[derive(Serialize)]
                         struct EnumerateProxy {
                             items: Vec<ItemProxy>,
-                            current_consensus_height: i32,
+                            current_consensus_height: u64,
                             deleted_identifiers: Option<Vec<String>>,
                         }
                         let mut items: Vec<ItemProxy> = result
@@ -105,12 +105,12 @@ pub fn capture(
                             filename: String,
                             parent_item_identifier: String,
                             file_size: Option<u64>,
-                            modification_height: Option<i32>,
+                            modification_height: Option<u64>,
                         }
                         #[derive(Serialize)]
                         struct EnumerateProxy {
                             items: Vec<ItemProxy>,
-                            current_consensus_height: i32,
+                            current_consensus_height: u64,
                             deleted_identifiers: Option<Vec<String>>,
                         }
                         let mut items: Vec<ItemProxy> = result
@@ -159,7 +159,7 @@ pub fn capture(
                         file_size: Option<u64>,
                         created_at: String,
                         modified_at: Option<String>,
-                        modification_height: Option<i32>,
+                        modification_height: Option<u64>,
                     }
                     FunctionResult::Ok {
                         value: serde_json::to_value(MetadataProxy {

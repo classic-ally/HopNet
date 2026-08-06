@@ -37,7 +37,18 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Anchor init value: strictly-greater filtering guarantees an empty
 /// delta; the response still carries the current height.
-pub const ANCHOR_INIT: Height = i32::MAX as Height;
+///
+/// `i64::MAX`, not `u64::MAX`, even though heights are u64: the server
+/// maps heights onto SQLite INTEGER with the lossless bit-cast
+/// (`hopnet_common::height`), so anything above `i64::MAX` lands as a
+/// NEGATIVE column value and `modified_at_height > ?` would then match
+/// EVERY row — the exact inverse of this sentinel. Any height at or
+/// below `i64::MAX` round-trips positive and orders correctly.
+///
+/// A magic height is still the wrong shape for "no anchor yet"; an
+/// out-of-band marker would not depend on the storage mapping at all.
+/// Left as-is here because changing it is a mount wire-protocol change.
+pub const ANCHOR_INIT: Height = i64::MAX as Height;
 
 pub struct Watcher {
     core: Arc<MountCore>,

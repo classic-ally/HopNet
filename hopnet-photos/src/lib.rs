@@ -68,8 +68,8 @@ impl Projection for PhotosProjection {
         db::install_schema(conn)
     }
 
-    fn tables(&self) -> &'static [&'static str] {
-        db::TABLES
+    fn snapshot_section(&self) -> Option<&'static hopnet_common::SectionSpec> {
+        Some(&db::SNAPSHOT_SECTION)
     }
 
     /// Blob ids committed by this projection's transactions — the host

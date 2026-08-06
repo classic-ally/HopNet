@@ -64,6 +64,10 @@ pub enum TxSubmitError {
     Timeout,
     /// Consensus failed the transaction (queue full / internal).
     Submit,
+    /// Mesh-global admission is closed (regenesis moratorium, RFC-019
+    /// S5) — retryable, unlike Rejected. Routes map it to 503; the
+    /// string is a serialized host-side refusal body.
+    Unavailable(String),
 }
 
 pub trait TxGateway: Send + Sync {
@@ -79,7 +83,7 @@ pub trait TxGateway: Send + Sync {
     fn submit_batch_decided(
         &self,
         txs: Vec<TxSpec>,
-    ) -> BoxFuture<'_, Vec<Result<i32, TxSubmitError>>>;
+    ) -> BoxFuture<'_, Vec<Result<u64, TxSubmitError>>>;
 
     /// Convenience: single transaction.
     fn submit(&self, tx: TxSpec) -> BoxFuture<'_, Result<(), TxSubmitError>> {
@@ -93,7 +97,7 @@ pub trait TxGateway: Send + Sync {
     }
 
     /// Convenience: single transaction, strict (decided + applied here).
-    fn submit_decided(&self, tx: TxSpec) -> BoxFuture<'_, Result<i32, TxSubmitError>> {
+    fn submit_decided(&self, tx: TxSpec) -> BoxFuture<'_, Result<u64, TxSubmitError>> {
         let fut = self.submit_batch_decided(vec![tx]);
         Box::pin(async move {
             fut.await

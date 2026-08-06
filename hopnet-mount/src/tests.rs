@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::attrs::DEFAULT_TTL;
 use crate::idmap::ROOT_INO;
 use crate::mock::{CallRecord, MockHandle, MockTransport};
-use crate::transport::{ItemId, ItemKind, NodeTransport};
+use crate::transport::{Height, ItemId, ItemKind, NodeTransport};
 use crate::vfs::{CoreError, Invalidation, MountCore};
 use crate::watch::{KernelInvalidator, Watcher};
 
@@ -222,7 +222,7 @@ impl RecordingInvalidator {
     }
 }
 
-fn changes_calls(handle: &MockHandle) -> Vec<i64> {
+fn changes_calls(handle: &MockHandle) -> Vec<Height> {
     handle
         .calls()
         .into_iter()

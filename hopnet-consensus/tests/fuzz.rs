@@ -17,9 +17,13 @@ use hopnet_consensus::sim::{FaultConfig, Partition, Sim};
 // Impact: the core safety guarantee of the migration, fuzzed. Liveness is not
 // asserted here (loss/partition legitimately strand nodes pre-sync); safety is
 // universal.
-#[test]
-fn safety_sweep_bft() {
-    for seed in 0..120u64 {
+//
+// Every sim is a pure function of its seed, so the sweep is chunked across
+// test fns purely for wall-clock: cargo's harness parallelizes BETWEEN tests
+// (one thread per fn), and per-event cost is real ed25519 signing — a single
+// sequential fn made this the ~13-minute long pole of the whole corpus.
+fn sweep_bft(seeds: std::ops::Range<u64>) {
+    for seed in seeds {
         let n = 3 + (seed % 3) as i32; // 3, 4, or 5 nodes
         let faults = FaultConfig::from_seed(seed, n as usize);
         let mut sim = Sim::with_faults(n, QuorumProfile::Bft, faults);
@@ -29,15 +33,31 @@ fn safety_sweep_bft() {
     }
 }
 
+#[test]
+fn safety_sweep_bft_a() {
+    sweep_bft(0..30);
+}
+#[test]
+fn safety_sweep_bft_b() {
+    sweep_bft(30..60);
+}
+#[test]
+fn safety_sweep_bft_c() {
+    sweep_bft(60..90);
+}
+#[test]
+fn safety_sweep_bft_d() {
+    sweep_bft(90..120);
+}
+
 // Should: hold the same safety guarantees under the crash-fault majority
 // profile.
 // Should not: let the weaker quorum threshold admit a divergence under faults.
 // Impact: the CFT home-mesh profile fuzzed alongside BFT — the majority
 // threshold must still give quorum intersection (safety) under the
 // no-equivocation assumption the fakes honour.
-#[test]
-fn safety_sweep_cft() {
-    for seed in 0..80u64 {
+fn sweep_cft(seeds: std::ops::Range<u64>) {
+    for seed in seeds {
         let n = 3 + (seed % 2) as i32; // 3 or 4 nodes
         let faults = FaultConfig::from_seed(seed.wrapping_mul(2_654_435_761), n as usize);
         let mut sim = Sim::with_faults(n, QuorumProfile::Majority, faults);
@@ -45,6 +65,23 @@ fn safety_sweep_cft() {
         sim.run_safety_only(20_000).unwrap();
         sim.assert_agreement_common();
     }
+}
+
+#[test]
+fn safety_sweep_cft_a() {
+    sweep_cft(0..20);
+}
+#[test]
+fn safety_sweep_cft_b() {
+    sweep_cft(20..40);
+}
+#[test]
+fn safety_sweep_cft_c() {
+    sweep_cft(40..60);
+}
+#[test]
+fn safety_sweep_cft_d() {
+    sweep_cft(60..80);
 }
 
 // Should: FIRE the liveness oracle when a mesh genuinely cannot make progress.

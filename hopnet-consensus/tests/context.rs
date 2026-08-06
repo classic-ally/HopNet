@@ -105,13 +105,24 @@ fn validator_lookup_by_address_and_index_agree() {
     assert!(vs.get_by_index(4).is_none());
 }
 
-// Should: round-trip heights through the SQLite i64 representation.
-// Should not: accept a negative height from the database.
+// Should: round-trip every u64 height through the SQLite i64 mapping
+// losslessly, including values above i64::MAX (stored as negative
+// INTEGERs by the bit cast).
+// Should not: panic, saturate, or bounds-check anywhere in the mapping.
 // Impact: the height column is i64; a silent wrap would corrupt the chain
-// position after restart.
+// position after restart. RFC-019 S0: heights are continuous across
+// regenesis epochs, so the mapping must cover the full engine range.
 #[test]
 fn height_db_roundtrip() {
-    for h in [0u64, 1, 12345, u32::MAX as u64 + 1] {
+    for h in [
+        0u64,
+        1,
+        12345,
+        u32::MAX as u64 + 1,
+        i64::MAX as u64,
+        i64::MAX as u64 + 1,
+        u64::MAX,
+    ] {
         assert_eq!(Height::from_db(Height(h).as_db()), Height(h));
     }
 }

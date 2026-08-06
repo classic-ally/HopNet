@@ -1,4 +1,4 @@
-# RFC-018: Module Versioning
+# RFC-020: Module Versioning
 
 **Status**: Draft (2026-07-23)
 **Depends on**: RFC-013 (atomic decide + decided-value sync), RFC-016

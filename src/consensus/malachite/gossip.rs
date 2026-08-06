@@ -22,8 +22,15 @@ pub enum ConsensusNetRequest {
     /// `hopnet_consensus::codec::WireConsensusMsg`. Fire-and-forget (ack only).
     Gossip(Vec<u8>),
     /// Fetch decided (block, certificate) pairs for `[from_height, to_height]`
-    /// — the decided-value sync protocol.
-    DecidedFetch { from_height: i64, to_height: i64 },
+    /// — the decided-value sync protocol. Carries the requester's epoch
+    /// (RFC-019 S6 handshake): the server refuses a mismatch explicitly —
+    /// cross-epoch history is not syncable, it needs the lineage record
+    /// (S7's epoch join answers here).
+    DecidedFetch {
+        from_height: u64,
+        to_height: u64,
+        epoch: u64,
+    },
 }
 
 /// Wire response for the "consensus" scope.
@@ -38,6 +45,14 @@ pub enum ConsensusNetResponse {
     },
     Error {
         message: String,
+    },
+    /// The structured epoch refusal (RFC-019 S7): decided history is only
+    /// meaningful within one epoch, and the requester must be able to tell
+    /// "you need an epoch join" from a transport failure — this variant is
+    /// the sync client's signpost into the epoch-join path. Appended after
+    /// the S6 variants so their bincode tags stay stable.
+    EpochMismatch {
+        local_epoch: u64,
     },
 }
 
@@ -56,12 +71,9 @@ fn peers(db_pool: &Pool<SqliteConnectionManager>, my_node_id: i32) -> Result<Vec
     let conn = db_pool.get().map_err(|e| format!("db pool: {e}"))?;
     let pending = hopnet_consensus::store::last_decided_height(&conn)
         .map_err(|e| e.to_string())?
-        .map_or(0i64, |h| h.as_db().saturating_add(1));
-    let validators = crate::db::consensus::get_validators_with_conn(
-        &conn,
-        i32::try_from(pending).unwrap_or(i32::MAX),
-    )
-    .map_err(|e| format!("validators: {e:?}"))?;
+        .map_or(0u64, |h| h.0.saturating_add(1));
+    let validators = crate::db::consensus::get_validators_with_conn(&conn, pending)
+        .map_err(|e| format!("validators: {e:?}"))?;
     Ok(validators
         .into_iter()
         .filter(|n| n.node_id != my_node_id)
@@ -75,8 +87,12 @@ fn peers(db_pool: &Pool<SqliteConnectionManager>, my_node_id: i32) -> Result<Vec
 /// How long the publisher trusts its cached peer list before re-reading the
 /// nodes table. Node membership changes only via decided blocks, so staleness
 /// here costs at most a few seconds of gossip to a brand-new node — which
-/// catches up through decided-value sync anyway.
-const PEER_CACHE_TTL: Duration = Duration::from_secs(5);
+/// catches up through decided-value sync anyway. The inverse holds too: a
+/// JUST-evicted node keeps receiving gossip for up to one TTL, a parting
+/// grace that can even rescue a live evictee through the ordinary
+/// SyncNeeded path (the probe-pong regression test must wait it out —
+/// which is why this is pub(crate)).
+pub(crate) const PEER_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Long-lived publisher: drains the shell's outbound channel and fire-and-
 /// forgets each message to every peer (comms' broadcast spawns one send per

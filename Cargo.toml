@@ -8,7 +8,11 @@ exclude = ["crates/ingress-core", "crates/ingress-ffi"]
 
 [package]
 name = "hopnet"
-version = "0.1.0"
+# CalVer YYYY.M.N (RFC-019 S3): year.month.counter-within-month. This is
+# the SINGLE authoritative version token — release tags are v{version},
+# the node attests it in consensus, and the epoch boot gate compares it
+# by exact equality. See src/version.rs for the integer encoding.
+version = "2026.8.0"
 edition = "2024"
 default-run = "hopnet"
 license = "AGPL-3.0-only"

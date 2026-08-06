@@ -166,7 +166,7 @@ pub async fn submit_inodes(
     blob_ops: Vec<hopnet_storage::store::BlobInsertOp>,
     inodes: Vec<Inode>,
     attestation: Option<Vec<u8>>,
-) -> Result<i32, StatusCode> {
+) -> Result<u64, StatusCode> {
     let payload = crate::envelopes::DriveInsertPayload { blob_ops, inodes };
     let encoded_inodes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|e| {
@@ -191,6 +191,14 @@ pub async fn submit_inodes(
     // Strict wait: success means decided AND applied locally (RFC-018
     // S6); the returned height is the insert entry's read anchor.
     let mut results = state.txs.submit_batch_decided(transactions).await;
+    // Admission closed (regenesis moratorium) is retryable — surface 503
+    // so clients back off instead of treating the freeze as a failure.
+    if results
+        .iter()
+        .any(|r| matches!(r, Err(crate::host::TxSubmitError::Unavailable(_))))
+    {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     if results.iter().any(|r| r.is_err()) {
         for result in &results {
             if let Err(e) = result {

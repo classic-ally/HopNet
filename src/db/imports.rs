@@ -24,7 +24,7 @@ use crate::db::DatabaseError;
 /// operators can see the bootstrap path was hit.
 pub async fn get_total_validator_storage_available(
     state: &crate::AppState,
-    height: i32,
+    height: u64,
 ) -> Result<u64, DatabaseError> {
     let db_lock = state.db_pool.get().map_err(|_| DatabaseError::LockError)?;
     let validators = crate::db::consensus::get_validators_with_conn(&db_lock, height)?;

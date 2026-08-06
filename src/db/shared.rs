@@ -54,9 +54,7 @@ pub fn database_exists(db_path: &str) -> bool {
 }
 
 /// Check if the database schema is initialized by checking for critical tables
-pub fn is_schema_initialized(
-    db: &PooledConnection<SqliteConnectionManager>,
-) -> Result<bool, DuckdbError> {
+pub fn is_schema_initialized(db: &rusqlite::Connection) -> Result<bool, DuckdbError> {
     // Check if the critical 'this_node' table exists (the legacy 'blocks'
     // table died with the bespoke engine at Stage 5b)
     let result = db.query_row(
@@ -170,21 +168,7 @@ impl r2d2::CustomizeConnection<rusqlite::Connection, rusqlite::Error> for Sqlite
     fn on_acquire(&self, conn: &mut rusqlite::Connection) -> Result<(), rusqlite::Error> {
         DB_COUNTERS.conn_acquires.fetch_add(1, Ordering::Relaxed);
 
-        // page_size must run before journal_mode = WAL: the WAL init writes
-        // the DB header at the current page size and locks it.
-        conn.execute_batch(&page_size_pragma())?;
-
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            PRAGMA foreign_keys = ON;
-            PRAGMA busy_timeout = 5000;
-        ",
-        )?;
-        let overrides = env_pragma_overrides();
-        if !overrides.is_empty() {
-            conn.execute_batch(&overrides)?;
-        }
+        apply_connection_pragmas(conn)?;
 
         // Count successful commits / rollbacks across the whole codebase.
         // commit_hook returns false to allow the commit to proceed.
@@ -196,9 +180,30 @@ impl r2d2::CustomizeConnection<rusqlite::Connection, rusqlite::Error> for Sqlite
             DB_COUNTERS.txn_rollbacks.fetch_add(1, Ordering::Relaxed);
         }))?;
 
-        register_custom_functions(conn)?;
         Ok(())
     }
+}
+
+/// The connection setup every HopNet database handle needs — pooled or
+/// plain (the regenesis boot transition opens plain connections before
+/// the pool exists). Ordering is load-bearing: page_size must run before
+/// journal_mode = WAL because the WAL init writes the file header at the
+/// current page size and locks it.
+pub fn apply_connection_pragmas(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&page_size_pragma())?;
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA foreign_keys = ON;
+        PRAGMA busy_timeout = 5000;
+    ",
+    )?;
+    let overrides = env_pragma_overrides();
+    if !overrides.is_empty() {
+        conn.execute_batch(&overrides)?;
+    }
+    register_custom_functions(conn)?;
+    Ok(())
 }
 
 /// Register custom SQL functions needed by queries across the codebase
@@ -258,7 +263,7 @@ pub fn register_custom_functions(conn: &rusqlite::Connection) -> rusqlite::Resul
     Ok(())
 }
 
-pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), DuckdbError> {
+pub fn initialize(db: &rusqlite::Connection) -> Result<(), DuckdbError> {
     db.execute_batch(
         "
             CREATE TABLE sequences (
@@ -286,6 +291,18 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
                 name            TEXT NOT NULL,
                 owner           INTEGER NOT NULL,
                 pubkey          BLOB NOT NULL UNIQUE,
+                -- Version attestation (RFC-019 S3): the node's objective
+                -- self-claim, overwritten wholesale by each
+                -- node_staged_version tx — a staged version upstream moved
+                -- past vanishes at the next attestation. Codes are CalVer
+                -- integers (src/version.rs); NULL until first attestation.
+                -- staged stays NULL until a staging-capable upgrade
+                -- provider exists (v1 git-release only reports). Read by
+                -- the upgrade advisory now, the regenesis_start
+                -- precondition later (S5).
+                running_version_code    INTEGER,
+                staged_version_code     INTEGER,
+                version_attested_height INTEGER,
 
                 FOREIGN KEY (owner) REFERENCES users(user_id)
             );
@@ -312,7 +329,12 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
                 hopnet_storage_gc_high_pct       INTEGER NOT NULL DEFAULT 90,
                 hopnet_storage_gc_low_pct        INTEGER NOT NULL DEFAULT 80,
                 hopnet_storage_reencode_enabled  INTEGER NOT NULL DEFAULT 1,
-                hopnet_storage_repair_budget_pct INTEGER NOT NULL DEFAULT 10
+                hopnet_storage_repair_budget_pct INTEGER NOT NULL DEFAULT 10,
+                -- Upgrade-provider settings (RFC-019 S3): node-local, no
+                -- determinism impact. NULL release_url = derive the default
+                -- from the crate's repository field.
+                hopnet_upgrade_check_enabled     INTEGER NOT NULL DEFAULT 1,
+                hopnet_upgrade_release_url       TEXT
             );
 
             CREATE TABLE metrics (
@@ -398,13 +420,28 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
                 nonce TEXT PRIMARY KEY
             );
 
+            -- Regenesis boundary state (RFC-019 S5): the committed phase of
+            -- the epoch boundary. Singleton row (mesh_key precedent) with
+            -- ONE canonical Normal encoding: the row is ABSENT in the normal
+            -- phase (fresh meshes converge on absence; abort deletes). Only
+            -- consensus handlers write here. Divergence-checked but never
+            -- exported: epoch N+1 is born normal from the genesis installer,
+            -- like the chain tables (see src/db/snapshot.rs).
+            CREATE TABLE regenesis_state (
+                internal_id         INTEGER PRIMARY KEY CHECK (internal_id = 1),
+                phase               INTEGER NOT NULL,  -- 1 moratorium | 2 sealed
+                target_version_code INTEGER NOT NULL,  -- CalVer code the next epoch requires
+                snapshot_hash       BLOB,              -- set by regenesis_commit
+                seal_height         INTEGER            -- terminal H (bit-cast u64), set by regenesis_commit
+            );
+
         "
     )?;
 
     // Malachite engine tables (consensus_wal, decided_blocks,
     // decided_certificates, consensus_meta, validators) — owned by
     // hopnet-consensus.
-    hopnet_consensus::store::install_schema(&db).map_err(|e| match e {
+    hopnet_consensus::store::install_schema(db).map_err(|e| match e {
         hopnet_consensus::store::StoreError::Db(db_err) => db_err,
         // install_schema only executes DDL — non-Db variants are unreachable
         other => rusqlite::Error::InvalidParameterName(other.to_string()),
@@ -419,9 +456,9 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
     // below the projection seam), then every registered projection's unit
     // in manifest order (= FK direction; storage FKs the host's nodes
     // table; drive FKs users (host) and data_blocks (storage)).
-    hopnet_storage::store::install_schema(&db)?;
+    hopnet_storage::store::install_schema(db)?;
     for projection in crate::projections::manifests() {
-        projection.install_schema(&db)?;
+        projection.install_schema(db)?;
     }
 
     Ok(())
@@ -456,6 +493,35 @@ pub fn read_storage_node_settings(
     )
     .map_err(|e| {
         tracing::error!("read storage node settings: {e:?}");
+        DatabaseError::RecallError
+    })
+}
+
+/// Node-local upgrade-provider settings from the this_node singleton
+/// (RFC-019 S3).
+#[derive(Debug, Clone)]
+pub struct UpgradeNodeSettings {
+    pub check_enabled: bool,
+    /// None = derive the default from the crate's repository field.
+    pub release_url: Option<String>,
+}
+
+pub fn read_upgrade_node_settings(
+    conn: &rusqlite::Connection,
+) -> Result<UpgradeNodeSettings, DatabaseError> {
+    conn.query_row(
+        "SELECT hopnet_upgrade_check_enabled, hopnet_upgrade_release_url
+         FROM this_node WHERE internal_id = 1",
+        [],
+        |row| {
+            Ok(UpgradeNodeSettings {
+                check_enabled: row.get::<_, i64>(0)? != 0,
+                release_url: row.get(1)?,
+            })
+        },
+    )
+    .map_err(|e| {
+        tracing::error!("read upgrade node settings: {e:?}");
         DatabaseError::RecallError
     })
 }

@@ -434,7 +434,7 @@ impl StateReader for NullNet {
     }
     fn placement_inputs_at(
         &self,
-        _height: i32,
+        _height: u64,
     ) -> Result<crate::traits::PlacementInputs, StorageError> {
         Err(StorageError::Host("null state reader".into()))
     }
@@ -1129,7 +1129,7 @@ mod tests {
         }
         fn placement_inputs_at(
             &self,
-            height: i32,
+            height: u64,
         ) -> Result<crate::traits::PlacementInputs, StorageError> {
             Ok(crate::traits::PlacementInputs {
                 height,
