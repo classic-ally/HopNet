@@ -128,6 +128,18 @@ deactivation in replicated state and re-enters through the normal
 readmission gate. One round trip. This asymmetry — cheap wrongful
 removal, expensive stall — shapes the hysteresis stance below.
 
+The observation step needs a mechanism that survives eviction, and
+only one signal qualifies: the status probe's pong height. An evicted
+node is outside the valset-only gossip set, is never anyone's
+proposer, and its own replicated state cannot yet contain the
+deactivation it hasn't synced (so any locally-gated poll skips
+itself). The implementation therefore compares every pong's decided
+height against its own and kicks decided-value sync on a same-epoch
+lag — probe-pong lag discovery → sync → readmission through the
+normal gate. Discovered the hard way: without that comparison a
+voted-out node sat dark for days, every other trigger structurally
+dead.
+
 ## Evidence & validation
 
 Membership transactions follow the two-phase handler pattern already

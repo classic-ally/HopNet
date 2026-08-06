@@ -568,8 +568,12 @@ fn fresh_node_syncs_vote_out_chain_without_wedging() {
         let mesh_tip = *n0.decided.borrow();
 
         // Bring node 2 up. It is OUT of the valset, so consensus gossip
-        // never reaches it — drive sync explicitly, exactly as the
-        // production tip-poll does.
+        // never reaches it — drive sync explicitly to exercise the apply
+        // side in isolation. (Production cannot lean on the tip-poll
+        // here: its is_node_active gate reads the node's OWN valset view,
+        // which cannot contain an eviction the node hasn't synced. The
+        // probe-pong path owns that discovery — see
+        // evicted_node_discovers_lag_and_rejoins_via_probe.)
         connect_mesh(&network).await;
         let n2 = start_engine(&network.nodes[2].app_state, 2).await;
         let peers = vec![
@@ -632,6 +636,163 @@ fn fresh_node_syncs_vote_out_chain_without_wedging() {
             hopnet_consensus::validators::last_departure(&conn, 2, pending).unwrap(),
             Some(hopnet_consensus::validators::DepartureKind::VotedOut)
         );
+    });
+}
+
+// Impact: the production rejoin deadlock (observed live: a validator
+// stalled at height h, voted out effective h+1, dark for days with zero
+// sync attempts). An evicted node is outside the valset-only gossip set,
+// is never anyone's proposer, and the tip-poll's gate reads the node's
+// OWN stale valset view — so every reactive lag trigger is structurally
+// dead, and only the probe scheduler's pong height can tell it the mesh
+// moved on. RFC-CONSENSUS-001 prices vote-out hysteresis on exactly this
+// recovery ("observes its own deactivation in replicated state").
+// Should: rescue an evicted node via the probe scheduler ALONE — no
+// explicit sync call — once transport exists: pong height, sync kick,
+// decided-value sync to the mesh tip.
+// Should: leave the rescued node seeing its own vote-out in replicated
+// state.
+// Should not: advance the evicted node by any other path while the probe
+// scheduler is not running — the deadlock itself, stated as an assertion.
+#[test]
+fn evicted_node_discovers_lag_and_rejoins_via_probe() {
+    let network = MockNetwork::setup_with_validators(3);
+    let rt = crate::consensus::tests::test_iroh_rt();
+    rt.block_on(async move {
+        for node in &network.nodes {
+            install_consensus_schema(&node.app_state);
+            // probe_base=1 -> probes every ~1-2 s (Cliff band, 1 s scan
+            // quantization); grace=2 keeps the probe RPC timeout
+            // comfortable on a loaded machine; t_out(Cliff) = 4 s.
+            let conn = node.app_state.db_pool.get().unwrap();
+            hopnet_consensus::store::apply_policy_rows(
+                &conn,
+                &[
+                    ("probe_base".to_string(), "1".to_string()),
+                    ("grace".to_string(), "2".to_string()),
+                ],
+            )
+            .unwrap();
+        }
+        // FULL mesh from the start: the deadlock this test pins does not
+        // depend on a partition — an evicted node starves with healthy
+        // transport, which is what makes it a deadlock.
+        connect_mesh(&network).await;
+
+        // Nodes 0 and 1 run engines; node 2 doesn't yet, so it misses
+        // the block carrying its own vote-out (the production stall,
+        // minus the four days).
+        let extra = ExtraCandidates::default();
+        let mut n0 =
+            start_engine_with_candidates(&network.nodes[0].app_state, 0, extra.clone()).await;
+        let mut n1 = start_engine(&network.nodes[1].app_state, 1).await;
+        wait_decided(&mut n0, 2, 300).await;
+
+        // Age node 2 past t_out on both observers, meet the attestation
+        // floor, and commit the vote-out.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        for node in &network.nodes[..2] {
+            node.app_state.evidence.record_probe_sent(2);
+            node.app_state.evidence.record_probe_sent(2);
+        }
+        let payload = bincode::serde::encode_to_vec(
+            &crate::consensus::handlers::VoteOutRequest { node_id: 2 },
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let tx = crate::consensus::dispatch::create_signed_transaction(
+            &network.nodes[0].app_state,
+            "validator_vote_out".to_string(),
+            payload,
+        )
+        .unwrap();
+        extra.lock().unwrap().push(tx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            {
+                let conn = network.nodes[0].app_state.db_pool.get().unwrap();
+                let pending = *n0.decided.borrow() + 1;
+                if !hopnet_consensus::validators::is_node_active(&conn, 2, pending).unwrap() {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "vote-out of node 2 never committed"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let voteout_tip = *n0.decided.borrow();
+        wait_decided(&mut n0, voteout_tip + 2, 300).await;
+        wait_decided(&mut n1, voteout_tip + 2, 300).await;
+
+        // Let the observers' publisher peer caches expire past the
+        // eviction: a JUST-evicted node still catches residual gossip
+        // for up to one PEER_CACHE_TTL, and that parting traffic can
+        // rescue it through the ordinary SyncNeeded path (observed while
+        // writing this test). The production victim was dark through
+        // that grace — the deadlock this test pins requires it lapsed.
+        tokio::time::sleep(gossip::PEER_CACHE_TTL + Duration::from_secs(2)).await;
+        let mesh_tip = *n0.decided.borrow();
+
+        // Refresh direct connections, then bring node 2's ENGINE up:
+        // live, churning rounds at height 1, still seated by its own
+        // validators table. This is the production state — the node does
+        // not know what it cannot sync, and it cannot sync what nothing
+        // triggers.
+        connect_mesh(&network).await;
+        let mut n2 = start_engine(&network.nodes[2].app_state, 2).await;
+
+        // The deadlock, stated as an assertion: fully connected, engine
+        // live, prevotes flowing — and nothing rescues it. Without the
+        // probe path this holds forever; the sleep bounds it at several
+        // probe cadences.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(
+            *n2.decided.borrow(),
+            0,
+            "an evicted node must have no rescue path other than the probe scheduler"
+        );
+
+        // The rescue: the probe scheduler alone. Its first pong learns
+        // the mesh tip; classify_pong routes same-epoch lag into
+        // kick_sync_if_behind.
+        crate::consensus::evidence::spawn_probe_scheduler(network.nodes[2].app_state.clone());
+        wait_decided(&mut n2, mesh_tip, 120).await;
+
+        // Byte-identical history through the tip it was rescued to.
+        let rows = |st: &AppState| -> Vec<(i64, Vec<u8>)> {
+            let conn = st.db_pool.get().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT height, block_hash FROM decided_blocks WHERE height <= ? ORDER BY height",
+                )
+                .unwrap();
+            let r = stmt
+                .query_map([mesh_tip as i64], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            r.collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(
+            rows(&network.nodes[0].app_state),
+            rows(&network.nodes[2].app_state),
+            "rescued history must match the mesh exactly"
+        );
+
+        // RFC-CONSENSUS-001's recovery clause, now with a mechanism
+        // behind it: the node observes its own deactivation in
+        // replicated state.
+        let conn = network.nodes[2].app_state.db_pool.get().unwrap();
+        let pending = mesh_tip + 1;
+        assert!(!hopnet_consensus::validators::is_node_active(&conn, 2, pending).unwrap());
+        assert_eq!(
+            hopnet_consensus::validators::last_departure(&conn, 2, pending).unwrap(),
+            Some(hopnet_consensus::validators::DepartureKind::VotedOut)
+        );
+
+        for n in [&n0, &n1, &n2] {
+            let _ = n.input_tx.send(HostInput::Shutdown).await;
+        }
     });
 }
 

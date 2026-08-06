@@ -87,8 +87,12 @@ fn peers(db_pool: &Pool<SqliteConnectionManager>, my_node_id: i32) -> Result<Vec
 /// How long the publisher trusts its cached peer list before re-reading the
 /// nodes table. Node membership changes only via decided blocks, so staleness
 /// here costs at most a few seconds of gossip to a brand-new node — which
-/// catches up through decided-value sync anyway.
-const PEER_CACHE_TTL: Duration = Duration::from_secs(5);
+/// catches up through decided-value sync anyway. The inverse holds too: a
+/// JUST-evicted node keeps receiving gossip for up to one TTL, a parting
+/// grace that can even rescue a live evictee through the ordinary
+/// SyncNeeded path (the probe-pong regression test must wait it out —
+/// which is why this is pub(crate)).
+pub(crate) const PEER_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Long-lived publisher: drains the shell's outbound channel and fire-and-
 /// forgets each message to every peer (comms' broadcast spawns one send per

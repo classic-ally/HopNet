@@ -363,7 +363,10 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
     // Non-validator tip-poll (RFC-CONSENSUS-002 S1): a node outside the
     // valset receives no consensus gossip (gossip::peers is valset-only),
     // so it polls peers' decided tips and feeds sync. Cheap when seated:
-    // one indexed validators lookup per tick, then sleep.
+    // one indexed validators lookup per tick, then sleep. CAVEAT: its
+    // gate is the node's OWN valset view, so it cannot cover a node that
+    // hasn't yet synced its own eviction — that discovery belongs to the
+    // probe scheduler's pong path (evidence::classify_pong).
     spawn_tip_poll(app_state.clone());
 
     // Evidence probe scheduler (RFC-CONSENSUS-002 S3): the deadline scan

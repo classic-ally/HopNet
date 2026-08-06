@@ -401,6 +401,45 @@ pub async fn status_probe(
     Ok((decided_height, epoch))
 }
 
+/// What a pong obliges the PROBER to do about its own state.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PongAction {
+    /// The responder is in a NEWER epoch: no amount of block sync crosses
+    /// a boundary — rejoin via the epoch-join path (RFC-019 S7).
+    EpochJoin,
+    /// Same epoch, responder decided past us: kick decided-value sync.
+    KickSync,
+    /// The responder is level, behind, or in an OLDER epoch: nothing to
+    /// learn from it.
+    Nothing,
+}
+
+/// Classify a pong against the prober's own (epoch, decided). Epoch
+/// comparison dominates height — heights from another epoch don't compare.
+///
+/// The KickSync arm is the prober's only SELF-lag signal that still works
+/// once the mesh has unseated it: gossip is valset-only, a
+/// TransactionForward only reaches whoever the forwarder believes is
+/// proposer, and the tip-poll's is_node_active gate reads the node's own
+/// valset view — which cannot contain an eviction it hasn't synced yet.
+/// Observed in production: a validator that stalled at height h and was
+/// voted out effective h+1 sat for days rebroadcasting a stale Prevote
+/// with zero sync attempts, every other trigger structurally dead.
+pub(crate) fn classify_pong(
+    my_epoch: u64,
+    peer_epoch: u64,
+    my_decided: u64,
+    pong_height: u64,
+) -> PongAction {
+    if peer_epoch > my_epoch {
+        return PongAction::EpochJoin;
+    }
+    if peer_epoch == my_epoch && pong_height > my_decided {
+        return PongAction::KickSync;
+    }
+    PongAction::Nothing
+}
+
 // ============================================================================
 // Probe scheduler: a 1s deadline SCAN (the probe deadline itself comes from
 // the policy band). Runs on queue_rt beside the tip-poll.
@@ -541,17 +580,31 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                         status_probe(&comms, &peer, decided, my_epoch, g).await
                     {
                         evidence.record_contact_with_height(peer.node_id, h);
-                        // The offline-through-regenesis case (RFC-019 S7):
-                        // this node woke in a sealed epoch with a quiet
-                        // mesh around it. Nothing will sync and nothing
-                        // will gossip — the pong is the only thing that
-                        // tells it to rejoin.
-                        if peer_epoch > my_epoch {
-                            crate::regenesis::join::spawn_epoch_join(
-                                &probe_state,
-                                crate::regenesis::join::JoinAnchor::OwnDb,
-                                vec![peer],
-                            );
+                        match classify_pong(my_epoch, peer_epoch, decided, h) {
+                            // The offline-through-regenesis case (RFC-019
+                            // S7): this node woke in a sealed epoch with a
+                            // quiet mesh around it. Nothing will sync and
+                            // nothing will gossip — the pong is the only
+                            // thing that tells it to rejoin.
+                            PongAction::EpochJoin => {
+                                crate::regenesis::join::spawn_epoch_join(
+                                    &probe_state,
+                                    crate::regenesis::join::JoinAnchor::OwnDb,
+                                    vec![peer],
+                                );
+                            }
+                            // Same-epoch lag discovery (see classify_pong):
+                            // `decided` is the scan-start snapshot, and the
+                            // kick re-checks against the live watch before
+                            // spawning a sync.
+                            PongAction::KickSync => {
+                                crate::consensus::malachite::engine::kick_sync_if_behind(
+                                    &probe_state,
+                                    h,
+                                    peer.node_id,
+                                );
+                            }
+                            PongAction::Nothing => {}
                         }
                     }
                     // Failure: the silence is already recorded as the
@@ -821,6 +874,44 @@ mod tests {
             bright_since: Some(last_contact),
             last_known_height: None,
         }
+    }
+
+    // Impact: this row WAS the production rejoin deadlock — a voted-out
+    // node's pongs said "the mesh is 33k heights ahead" on every probe
+    // cycle and the scheduler discarded the comparison, so an evicted
+    // node could never discover its own lag (every other trigger is
+    // structurally dead for it: gossip is valset-only, TransactionForward
+    // targets the proposer, the tip-poll gate reads the node's own stale
+    // valset view).
+    // Should: kick decided-value sync when a same-epoch peer's pong is
+    // ahead of our decided height.
+    #[test]
+    fn classify_pong_kicks_sync_when_a_same_epoch_peer_is_ahead() {
+        assert_eq!(classify_pong(1, 1, 2430, 35740), PongAction::KickSync);
+        assert_eq!(classify_pong(1, 1, 0, 1), PongAction::KickSync);
+    }
+
+    // Should: do nothing when a same-epoch peer is level with us or
+    // behind us — the pong carries nothing we lack.
+    #[test]
+    fn classify_pong_ignores_a_level_or_lagging_peer() {
+        assert_eq!(classify_pong(1, 1, 10, 10), PongAction::Nothing);
+        assert_eq!(classify_pong(1, 1, 10, 3), PongAction::Nothing);
+    }
+
+    // Should: route a newer-epoch pong to epoch join regardless of the
+    // relative heights — block sync never crosses a boundary.
+    #[test]
+    fn classify_pong_joins_a_newer_epoch_at_any_height() {
+        assert_eq!(classify_pong(1, 2, 10, 999), PongAction::EpochJoin);
+        assert_eq!(classify_pong(1, 2, 999, 10), PongAction::EpochJoin);
+    }
+
+    // Should not: let a height from an OLDER epoch drag us into a sync —
+    // heights don't compare across epochs.
+    #[test]
+    fn classify_pong_never_syncs_toward_a_retired_epoch() {
+        assert_eq!(classify_pong(2, 1, 10, 999), PongAction::Nothing);
     }
 
     // Should: classification be a pure function of the snapshot — same
