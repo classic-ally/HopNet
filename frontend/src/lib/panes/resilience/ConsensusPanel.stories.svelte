@@ -30,7 +30,7 @@
   }
 
   const { Story } = defineMeta({
-    title: 'Components/ConsensusPanel',
+    title: 'Panes/Resilience/ConsensusPanel',
     component: ConsensusPanel,
     argTypes: {
       v: { control: { type: 'range', min: 1, max: 20, step: 1 }, description: 'Seated validators' },

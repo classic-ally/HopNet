@@ -4,7 +4,7 @@
   import { defaultFilterState, toFilter, type FilterState } from './filters';
 
   const { Story } = defineMeta({
-    title: 'Photos/FilterDropdown',
+    title: 'Panes/Photos/FilterDropdown',
     component: FilterDropdown,
     // These components are dark-only; the main preview offers a light option.
     parameters: { backgrounds: { default: 'dark' } },

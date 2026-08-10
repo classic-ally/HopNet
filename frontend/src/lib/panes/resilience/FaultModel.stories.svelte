@@ -10,7 +10,7 @@
   }
 
   const { Story } = defineMeta({
-    title: 'Components/FaultModel',
+    title: 'Panes/Resilience/FaultModel',
     component: FaultModel,
     argTypes: {
       v: {
