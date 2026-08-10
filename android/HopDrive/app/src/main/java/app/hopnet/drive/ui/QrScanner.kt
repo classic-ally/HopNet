@@ -96,13 +96,23 @@ fun QrScannerScreen(onResult: (String) -> Unit, onDismiss: () -> Unit) {
                             val preview = Preview.Builder().build().also {
                                 it.surfaceProvider = previewView.surfaceProvider
                             }
+                            // The analyzer decodes on its own executor; the
+                            // result callback touches Compose state and
+                            // Toasts, so deliver it on the main thread.
+                            val mainExecutor =
+                                androidx.core.content.ContextCompat.getMainExecutor(viewContext)
                             val analysis = ImageAnalysis.Builder()
                                 .setBackpressureStrategy(
                                     ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
                                 )
                                 .build()
                                 .also {
-                                    it.setAnalyzer(executor, QrAnalyzer(onResult))
+                                    it.setAnalyzer(
+                                        executor,
+                                        QrAnalyzer { text ->
+                                            mainExecutor.execute { onResult(text) }
+                                        }
+                                    )
                                 }
                             provider.unbindAll()
                             provider.bindToLifecycle(
