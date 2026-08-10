@@ -8,7 +8,7 @@
     title: 'Panes/Setup/JoinQR',
     component: JoinQR,
     argTypes: {
-      name: { control: 'text', description: 'Device name for QR code' }
+      onBackButton: { action: 'onBackButton' }
     },
     parameters: {
       docs: {
@@ -25,28 +25,28 @@
 {#snippet template(args)}
   <div class="min-h-screen bg-base p-6 flex items-center justify-center">
     <div class="w-full max-w-md">
-      <JoinQR api={mockSetupApi()} {...args} />
+      <JoinQR api={mockSetupApi()} onBackButton={() => console.log("back")} {...args} />
     </div>
   </div>
 {/snippet}
 
-<Story name="Default" {template} args={{ name: 'allison-macbook' }} />
+<Story name="Default" {template} args={{}} />
 
 <!-- Long latency parks the pane in its loading state so it can be inspected. -->
 {#snippet loading(args)}
   <div class="min-h-screen bg-base p-6 flex items-center justify-center">
     <div class="w-full max-w-md">
-      <JoinQR api={mockSetupApi({ latencyMs: 600_000 })} name={args.name} />
+      <JoinQR api={mockSetupApi({ latencyMs: 600_000 })} />
     </div>
   </div>
 {/snippet}
 
-<Story name="Loading" template={loading} args={{ name: 'allison-macbook' }} />
+<Story name="Loading" template={loading} args={{}} />
 
 {#snippet failing(args)}
   <div class="min-h-screen bg-base p-6 flex items-center justify-center">
     <div class="w-full max-w-md">
-      <JoinQR api={mockSetupApi({ failWith: args.failWith })} name={args.name} />
+      <JoinQR api={mockSetupApi({ failWith: args.failWith })} />
     </div>
   </div>
 {/snippet}
@@ -54,11 +54,11 @@
 <Story
   name="Fetch Rejected"
   template={failing}
-  args={{ name: 'allison-macbook', failWith: 500 }}
+  args={{ failWith: 500 }}
 />
 
 <Story
   name="No Backend"
   template={failing}
-  args={{ name: 'allison-macbook', failWith: TRANSPORT_FAILURE }}
+  args={{ failWith: TRANSPORT_FAILURE }}
 />

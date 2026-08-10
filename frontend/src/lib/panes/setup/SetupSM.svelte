@@ -3,16 +3,18 @@
      * The steps of the setup flow. Two branches lead off `initial`:
      *
      *   create: create-network → confirm → passphrase-display → passphrase-verify
-     *   join:   configure-device → join-qr
+     *   join:   join-qr
      *
-     * The join branch has no terminal step of its own — join-qr waits for a
-     * peer on the other side to accept the pairing.
+     * The join branch is a single step and has no terminal state of its own —
+     * join-qr waits for a peer on the other side to accept the pairing. It used
+     * to be preceded by a device-naming step, but this node has no say in its
+     * own name: whoever adds it supplies one, and `POST /api/nodes` takes the
+     * name from that request. The step collected a value nothing read.
      */
     export type SetupStep =
         | 'initial'
         | 'create-network'
         | 'confirm'
-        | 'configure-device'
         | 'join-qr'
         | 'passphrase-display'
         | 'passphrase-verify';
@@ -20,7 +22,6 @@
 
 <script lang="ts">
     import { fade } from 'svelte/transition';
-    import ConfigureDevice from "./ConfigureDevice.svelte";
     import ConfirmPane from "./ConfirmPane.svelte";
     import CreateNetwork from "./CreateNetwork.svelte";
     import InitialSetup from "./InitialSetup.svelte";
@@ -85,7 +86,7 @@
       <div in:fade={ANIM_PANE}>
         <InitialSetup
           onCreateNetwork={() => { step = 'create-network'; }}
-          onJoinNetwork={() => { step = 'configure-device'; }}
+          onJoinNetwork={() => { step = 'join-qr'; }}
         />
       </div>
     {:else if step === 'create-network'}
@@ -97,19 +98,11 @@
           onForwardButton={() => { step = 'confirm'; }}
         />
       </div>
-    {:else if step === 'configure-device'}
-      <div in:fade={ANIM_PANE}>
-        <ConfigureDevice
-          bind:computername
-          onBackButton={() => { step = 'initial'; }}
-          onForwardButton={() => { step = 'join-qr'; }}
-        />
-      </div>
     {:else if step === 'join-qr'}
       <div in:fade={ANIM_PANE}>
         <JoinQr
-          name={computername}
           {api}
+          onBackButton={() => { step = 'initial'; }}
         />
       </div>
     {:else if step === 'confirm'}

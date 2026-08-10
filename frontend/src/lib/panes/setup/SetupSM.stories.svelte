@@ -14,7 +14,6 @@
           'initial',
           'create-network',
           'confirm',
-          'configure-device',
           'join-qr',
           'passphrase-display',
           'passphrase-verify'
@@ -75,8 +74,6 @@
   {template}
   args={{ step: 'passphrase-verify', username: 'allison', passphrase: MOCK_PASSPHRASE }}
 />
-
-<Story name="Join — Device Name" {template} args={{ step: 'configure-device' }} />
 
 <Story name="Join — Pairing QR" {template} args={{ step: 'join-qr', computername: 'laptop' }} />
 

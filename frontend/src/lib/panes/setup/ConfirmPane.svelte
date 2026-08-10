@@ -38,6 +38,8 @@
 <SetupPane
     title="Confirm Selections"
     body="Creating new network as follows:"
+    onBack={onBackButton}
+    buttonsClass="flex items-center justify-end gap-3"
 >
     {#snippet features()}
         <EntryRow
@@ -63,12 +65,6 @@
     {/snippet}
 
     {#snippet buttons()}
-        <Button
-            icon="i-carbon-chevron-left"
-            text="Back"
-            onClick={() => {onBackButton()}}
-            disabled={isLoading}
-        />
         <Button
             icon="i-carbon-save"
             text="Save"

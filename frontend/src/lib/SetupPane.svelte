@@ -25,6 +25,13 @@
          * opinion of its own.
          */
         buttonsClass?: string;
+        /**
+         * Backward navigation, rendered by Modal as an icon button to the left
+         * of the title rather than as a footer action. Keeps the footer for the
+         * one thing the step wants you to do next, and puts "back" where it
+         * sits in every other dialog in the app.
+         */
+        onBack?: () => void;
         features: Snippet;
         /// Omitted by steps that have no actions of their own (JoinQR waits on a
         /// peer), which keeps Modal from drawing an empty footer rule.
@@ -36,6 +43,7 @@
         body = '',
         logoSrc = undefined,
         buttonsClass = 'grid grid-cols-2 gap-2',
+        onBack = undefined,
         features,
         buttons = undefined,
     }: SetupPaneProps = $props();
@@ -49,6 +57,7 @@
 
 <Modal
     {title}
+    {onBack}
     showCloseButton={false}
     closeOnBackdrop={false}
     closeOnEscape={false}
