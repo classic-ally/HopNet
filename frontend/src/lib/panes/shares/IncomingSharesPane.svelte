@@ -6,6 +6,7 @@
     import Toolbar from '../../primitives/Toolbar.svelte';
     import IncomingSharesList from './IncomingSharesList.svelte';
     import AcceptShareModal from './AcceptShareModal.svelte';
+    import PaneHeader from '../../primitives/PaneHeader.svelte';
 
     export let onToggleSidebar: () => void = () => {};
 
@@ -95,10 +96,7 @@
     {onToggleSidebar}
 />
 
-<div>
-    <h3>Shared With Me</h3>
-    <p class="text-sm text-muted">Files others have shared with you</p>
-</div>
+<PaneHeader title="Shared With Me" subtitle="Files others have shared with you" />
 
 <div class="border-solid border-1 rounded-lg p-3 border-overlay1">
     {#if error}

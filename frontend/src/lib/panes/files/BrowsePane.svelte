@@ -16,6 +16,7 @@
     import ShareDetailsModal from './ShareDetailsModal.svelte'
     import { fetchUsers, shareFile, fetchShareDetails, unshareFile, type UserInfo } from '../../api/shares'
     import type { ShareParticipant } from '../../types'
+    import PaneHeader from '../../primitives/PaneHeader.svelte'
 
     let files: FileItem[] = []
     let loading = true
@@ -658,10 +659,7 @@
 />
 
 <!-- Page Title -->
-<div>
-    <h3>Browse</h3>
-    <p class="text-sm text-muted">{files.length} {files.length === 1 ? 'item' : 'items'} in this folder</p>
-</div>
+<PaneHeader title="Browse" subtitle={`${files.length} ${files.length === 1 ? 'item' : 'items'} in this folder`} />
 
 <div class="border-solid border-1 rounded-lg p-1 border-overlay1">
     {#if error}

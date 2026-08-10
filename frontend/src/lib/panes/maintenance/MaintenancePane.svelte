@@ -4,6 +4,7 @@
     import Toolbar from '../../primitives/Toolbar.svelte';
     import type { ToolbarItem } from '../../primitives/Toolbar.svelte';
     import Button from '../../Button.svelte';
+    import PaneHeader from '../../primitives/PaneHeader.svelte';
 
     // Props
     export let onToggleSidebar: () => void = () => {};
@@ -124,10 +125,7 @@
 />
 
 <!-- Page Title -->
-<div>
-    <h3>System Maintenance</h3>
-    <p class="text-sm text-muted">Clean up orphaned fragments and optimize storage</p>
-</div>
+<PaneHeader title="System Maintenance" subtitle="Clean up orphaned fragments and optimize storage" />
 
 <!-- Error Display -->
 {#if error}

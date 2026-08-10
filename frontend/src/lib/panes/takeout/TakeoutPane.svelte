@@ -6,6 +6,7 @@
     import { formatDateResponsive, formatIdResponsive } from '../../utils/formatters'
     import Toolbar from '../../primitives/Toolbar.svelte'
     import type { ToolbarItem } from '../../primitives/Toolbar.svelte'
+    import PaneHeader from '../../primitives/PaneHeader.svelte'
 
     // Props
     export let onToggleSidebar: () => void = () => {};
@@ -384,10 +385,7 @@
 />
 
 <!-- Page Title -->
-<div>
-    <h3>Data Takeouts</h3>
-    <p class="text-sm text-muted">Export and download your data</p>
-</div>
+<PaneHeader title="Data Takeouts" subtitle="Export and download your data" />
 
 <!-- Takeouts Table -->
 <div class="border-solid border-1 rounded-lg p-1 border-overlay1" bind:this={containerRef}>

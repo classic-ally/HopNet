@@ -8,6 +8,7 @@
     import { tableColumns, recentsBrowserColumns } from '../../utils/tableColumns'
     import FilePreview from '../../Interface/FilePreview.svelte'
     import Toolbar from '../../primitives/Toolbar.svelte'
+    import PaneHeader from '../../primitives/PaneHeader.svelte'
 
     export let onToggleSidebar: () => void = () => {};
 
@@ -97,10 +98,7 @@
     {onToggleSidebar}
 />
 
-<div>
-    <h3>Recents</h3>
-    <p class="text-sm text-muted">{files.length} recently modified {files.length === 1 ? 'file' : 'files'}</p>
-</div>
+<PaneHeader title="Recents" subtitle={`${files.length} recently modified ${files.length === 1 ? 'file' : 'files'}`} />
 
 <div class="border-solid border-1 rounded-lg p-1 border-overlay1">
     {#if error}

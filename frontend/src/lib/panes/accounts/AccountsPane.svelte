@@ -7,6 +7,7 @@
     import AddAccountModal from './AddAccountModal.svelte';
     import ProfileEditor from './ProfileEditor.svelte';
     import { fetchAccounts, type UserInfo } from '../../api/accounts';
+    import PaneHeader from '../../primitives/PaneHeader.svelte';
 
     // Props
     export let onToggleSidebar: () => void = () => {};
@@ -100,10 +101,7 @@
 </div>
 
 <!-- Page Title -->
-<div>
-    <h3>User Accounts</h3>
-    <p class="text-sm text-muted">Manage user accounts on this node</p>
-</div>
+<PaneHeader title="User Accounts" subtitle="Manage user accounts on this node" />
 
 <!-- Accounts Table -->
 <div class="border-solid border-1 rounded-lg p-1 border-overlay1" bind:this={containerRef}>

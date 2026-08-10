@@ -7,6 +7,7 @@
     import type { ToolbarItem } from '../../primitives/Toolbar.svelte';
     import AddDeviceModal from './AddDeviceModal.svelte';
     import DeviceKeyModal from './DeviceKeyModal.svelte';
+    import PaneHeader from '../../primitives/PaneHeader.svelte';
 
     // Props
     export let onToggleSidebar: () => void = () => {};
@@ -185,10 +186,7 @@
 />
 
 <!-- Page Title -->
-<div>
-    <h3>Connected Devices</h3>
-    <p class="text-sm text-muted">Manage devices that can access your files</p>
-</div>
+<PaneHeader title="Connected Devices" subtitle="Manage devices that can access your files" />
 
 <!-- Devices Table -->
 <div class="border-solid border-1 rounded-lg p-1 border-overlay1" bind:this={containerRef}>

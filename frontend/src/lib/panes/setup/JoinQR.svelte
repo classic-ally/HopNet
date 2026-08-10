@@ -87,6 +87,4 @@
 
     {/snippet}
 
-    {#snippet buttons()}
-    {/snippet}
 </SetupPane>

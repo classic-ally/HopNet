@@ -2,6 +2,20 @@
   font-family: 'Red Hat Display Variable', ui-sans-serif, system-ui, sans-serif;
   background-color: #11111b;
 
+  /* Pairs with the background above. Without it, anything that does not name its
+     own colour inherits the UA default — black on a near-black page. The app got
+     away with it because Interface.svelte and the dialog chrome each set
+     text-primary on their wrapper, so the gap only showed outside those: a bare
+     <h3> in a pane rendered black, and every Storybook story that mounts a
+     component without the Interface wrapper still does. #cdd6f4 = text/primary. */
+  color: #cdd6f4;
+
+  /* The reset gives every element `border-style: solid` with this colour as the
+     fallback, so a width utility used without a colour utility draws something
+     sensible instead of Tailwind's light grey (#e5e7eb) on a dark theme.
+     overlay0 — the palette's subtle-separation border. */
+  --un-default-border-color: #6c7086;
+
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;

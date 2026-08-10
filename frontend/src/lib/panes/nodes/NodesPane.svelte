@@ -7,6 +7,7 @@
     import NodeAddPane from './NodeAddPane.svelte'
     import { fetchUsers } from '../../api/shares'
     import type { UserInfo } from '../../api/shares'
+    import PaneHeader from '../../primitives/PaneHeader.svelte'
 
     interface Node {
         node_id: number;
@@ -133,10 +134,7 @@
 />
 
 <!-- Page Title -->
-<div>
-    <h3>Networked Nodes</h3>
-    <p class="text-sm text-muted">Total nodes: {nodes.length}</p>
-</div>
+<PaneHeader title="Networked Nodes" subtitle={`Total nodes: ${nodes.length}`} />
 
 <!-- Nodes Table -->
 <div class="border-solid border-1 rounded-lg p-1 border-overlay1">

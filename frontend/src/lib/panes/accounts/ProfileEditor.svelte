@@ -65,7 +65,7 @@
 
 {#if $currentUserStore}
 <div class="border-solid border-1 rounded-lg p-3 border-overlay1">
-    <h3 class="mb-2 text-primary">My Profile</h3>
+    <h3 class="mb-2 text-lg font-semibold">My Profile</h3>
     <div class="flex gap-4 items-start">
         <div class="flex flex-col items-center gap-1 flex-shrink-0">
             <button

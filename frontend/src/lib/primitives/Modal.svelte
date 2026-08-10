@@ -86,9 +86,12 @@
     onkeydown={(e) => e.key === 'Enter' && handleBackdropClick()}
     transition:fade={ANIM_PANE}
 >
-    <!-- Modal Container -->
+    <!-- Modal Container.
+         text-primary is load-bearing, not decoration: app.css sets no colour on
+         the root, so content that does not name its own (FeatureItem, for one)
+         falls back to the UA default black and vanishes against the panel. -->
     <div
-        class="bg-surface0 border border-overlay1 rounded-lg shadow-xl z-50 {sizeClasses[size]} max-h-[90vh] overflow-hidden flex flex-col"
+        class="bg-surface0 text-primary border border-overlay1 rounded-lg shadow-xl z-50 {sizeClasses[size]} max-h-[90vh] overflow-hidden flex flex-col"
         onclick={handleModalClick}
         onkeydown={(e) => e.key === 'Enter' && e.stopPropagation()}
         role="dialog"
