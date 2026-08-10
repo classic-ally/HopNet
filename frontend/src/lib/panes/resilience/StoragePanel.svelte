@@ -1,4 +1,5 @@
 <script lang="ts">
+    import Card from '../../primitives/Card.svelte';
     import FaultToleranceChart from './FaultToleranceChart.svelte';
     import UnplacedByAge from './UnplacedByAge.svelte';
     import StorageSummary from './StorageSummary.svelte';
@@ -50,9 +51,8 @@
             : null;
 </script>
 
-<div class="p-4 bg-surface0">
-    <div class="flex items-baseline justify-between mb-4 gap-3">
-        <h4 class="text-lg font-semibold text-primary">Data Replication</h4>
+<Card title="Data Replication">
+    {#snippet headerRight()}
         {#if worstTolerance !== null}
             <span class="text-xs font-mono">
                 <span class="text-subtitle">worst block tolerates</span>
@@ -62,7 +62,7 @@
                 <span class="text-subtitle">node failures</span>
             </span>
         {/if}
-    </div>
+    {/snippet}
 
     <StorageSummary {consumedGb} {capacityGb} {unrecoverableGb} {unplacedBuckets} />
 
@@ -79,4 +79,4 @@
     <div class="my-4 border-t border-overlay0"></div>
 
     <UnplacedByAge buckets={unplacedBuckets} />
-</div>
+</Card>

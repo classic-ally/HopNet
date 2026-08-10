@@ -115,14 +115,10 @@
 {/if}
 
 {#if consensusProps && storageProps}
+    <!-- The panels are Cards; they bring their own surface and border. -->
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div class="border-solid border-1 rounded-lg border-overlay1">
-            <StoragePanel {...storageProps} />
-        </div>
-
-        <div class="border-solid border-1 rounded-lg border-overlay1">
-            <ConsensusPanel {...consensusProps} />
-        </div>
+        <StoragePanel {...storageProps} />
+        <ConsensusPanel {...consensusProps} />
     </div>
 {:else if loading}
     <div class="text-subtitle text-sm py-8 text-center">Loading…</div>

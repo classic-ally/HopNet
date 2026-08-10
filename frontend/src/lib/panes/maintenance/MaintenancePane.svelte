@@ -5,6 +5,7 @@
     import type { ToolbarItem } from '../../primitives/Toolbar.svelte';
     import Button from '../../Button.svelte';
     import PaneHeader from '../../primitives/PaneHeader.svelte';
+    import Card from '../../primitives/Card.svelte';
 
     // Props
     export let onToggleSidebar: () => void = () => {};
@@ -140,15 +141,10 @@
 <!-- Main Content -->
 <div class="space-y-4">
     <!-- Orphaned Fragments Section -->
-    <div class="border-solid border-1 rounded-lg p-6 border-overlay1">
-        <div class="mb-4">
-            <h4 class="text-lg font-semibold text-primary mb-2">Orphaned Fragment Cleanup</h4>
-            <p class="text-sm text-subtitle">
-                Scan the filesystem for fragments that aren't tracked in the database and remove them to free up space.
-                Only fragments older than 1 hour are considered to avoid race conditions.
-            </p>
-        </div>
-
+    <Card
+        title="Orphaned Fragment Cleanup"
+        subtitle="Scan the filesystem for fragments that aren't tracked in the database and remove them to free up space. Only fragments older than 1 hour are considered to avoid race conditions."
+    >
         <!-- Scan Button -->
         <div class="flex gap-3 mb-4">
             <Button
@@ -170,9 +166,9 @@
             {/if}
         </div>
 
-        <!-- Scan Results -->
+        <!-- Scan Results: surface1 so the box still reads against the card's surface0 -->
         {#if scanResult}
-            <div class="bg-surface0 border border-overlay0 rounded-lg p-4 space-y-3">
+            <div class="bg-surface1 border border-overlay0 rounded-lg p-4 space-y-3">
                 <div class="flex items-center justify-between pb-3 border-b border-overlay0">
                     <span class="text-sm font-medium text-subtitle">Scan Results</span>
                     <span class="text-xs text-muted">{formatTimestamp(scanResult.scanned_at)}</span>
@@ -210,7 +206,7 @@
 
         <!-- Delete Results -->
         {#if deleteResult}
-            <div class="bg-surface0 border border-green rounded-lg p-4 mt-4">
+            <div class="bg-surface1 border border-green rounded-lg p-4 mt-4">
                 <div class="flex items-center gap-2 mb-3">
                     <div class="i-carbon-checkmark-filled text-green text-lg"></div>
                     <span class="text-sm font-medium text-primary">Cleanup Complete</span>
@@ -236,16 +232,14 @@
                 </div>
             </div>
         {/if}
-    </div>
+    </Card>
 
     <!-- Additional Maintenance Tasks (Placeholder for future) -->
-    <div class="border-solid border-1 rounded-lg p-6 border-overlay1 opacity-50">
-        <div class="mb-4">
-            <h4 class="text-lg font-semibold text-primary mb-2">Data Block Cleanup</h4>
-            <p class="text-sm text-subtitle">
-                Remove orphaned data blocks that are no longer referenced by any files.
-            </p>
-        </div>
+    <Card
+        title="Data Block Cleanup"
+        subtitle="Remove orphaned data blocks that are no longer referenced by any files."
+        className="opacity-50"
+    >
         <Button
             icon="i-carbon-clean"
             text="Coming Soon"
@@ -253,5 +247,5 @@
             disabled={true}
             className="px-3 py-2"
         />
-    </div>
+    </Card>
 </div>

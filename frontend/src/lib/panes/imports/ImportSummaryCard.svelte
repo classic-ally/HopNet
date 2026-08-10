@@ -1,4 +1,5 @@
 <script lang="ts">
+    import Card from '../../primitives/Card.svelte';
     import type { ImportPathCounts, ImportStatus, ImportPathRow } from '../../types';
 
     interface Props {
@@ -19,44 +20,32 @@
     })());
 
     const isComplete = $derived(status === 'Completed');
+    const icon = $derived(isComplete
+        ? 'i-carbon-checkmark-filled text-green'
+        : 'i-carbon-warning-filled text-red');
+    const title = $derived(isComplete ? 'Import complete' : 'Import failed');
+
+    const subtitle = $derived(counts
+        ? `${counts.imported} of ${counts.total} files imported.`
+            + (counts.failed > 0 ? ` ${counts.failed} failed.` : '')
+            + (counts.skipped > 0 ? ` ${counts.skipped} skipped.` : '')
+        : 'Detailed counts only available on the owner device.');
 </script>
 
-{#if counts}
-    <div class="bg-surface0 border border-overlay0 rounded-lg p-4 space-y-3">
-        <div class="flex items-center gap-3">
-            <div class="{isComplete ? 'i-carbon-checkmark-filled text-green' : 'i-carbon-warning-filled text-red'} text-2xl flex-shrink-0"></div>
-            <div class="flex-1">
-                <h4 class="font-medium text-primary">
-                    {isComplete ? 'Import complete' : 'Import failed'}
-                </h4>
-                <p class="text-sm text-muted">
-                    {counts.imported} of {counts.total} files imported.
-                    {#if counts.failed > 0}{counts.failed} failed.{/if}
-                    {#if counts.skipped > 0}{counts.skipped} skipped.{/if}
-                </p>
-            </div>
-        </div>
-        {#if failedByCode.length > 0}
-            <div class="border-t border-overlay0 pt-3">
-                <h5 class="text-sm font-medium text-subtitle mb-2">Failures by reason</h5>
-                <ul class="space-y-1 text-sm">
-                    {#each failedByCode as [code, count]}
-                        <li class="flex justify-between">
-                            <span class="text-muted">{code}</span>
-                            <span class="text-red">{count}</span>
-                        </li>
-                    {/each}
-                </ul>
-            </div>
-        {/if}
+{#snippet failures()}
+    <div class="border-t border-overlay0 pt-3">
+        <h5 class="text-sm font-medium text-subtitle mb-2">Failures by reason</h5>
+        <ul class="space-y-1 text-sm">
+            {#each failedByCode as [code, count]}
+                <li class="flex justify-between">
+                    <span class="text-muted">{code}</span>
+                    <span class="text-red">{count}</span>
+                </li>
+            {/each}
+        </ul>
     </div>
-{:else}
-    <!-- Non-owner — terminal status known but no counts -->
-    <div class="bg-surface0 border border-overlay0 rounded-lg p-4 flex items-center gap-3">
-        <div class="{isComplete ? 'i-carbon-checkmark-filled text-green' : 'i-carbon-warning-filled text-red'} text-2xl flex-shrink-0"></div>
-        <div>
-            <h4 class="font-medium text-primary">{isComplete ? 'Import complete' : 'Import failed'}</h4>
-            <p class="text-sm text-muted">Detailed counts only available on the owner device.</p>
-        </div>
-    </div>
-{/if}
+{/snippet}
+
+<!-- The snippet rides as a value so a failure-free summary is header-only,
+     with no dangling header margin. -->
+<Card {title} {subtitle} {icon} children={failedByCode.length > 0 ? failures : undefined} />

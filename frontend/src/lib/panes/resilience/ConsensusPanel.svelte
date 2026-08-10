@@ -1,4 +1,5 @@
 <script lang="ts">
+    import Card from '../../primitives/Card.svelte';
     import FaultModel from './FaultModel.svelte';
     import ValidatorPool from './ValidatorPool.svelte';
     import ValidatorActivity from './ValidatorActivity.svelte';
@@ -52,11 +53,10 @@
     $: seatedPct = totalNodes > 0 ? (v / totalNodes) * 100 : 0;
 </script>
 
-<div class="p-4 bg-surface0">
-    <div class="flex items-baseline justify-between mb-4 gap-3">
-        <h4 class="text-lg font-semibold text-primary">State Machine Replication</h4>
+<Card title="State Machine Replication">
+    {#snippet headerRight()}
         <span class="text-lg font-semibold {status.tone}">{status.label}</span>
-    </div>
+    {/snippet}
 
     <FaultModel {v} {live} {faultBudget} {headroom} {band} />
 
@@ -109,4 +109,4 @@
             <span class="text-muted">(pinned)</span>
         {/if}
     </div>
-</div>
+</Card>
