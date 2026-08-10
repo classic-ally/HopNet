@@ -108,6 +108,36 @@ class ApiClient(private val pairing: Pairing) {
     fun statfs(signal: CancellationSignal? = null): StatfsResponse =
         getJson(url("/api/integrations/mount/statfs"), signal)
 
+    /** Per-user delta since the given height anchor. */
+    fun changes(sinceHeight: Long): MountChangesResponse =
+        getJson(
+            url("/api/integrations/mount/changes", "since_height" to sinceHeight.toString()),
+            null
+        )
+
+    /**
+     * Open the SSE poke stream. Derived client: the 45s read timeout IS
+     * the liveness detector (3 missed 15s server keepalives), and there
+     * must be no overall call timeout on a long-lived stream. Caller owns
+     * the Response.
+     */
+    fun openWatch(): Response {
+        val watchHttp = http.newBuilder()
+            .readTimeout(45, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS)
+            .build()
+        val request = Request.Builder()
+            .url(url("/api/integrations/mount/watch"))
+            .build()
+        val response = watchHttp.newCall(request).execute()
+        if (!response.isSuccessful) {
+            val code = response.code
+            response.close()
+            throw NodeHttpException(code, "watch stream refused")
+        }
+        return response
+    }
+
     fun createFolder(
         parentId: String?,
         name: String,

@@ -20,11 +20,11 @@ import app.hopnet.drive.net.MIME_TYPE_DIR
 import app.hopnet.drive.net.NodeHttpException
 import app.hopnet.drive.net.ROOT_ID
 import app.hopnet.drive.net.ReadProxyCallback
+import app.hopnet.drive.net.WatchLoop
 import app.hopnet.drive.net.WriteProxyCallback
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Live SAF provider for a paired HopNet node.
@@ -69,12 +69,6 @@ class HopDriveProvider : DocumentsProvider() {
             Document.COLUMN_SIZE,
         )
 
-        /**
-         * Ephemeral child → parent map (ROOT_ID for root-parented items),
-         * fed by every enumerate/item response; isChildDocument walks it
-         * instead of issuing one request per ancestry level.
-         */
-        private val parentMap = ConcurrentHashMap<String, String>()
     }
 
     override fun onCreate(): Boolean {
@@ -95,6 +89,7 @@ class HopDriveProvider : DocumentsProvider() {
     // --- roots ---
 
     override fun queryRoots(projection: Array<out String>?): Cursor {
+        WatchLoop.touch(context!!)
         val result = MatrixCursor(projection ?: DEFAULT_ROOT_PROJECTION)
         val pairing = PairingStore.load(context!!) ?: return result
         val client = ApiClient.forContext(context!!) ?: return result
@@ -130,6 +125,7 @@ class HopDriveProvider : DocumentsProvider() {
     // --- queries ---
 
     override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
+        WatchLoop.touch(context!!)
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
         if (documentId == ROOT_ID) {
             result.newRow().apply {
@@ -144,7 +140,7 @@ class HopDriveProvider : DocumentsProvider() {
         }
         return withQueryErrors(result) {
             val item = requireClient().item(documentId)
-            parentMap[item.id] = item.parentId ?: ROOT_ID
+            WatchLoop.parentMap[item.id] = item.parentId ?: ROOT_ID
             addItemRow(result, item)
             result
         }
@@ -155,6 +151,7 @@ class HopDriveProvider : DocumentsProvider() {
         projection: Array<out String>?,
         sortOrder: String?,
     ): Cursor {
+        WatchLoop.touch(context!!)
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
         result.setNotificationUri(
             context?.contentResolver,
@@ -163,7 +160,7 @@ class HopDriveProvider : DocumentsProvider() {
         return withQueryErrors(result) {
             val items = requireClient().enumerate(apiParent(parentDocumentId))
             items.forEach { item ->
-                parentMap[item.id] = parentDocumentId
+                WatchLoop.parentMap[item.id] = parentDocumentId
                 addItemRow(result, item)
             }
             result
@@ -177,9 +174,9 @@ class HopDriveProvider : DocumentsProvider() {
                 return parentDocumentId == ROOT_ID && current == ROOT_ID
             }
             if (current == parentDocumentId) return true
-            current = parentMap[current] ?: try {
+            current = WatchLoop.parentMap[current] ?: try {
                 val item = requireClient().item(current!!)
-                (item.parentId ?: ROOT_ID).also { parentMap[current!!] = it }
+                (item.parentId ?: ROOT_ID).also { WatchLoop.parentMap[current!!] = it }
             } catch (e: Exception) {
                 Log.w(TAG, "isChildDocument lookup failed for $current", e)
                 return false
@@ -195,6 +192,7 @@ class HopDriveProvider : DocumentsProvider() {
         mode: String,
         signal: CancellationSignal?,
     ): ParcelFileDescriptor {
+        WatchLoop.touch(context!!)
         val client = requireClient()
         val item = try {
             client.item(documentId, signal)
@@ -203,7 +201,7 @@ class HopDriveProvider : DocumentsProvider() {
         } catch (e: IOException) {
             throw FileNotFoundException("Node unreachable: $e")
         }
-        parentMap[item.id] = item.parentId ?: ROOT_ID
+        WatchLoop.parentMap[item.id] = item.parentId ?: ROOT_ID
 
         val storageManager = context!!.getSystemService(StorageManager::class.java)
         val accessMode = ParcelFileDescriptor.parseMode(mode)
@@ -231,7 +229,7 @@ class HopDriveProvider : DocumentsProvider() {
                     throw FileNotFoundException("Prefill for $mode failed: $e")
                 }
             }
-            val parentDocId = parentMap[documentId] ?: ROOT_ID
+            val parentDocId = WatchLoop.parentMap[documentId] ?: ROOT_ID
             WriteProxyCallback(client, documentId, temp, thread) {
                 notifyChildrenChanged(parentDocId)
                 context?.contentResolver?.notifyChange(
@@ -274,7 +272,7 @@ class HopDriveProvider : DocumentsProvider() {
                     }
                 }
                 val id = item.id ?: throw FileNotFoundException("create returned no id")
-                parentMap[id] = parentDocumentId
+                WatchLoop.parentMap[id] = parentDocumentId
                 notifyChildrenChanged(parentDocumentId)
                 return id
             } catch (e: NodeHttpException) {
@@ -292,7 +290,7 @@ class HopDriveProvider : DocumentsProvider() {
 
     override fun deleteDocument(documentId: String) {
         val client = requireClient()
-        val parentDocId = parentMap[documentId]
+        val parentDocId = WatchLoop.parentMap[documentId]
             ?: runCatching { client.item(documentId).parentId ?: ROOT_ID }.getOrNull()
             ?: ROOT_ID
         try {
@@ -302,7 +300,7 @@ class HopDriveProvider : DocumentsProvider() {
         } catch (e: IOException) {
             throw FileNotFoundException("delete $documentId: $e")
         }
-        parentMap.remove(documentId)
+        WatchLoop.parentMap.remove(documentId)
         notifyChildrenChanged(parentDocId)
     }
 
@@ -311,7 +309,7 @@ class HopDriveProvider : DocumentsProvider() {
         try {
             val item = client.rename(documentId, displayName)
             val parentDocId = item.parentId ?: ROOT_ID
-            parentMap[documentId] = parentDocId
+            WatchLoop.parentMap[documentId] = parentDocId
             notifyChildrenChanged(parentDocId)
         } catch (e: NodeHttpException) {
             throw FileNotFoundException("rename $documentId: HTTP ${e.code}")
@@ -335,7 +333,7 @@ class HopDriveProvider : DocumentsProvider() {
         } catch (e: IOException) {
             throw FileNotFoundException("move $sourceDocumentId: $e")
         }
-        parentMap[sourceDocumentId] = targetParentDocumentId
+        WatchLoop.parentMap[sourceDocumentId] = targetParentDocumentId
         notifyChildrenChanged(sourceParentDocumentId)
         notifyChildrenChanged(targetParentDocumentId)
         return sourceDocumentId

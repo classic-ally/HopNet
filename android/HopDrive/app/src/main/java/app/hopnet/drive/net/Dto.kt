@@ -52,6 +52,14 @@ data class MountItem(
 data class MountMutationResponse(val item: MountItem? = null, val height: Long)
 
 @Serializable
+data class MountChangesResponse(
+    val items: List<MountItem>,
+    @SerialName("deleted_ids") val deletedIds: List<String>,
+    /** The snapshot's height — the client's next anchor. */
+    val height: Long,
+)
+
+@Serializable
 data class MountModifyRequest(
     val id: String,
     @SerialName("new_parent_id") val newParentId: String? = null,

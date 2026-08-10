@@ -76,10 +76,27 @@ copy) — deliberately no Google Play Services dependency.
   `-Pandroid.aapt2FromMavenOverride=$ANDROID_HOME/build-tools/<v>/aapt2`
   and pin `buildToolsVersion` to the nix-provisioned SDK.
 
+## Change feed (push refresh)
+
+`net/WatchLoop.kt` — one daemon thread holding the node's SSE poke
+stream (`GET /mount/watch`), started lazily by any provider entry point
+and self-stopping after 3 idle minutes; the provider process only lives
+while clients hold cursors, so the connection's cost is bounded to
+active browsing (no service). Shape mirrors the FUSE daemon's watcher:
+sync on every (re)connect, coalesce poke bursts (75 ms drain — also
+skips the node's poke-fires-pre-commit window), anchor on each delta's
+`height` (first-connect sentinel exactly `i64::MAX`; the server's
+height bit-cast makes larger values match everything). The delta's
+`items`/`deleted_ids` map to `notifyChange` on affected children URIs,
+using the shared child→parent map for move/delete old-parent
+invalidation. Pokes are node-scoped; `/changes` filters per-user.
+`/changes` reads its delta and height anchor in one SQLite snapshot
+(fix landed with this feature) so a poke-driven client can trust the
+anchor. Each open watch holds one API concurrency slot — fine at
+personal-device scale.
+
 ## Future work
 
-- [ ] Push-driven refresh via the mount `/changes` + `/watch` feed
-      instead of notify-on-own-mutation only
 - [ ] Retry queue for release-time upload failures
 - [ ] Keystore-wrapped pairing storage
 - [ ] Camera E2E on a physical device (emulator uses manual pairing)

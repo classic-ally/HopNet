@@ -84,6 +84,7 @@ object PairingStore {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply()
         cached = null
         loaded = true
+        app.hopnet.drive.net.WatchLoop.stop()
         notifyRootsChanged(context)
         notifyListeners()
     }

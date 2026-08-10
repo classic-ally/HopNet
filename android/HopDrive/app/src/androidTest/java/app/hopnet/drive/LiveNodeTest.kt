@@ -94,6 +94,46 @@ class LiveNodeTest {
         assertEquals(String(expected), last)
     }
 
+    // Impact: this is the only path that proves remote-origin changes
+    // reach the Files app without user action.
+    // Should: surface a mutation made outside the provider as a change
+    // notification on the affected children URI.
+    @Test
+    fun remoteChangeNotifiesChildrenUri() {
+        // A query starts the watch loop (provider touch) and anchors it.
+        childNames(ROOT_ID)
+
+        val changed = java.util.concurrent.CountDownLatch(1)
+        val observer = object : android.database.ContentObserver(null) {
+            override fun onChange(selfChange: Boolean) {
+                changed.countDown()
+            }
+        }
+        resolver.registerContentObserver(childrenUri(ROOT_ID), false, observer)
+        try {
+            // Mutate BEHIND the provider's back: a raw ApiClient call can't
+            // trigger the provider's own notifyChange — only the watch
+            // loop's delta sync can surface it.
+            val client = app.hopnet.drive.net.ApiClient.forContext(context)!!
+            val name = "watch-probe-${System.currentTimeMillis()}"
+            val item = client.createFolder(null, name)
+            try {
+                assertTrue(
+                    "no change notification within 15s of a remote mutation",
+                    changed.await(15, java.util.concurrent.TimeUnit.SECONDS)
+                )
+                assertTrue(
+                    "remote folder not visible after notification",
+                    name in childNames(ROOT_ID)
+                )
+            } finally {
+                client.delete(item.id!!, recursive = false)
+            }
+        } finally {
+            resolver.unregisterContentObserver(observer)
+        }
+    }
+
     // Should: expose exactly one root once paired.
     @Test
     fun rootIsExposedWhenPaired() {
