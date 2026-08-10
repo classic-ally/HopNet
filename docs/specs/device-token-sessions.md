@@ -74,9 +74,9 @@ No key stretching (Argon2id) is needed because the device secret already has 256
 | **Credential interception** | Passphrase sent once at login | Device secret sent on every request |
 | **Credential storage** | User's memory only | Device keychain/keystore |
 | **Revocation** | Change passphrase (re-wraps key) | Delete device token (removes ciphertext from all nodes) |
-| **Transport security** | Same (iroh QUIC/TLS or localhost) | Same (iroh QUIC/TLS or localhost) |
+| **Transport security** | Pinned HTTPS or loopback (RFC-022) | Pinned HTTPS or loopback (RFC-022) |
 
-The device secret is transmitted more frequently than the passphrase, but both travel over the same transport (iroh or localhost HTTP). The device secret is stored on the device (macOS Keychain, Android Keystore), while the passphrase exists only in the user's memory. These are complementary threat surfaces — compromising one does not help with the other.
+The device secret is transmitted more frequently than the passphrase. Both travel over the node's TLS-only network surface ([pinned-https](pinned-https.md)) when the caller is remote (Hop Drive on the LAN), or over loopback plaintext when co-resident (FileProvider, photo-ingress, hopnet-mount). The device secret is stored on the device (macOS Keychain, Android Keystore), while the passphrase exists only in the user's memory. These are complementary threat surfaces — compromising one does not help with the other.
 
 ### Key Revocation Properties
 
