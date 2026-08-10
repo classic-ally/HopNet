@@ -56,7 +56,7 @@
 >
     {#snippet content()}
         {#if logoSrc}
-            <img src={logoSrc} alt="HopNet" class="w-40 h-auto mx-auto block" />
+            <img src={logoSrc} alt="HopNet" class="w-40 h-auto mx-auto block mt-2" />
         {/if}
         {#if body}
             <p>{body}</p>
