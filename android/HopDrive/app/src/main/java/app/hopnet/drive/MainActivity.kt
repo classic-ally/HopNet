@@ -46,9 +46,19 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.Manifest
+import android.content.pm.PackageManager
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import app.hopnet.drive.data.ApiCallLog
 import app.hopnet.drive.data.LogRepository
+import app.hopnet.drive.data.Pairing
+import app.hopnet.drive.data.PairingStore
 import app.hopnet.drive.ui.PairingTab
+import app.hopnet.drive.ui.QrScannerScreen
+import app.hopnet.drive.ui.parsePairingPayload
 import app.hopnet.drive.ui.theme.HopDriveTheme
 
 class MainActivity : ComponentActivity() {
@@ -68,6 +78,42 @@ class MainActivity : ComponentActivity() {
 fun DocumentStoreViewer() {
     var selectedTab by remember { mutableIntStateOf(0) }
     val tabs = listOf("Pairing", "Request Log")
+    val context = LocalContext.current
+    var scanning by remember { mutableStateOf(false) }
+    val cameraPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> if (granted) scanning = true }
+
+    if (scanning) {
+        QrScannerScreen(
+            onResult = { text ->
+                scanning = false
+                parsePairingPayload(text).fold(
+                    onSuccess = { payload ->
+                        if (payload.host != null) {
+                            PairingStore.save(
+                                context,
+                                Pairing(payload.host, payload.port, payload.spki, payload.token)
+                            )
+                            Toast.makeText(context, "Paired", Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(
+                                context,
+                                "Code has no host address — use manual entry",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    },
+                    onFailure = {
+                        Toast.makeText(context, it.message ?: "Not a pairing code", Toast.LENGTH_LONG)
+                            .show()
+                    }
+                )
+            },
+            onDismiss = { scanning = false }
+        )
+        return
+    }
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
@@ -97,7 +143,16 @@ fun DocumentStoreViewer() {
             }
 
             when (selectedTab) {
-                0 -> PairingTab()
+                0 -> PairingTab(onScanQr = {
+                    val granted = ContextCompat.checkSelfPermission(
+                        context, Manifest.permission.CAMERA
+                    ) == PackageManager.PERMISSION_GRANTED
+                    if (granted) {
+                        scanning = true
+                    } else {
+                        cameraPermission.launch(Manifest.permission.CAMERA)
+                    }
+                })
                 1 -> ApiLogsTab()
             }
         }
