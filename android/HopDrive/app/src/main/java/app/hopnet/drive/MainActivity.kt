@@ -47,8 +47,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.hopnet.drive.data.ApiCallLog
-import app.hopnet.drive.data.DocumentRepository
 import app.hopnet.drive.data.LogRepository
+import app.hopnet.drive.ui.PairingTab
 import app.hopnet.drive.ui.theme.HopDriveTheme
 
 class MainActivity : ComponentActivity() {
@@ -67,7 +67,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun DocumentStoreViewer() {
     var selectedTab by remember { mutableIntStateOf(0) }
-    val tabs = listOf("JSON Data", "API Logs")
+    val tabs = listOf("Pairing", "Request Log")
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
@@ -97,100 +97,10 @@ fun DocumentStoreViewer() {
             }
 
             when (selectedTab) {
-                0 -> JsonDataTab()
+                0 -> PairingTab()
                 1 -> ApiLogsTab()
             }
         }
-    }
-}
-
-@Composable
-fun JsonDataTab() {
-    val context = LocalContext.current
-    val repository = remember { DocumentRepository.getInstance(context) }
-
-    var jsonContent by remember { mutableStateOf(repository.toJson()) }
-    val filePath by remember { mutableStateOf(repository.getFilePath()) }
-
-    DisposableEffect(repository) {
-        val listener = { jsonContent = repository.toJson() }
-        repository.addChangeListener(listener)
-        onDispose { repository.removeChangeListener(listener) }
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-    ) {
-        Text(
-            text = "JSON Data File",
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.primary
-        )
-        Text(
-            text = filePath,
-            style = MaterialTheme.typography.bodySmall,
-            fontFamily = FontFamily.Monospace,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Row(modifier = Modifier.fillMaxWidth()) {
-            Button(
-                onClick = {
-                    repository.reload()
-                    jsonContent = repository.toJson()
-                },
-                modifier = Modifier.padding(end = 8.dp)
-            ) {
-                Text("Refresh")
-            }
-            Button(
-                onClick = {
-                    repository.reset()
-                    jsonContent = repository.toJson()
-                },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.error
-                )
-            ) {
-                Text("Reset")
-            }
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            color = MaterialTheme.colorScheme.surfaceVariant,
-            shape = MaterialTheme.shapes.medium
-        ) {
-            val verticalScrollState = rememberScrollState()
-            val horizontalScrollState = rememberScrollState()
-
-            Text(
-                text = jsonContent,
-                modifier = Modifier
-                    .padding(12.dp)
-                    .verticalScroll(verticalScrollState)
-                    .horizontalScroll(horizontalScrollState),
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Text(
-            text = "Use the Files app to modify documents. Changes appear here automatically.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
     }
 }
 
