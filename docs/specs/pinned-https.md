@@ -127,6 +127,10 @@ implementation.
   positive and negative.
 - The desktop GUI now opens an authenticated network port
   (`0.0.0.0:34632`); all routes remain behind JWT / device-token auth.
+- **Stale hopnet-mount configs**: a `mount.json` whose `url` was stored
+  as `http://127.0.0.1:34632` in the fixed-port era outranks the
+  endpoint file and now points plaintext at the TLS port. Re-run
+  `hopnet-mount login` (or drop the `url` key) on affected hosts.
 
 ## Future work
 
