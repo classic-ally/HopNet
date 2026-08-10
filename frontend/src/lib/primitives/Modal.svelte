@@ -6,7 +6,16 @@
 
     interface ModalProps {
         title: string;
-        size?: 'sm' | 'md' | 'lg' | 'xl';
+        /// Iconify class shown before the title, e.g. a file-type glyph.
+        titleIcon?: string;
+        size?: 'sm' | 'md' | 'lg' | 'xl' | '2xl';
+        /**
+         * `auto` lets the panel shrink to its content up to 90vh. `tall` pins it
+         * at 90vh, which a preview needs: an image, a PDF or an editor has no
+         * intrinsic height to size from, and a panel that resizes as each file
+         * loads is worse than one that holds still.
+         */
+        height?: 'auto' | 'tall';
         mode?: 'desktop' | 'mobile';
         onClose?: () => void;
         /// Optional back navigation. When set, a back button mirrors the close
@@ -18,6 +27,15 @@
         // Content injection via snippets
         content?: Snippet;
         footer?: Snippet;
+        /// Actions in the header, to the left of the close button.
+        headerActions?: Snippet;
+
+        /**
+         * Off when the content is a single edge-to-edge surface — an image, a
+         * PDF frame, a Monaco instance — which supplies its own insets and
+         * looks inset twice otherwise.
+         */
+        contentPadding?: boolean;
 
         // State management
         loading?: boolean;
@@ -32,12 +50,16 @@
 
     let {
         title,
+        titleIcon = undefined,
         size = 'md',
+        height = 'auto',
         mode = 'desktop',
         onClose = () => {},
         onBack = undefined,
         content,
         footer,
+        headerActions = undefined,
+        contentPadding = true,
         loading = false,
         error = undefined,
         success = undefined,
@@ -51,7 +73,13 @@
         sm: 'w-full max-w-sm',
         md: 'w-full max-w-md',
         lg: 'w-full max-w-lg',
-        xl: 'w-full max-w-2xl'
+        xl: 'w-full max-w-2xl',
+        '2xl': 'w-full max-w-4xl'
+    };
+
+    const heightClasses: Record<string, string> = {
+        auto: 'max-h-[90vh]',
+        tall: 'h-[90vh]'
     };
 
     // Close button variant - compact for desktop (obvious function), mobile for touch
@@ -91,7 +119,7 @@
          the root, so content that does not name its own (FeatureItem, for one)
          falls back to the UA default black and vanishes against the panel. -->
     <div
-        class="bg-surface0 text-primary border border-overlay1 rounded-lg shadow-xl z-50 {sizeClasses[size]} max-h-[90vh] overflow-hidden flex flex-col"
+        class="bg-surface0 text-primary border border-overlay1 rounded-lg shadow-xl z-50 {sizeClasses[size]} {heightClasses[height]} overflow-hidden flex flex-col"
         onclick={handleModalClick}
         onkeydown={(e) => e.key === 'Enter' && e.stopPropagation()}
         role="dialog"
@@ -113,8 +141,13 @@
                             tooltip="Back"
                         />
                     {/if}
+                    {#if titleIcon}
+                        <div class="{titleIcon} w-5 h-5 text-primary flex-shrink-0"></div>
+                    {/if}
                     <h3 id="modal-title" class="text-lg font-semibold text-primary truncate">{title}</h3>
                 </div>
+                <div class="flex items-center gap-2 flex-shrink-0">
+                    {@render headerActions?.()}
                 {#if showCloseButton}
                     <Button
                         icon="i-carbon-close"
@@ -127,11 +160,12 @@
                         tooltip="Close modal"
                     />
                 {/if}
+                </div>
             </div>
 
             <!-- Content Area -->
             <div class="flex-1 overflow-y-auto">
-                <div class="p-4 space-y-4">
+                <div class={contentPadding ? "p-4 space-y-4" : "h-full"}>
                     <!-- Error State -->
                     {#if error}
                         <div class="bg-red/20 border border-red rounded-lg p-3">

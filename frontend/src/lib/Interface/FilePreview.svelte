@@ -1,12 +1,11 @@
 <script lang="ts">
-    import { tokenStore, API_BASE_URL } from '../stores'
+    import { liveFilePreviewApi, type FilePreviewApi } from '../api/filePreview'
     import Button from '../Button.svelte'
     import { onMount, untrack } from 'svelte'
-    import { fade, scale } from 'svelte/transition'
+    import Modal from '../primitives/Modal.svelte'
     import type { FileItem } from '../types'
     import { InodeType } from '../types'
     import { getFileName, getFileExtension, getFileIcon } from '../utils/formatters'
-    import { ANIM_PANE } from '../primitives/animation'
 
     // Dynamically load MonacoEditor when preview opens
     let MonacoEditor: any = $state(null)
@@ -98,13 +97,16 @@
         fileList = [],
         currentIndex = 0,
         onClose,
-        onNavigate = null
+        onNavigate = null,
+        api = liveFilePreviewApi
     }: {
         file: FileItem,
         fileList?: FileItem[],
         currentIndex?: number,
         onClose: () => void,
-        onNavigate?: ((newIndex: number) => void) | null
+        onNavigate?: ((newIndex: number) => void) | null,
+        /** Injectable content fetch; see api/filePreview.ts. */
+        api?: FilePreviewApi
     } = $props()
 
     let loading = $state(true)
@@ -121,136 +123,64 @@
     const previewType = $derived(getPreviewType(filename))
 
     async function fetchFilePreview() {
+        loading = true
+        error = ''
+
         try {
-            loading = true
-            error = ''
+            // Nothing to fetch for a type we cannot render.
+            if (!previewType) return
 
-            const token = $tokenStore
-            if (!token) {
-                error = 'No authentication token found'
-                return
-            }
+            const config = SUPPORTED_PREVIEW_TYPES[previewType]
 
-            // Only fetch file content if we can preview it
-            if (previewType) {
-                const config = SUPPORTED_PREVIEW_TYPES[previewType]
-
-                // Check file size limit for text files
-                if (config.maxSize && file.file_size) {
-                    const fileSizeBytes = parseInt(file.file_size)
-                    if (fileSizeBytes > config.maxSize) {
-                        fileTooLarge = true
-                        loading = false
-                        return
-                    }
-                }
-
-                fileTooLarge = false
-
-                // Extract the path part after the first slash for the API call
-                let apiPath = file.path
-                if (apiPath.startsWith('/')) {
-                    apiPath = apiPath.substring(1)
-                }
-
-                // Fetch the file content for preview
-                const previewResponse = await fetch(`${API_BASE_URL}/files/${apiPath}`, {
-                    method: 'GET',
-                    headers: {
-                        'Authorization': `Bearer ${token}`,
-                    },
-                })
-
-                if (previewResponse.ok) {
-                    if (previewType === 'text' || previewType === 'code') {
-                        // Handle text and code files
-                        textContent = await previewResponse.text()
-                    } else {
-                        // Handle binary files (PDFs, etc.)
-                        const blob = await previewResponse.blob()
-                        const typedBlob = new Blob([blob], { type: config.mimeType })
-                        previewUrl = URL.createObjectURL(typedBlob)
-                    }
-                } else {
-                    console.warn('Failed to fetch preview:', previewResponse.status)
-                    error = `Failed to load preview: ${previewResponse.status}`
+            // Oversized text and code are refused before the request, not after.
+            if (config.maxSize && file.file_size) {
+                if (parseInt(file.file_size) > config.maxSize) {
+                    fileTooLarge = true
+                    return
                 }
             }
-        } catch (err) {
-            error = `Network error: ${err instanceof Error ? err.message : 'Unknown error'}`
-            console.error('Error fetching file preview:', err)
+            fileTooLarge = false
+
+            if (previewType === 'text' || previewType === 'code') {
+                const result = await api.fetchText(file.path)
+                if (result.ok) textContent = result.text
+                else error = result.detail
+            } else {
+                const result = await api.fetchBlob(file.path, config.mimeType)
+                if (result.ok) previewUrl = result.url
+                else error = result.detail
+            }
         } finally {
             loading = false
         }
     }
 
     async function downloadFile() {
-        try {
-            const token = $tokenStore
-            if (!token) {
-                error = 'No authentication token found'
-                return
-            }
-
-            // Extract the path part after the first slash for the API call
-            let apiPath = file.path
-            if (apiPath.startsWith('/')) {
-                apiPath = apiPath.substring(1)
-            }
-
-            const response = await fetch(`${API_BASE_URL}/files/${apiPath}`, {
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${token}`,
-                },
-            })
-
-            if (response.ok) {
-                // Get the filename from the response headers or extract from path
-                const contentDisposition = response.headers.get('Content-Disposition')
-                let downloadFilename = filename
-
-                // Try to extract filename from Content-Disposition header if present
-                if (contentDisposition) {
-                    const match = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/)
-                    if (match && match[1]) {
-                        downloadFilename = match[1].replace(/['"]/g, '')
-                    }
-                }
-
-                // Create blob and trigger download
-                const blob = await response.blob()
-                const url = window.URL.createObjectURL(blob)
-                const a = document.createElement('a')
-                a.href = url
-                a.download = downloadFilename
-                document.body.appendChild(a)
-                a.click()
-                window.URL.revokeObjectURL(url)
-                document.body.removeChild(a)
-
-                // Close the preview after download
-                onClose()
-            } else {
-                error = `Failed to download file: ${response.status} ${response.statusText}`
-                console.error('Failed to download file:', response.status)
-            }
-        } catch (err) {
-            error = `Network error: ${err instanceof Error ? err.message : 'Unknown error'}`
-            console.error('Error downloading file:', err)
+        const result = await api.download(file.path, filename)
+        if (!result.ok) {
+            error = result.detail
+            return
         }
+
+        // The save itself stays here: the seam hands back bytes and a name, and
+        // reaching into the DOM is the component's job, not the API layer's.
+        const a = document.createElement('a')
+        a.href = result.url
+        a.download = result.filename
+        document.body.appendChild(a)
+        a.click()
+        URL.revokeObjectURL(result.url)
+        document.body.removeChild(a)
+
+        onClose()
     }
 
-    function handleBackdropMouseDown(event: MouseEvent) {
-        if (event.target === event.currentTarget) {
-            onClose()
-        }
-    }
-
+    /**
+     * Arrows only. Escape belongs to Modal, which closes on it by default —
+     * handling it here as well would call onClose twice.
+     */
     function handleKeydown(event: KeyboardEvent) {
-        if (event.key === 'Escape') {
-            onClose()
-        } else if (event.key === 'ArrowLeft' && !loading) {
+        if (event.key === 'ArrowLeft' && !loading) {
             previousFile()
         } else if (event.key === 'ArrowRight' && !loading) {
             nextFile()
@@ -306,44 +236,32 @@
     })
 </script>
 
-<!-- Backdrop -->
-<div
-    class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4"
-    onmousedown={handleBackdropMouseDown}
-    transition:fade={ANIM_PANE}
->
-    <!-- Modal -->
-    <div
-        class="bg-surface0 border border-overlay1 rounded-lg shadow-xl w-full max-w-4xl h-[90vh] overflow-hidden flex flex-col"
-        transition:scale={{ ...ANIM_PANE, start: 0.96, opacity: 0 }}
-    >
-        <!-- Header -->
-        <div class="flex items-center justify-between p-4 border-b border-overlay0">
-            <div class="flex items-center gap-2 flex-1 mr-4 min-w-0">
-                <div class="{getFileIcon(file.inode_type === InodeType.Folder ? 'Folder' : 'File', filename, 'detail')} w-5 h-5 text-primary flex-shrink-0"></div>
-                <h3 class="text-lg font-semibold text-white truncate">{filename}</h3>
-            </div>
-            <div class="flex gap-2 items-center">
-                <Button
-                    icon="i-carbon-download"
-                    text="Download"
-                    onClick={downloadFile}
-                    disabled={loading}
-                />
-                <button
-                    class="text-muted hover:text-primary transition-colors p-1"
-                    onclick={onClose}
-                    aria-label="Close preview"
-                >
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                </button>
-            </div>
-        </div>
+<!--
+  Chrome comes from Modal: backdrop, panel, header, footer rule, Escape and
+  backdrop dismissal. This file previously reimplemented all of it, down to a
+  hand-drawn SVG cross where every other dialog uses the icon button.
 
-        <!-- Content Area -->
-        <div class="flex-1 overflow-auto">
+  `loading` and `error` are deliberately not handed to Modal — the preview shows
+  its own in-content states, and Modal's banners would duplicate them.
+-->
+<Modal
+    title={filename}
+    titleIcon={getFileIcon(file.inode_type === InodeType.Folder ? 'Folder' : 'File', filename, 'detail')}
+    size="2xl"
+    height="tall"
+    contentPadding={false}
+    {onClose}
+>
+    {#snippet headerActions()}
+        <Button
+            icon="i-carbon-download"
+            text="Download"
+            onClick={downloadFile}
+            disabled={loading}
+        />
+    {/snippet}
+
+    {#snippet content()}
             {#if loading}
                 <div class="flex items-center justify-center h-64">
                     <div class="text-muted">Loading preview...</div>
@@ -419,11 +337,11 @@
                     </div>
                 </div>
             {/if}
-        </div>
+    {/snippet}
 
-        <!-- Navigation Footer (only show if we have navigation context) -->
+    {#snippet footer()}
         {#if fileList.length > 1 && onNavigate}
-            <div class="flex items-center justify-between p-4 border-t border-overlay0">
+            <div class="flex items-center justify-between">
                 <Button
                     icon="i-carbon-chevron-left"
                     text="Previous"
@@ -449,5 +367,5 @@
                 />
             </div>
         {/if}
-    </div>
-</div>
+    {/snippet}
+</Modal>
