@@ -2,6 +2,7 @@
     import Button from '../../Button.svelte';
     import EntryRow from '../../EntryRow.svelte';
     import PassphraseInput from './PassphraseInput.svelte';
+    import Checkbox from '../../primitives/Checkbox.svelte';
     import SetupPane from '../../SetupPane.svelte';
     import StatusSpinner from '../../primitives/StatusSpinner.svelte';
     import { mergeStatusWords, AUTH } from '../../primitives/statusWords';
@@ -60,10 +61,11 @@
             bind:value={username}
         />
         <PassphraseInput bind:value={passphrase} />
-        <label class="flex items-center gap-2 text-sm text-overlay1 mt-2 cursor-pointer select-none">
-            <input type="checkbox" bind:checked={rememberMe} class="accent-mauve" />
-            Remember me for 24 hours
-        </label>
+        <Checkbox
+            bind:checked={rememberMe}
+            label="Remember me for 24 hours"
+            className="text-overlay1 mt-2"
+        />
         {#if errorMessage}
             <p class="text-red text-sm mt-2">{errorMessage}</p>
         {/if}
