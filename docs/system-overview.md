@@ -540,7 +540,7 @@ End-to-end encryption and comprehensive authentication system.
 - [x] Per-file encryption keys with user access control
 - [x] Consensus operation authentication and validation
 - [x] TLS-only network surface with per-node self-signed cert and SPKI pairing ([RFC-022](specs/pinned-https.md)); plaintext HTTP is loopback-only
-- [ ] Android Hop Drive client consuming QR pairing payload v1 ([RFC-022](specs/pinned-https.md))
+- [x] Android Hop Drive client — live SAF provider over pinned HTTPS ([spec](specs/hop-drive-android.md))
 - [ ] Advanced permission models (read-only, time-limited access)
 - [ ] Key rotation and recovery mechanisms
 - [ ] Audit logging and security monitoring

@@ -136,5 +136,5 @@ implementation.
 
 - [ ] Certificate rotation with signed rollover (pin continuity)
 - [ ] mDNS advertisement of `{host, port}` for pairing without manual entry
-- [ ] Android Hop Drive client consuming QR payload v1
+- [x] Android Hop Drive client consuming QR payload v1 ([hop-drive-android](hop-drive-android.md))
 - [ ] iroh as an alternative device transport (NAT traversal, roaming)
