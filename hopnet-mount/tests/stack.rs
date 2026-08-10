@@ -528,6 +528,53 @@ async fn transport_write_methods_roundtrip() {
     );
 }
 
+// Impact: the node parses /create's multipart as a stream, so `parent_id`
+// must reach it before the part that names the new item. Every other
+// folder-creating test builds its tree one level deep, leaving
+// create_folder's non-root-parent arm — the only place that ordering can
+// go wrong — unexecuted. Anything that walks a tree (rsync, a file
+// manager, tar -x) hits it on the first subdirectory.
+// Should: create a folder under a non-root parent and resolve it there.
+// Should not: leave the nested folder at the root.
+#[tokio::test]
+async fn create_folder_nests_under_a_non_root_parent() {
+    let node = boot_node().await;
+    let (api_key, _jwt) = provision(&node).await;
+    let transport = HttpTransport::new(&node.base(), &api_key).unwrap();
+
+    let parent = transport
+        .create_folder(ItemId::Root, "Parent".to_string())
+        .await
+        .expect("create parent folder")
+        .item
+        .unwrap();
+
+    let child = transport
+        .create_folder(parent.id.clone(), "Child".to_string())
+        .await
+        .expect("create folder under a non-root parent")
+        .item
+        .unwrap();
+
+    assert_eq!(child.parent, parent.id, "nested folder carries its parent");
+    assert!(
+        transport
+            .lookup(parent.id.clone(), "Child".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "nested folder resolvable under its parent"
+    );
+    assert!(
+        transport
+            .lookup(ItemId::Root, "Child".to_string())
+            .await
+            .unwrap()
+            .is_none(),
+        "nested folder must not land at the root"
+    );
+}
+
 // Should: expose a live node's tree through a real kernel mount — ls and
 // stat via std::fs observe the seeded namespaces with sane metadata — and
 // reflect a REMOTE content modification in stat within seconds (the

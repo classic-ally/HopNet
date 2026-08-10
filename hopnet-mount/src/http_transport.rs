@@ -363,10 +363,15 @@ impl NodeTransport for HttpTransport {
         name: String,
     ) -> BoxFuture<'_, Result<Mutated, TransportError>> {
         Box::pin(async move {
-            let mut form = reqwest::multipart::Form::new().text("folder_name", name);
+            // `parent_id` FIRST: the node parses this multipart as a
+            // stream and resolves the parent when it reaches the part
+            // naming the item, so a trailing parent_id is both too late
+            // and a 400 (see create_file, which orders it the same way).
+            let mut form = reqwest::multipart::Form::new();
             if let ItemId::Inode(uuid) = &parent {
                 form = form.text("parent_id", uuid.to_string());
             }
+            let form = form.text("folder_name", name);
             let response = self
                 .upload_client
                 .post(self.url("create"))
