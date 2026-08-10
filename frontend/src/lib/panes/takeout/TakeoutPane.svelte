@@ -1,35 +1,49 @@
 <script lang="ts">
-    import { TableHandler, ThSort, Th, Datatable } from '@vincjo/datatables'
     import { tokenStore, API_BASE_URL } from '../../stores'
-    import { onMount, tick } from 'svelte'
+    import { onMount } from 'svelte'
     import type { TakeoutRecord, TakeoutStatus } from '../../types'
-    import { formatDateResponsive, formatIdResponsive } from '../../utils/formatters'
     import Toolbar from '../../primitives/Toolbar.svelte'
     import type { ToolbarItem } from '../../primitives/Toolbar.svelte'
+    import Table from '../../primitives/Table.svelte'
+    import { TableState } from '../../primitives/tableState.svelte'
+    import DateCell from '../../primitives/DateCell.svelte'
     import PaneHeader from '../../primitives/PaneHeader.svelte'
 
-    // Props
-    export let onToggleSidebar: () => void = () => {};
+    let { onToggleSidebar = () => {} }: { onToggleSidebar?: () => void } = $props()
 
-    // State
-    let takeouts: TakeoutRecord[] = []
-    let loading = true
-    let error = ''
-    let actionLoading: string | null = null // Track which action is loading
-    let canCreateTakeout = false // Track if user can create new takeout
-    let containerWidth = 0 // Track container width for responsive rendering
-    let containerRef: HTMLElement
+    let takeouts = $state.raw<TakeoutRecord[]>([])
+    let loading = $state(true)
+    let error = $state('')
+    let actionLoading = $state<string | null>(null) // Track which action is loading
+    let canCreateTakeout = $state(false)
     let autoRefreshInterval: number | null = null
     const AUTO_REFRESH_DELAY = 5000 // Refresh every 5 seconds
 
-    const table = new TableHandler(takeouts, {
-        rowsPerPage: 20,
-        selectBy: 'id',
-    })
-    const search = table.createSearch()
+    function canDownload(status: TakeoutStatus): boolean {
+        return status === 'Ready'
+    }
 
-    // Track selections manually for reactivity
-    let selectedIds = []
+    function canCancel(status: TakeoutStatus): boolean {
+        return status === 'Pending' || status === 'Materializing' || status === 'Ready'
+    }
+
+    function canSelect(status: TakeoutStatus): boolean {
+        return status !== 'Expired' && status !== 'Cancelled'
+    }
+
+    // Terminal takeouts are not selectable; setRows prunes rows that expire
+    // out from under a selection during the background refresh, so the bulk
+    // actions can never target them.
+    const table = new TableState<TakeoutRecord>([], {
+        key: (r) => r.id,
+        searchFields: (r) => [r.id, r.status],
+        rowsPerPage: 20,
+        selectable: (r) => canSelect(r.status)
+    })
+
+    const selectedRecords = $derived(
+        [...table.selected].flatMap((id) => takeouts.filter((t) => t.id === id))
+    )
 
     // Data fetching
     async function fetchTakeouts(isAutoRefresh = false) {
@@ -65,14 +79,8 @@
             ])
 
             if (takeutsResponse.ok) {
-                const data = await takeutsResponse.json()
-                takeouts = data
+                takeouts = await takeutsResponse.json()
                 table.setRows(takeouts)
-                // Update selections array for reactivity
-                selectedIds = [...table.selected]
-                // Update container width after DOM updates to ensure responsive formatting
-                await tick()
-                updateContainerWidth()
             } else {
                 error = `Failed to fetch takeouts: ${takeutsResponse.status} ${takeutsResponse.statusText}`
                 console.error('Failed to fetch takeouts:', takeutsResponse.status)
@@ -204,39 +212,28 @@
     }
 
     function handleDownloadSelected() {
-        const readyTakeouts = table.selected.filter(id => {
-            const takeout = takeouts.find(t => t.id === id)
-            return takeout && canDownload(takeout.status)
-        })
-
-        if (readyTakeouts.length === 0) {
+        const ready = selectedRecords.filter((t) => canDownload(t.status))
+        if (ready.length === 0) {
             error = 'No ready takeouts selected for download'
             return
         }
-
-        // Download each selected ready takeout
-        readyTakeouts.forEach(id => downloadTakeout(id))
+        ready.forEach((t) => downloadTakeout(t.id))
     }
 
     function handleDeleteSelected() {
-        const cancellableTakeouts = table.selected.filter(id => {
-            const takeout = takeouts.find(t => t.id === id)
-            return takeout && canCancel(takeout.status)
-        })
-
-        if (cancellableTakeouts.length === 0) {
+        const cancellable = selectedRecords.filter((t) => canCancel(t.status))
+        if (cancellable.length === 0) {
             error = 'No cancellable takeouts selected'
             return
         }
 
-        const count = cancellableTakeouts.length
+        const count = cancellable.length
         const message = count === 1
             ? 'Are you sure you want to delete this takeout?'
             : `Are you sure you want to delete these ${count} takeouts?`
 
         if (confirm(message)) {
-            // Cancel each selected takeout
-            cancellableTakeouts.forEach(id => cancelTakeout(id))
+            cancellable.forEach((t) => cancelTakeout(t.id))
         }
     }
 
@@ -250,31 +247,6 @@
             case 'Cancelled': return 'text-red'
             default: return 'text-muted'
         }
-    }
-
-    function updateContainerWidth() {
-        if (containerRef) {
-            containerWidth = containerRef.clientWidth
-        }
-    }
-
-    function handleSelection(id: string) {
-        if (!canSelect(takeouts.find(t => t.id === id)?.status || '')) return
-
-        table.select(id)
-        selectedIds = [...table.selected] // Force reactivity by creating new array
-    }
-
-    function canDownload(status: TakeoutStatus): boolean {
-        return status === 'Ready'
-    }
-
-    function canCancel(status: TakeoutStatus): boolean {
-        return status === 'Pending' || status === 'Materializing' || status === 'Ready'
-    }
-
-    function canSelect(status: TakeoutStatus): boolean {
-        return status !== 'Expired' && status !== 'Cancelled'
     }
 
     // Auto-refresh management
@@ -297,34 +269,21 @@
         }
     }
 
-    // Reactive statements
-    $: containerWidth && table.setRows(takeouts)
-
-    // Reactive statement to pause auto-refresh during actions
-    $: if (actionLoading) {
-        stopAutoRefresh()
-    } else if (!autoRefreshInterval) {
-        startAutoRefresh()
-    }
-
-    // Check if any takeouts are in transitional states that need monitoring
-    $: hasActiveOperations = takeouts.some(t =>
-        t.status === 'Pending' || t.status === 'Materializing'
-    )
+    // Pause auto-refresh during actions
+    $effect(() => {
+        if (actionLoading) {
+            stopAutoRefresh()
+        } else if (!autoRefreshInterval) {
+            startAutoRefresh()
+        }
+    })
 
     // Reactive state for button enabling
-    $: canDownloadSelected = selectedIds.length > 0 && selectedIds.some(id => {
-        const takeout = takeouts.find(t => t.id === id)
-        return takeout && canDownload(takeout.status)
-    })
-
-    $: canDeleteSelected = selectedIds.length > 0 && selectedIds.some(id => {
-        const takeout = takeouts.find(t => t.id === id)
-        return takeout && canCancel(takeout.status)
-    })
+    const canDownloadSelected = $derived(selectedRecords.some((t) => canDownload(t.status)))
+    const canDeleteSelected = $derived(selectedRecords.some((t) => canCancel(t.status)))
 
     // Toolbar configuration
-    $: leftElements = [
+    const leftElements = $derived([
         {
             type: 'action' as const,
             icon: 'i-carbon-add',
@@ -334,9 +293,9 @@
             tooltip: canCreateTakeout ? "Create new takeout" : "Cannot create - you already have an active takeout",
             disabled: !canCreateTakeout || actionLoading === 'initiate'
         }
-    ] satisfies ToolbarItem[];
+    ] satisfies ToolbarItem[]);
 
-    $: rightElements = [
+    const rightElements = $derived([
         {
             type: 'action' as const,
             icon: 'i-carbon-cloud-download',
@@ -355,141 +314,57 @@
             tooltip: canDeleteSelected ? "Delete selected takeouts" : "No cancellable takeouts selected",
             disabled: !canDeleteSelected
         }
-    ] satisfies ToolbarItem[];
+    ] satisfies ToolbarItem[]);
 
     // Lifecycle
     onMount(() => {
         fetchTakeouts()
-        updateContainerWidth()
-        window.addEventListener('resize', updateContainerWidth)
         startAutoRefresh()
 
         return () => {
-            window.removeEventListener('resize', updateContainerWidth)
             stopAutoRefresh()
         }
     })
 
-    // Reactive statement to refetch when token changes
-    $: if ($tokenStore) {
-        fetchTakeouts()
-    }
+    // Refetch when the token changes (login/logout).
+    $effect(() => {
+        if ($tokenStore) fetchTakeouts()
+    })
 </script>
 
-<!-- Integrated Toolbar -->
-<Toolbar
-    {leftElements}
-    centerElements={[]}
-    {rightElements}
-    {onToggleSidebar}
-/>
+<Toolbar {leftElements} centerElements={[]} {rightElements} {onToggleSidebar} />
 
-<!-- Page Title -->
 <PaneHeader title="Data Takeouts" subtitle="Export and download your data" />
 
-<!-- Takeouts Table -->
-<div class="border-solid border-1 rounded-lg p-1 border-overlay1" bind:this={containerRef}>
+{#snippet idCell(row: TakeoutRecord)}
+    <span class="font-mono text-sm" title={row.id}>{row.id}</span>
+{/snippet}
 
-    {#if error}
-        <div class="text-red p-2 mb-2 border border-red rounded">
-            {error}
-            <button
-                class="ml-2 text-blue underline"
-                onclick={() => fetchTakeouts()}
-            >
-                Retry
-            </button>
-        </div>
-    {/if}
+{#snippet statusCell(row: TakeoutRecord)}
+    <span class={getStatusColor(row.status)}>{row.status}</span>
+{/snippet}
 
-    <div class="flex gap-1 mb-2">
-        <!-- Search bar -->
-        <input
-            class="flex-1 bg-transparent text-primary border-overlay0 border-2 border-solid rounded-md p-1"
-            type="text"
-            placeholder="Search takeouts..."
-            bind:value={search.value}
-            oninput={() => search.set()}
-            disabled={loading}
-        >
-        <!-- Rows per page selector -->
-        <select
-            class="p-1 border-overlay0 border-2 border-solid rounded-md bg-transparent text-primary"
-            bind:value={table.rowsPerPage}
-            onchange={() => table.setPage(1)}
-            disabled={loading}
-        >
-            {#each [10, 20, 50] as option}
-                <option value={option}>{option} items</option>
-            {/each}
-        </select>
-    </div>
+{#snippet createdCell(row: TakeoutRecord)}
+    <span class="text-sm"><DateCell date={row.created_at} /></span>
+{/snippet}
 
-    {#if loading}
-        <div class="text-muted p-4 text-center">
-            Loading takeouts...
-        </div>
-    {:else}
-        <div class="overflow-x-auto">
-        <Datatable {table}>
-            <table class="w-full whitespace-nowrap">
-                <thead>
-                    <tr class="text-subtitle">
-                        <Th></Th>
-                        <Th>ID</Th>
-                        <ThSort {table} field="status">Status</ThSort>
-                        <ThSort {table} field="created_at">Created</ThSort>
-                        <ThSort {table} field="expires_at">Expires</ThSort>
-                    </tr>
-                </thead>
-                <tbody>
-                    {#each table.rows as row}
-                        <tr class="text-left">
-                            <td>
-                                <input type="checkbox"
-                                    checked={selectedIds.includes(row.id)}
-                                    disabled={!canSelect(row.status)}
-                                    onclick={() => handleSelection(row.id)}
-                                >
-                            </td>
-                            <td class="font-mono text-sm whitespace-nowrap">{formatIdResponsive(row.id, containerWidth)}</td>
-                            <td class="{getStatusColor(row.status)} whitespace-nowrap">{row.status}</td>
-                            <td class="text-sm whitespace-nowrap">{formatDateResponsive(row.created_at, containerWidth)}</td>
-                            <td class="text-sm whitespace-nowrap">{formatDateResponsive(row.expires_at, containerWidth)}</td>
-                        </tr>
-                    {:else}
-                        <tr>
-                            <td colspan="5" class="text-center text-muted p-4">
-                                No takeouts found. Create your first data export above.
-                            </td>
-                        </tr>
-                    {/each}
-                </tbody>
-            </table>
-        </Datatable>
-        </div>
-    {/if}
-</div>
+{#snippet expiresCell(row: TakeoutRecord)}
+    <span class="text-sm"><DateCell date={row.expires_at} /></span>
+{/snippet}
 
-<style>
-    tbody tr:hover {
-        background-color: #313244 !important; /* surface0 */
-    }
-
-    :global(footer) {
-        border-top: none !important;
-    }
-
-    /* Footer text */
-    :global(aside) {
-        color: #bac2de !important; /* subtitle */
-    }
-
-    :global(td) {
-        border: 1px solid #313244 !important; /* surface0 - very subtle borders */
-    }
-
-    :global(th) {
-        border-bottom: 1px solid #313244 !important; /* surface0 - header separator */
-    }
-</style>
+<Table
+    state={table}
+    selection="checkbox"
+    searchPlaceholder="Search takeouts..."
+    {loading}
+    loadingText="Loading takeouts..."
+    {error}
+    onRetry={() => fetchTakeouts()}
+    empty="No takeouts found. Create your first data export above."
+    columns={[
+        { id: 'id', header: 'ID', preset: 'uuid', cell: idCell },
+        { id: 'status', header: 'Status', sortField: 'status', preset: 'status', cell: statusCell },
+        { id: 'created', header: 'Created', sortField: 'created_at', preset: 'date', cell: createdCell },
+        { id: 'expires', header: 'Expires', sortField: 'expires_at', preset: 'date', cell: expiresCell }
+    ]}
+/>
