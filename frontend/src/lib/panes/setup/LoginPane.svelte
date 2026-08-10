@@ -5,11 +5,13 @@
     import SetupPane from '../../SetupPane.svelte';
     import StatusSpinner from '../../primitives/StatusSpinner.svelte';
     import { mergeStatusWords, AUTH } from '../../primitives/statusWords';
-    import { tokenStore, API_BASE_URL } from '../../stores';
+    import { tokenStore } from '../../stores';
     import { router } from '../../router.svelte';
+    import { liveSetupApi, TRANSPORT_FAILURE, type SetupApi } from '../../api/setup';
 
     export let username = '';
     export let passphrase = '';
+    export let api: SetupApi = liveSetupApi;
     let rememberMe = false;
     let loading = false;
     let errorMessage = '';
@@ -19,41 +21,28 @@
     async function handleLogin() {
         loading = true;
         errorMessage = '';
-        try {
-            const response = await fetch(`${API_BASE_URL}/login`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    username,
-                    passphrase,
-                    remember_me: rememberMe,
-                }),
-            });
 
-            if (response.ok) {
-                const data = await response.json();
-                tokenStore.set(data.token);
-                router.redirectToIntended();
-                // Drop the raw passphrase from component state once we have a
-                // token. Binding propagates the clear back to App.svelte and
-                // resets PassphraseInput's word fields. Doesn't guarantee V8
-                // releases the buffer immediately, but removes the live ref.
-                passphrase = '';
-                username = '';
-            } else if (response.status === 401) {
-                errorMessage = 'Invalid username or passphrase';
-            } else if (response.status === 503) {
-                errorMessage = 'Node not initialized';
-            } else {
-                errorMessage = 'Login failed. Please try again.';
-            }
-        } catch (error) {
+        const result = await api.login(username, passphrase, rememberMe);
+        if (result.ok) {
+            tokenStore.set(result.token);
+            router.redirectToIntended();
+            // Drop the raw passphrase from component state once we have a
+            // token. Binding propagates the clear back to App.svelte and
+            // resets PassphraseInput's word fields. Doesn't guarantee V8
+            // releases the buffer immediately, but removes the live ref.
+            passphrase = '';
+            username = '';
+        } else if (result.status === TRANSPORT_FAILURE) {
             errorMessage = 'Connection error. Is the server running?';
-        } finally {
-            loading = false;
+        } else if (result.status === 401) {
+            errorMessage = 'Invalid username or passphrase';
+        } else if (result.status === 503) {
+            errorMessage = 'Node not initialized';
+        } else {
+            errorMessage = 'Login failed. Please try again.';
         }
+
+        loading = false;
     }
 </script>
 

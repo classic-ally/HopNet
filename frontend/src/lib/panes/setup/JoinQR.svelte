@@ -2,10 +2,11 @@
     import { onMount } from 'svelte';
     import SetupPane from "../../SetupPane.svelte";
     import QrCode from "svelte-qrcode";
-    import { API_BASE_URL } from '../../stores';
+    import { liveSetupApi, TRANSPORT_FAILURE, type SetupApi } from '../../api/setup';
 
     // Props from previous setup page
     export let name: string;
+    export let api: SetupApi = liveSetupApi;
 
     let manualInfoExpanded = false;
     let pubkey: string = '';
@@ -26,24 +27,15 @@
     }
 
     async function fetchPubkey() {
-        try {
-            const response = await fetch(`${API_BASE_URL}/setup`);
-
-            // The /setup endpoint returns (status_code, pubkey)
-            // Status is 404 if not setup, 200 if setup
-            // But the pubkey is in the response body regardless of status
-            if (response.status === 404 || response.ok) {
-                const pubkeyData = await response.json();
-                pubkey = pubkeyData;
-                loading = false;
-            } else {
-                error = 'Failed to fetch public key';
-                loading = false;
-            }
-        } catch (err) {
-            error = `Network error: ${err instanceof Error ? err.message : 'Unknown error'}`;
-            loading = false;
+        const result = await api.fetchPubkey();
+        if (result.ok) {
+            pubkey = result.pubkey;
+        } else if (result.status === TRANSPORT_FAILURE) {
+            error = `Network error: ${result.detail ?? 'Unknown error'}`;
+        } else {
+            error = 'Failed to fetch public key';
         }
+        loading = false;
     }
 
     onMount(() => {

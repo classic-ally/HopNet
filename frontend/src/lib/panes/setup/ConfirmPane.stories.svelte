@@ -1,6 +1,8 @@
 <script module lang="ts">
   import { defineMeta } from '@storybook/addon-svelte-csf';
   import ConfirmPane from './ConfirmPane.svelte';
+  import { mockSetupApi } from '../../api/setup.mock';
+  import { TRANSPORT_FAILURE } from '../../api/setup';
 
   const { Story } = defineMeta({
     title: 'Panes/Setup/ConfirmPane',
@@ -14,7 +16,9 @@
     parameters: {
       docs: {
         description: {
-          component: 'The Save button triggers a real POST to /setup. In Storybook this will fail without a backend.'
+          component:
+            'Save runs genesis against a mock API, so the spinner and the minted passphrase ' +
+            'are both observable without a backend.'
         }
       }
     }
@@ -25,6 +29,7 @@
   <div class="min-h-screen bg-base p-6 flex items-center justify-center">
     <div class="w-full max-w-md">
       <ConfirmPane
+        api={mockSetupApi()}
         onBackButton={() => console.log('Back clicked')}
         onSetupComplete={(pp) => console.log('Setup complete, passphrase:', pp)}
         {...args}
@@ -34,3 +39,29 @@
 {/snippet}
 
 <Story name="Default" {template} args={{ username: 'alice', computername: 'allison-macbook' }} />
+
+{#snippet failing(args)}
+  <div class="min-h-screen bg-base p-6 flex items-center justify-center">
+    <div class="w-full max-w-md">
+      <ConfirmPane
+        api={mockSetupApi({ failWith: args.failWith })}
+        onBackButton={() => console.log('Back clicked')}
+        onSetupComplete={(pp) => console.log('Setup complete, passphrase:', pp)}
+        username={args.username}
+        computername={args.computername}
+      />
+    </div>
+  </div>
+{/snippet}
+
+<Story
+  name="Genesis Rejected"
+  template={failing}
+  args={{ username: 'alice', computername: 'allison-macbook', failWith: 503 }}
+/>
+
+<Story
+  name="No Backend"
+  template={failing}
+  args={{ username: 'alice', computername: 'allison-macbook', failWith: TRANSPORT_FAILURE }}
+/>
