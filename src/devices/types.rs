@@ -2,7 +2,9 @@ use crate::db::{Blake3Hash, CustomUUID};
 use serde::{Deserialize, Serialize};
 
 // Re-export API types from common for use elsewhere in this crate
-pub use hopnet_common::{DeviceInfo, RegisterDeviceRequest, RegisterDeviceResponse};
+pub use hopnet_common::{
+    DeviceInfo, PairingInfoResponse, RegisterDeviceRequest, RegisterDeviceResponse,
+};
 
 /// Payload for RegisterDevice consensus transaction
 #[derive(Debug, Clone, Serialize, Deserialize)]

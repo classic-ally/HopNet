@@ -23,7 +23,7 @@ pub use db::{
     CustomUUID, FileItem, ImportPathCounts, ImportPathRow, ImportPathStatus, ImportRecord,
     ImportStatus, InodeType, TakeoutRecord, TakeoutStatus,
 };
-pub use devices::{DeviceInfo, RegisterDeviceRequest, RegisterDeviceResponse};
+pub use devices::{DeviceInfo, PairingInfoResponse, RegisterDeviceRequest, RegisterDeviceResponse};
 pub use fileprovider::{
     ChangesQuery, ChangesResponse, DeleteItemRequest, EnumerateResponse, FileProviderItem,
     HealthResponse, HealthStatus,
