@@ -100,6 +100,17 @@ urlencoding = "2.1.3"
 image = { version = "0.25", default-features = false, features = ["webp", "jpeg", "png"] }
 base64 = "0.22"
 
+# Pinned-HTTPS network surface (docs/specs/pinned-https.md). All pinned to the
+# ring provider: iroh already vendors ring, and axum-server's default
+# `tls-rustls` feature would drag in aws-lc-sys (C/CMake build) plus a
+# two-provider ambiguity. Keep `-no-provider` + explicit ring everywhere.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+ring = "0.17"
+rustls-pemfile = "2"
+x509-parser = "0.17"
+
 # Tauri dependencies (optional for GUI mode)
 tauri = { version = "2.7.0", features = ["tray-icon", "image-png"], optional = true }
 thiserror = "2.0.18"

@@ -34,9 +34,21 @@ use tower_http::trace::TraceLayer;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
-/// Default HTTP port for headless mode (browser-served deployments).
-/// GUI mode binds an ephemeral loopback port — see `run_server`.
-const HEADLESS_BACKEND_PORT: u16 = 34632;
+/// Default port for the pinned-HTTPS listener — the node's ONLY network
+/// surface (docs/specs/pinned-https.md). Plaintext HTTP is loopback-only
+/// on a kernel-assigned port in both headless and GUI modes.
+///
+/// Env overrides:
+/// - `HOPNET_HTTPS_PORT`: TLS port (default 34632).
+/// - `HOPNET_HTTP_PORT`: pin the loopback plaintext port instead of
+///   kernel-assigned — dev tooling (vite proxy, tauri devUrl) and
+///   in-container tests need a fixed local port. Must differ from the
+///   TLS port.
+/// - `HOPNET_DISABLE_TLS` (presence): skip the TLS listener entirely,
+///   leaving only loopback plaintext (dev runs, or deployments fronted
+///   by something that proxies to loopback, e.g. `tailscale serve`).
+///   Dev convention: `HOPNET_DISABLE_TLS=1 HOPNET_HTTP_PORT=34632`.
+const DEFAULT_HTTPS_PORT: u16 = 34632;
 
 /// Exit code requesting a process restart (BSD EX_TEMPFAIL): the epoch
 /// sealed and this binary already runs the required version, so a fresh
@@ -86,9 +98,10 @@ async fn serve_spa(request: Request) -> Response<Body> {
 
 /// Run the axum server.
 ///
-/// `bind_addr` is the address to bind. Headless: `0.0.0.0:34632` (publicly
-/// reachable). GUI: `127.0.0.1:0` (loopback, kernel-assigned port — prevents
-/// collisions between concurrent HopNet processes).
+/// `bind_addr` is the loopback plaintext address to bind — `127.0.0.1:0`
+/// (kernel-assigned) in both headless and GUI modes unless pinned via
+/// `HOPNET_HTTP_PORT`. The network surface is the pinned-HTTPS listener
+/// on `0.0.0.0:{DEFAULT_HTTPS_PORT}`, bound here too.
 async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     // tracing
     tracing_subscriber::fmt::init();
@@ -97,10 +110,61 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     // projection's cross-crate inventory registrations.
     assert_projection_registrations();
 
-    // Bind before anything else. With `127.0.0.1:0` the kernel assigns a
-    // free port; we need to capture the result and thread it into AppState
-    // so things like the FileProvider keychain config point at the correct
-    // loopback URL.
+    // Pinned-HTTPS listener: the node's only network surface. Bound BEFORE
+    // the plaintext listener so a kernel-assigned loopback port can never
+    // land on the TLS port and shadow it (the wildcard bind wins first).
+    // Cert material is data-dir-only, so this needs no DB.
+    let tls_bound = if std::env::var("HOPNET_DISABLE_TLS").is_ok() {
+        tracing::info!("TLS listener disabled (HOPNET_DISABLE_TLS); loopback plaintext only");
+        None
+    } else {
+        let https_port = std::env::var("HOPNET_HTTPS_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(DEFAULT_HTTPS_PORT);
+        if bind_addr.ends_with(&format!(":{https_port}")) {
+            return Err(format!(
+                "HOPNET_HTTP_PORT collides with the TLS port ({https_port}); \
+                 the loopback plaintext port must differ"
+            )
+            .into());
+        }
+        let init = (|| {
+            let identity = hopnet::tls::load_or_generate(&hopnet::tls::default_tls_dir())?;
+            let config = hopnet::tls::server_config(&identity)?;
+            let listener = std::net::TcpListener::bind(("0.0.0.0", https_port))
+                .map_err(|e| format!("tls bind 0.0.0.0:{https_port}: {e}"))?;
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| format!("tls listener nonblocking: {e}"))?;
+            Ok::<_, String>((listener, config, identity.spki_sha256))
+        })();
+        match init {
+            Ok((listener, config, spki_sha256)) => {
+                tracing::info!(https_port, spki = %spki_sha256, "TLS listening on 0.0.0.0");
+                hopnet::tls::publish_runtime_info(hopnet::tls::TlsRuntimeInfo {
+                    https_port,
+                    spki_sha256,
+                });
+                Some((listener, config))
+            }
+            // GUI: the loopback webview is the desktop app's core — losing
+            // the pairing surface (say, a port clash with another local
+            // process) must not brick it. Headless: TLS is the only network
+            // surface, so starting without it would leave the server dark
+            // behind a single warn line — refuse instead.
+            Err(e) if cfg!(feature = "gui") => {
+                tracing::warn!(error = %e, "TLS listener unavailable; continuing loopback-only");
+                None
+            }
+            Err(e) => return Err(format!("TLS listener init failed: {e}").into()),
+        }
+    };
+
+    // Bind the loopback plaintext listener. With `127.0.0.1:0` the kernel
+    // assigns a free port; we need to capture the result and thread it into
+    // AppState so things like the FileProvider keychain config point at the
+    // correct loopback URL.
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let port = listener.local_addr()?.port();
     ACTUAL_BACKEND_PORT.store(port, std::sync::atomic::Ordering::SeqCst);
@@ -941,8 +1005,32 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // lets final-block gossip and in-flight serves settle before
             // the whole mesh drops at once.
             let restart_requested = restart_signal.notified();
+            // TLS serves the same router. In GUI mode a dying TLS accept
+            // loop must not take the loopback webview down with it, so the
+            // future logs and pends instead of resolving; headless
+            // propagates (fail-fast — TLS is the only network surface).
+            let tls_app = app.clone();
+            let tls_serve = async move {
+                let Some((std_listener, config)) = tls_bound else {
+                    return std::future::pending::<Result<(), std::io::Error>>().await;
+                };
+                let rustls_config =
+                    axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(config));
+                let result = axum_server::from_tcp_rustls(std_listener, rustls_config)
+                    .serve(tls_app.into_make_service())
+                    .await;
+                if cfg!(feature = "gui") {
+                    if let Err(e) = &result {
+                        tracing::warn!(error = %e, "TLS listener exited; continuing loopback-only");
+                    }
+                    std::future::pending::<Result<(), std::io::Error>>().await
+                } else {
+                    result
+                }
+            };
             tokio::select! {
                 r = serve(listener, app) => { r?; }
+                r = tls_serve => { r.map_err(|e| format!("TLS server error: {e}"))?; }
                 _ = restart_requested => {
                     let grace_ms = std::env::var("HOPNET_RESTART_GRACE_MS")
                         .ok()
@@ -985,13 +1073,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(not(feature = "gui"))]
     {
-        // HOPNET_HTTP_PORT lets a dev copy run alongside a real node on the
-        // same machine (pair with XDG_DATA_HOME for storage isolation).
+        // Loopback-only plaintext, kernel-assigned by default so a dev copy
+        // and a real node never clash (pair with XDG_DATA_HOME for storage
+        // isolation). HOPNET_HTTP_PORT pins it for tooling that needs a
+        // fixed local port; the network surface is the TLS listener bound
+        // inside run_server.
         let port = std::env::var("HOPNET_HTTP_PORT")
             .ok()
             .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(HEADLESS_BACKEND_PORT);
-        run_server(&format!("0.0.0.0:{}", port)).await
+            .unwrap_or(0);
+        run_server(&format!("127.0.0.1:{}", port)).await
     }
 }
 
