@@ -1,9 +1,10 @@
 <script lang="ts">
-    import { TableHandler, ThSort, Th, Datatable } from '@vincjo/datatables'
     import { tokenStore, API_BASE_URL } from '../../stores'
     import { onMount } from 'svelte'
     import Toolbar from '../../primitives/Toolbar.svelte'
     import type { ToolbarItem } from '../../primitives/Toolbar.svelte'
+    import Table from '../../primitives/Table.svelte'
+    import { TableState } from '../../primitives/tableState.svelte'
     import NodeAddPane from './NodeAddPane.svelte'
     import { fetchUsers } from '../../api/shares'
     import type { UserInfo } from '../../api/shares'
@@ -15,23 +16,34 @@
         owner: number;
     }
 
-    // Props
-    export let onToggleSidebar: () => void = () => {};
+    let { onToggleSidebar = () => {} }: { onToggleSidebar?: () => void } = $props()
 
-    // State
-    let nodes: Node[] = []
-    let loading = true
-    let error = ''
-    let isNodeAddOpen = false
-    let usersMap: Map<number, UserInfo> = new Map()
+    let loading = $state(true)
+    let error = $state('')
+    let isNodeAddOpen = $state(false)
+    let usersMap = $state<Map<number, UserInfo>>(new Map())
+    let nodeCount = $state(0)
 
-    const table = new TableHandler(nodes, {
-        rowsPerPage: 50,
-        selectBy: 'node_id',
+    // Owner search matches the displayed identity, not the numeric id the row
+    // carries — usersMap is reactive state, so results refresh when it loads.
+    const table = new TableState<Node>([], {
+        key: (r) => r.node_id,
+        searchFields: (r) => {
+            const owner = usersMap.get(r.owner)
+            return [r.name, owner?.username, owner?.first_name, owner?.last_name]
+        },
+        rowsPerPage: 50
     })
-    const search = table.createSearch()
 
-    // Node management functions
+    const selectedCount = $derived(table.selected.size)
+
+    function ownerLabel(owner: UserInfo | undefined, fallback: number): string {
+        if (owner?.first_name) {
+            return `${owner.first_name}${owner.last_name ? ` ${owner.last_name}` : ''}`
+        }
+        return owner?.username ?? String(fallback)
+    }
+
     async function fetchNodes() {
         try {
             loading = true
@@ -53,8 +65,8 @@
 
             if (response.ok) {
                 const data = await response.json()
-                nodes = data
-                table.setRows(nodes)
+                table.setRows(data)
+                nodeCount = data.length
             } else {
                 error = `Failed to fetch nodes: ${response.status} ${response.statusText}`
                 console.error('Failed to fetch nodes:', response.status)
@@ -67,35 +79,23 @@
         }
     }
 
-    function handleAddNode() {
-        isNodeAddOpen = true;
-    }
-
-    function handleNodeAdded() {
-        // Refresh the nodes list after a node is added
-        fetchNodes();
-    }
-
     function handleDeleteNode() {
         // TODO: Implement delete functionality for selected nodes
         console.log('Delete node clicked');
     }
 
-    // Toolbar configuration
-    $: selectedCount = table.selected?.length || 0;
-
-    $: leftElements = [
+    const leftElements = [
         {
             type: 'action' as const,
             icon: 'i-carbon-add',
             text: 'Add Node',
-            onClick: handleAddNode,
+            onClick: () => (isNodeAddOpen = true),
             compactStage: 2,
             tooltip: 'Add a new node to the network'
         }
     ] satisfies ToolbarItem[];
 
-    $: rightElements = [
+    const rightElements = $derived([
         {
             type: 'action' as const,
             icon: 'i-carbon-trash-can',
@@ -105,7 +105,7 @@
             tooltip: selectedCount > 0 ? `Delete ${selectedCount} selected node${selectedCount === 1 ? '' : 's'}` : 'Select nodes to delete',
             disabled: selectedCount === 0
         }
-    ] satisfies ToolbarItem[];
+    ] satisfies ToolbarItem[]);
 
     async function loadUsers() {
         try {
@@ -119,135 +119,53 @@
         loadUsers()
     })
 
-    // Reactive statement to refetch when token changes
-    $: if ($tokenStore) {
-        fetchNodes()
-    }
+    // Refetch when the token changes (login/logout).
+    $effect(() => {
+        if ($tokenStore) fetchNodes()
+    })
 </script>
 
-<!-- Integrated Toolbar -->
-<Toolbar
-    {leftElements}
-    centerElements={[]}
-    {rightElements}
-    {onToggleSidebar}
+<Toolbar {leftElements} centerElements={[]} {rightElements} {onToggleSidebar} />
+
+<PaneHeader title="Networked Nodes" subtitle={`Total nodes: ${nodeCount}`} />
+
+{#snippet ownerCell(row: Node)}
+    {@const owner = usersMap.get(row.owner)}
+    <div class="flex items-center gap-2">
+        {#if owner?.avatar}
+            <img src="data:image/jpeg;base64,{owner.avatar}" alt="" class="w-5 h-5 rounded-full object-cover flex-shrink-0" />
+        {:else}
+            <div class="i-carbon-user w-5 h-5 text-muted flex-shrink-0"></div>
+        {/if}
+        <span>{ownerLabel(owner, row.owner)}</span>
+    </div>
+{/snippet}
+
+<Table
+    state={table}
+    selection="checkbox"
+    searchPlaceholder="Search"
+    {loading}
+    loadingText="Loading nodes..."
+    {error}
+    onRetry={fetchNodes}
+    empty="No nodes found"
+    rowsPerPageOptions={[5, 10, 20, 50]}
+    columns={[
+        { id: 'name', header: 'Name', sortField: 'name', preset: 'name', field: 'name' },
+        {
+            id: 'owner',
+            header: 'Owner',
+            sortField: 'owner',
+            sortValue: (r) => ownerLabel(usersMap.get(r.owner), r.owner),
+            preset: 'description',
+            cell: ownerCell
+        }
+    ]}
 />
 
-<!-- Page Title -->
-<PaneHeader title="Networked Nodes" subtitle={`Total nodes: ${nodes.length}`} />
-
-<!-- Nodes Table -->
-<div class="border-solid border-1 rounded-lg p-1 border-overlay1">
-    {#if error}
-        <div class="text-red p-2 mb-2 border border-red rounded">
-            {error}
-            <button
-                class="ml-2 text-blue underline"
-                onclick={fetchNodes}
-            >
-                Retry
-            </button>
-        </div>
-    {/if}
-
-    <div class="flex gap-1">
-    <!-- Search bar -->
-    <input
-        class="w-full bg-transparent text-primary border-overlay0 border-2 border-solid rounded-md p-1"
-        type="text"
-        placeholder="Search"
-        bind:value={search.value}
-        oninput={() => search.set()}
-        disabled={loading}
-    >
-    <!-- Selector of qty -->
-    <select
-        class="p-1 border-overlay0 border-2 border-solid rounded-md bg-transparent text-primary"
-        bind:value={table.rowsPerPage}
-        onchange={() => table.setPage(1)}
-        disabled={loading}
-    >
-        {#each [5, 10, 20, 50] as option}
-            <option value={option}>{option} nodes</option>
-        {/each}
-    </select>
-    </div>
-
-    {#if loading}
-        <div class="text-muted p-4 text-center">
-            Loading nodes...
-        </div>
-    {:else}
-        <Datatable {table}>
-            <table>
-                <thead>
-                    <tr class="text-subtitle">
-                        <Th></Th>
-                        <ThSort {table} field="name">Name</ThSort>
-                        <ThSort {table} field="owner">Owner</ThSort>
-                    </tr>
-                </thead>
-                <tbody>
-                    {#each table.rows as row}
-                        {@const owner = usersMap.get(row.owner)}
-                        <tr class="text-left">
-                            <td>
-                                <input type="checkbox"
-                                    checked={table.selected.includes(row.node_id)}
-                                    onclick={()=>table.select(row.node_id)}
-                                >
-                            </td>
-                            <td>{row.name}</td>
-                            <td>
-                                <div class="flex items-center gap-2">
-                                    {#if owner?.avatar}
-                                        <img src="data:image/jpeg;base64,{owner.avatar}" alt="" class="w-5 h-5 rounded-full object-cover flex-shrink-0" />
-                                    {:else}
-                                        <div class="i-carbon-user w-5 h-5 text-muted flex-shrink-0"></div>
-                                    {/if}
-                                    <span>{owner?.first_name ? `${owner.first_name}${owner.last_name ? ` ${owner.last_name}` : ''}` : owner?.username ?? row.owner}</span>
-                                </div>
-                            </td>
-                        </tr>
-                    {:else}
-                        <tr>
-                            <td colspan="3" class="text-center text-muted p-4">
-                                No nodes found
-                            </td>
-                        </tr>
-                    {/each}
-                </tbody>
-            </table>
-        </Datatable>
-    {/if}
-</div>
-
-<!-- Node Add Overlay -->
 <NodeAddPane
     isOpen={isNodeAddOpen}
     onClose={() => {isNodeAddOpen = false}}
-    onNodeAdded={handleNodeAdded}
+    onNodeAdded={fetchNodes}
 />
-
-<style>
-    tbody tr:hover {
-        background-color: #313244 !important; /* surface0 */
-    }
-
-    :global(footer) {
-        border-top: none !important;
-    }
-
-    /* Footer text */
-    :global(aside) {
-        color: #bac2de !important; /* subtitle */
-    }
-
-    :global(td) {
-        border: 1px solid #313244 !important; /* surface0 - very subtle borders */
-    }
-
-    :global(th)  {
-        border-bottom: 1px solid #313244 !important; /* surface0 - header separator */
-    }
-</style>
