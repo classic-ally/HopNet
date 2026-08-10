@@ -59,6 +59,10 @@ async fn boot_node() -> NodeGuard {
         .env("HOPNET_EPHEMERAL_DB", "1")
         .env("HOPNET_HTTP_PORT", port.to_string())
         .env("HOPNET_TEST_MODE", "1")
+        // Loopback-only harness: skip the TLS listener (RFC-022), which
+        // would otherwise fail-fast when concurrent test nodes — or a
+        // real node on this machine — already hold 0.0.0.0:34632.
+        .env("HOPNET_DISABLE_TLS", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
