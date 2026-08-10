@@ -59,10 +59,24 @@ blob per sync). Two documented windows:
 `SpkiPinningTrustManager`: SHA-256 over the leaf certificate's
 SubjectPublicKeyInfo DER compared against the pinned fingerprint —
 no chain, validity, or hostname checks (the pin IS the trust,
-RFC-022). Pairing lives in app-private SharedPreferences with
-`allowBackup=false`; Keystore wrapping is future hardening. QR
-scanning is ZXing core over CameraX frames (rowStride-aware Y-plane
-copy) — deliberately no Google Play Services dependency.
+RFC-022). QR scanning is ZXing core over CameraX frames
+(rowStride-aware Y-plane copy) — deliberately no Google Play Services
+dependency.
+
+Pairing lives in app-private SharedPreferences with `allowBackup=false`.
+The device token — the only secret in it — is envelope-encrypted by a
+non-exportable AES-256-GCM key generated inside the Android Keystore
+(StrongBox attempted first, TEE fallback), so the prefs file alone
+yields ciphertext. The key is unlock-bound (`setUnlockedDeviceRequired`),
+sealing the token on a locked device; decrypt failures are classified
+conservatively — only known-permanent errors (key invalidated, AEAD tag
+failure, unrecoverable/missing key) drop the wrapped token and flag a
+re-pair prompt (host/port/SPKI are kept plaintext to prefill it; they
+are not secrets), while anything else is transient and simply retried
+on the next provider call. v1 plaintext tokens migrate to wrapped form
+on first load. Deliberately NOT auth-bound (biometric window): the
+provider is invoked in the background by DocumentsUI with no way to
+show an auth prompt.
 
 ## Verification
 
@@ -112,5 +126,5 @@ most of it).
 ## Future work
 
 - [ ] Retry queue for release-time upload failures
-- [ ] Keystore-wrapped pairing storage
+- [x] Keystore-wrapped pairing storage (unlock-bound, StrongBox-first)
 - [ ] Camera E2E on a physical device (emulator uses manual pairing)

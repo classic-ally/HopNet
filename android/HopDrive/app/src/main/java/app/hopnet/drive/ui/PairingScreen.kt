@@ -79,10 +79,13 @@ fun PairingTab(onScanQr: (() -> Unit)? = null) {
 
 @Composable
 private fun UnpairedContent(onScanQr: (() -> Unit)?, onPaired: (Pairing) -> Unit) {
+    val context = LocalContext.current
+    val invalidated = remember { PairingStore.wasInvalidated(context) }
+    val remnant = remember { PairingStore.invalidatedRemnant(context) }
     var payloadText by remember { mutableStateOf("") }
-    var host by remember { mutableStateOf("") }
-    var port by remember { mutableStateOf("34632") }
-    var spki by remember { mutableStateOf("") }
+    var host by remember { mutableStateOf(remnant?.host ?: "") }
+    var port by remember { mutableStateOf(remnant?.port?.toString() ?: "34632") }
+    var spki by remember { mutableStateOf(remnant?.spki ?: "") }
     var token by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
 
@@ -94,6 +97,21 @@ private fun UnpairedContent(onScanQr: (() -> Unit)?, onPaired: (Pairing) -> Unit
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Text("Pair with a node", style = MaterialTheme.typography.titleMedium)
+
+        if (invalidated) {
+            Card {
+                Text(
+                    "The stored device token was invalidated — usually a " +
+                        "lock-screen change or a keystore reset. Re-scan the " +
+                        "pairing QR from the node; its device registration is " +
+                        "unchanged. The node details below are prefilled.",
+                    modifier = Modifier.padding(12.dp),
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
+
         Text(
             "Register this device on your node (Settings → Devices) and scan " +
                 "the QR code, or paste/enter the pairing details.",
