@@ -323,8 +323,16 @@ pub async fn get_changes(
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Delta and anchor must come from ONE snapshot: a commit landing
+    // between the two reads would hand out a height newer than the delta,
+    // and a poke-driven client anchors past a change it never saw.
+    // Read-only transaction; dropped (rolled back) after the reads.
+    let tx = db_lock
+        .unchecked_transaction()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     let (items, deleted_ids) = db::mount::changes_since(
-        &db_lock,
+        &tx,
         user_id,
         since,
         &session.siv_key,
@@ -332,7 +340,7 @@ pub async fn get_changes(
     )
     .map_err(status_of)?;
 
-    let height = db::current_height(&db_lock).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let height = db::current_height(&tx).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(MountChangesResponse {
         items,

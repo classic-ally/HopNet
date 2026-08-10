@@ -189,7 +189,9 @@ pub fn item_by_exact_path(
 /// touched inode (grouped to MAX height), split into live items and
 /// deleted ids.
 pub fn changes_since(
-    db_lock: &PooledConnection<SqliteConnectionManager>,
+    // &Connection (not the pooled guard) so callers can pass a Transaction
+    // and read the delta + height anchor from one snapshot.
+    db_lock: &rusqlite::Connection,
     user_id: i32,
     since_height: u64,
     siv_key: &Key<Aes256Siv>,
