@@ -23,8 +23,8 @@ pub async fn upload_file(
     filename: &str,
     contents: Vec<u8>,
 ) -> Result<()> {
-    let client = Client::new();
-    let url = format!("http://{}:{}/api/files", node.ip_address, node.port);
+    let client = crate::insecure_client();
+    let url = format!("https://{}:{}/api/files", node.ip_address, node.port);
 
     let contents_len = contents.len();
 
@@ -65,8 +65,8 @@ pub async fn upload_files_multi(
     path: &str,
     files: Vec<(String, Vec<u8>)>,
 ) -> Result<()> {
-    let client = Client::new();
-    let url = format!("http://{}:{}/api/files", node.ip_address, node.port);
+    let client = crate::insecure_client();
+    let url = format!("https://{}:{}/api/files", node.ip_address, node.port);
 
     let mut form = reqwest::multipart::Form::new().text("path", path.to_string());
     for (filename, contents) in files {
@@ -105,8 +105,8 @@ pub async fn upload_files_multi(
 /// * `inode_id` - The inode ID of the file to modify
 /// * `new_contents` - The new file contents as bytes
 pub async fn modify_file(node: &NodeInfo, inode_id: &str, new_contents: Vec<u8>) -> Result<()> {
-    let client = Client::new();
-    let url = format!("http://{}:{}/api/files", node.ip_address, node.port);
+    let client = crate::insecure_client();
+    let url = format!("https://{}:{}/api/files", node.ip_address, node.port);
 
     let contents_len = new_contents.len();
 
@@ -169,12 +169,12 @@ pub async fn download_file_with_timeout(
     let mut last_error = None;
 
     for attempt in 1..=MAX_RETRIES {
-        let client = Client::builder().timeout(timeout).build()?;
+        let client = crate::insecure_client_builder().timeout(timeout).build()?;
 
         // Strip leading slash if present for URL construction
         let path_trimmed = path.strip_prefix('/').unwrap_or(path);
         let url = format!(
-            "http://{}:{}/api/files/{}",
+            "https://{}:{}/api/files/{}",
             node.ip_address, node.port, path_trimmed
         );
 
@@ -322,9 +322,9 @@ pub fn verify_all_identical(data: &[Vec<u8>]) -> Result<()> {
 /// # Returns
 /// JSON array of file items
 pub async fn list_files(node: &NodeInfo, path: &str) -> Result<serde_json::Value> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/files?path={}",
+        "https://{}:{}/api/files?path={}",
         node.ip_address, node.port, path
     );
 
@@ -421,9 +421,9 @@ pub fn verify_listings_identical(listings: &[serde_json::Value]) -> Result<()> {
 /// * `node` - The node to delete from
 /// * `path` - The full file path to delete
 pub async fn delete_file(node: &NodeInfo, path: &str) -> Result<()> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/files?path={}",
+        "https://{}:{}/api/files?path={}",
         node.ip_address, node.port, path
     );
 
@@ -480,9 +480,9 @@ pub struct FileFragmentDistribution {
 ///
 /// This triggers the manual fragment inventory sync via POST /maintenance/fragment-inventory-self-check
 pub async fn trigger_fragment_inventory_sync(node: &NodeInfo) -> Result<()> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/maintenance/fragment-inventory-self-check",
+        "https://{}:{}/api/maintenance/fragment-inventory-self-check",
         node.ip_address, node.port
     );
 
@@ -544,9 +544,9 @@ pub async fn get_fragment_distribution(
     node: &NodeInfo,
     path: &str,
 ) -> Result<FileFragmentDistribution> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/diagnostics/file-fragments?path={}",
+        "https://{}:{}/api/diagnostics/file-fragments?path={}",
         node.ip_address,
         node.port,
         urlencoding::encode(path)
@@ -831,12 +831,12 @@ pub async fn download_file_headers(
     node: &NodeInfo,
     path: &str,
 ) -> Result<(Vec<u8>, DownloadHeaders)> {
-    let client = Client::builder()
+    let client = crate::insecure_client_builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
     let path_trimmed = path.strip_prefix('/').unwrap_or(path);
     let url = format!(
-        "http://{}:{}/api/files/{}",
+        "https://{}:{}/api/files/{}",
         node.ip_address, node.port, path_trimmed
     );
 
@@ -881,12 +881,12 @@ pub async fn download_file_range(
     start: u64,
     end: Option<u64>,
 ) -> Result<(Vec<u8>, DownloadHeaders)> {
-    let client = Client::builder()
+    let client = crate::insecure_client_builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
     let path_trimmed = path.strip_prefix('/').unwrap_or(path);
     let url = format!(
-        "http://{}:{}/api/files/{}",
+        "https://{}:{}/api/files/{}",
         node.ip_address, node.port, path_trimmed
     );
 

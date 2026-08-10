@@ -19,7 +19,7 @@ const MONTHS: u32 = 6;
 pub struct PhotosUploadConsistency;
 
 fn base_url(node: &NodeInfo) -> String {
-    format!("http://{}:{}", node.ip_address, node.port)
+    format!("https://{}:{}", node.ip_address, node.port)
 }
 
 /// Field-selective gallery row identity — robust against node-local fields.
@@ -170,7 +170,7 @@ impl TestScenario for PhotosUploadConsistency {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = reqwest::Client::new();
+        let client = crate::insecure_client();
 
         println!("\nRunning checks:");
 

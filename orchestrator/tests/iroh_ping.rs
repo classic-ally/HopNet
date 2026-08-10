@@ -41,7 +41,7 @@ impl TestScenario for IrohPing {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
 
         println!("\nRunning iroh connectivity checks:");
 
@@ -50,7 +50,7 @@ impl TestScenario for IrohPing {
         // Each node pings all other nodes
         for source in nodes {
             let url = format!(
-                "http://{}:{}/api/debug/iroh-ping",
+                "https://{}:{}/api/debug/iroh-ping",
                 source.ip_address, source.port
             );
 

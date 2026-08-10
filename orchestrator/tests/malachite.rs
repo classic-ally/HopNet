@@ -30,8 +30,8 @@ use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 /// Read one node's /consensus shim: (proposal-target height, proposer
 /// node_id, last decided height).
 async fn consensus_status(node: &NodeInfo) -> Result<(u64, u32, u64)> {
-    let client = Client::new();
-    let url = format!("http://{}:{}/api/consensus", node.ip_address, node.port);
+    let client = crate::insecure_client();
+    let url = format!("https://{}:{}/api/consensus", node.ip_address, node.port);
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
@@ -125,9 +125,9 @@ async fn wait_caught_up_to_tip(
 
 /// Hold or release a consensus barrier on one node (test-mode HTTP routes).
 async fn set_barrier(node: &NodeInfo, name: &str, action: &str) -> Result<()> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/test/barriers/consensus/{}/{}",
+        "https://{}:{}/api/test/barriers/consensus/{}/{}",
         node.ip_address, node.port, name, action
     );
     let resp = client

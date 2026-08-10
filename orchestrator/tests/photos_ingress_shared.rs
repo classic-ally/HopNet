@@ -34,7 +34,7 @@ const PERSONAL_START: u32 = 100;
 pub struct PhotosIngressShared;
 
 fn base_url(node: &NodeInfo) -> String {
-    format!("http://{}:{}", node.ip_address, node.port)
+    format!("https://{}:{}", node.ip_address, node.port)
 }
 
 /// Run the e2e driver, tolerating scripted non-zero exits; returns
@@ -167,7 +167,7 @@ impl TestScenario for PhotosIngressShared {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
 
         println!("\nRunning shared-ingress publish checks:");
 

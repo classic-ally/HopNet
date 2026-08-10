@@ -78,7 +78,7 @@ impl TestScenario for DeviceTokenSessionBootstrap {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
 
         println!("\nRunning device token session bootstrap checks:");
 
@@ -370,7 +370,7 @@ impl TestScenario for FileProviderDeviceTokenAuth {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
 
         println!("\nRunning FileProvider device token auth checks:");
 
@@ -779,7 +779,7 @@ async fn register_device(
     device_name: &str,
 ) -> Result<RegisterDeviceResponse> {
     let url = format!(
-        "http://{}:{}/api/devices/register",
+        "https://{}:{}/api/devices/register",
         node.ip_address, node.port
     );
 
@@ -803,7 +803,7 @@ async fn register_device(
 
 async fn revoke_device(client: &Client, node: &NodeInfo, device_id: &str) -> Result<()> {
     let url = format!(
-        "http://{}:{}/api/devices/{}",
+        "https://{}:{}/api/devices/{}",
         node.ip_address, node.port, device_id
     );
 
@@ -834,7 +834,7 @@ async fn fp_enumerate(
     parent_item_identifier: Option<&str>,
 ) -> Result<FPEnumerateResponse> {
     let mut url = format!(
-        "http://{}:{}/api/integrations/fileprovider/enumerate",
+        "https://{}:{}/api/integrations/fileprovider/enumerate",
         node.ip_address, node.port
     );
     if let Some(pid) = parent_item_identifier {
@@ -865,7 +865,7 @@ async fn fp_create_folder(
     folder_name: &str,
 ) -> Result<()> {
     let url = format!(
-        "http://{}:{}/api/integrations/fileprovider/create",
+        "https://{}:{}/api/integrations/fileprovider/create",
         node.ip_address, node.port
     );
 
@@ -899,7 +899,7 @@ async fn fp_create_file(
     content: &[u8],
 ) -> Result<()> {
     let url = format!(
-        "http://{}:{}/api/integrations/fileprovider/create",
+        "https://{}:{}/api/integrations/fileprovider/create",
         node.ip_address, node.port
     );
 
@@ -935,7 +935,7 @@ async fn fp_download(
     identifier: &str,
 ) -> Result<Vec<u8>> {
     let url = format!(
-        "http://{}:{}/api/integrations/fileprovider/download?identifier={}",
+        "https://{}:{}/api/integrations/fileprovider/download?identifier={}",
         node.ip_address, node.port, identifier
     );
 
@@ -962,7 +962,7 @@ async fn fp_changes(
     since_height: u64,
 ) -> Result<FPChangesResponse> {
     let url = format!(
-        "http://{}:{}/api/integrations/fileprovider/changes?since_height={}",
+        "https://{}:{}/api/integrations/fileprovider/changes?since_height={}",
         node.ip_address, node.port, since_height
     );
 
@@ -1003,7 +1003,7 @@ async fn dp_upload_file(
     content: &[u8],
 ) -> Result<()> {
     let url = format!(
-        "http://{}:{}/api/integrations/documentprovider/upload",
+        "https://{}:{}/api/integrations/documentprovider/upload",
         node.ip_address, node.port
     );
 
@@ -1042,7 +1042,7 @@ async fn dp_download_file(
     file_id: &str,
 ) -> Result<Vec<u8>> {
     let url = format!(
-        "http://{}:{}/api/integrations/documentprovider/download?id={}",
+        "https://{}:{}/api/integrations/documentprovider/download?id={}",
         node.ip_address, node.port, file_id
     );
 
@@ -1069,7 +1069,7 @@ async fn dp_enumerate(
     parent_id: Option<&str>,
 ) -> Result<Vec<DocumentProviderItem>> {
     let mut url = format!(
-        "http://{}:{}/api/integrations/documentprovider/enumerate",
+        "https://{}:{}/api/integrations/documentprovider/enumerate",
         node.ip_address, node.port
     );
     if let Some(pid) = parent_id {
@@ -1212,7 +1212,7 @@ async fn poll_until_token_rejected(
         let mut all_rejected = true;
         for node in nodes {
             let url = format!(
-                "http://{}:{}/api/integrations/fileprovider/enumerate",
+                "https://{}:{}/api/integrations/fileprovider/enumerate",
                 node.ip_address, node.port
             );
             match client

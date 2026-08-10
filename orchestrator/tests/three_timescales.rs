@@ -44,7 +44,7 @@ impl TestScenario for ThreeTimescales {
     async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
         anyhow::ensure!(nodes.len() == 3, "three-timescales expects a 3-node mesh");
 
         let timestamp = std::time::SystemTime::now()

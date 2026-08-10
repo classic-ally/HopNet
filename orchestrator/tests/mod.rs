@@ -53,6 +53,7 @@ mod sharing;
 mod takeout;
 mod three_timescales;
 mod tier_membership;
+mod tls_pinning;
 mod upload_and_confirm_placement;
 mod vote_out;
 
@@ -302,6 +303,11 @@ pub async fn run_test_by_name(
         }
         "device-token-consistency" => {
             device_tokens::DeviceTokenConsistency
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "tls-pinned-https" => {
+            tls_pinning::PinnedTlsAccess
                 .run(mesh_id, nodes, flags)
                 .await
         }
@@ -597,6 +603,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "three-timescales",
         "evidence-drives-voteout",
         "device-token-consistency",
+        "tls-pinned-https",
         "documentprovider-write-consistency",
         "iroh-ping",
         "iroh-reject-unknown",
@@ -656,7 +663,7 @@ pub fn list_test_names() -> Vec<&'static str> {
 /// Get the maximum consensus view across all nodes
 /// Polls all nodes in parallel and returns the highest view number
 pub async fn get_max_view(nodes: &[NodeInfo]) -> Result<u64> {
-    let client = Client::new();
+    let client = crate::insecure_client();
 
     // Poll ALL nodes in parallel
     let mut tasks = Vec::new();
@@ -664,7 +671,7 @@ pub async fn get_max_view(nodes: &[NodeInfo]) -> Result<u64> {
         let client = client.clone();
         let node = node.clone();
         let task = tokio::spawn(async move {
-            let url = format!("http://{}:{}/api/consensus", node.ip_address, node.port);
+            let url = format!("https://{}:{}/api/consensus", node.ip_address, node.port);
             let response = client
                 .get(&url)
                 .header("Authorization", format!("Bearer {}", node.jwt_token))
@@ -708,7 +715,7 @@ pub async fn wait_for_minimum_view(
     timeout: Duration,
 ) -> Result<bool> {
     let start = Instant::now();
-    let client = Client::new();
+    let client = crate::insecure_client();
 
     loop {
         if start.elapsed() > timeout {
@@ -721,7 +728,7 @@ pub async fn wait_for_minimum_view(
             let client = client.clone();
             let node = node.clone();
             let task = tokio::spawn(async move {
-                let url = format!("http://{}:{}/api/consensus", node.ip_address, node.port);
+                let url = format!("https://{}:{}/api/consensus", node.ip_address, node.port);
                 let response = client
                     .get(&url)
                     .header("Authorization", format!("Bearer {}", node.jwt_token))

@@ -54,9 +54,9 @@ where
 }
 
 async fn update_user_profile(node: &NodeInfo, first_name: &str, last_name: &str) -> Result<()> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/users/me/profile",
+        "https://{}:{}/api/users/me/profile",
         node.ip_address, node.port
     );
 
@@ -90,9 +90,9 @@ struct RegisterDeviceResponse {
 
 /// POST /devices/register
 async fn register_device(node: &NodeInfo, device_name: &str) -> Result<RegisterDeviceResponse> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/devices/register",
+        "https://{}:{}/api/devices/register",
         node.ip_address, node.port
     );
 
@@ -120,9 +120,9 @@ async fn register_device(node: &NodeInfo, device_name: &str) -> Result<RegisterD
 
 /// DELETE /devices/{device_id}
 async fn revoke_device(node: &NodeInfo, device_id: &str) -> Result<()> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/devices/{}",
+        "https://{}:{}/api/devices/{}",
         node.ip_address, node.port, device_id
     );
 

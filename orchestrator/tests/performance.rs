@@ -90,10 +90,10 @@ async fn download_file_with_ttfb(
     node: &NodeInfo,
     path: &str,
 ) -> Result<(Vec<u8>, Duration, Duration)> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let path_trimmed = path.strip_prefix('/').unwrap_or(path);
     let url = format!(
-        "http://{}:{}/api/files/{}",
+        "https://{}:{}/api/files/{}",
         node.ip_address, node.port, path_trimmed
     );
 

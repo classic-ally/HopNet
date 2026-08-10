@@ -17,8 +17,8 @@ use crate::tests::{get_max_view, wait_for_minimum_view};
 /// POST /shares — share a file with another user by inode_id.
 /// Returns Ok(status_code) so callers can assert on 200 vs 409 etc.
 async fn share_file(node: &NodeInfo, inode_id: &str, recipient_username: &str) -> Result<u16> {
-    let client = Client::new();
-    let url = format!("http://{}:{}/api/shares", node.ip_address, node.port);
+    let client = crate::insecure_client();
+    let url = format!("https://{}:{}/api/shares", node.ip_address, node.port);
 
     let response = client
         .post(&url)
@@ -37,9 +37,9 @@ async fn share_file(node: &NodeInfo, inode_id: &str, recipient_username: &str) -
 
 /// GET /shares/incoming — list pending incoming shares.
 async fn get_incoming_shares(node: &NodeInfo) -> Result<Vec<serde_json::Value>> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/shares/incoming",
+        "https://{}:{}/api/shares/incoming",
         node.ip_address, node.port
     );
 
@@ -65,9 +65,9 @@ async fn get_incoming_shares(node: &NodeInfo) -> Result<Vec<serde_json::Value>> 
 
 /// GET /shares/incoming/count — badge count.
 async fn get_incoming_share_count(node: &NodeInfo) -> Result<i64> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/shares/incoming/count",
+        "https://{}:{}/api/shares/incoming/count",
         node.ip_address, node.port
     );
 
@@ -96,9 +96,9 @@ async fn get_incoming_share_count(node: &NodeInfo) -> Result<i64> {
 
 /// POST /shares/{id}/accept — accept a pending share.
 async fn accept_share(node: &NodeInfo, share_id: &str, placement_path: &str) -> Result<u16> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/shares/{}/accept",
+        "https://{}:{}/api/shares/{}/accept",
         node.ip_address, node.port, share_id
     );
 
@@ -118,9 +118,9 @@ async fn accept_share(node: &NodeInfo, share_id: &str, placement_path: &str) -> 
 
 /// DELETE /shares/incoming/{id} — decline a pending share.
 async fn decline_share(node: &NodeInfo, share_id: &str) -> Result<u16> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/shares/incoming/{}",
+        "https://{}:{}/api/shares/incoming/{}",
         node.ip_address, node.port, share_id
     );
 
@@ -136,9 +136,9 @@ async fn decline_share(node: &NodeInfo, share_id: &str) -> Result<u16> {
 
 /// GET /shares/file/{inode_id} — sharing detail view.
 async fn get_share_details(node: &NodeInfo, inode_id: &str) -> Result<serde_json::Value> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/shares/file/{}",
+        "https://{}:{}/api/shares/file/{}",
         node.ip_address, node.port, inode_id
     );
 
@@ -165,9 +165,9 @@ async fn get_share_details(node: &NodeInfo, inode_id: &str) -> Result<serde_json
 
 /// DELETE /shares/file/{inode_id} — unshare (remove self from shared file).
 async fn unshare_file(node: &NodeInfo, inode_id: &str) -> Result<u16> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/shares/file/{}",
+        "https://{}:{}/api/shares/file/{}",
         node.ip_address, node.port, inode_id
     );
 

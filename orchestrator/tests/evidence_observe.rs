@@ -20,7 +20,7 @@ pub struct EvidenceObserve;
 
 pub(crate) async fn fetch_evidence(client: &Client, node: &NodeInfo) -> Result<serde_json::Value> {
     let url = format!(
-        "http://{}:{}/api/consensus/evidence",
+        "https://{}:{}/api/consensus/evidence",
         node.ip_address, node.port
     );
     let resp = client
@@ -51,7 +51,7 @@ impl TestScenario for EvidenceObserve {
 
     async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
         anyhow::ensure!(nodes.len() == 3, "evidence-observe expects a 3-node mesh");
 
         println!("\nRunning evidence-observe checks:");

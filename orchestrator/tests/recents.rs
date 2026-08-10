@@ -384,9 +384,9 @@ impl TestScenario for RecentsOrdering {
 
 /// Fetch recent files from a node
 async fn list_recent_files(node: &NodeInfo, limit: u32) -> Result<serde_json::Value> {
-    let client = reqwest::Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/files/recent?limit={}",
+        "https://{}:{}/api/files/recent?limit={}",
         node.ip_address, node.port, limit
     );
 

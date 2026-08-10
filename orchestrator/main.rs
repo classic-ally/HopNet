@@ -190,7 +190,7 @@ async fn main() -> Result<()> {
             println!("  passphrase: {}", passphrase);
             println!("  nodes:");
             for (node_id, host, port) in addresses {
-                println!("    node {}: http://{}:{}", node_id, host, port);
+                println!("    node {}: https://{}:{}", node_id, host, port);
             }
             println!("open a node URL in a browser and sign in with the above.");
         }
@@ -552,7 +552,7 @@ async fn wait_for_formation(
     runtime: sys::ContainerRuntime,
     timeout: std::time::Duration,
 ) -> Result<u32> {
-    let client = reqwest::Client::new();
+    let client = crate::insecure_client();
     let token = get_jwt_token(docker, mesh_id, 0, runtime).await?;
     let addrs = get_external_addresses(docker, mesh_id, runtime).await?;
     let (host, port) = addrs
@@ -560,7 +560,7 @@ async fn wait_for_formation(
         .find(|(id, _, _)| *id == 0)
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("node 0 address"))?;
-    let url = format!("http://{}:{}/api/consensus/view", host, port);
+    let url = format!("https://{}:{}/api/consensus/view", host, port);
 
     let start = std::time::Instant::now();
     let mut prev: Option<u32> = None;
@@ -1107,6 +1107,12 @@ pub(crate) async fn create_hopnet_container(
                 "HOME=/root".to_string(),
                 // Self-hosted relay: no n0 public relay/discovery dependency.
                 format!("HOPNET_RELAY_URL={}", naming::relay_url(mesh_id)),
+                // Pin the loopback plaintext port: the endpoint-file seam is
+                // disabled under HOPNET_TEST_MODE, so co-resident CLI
+                // consumers (hopnet-mount in the mount scenario) need a
+                // deterministic in-container port. The network surface stays
+                // pinned-HTTPS on 34632.
+                "HOPNET_HTTP_PORT=34630".to_string(),
             ];
             // Forward HOPNET_DB_* (pragma tuning), HOPNET_CONSENSUS_*/
             // HOPNET_QUORUM_* (timeouts, quorum profile),
@@ -1203,7 +1209,7 @@ async fn setup_node_0(
     node_name: &str,
     runtime: sys::ContainerRuntime,
 ) -> Result<String> {
-    let client = reqwest::Client::new();
+    let client = crate::insecure_client();
 
     // Get runtime-aware connection info for node 0
     let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
@@ -1213,7 +1219,7 @@ async fn setup_node_0(
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("Node 0 not found"))?;
 
-    let url = format!("http://{}:{}/api/setup", host, port);
+    let url = format!("https://{}:{}/api/setup", host, port);
 
     let setup_data = json!({
         "username": "allison",
@@ -1303,7 +1309,7 @@ pub async fn get_jwt_token(
     node_id: u32,
     runtime: sys::ContainerRuntime,
 ) -> Result<String> {
-    let client = reqwest::Client::new();
+    let client = crate::insecure_client();
 
     // Get runtime-aware connection info for this node
     let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
@@ -1313,7 +1319,7 @@ pub async fn get_jwt_token(
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
 
-    let login_url = format!("http://{}:{}/api/login", host, port);
+    let login_url = format!("https://{}:{}/api/login", host, port);
 
     let passphrase = load_mesh_passphrase(docker, mesh_id).await?;
 
@@ -1364,7 +1370,7 @@ async fn register_node_with_node_0(
     node_name: &str,
     runtime: sys::ContainerRuntime,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = crate::insecure_client();
 
     // Get runtime-aware connection info for this node
     let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
@@ -1375,7 +1381,7 @@ async fn register_node_with_node_0(
         .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
 
     // Step 1: Get the public key from the node's /setup GET route
-    let get_setup_url = format!("http://{}:{}/api/setup", node_host, node_port);
+    let get_setup_url = format!("https://{}:{}/api/setup", node_host, node_port);
     println!("  Getting public key from: {}", get_setup_url);
 
     let start_time = std::time::Instant::now();
@@ -1445,7 +1451,7 @@ async fn register_node_with_node_0(
         .find(|(id, _, _)| *id == 0)
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("Node 0 not found"))?;
-    let register_url = format!("http://{}:{}/api/nodes", node_0_host, node_0_port);
+    let register_url = format!("https://{}:{}/api/nodes", node_0_host, node_0_port);
     let node_data = json!({
         "name": node_name,
         "owner": 0,
@@ -1984,7 +1990,7 @@ async fn show_node_history(
         .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
 
     let jwt_token = get_jwt_token(docker, mesh_id, node_id, runtime).await?;
-    let client = reqwest::Client::new();
+    let client = crate::insecure_client();
 
     // If specific view requested, show detailed view state
     if let Some(view_number) = view {
@@ -1994,7 +2000,7 @@ async fn show_node_history(
         );
         println!("{}", "=".repeat(60));
 
-        let url = format!("http://{}:{}/api/consensus/view", host, port);
+        let url = format!("https://{}:{}/api/consensus/view", host, port);
         let response = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", jwt_token))
@@ -2058,7 +2064,7 @@ async fn show_node_history(
         // Show full history table (existing behavior)
         println!("Node {} Consensus History (Mesh {})", node_id, mesh_id);
 
-        let url = format!("http://{}:{}/api/consensus/history", host, port);
+        let url = format!("https://{}:{}/api/consensus/history", host, port);
         let response = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", jwt_token))
@@ -2115,7 +2121,7 @@ async fn get_node_status(
     node_id: u32,
     runtime: sys::ContainerRuntime,
 ) -> Result<NodeStatus> {
-    let client = reqwest::Client::new();
+    let client = crate::insecure_client();
 
     // Get runtime-aware connection info
     let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
@@ -2132,7 +2138,7 @@ async fn get_node_status(
     };
 
     // Query consensus state with JWT
-    let consensus_url = format!("http://{}:{}/api/consensus", host, port);
+    let consensus_url = format!("https://{}:{}/api/consensus", host, port);
 
     match client
         .get(&consensus_url)
@@ -2363,7 +2369,22 @@ async fn load_mesh_passphrase(docker: &Docker, mesh_id: u32) -> Result<String> {
 /// flow through this function so a URL-scheme change (e.g. prefixing all
 /// routes with /api) is a single-site edit.
 pub fn node_url(node: &NodeInfo, path: &str) -> String {
-    format!("http://{}:{}{}", node.ip_address, node.port, path)
+    format!("https://{}:{}{}", node.ip_address, node.port, path)
+}
+
+/// Nodes serve pinned-HTTPS with per-node self-signed certs
+/// (docs/specs/pinned-https.md); the orchestrator trusts the container
+/// boundary rather than the cert, so every node-facing client skips
+/// verification. The tls-pinned-https scenario exercises the real
+/// SPKI-pinning path.
+pub fn insecure_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().danger_accept_invalid_certs(true)
+}
+
+pub fn insecure_client() -> reqwest::Client {
+    insecure_client_builder()
+        .build()
+        .expect("reqwest client build")
 }
 
 /// Call a HopNet node API with authentication and optional retry
@@ -2373,7 +2394,7 @@ pub async fn call_node_api(
     retry: bool,
 ) -> Result<reqwest::Response> {
     let url = node_url(node_info, path);
-    let client = reqwest::Client::new();
+    let client = crate::insecure_client();
 
     let make_request = || async {
         client

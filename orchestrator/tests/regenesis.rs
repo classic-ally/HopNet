@@ -29,8 +29,8 @@ async fn post_json(
     path: &str,
     body: Option<serde_json::Value>,
 ) -> Result<(u16, String)> {
-    let client = Client::new();
-    let url = format!("http://{}:{}{}", node.ip_address, node.port, path);
+    let client = crate::insecure_client();
+    let url = format!("https://{}:{}{}", node.ip_address, node.port, path);
     let mut req = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))

@@ -28,7 +28,7 @@ const COUNT: u32 = 3;
 pub struct PhotosIngressEdit;
 
 fn base_url(node: &NodeInfo) -> String {
-    format!("http://{}:{}", node.ip_address, node.port)
+    format!("https://{}:{}", node.ip_address, node.port)
 }
 
 /// The (photo_id, kind) → blake3 map a driver report describes.
@@ -155,7 +155,7 @@ impl TestScenario for PhotosIngressEdit {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = reqwest::Client::new();
+        let client = crate::insecure_client();
         let data_dir = tempfile::tempdir().context("temp data dir")?;
 
         println!("\nRunning checks:");

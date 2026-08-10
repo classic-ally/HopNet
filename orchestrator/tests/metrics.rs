@@ -48,7 +48,7 @@ impl TestScenario for MetricsCollection {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
         let num_nodes = nodes.len();
 
         println!("\nRunning metrics collection checks:");
@@ -67,7 +67,7 @@ impl TestScenario for MetricsCollection {
         // 2. Trigger metrics collection on node 0
         let trigger_node = &nodes[0];
         let url = format!(
-            "http://{}:{}/api/metrics/trigger",
+            "https://{}:{}/api/metrics/trigger",
             trigger_node.ip_address, trigger_node.port
         );
         let response = client
@@ -248,7 +248,7 @@ impl TestScenario for MetricsCollection {
         let mut fetch_ok = true;
 
         for node in nodes {
-            let url = format!("http://{}:{}/api/metrics", node.ip_address, node.port);
+            let url = format!("https://{}:{}/api/metrics", node.ip_address, node.port);
             match client
                 .get(&url)
                 .header("Authorization", format!("Bearer {}", node.jwt_token))

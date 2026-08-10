@@ -442,9 +442,9 @@ async fn trigger_cleanup(
     batch_size: i32,
     retention_days: i64,
 ) -> Result<CleanupResponse> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/maintenance/cleanup-orphaned?batch_size={}&retention_days={}",
+        "https://{}:{}/api/maintenance/cleanup-orphaned?batch_size={}&retention_days={}",
         node.ip_address, node.port, batch_size, retention_days
     );
 

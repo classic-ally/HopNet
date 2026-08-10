@@ -45,7 +45,7 @@ impl TestScenario for FragmentHealthCheck {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
 
         println!("\nRunning fragment health check test:");
 
@@ -162,7 +162,7 @@ impl TestScenario for FragmentHealthCheck {
 
         for source in nodes {
             let url = format!(
-                "http://{}:{}/api/test/fragment-health-check/{}",
+                "https://{}:{}/api/test/fragment-health-check/{}",
                 source.ip_address, source.port, fragment_hash
             );
 

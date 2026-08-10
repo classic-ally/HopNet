@@ -43,7 +43,7 @@ pub(crate) async fn rebuild_nodes(docker: &Docker, mesh_id: u32) -> Result<Vec<N
 
 async fn seated_count(client: &Client, node: &NodeInfo, height: i64) -> usize {
     let url = format!(
-        "http://{}:{}/api/consensus/view",
+        "https://{}:{}/api/consensus/view",
         node.ip_address, node.port
     );
     let Ok(resp) = client
@@ -74,7 +74,7 @@ impl TestScenario for MeshGrowth {
 
     async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
         anyhow::ensure!(nodes.len() == 3, "mesh-growth expects a 3-node mesh");
         let docker = Docker::connect_with_local_defaults()?;
 
