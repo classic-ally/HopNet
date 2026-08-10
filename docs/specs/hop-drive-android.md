@@ -95,6 +95,20 @@ invalidation. Pokes are node-scoped; `/changes` filters per-user.
 anchor. Each open watch holds one API concurrency slot — fine at
 personal-device scale.
 
+**Cached-app freezer constraint** (verified on a Pixel 9a): while
+another app (DocumentsUI) browses the provider, our process is cached
+and Android freezes it — threads stop and sockets abort, so the SSE
+connection cannot be held. The loop therefore degrades to
+sync-on-interaction: every binder call (any navigation or query) thaws
+the process, the loop reconnects and catches up immediately, and its
+notifyChange refreshes the open listing. True dwell-on-screen push
+works only while the process is unfrozen — the Hop Drive app in the
+foreground, or the post-interaction grace window. Fixing this fully
+would require a foreground service (rejected: persistent notification)
+or FCM (rejected: no Google Play Services); the failed reconnects while
+frozen are harmless (backoff caps at 30s and the process is asleep for
+most of it).
+
 ## Future work
 
 - [ ] Retry queue for release-time upload failures
