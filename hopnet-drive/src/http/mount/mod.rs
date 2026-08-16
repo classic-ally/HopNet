@@ -574,8 +574,12 @@ pub async fn patch_modify(
             .db_pool
             .get()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        // IMMEDIATE: this transaction reads then writes. A DEFERRED
+        // read→write upgrade fails instantly (busy handler bypassed) while
+        // any other connection is writing; taking the write lock at BEGIN
+        // keeps busy_timeout in play.
         let db_tx = conn
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         db::files::modify_item(
             &db_tx,
@@ -725,8 +729,9 @@ pub async fn delete_item(
             .db_pool
             .get()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        // IMMEDIATE: reads then writes — same rationale as patch_modify.
         let db_tx = conn
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         if !request.recursive {
             let is_empty =
