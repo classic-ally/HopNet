@@ -84,7 +84,7 @@ pub async fn start_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<(
 /// Wait for a node to become responsive after restart
 pub async fn wait_for_node_ready(node: &NodeInfo, timeout: Duration) -> Result<bool> {
     let start = Instant::now();
-    let client = Client::new();
+    let client = crate::insecure_client();
 
     loop {
         if start.elapsed() > timeout {
@@ -92,7 +92,7 @@ pub async fn wait_for_node_ready(node: &NodeInfo, timeout: Duration) -> Result<b
         }
 
         // Use unauthenticated /setup endpoint since JWT tokens expire after restart
-        let url = format!("http://{}:{}/api/setup", node.ip_address, node.port);
+        let url = format!("https://{}:{}/api/setup", node.ip_address, node.port);
         let response = client
             .get(&url)
             .timeout(Duration::from_secs(2))
@@ -109,8 +109,8 @@ pub async fn wait_for_node_ready(node: &NodeInfo, timeout: Duration) -> Result<b
 
 /// Get a node's public key from the setup endpoint
 pub async fn get_node_pubkey(node: &NodeInfo) -> Result<String> {
-    let client = Client::new();
-    let url = format!("http://{}:{}/api/setup", node.ip_address, node.port);
+    let client = crate::insecure_client();
+    let url = format!("https://{}:{}/api/setup", node.ip_address, node.port);
 
     let response = client
         .get(&url)

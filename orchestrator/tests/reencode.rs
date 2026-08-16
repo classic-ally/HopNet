@@ -28,7 +28,7 @@ pub struct ReencodeAfterDeparture;
 
 pub(crate) async fn trigger_metrics(client: &Client, node: &NodeInfo) {
     let url = format!(
-        "http://{}:{}/api/metrics/trigger",
+        "https://{}:{}/api/metrics/trigger",
         node.ip_address, node.port
     );
     // A dead peer costs ~25s of measurement timeouts server-side; a short
@@ -44,7 +44,7 @@ pub(crate) async fn trigger_metrics(client: &Client, node: &NodeInfo) {
 
 pub(crate) async fn trigger_tick(client: &Client, node: &NodeInfo) {
     let url = format!(
-        "http://{}:{}/api/maintenance/policy-tick",
+        "https://{}:{}/api/maintenance/policy-tick",
         node.ip_address, node.port
     );
     let _ = client
@@ -60,7 +60,7 @@ pub(crate) async fn view_members(client: &Client, node: &NodeInfo) -> Result<Vec
     struct View {
         members: Vec<i32>,
     }
-    let url = format!("http://{}:{}/api/storage/view", node.ip_address, node.port);
+    let url = format!("https://{}:{}/api/storage/view", node.ip_address, node.port);
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
@@ -83,7 +83,7 @@ impl TestScenario for ReencodeAfterDeparture {
     async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -33,7 +33,7 @@ impl TestScenario for VoteOutAfterKill {
 
     async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
         anyhow::ensure!(
             nodes.len() == 3,
             "vote-out-after-kill expects a 3-node mesh"

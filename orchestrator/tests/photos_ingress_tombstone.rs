@@ -26,7 +26,7 @@ const COUNT: u32 = 4;
 pub struct PhotosIngressTombstone;
 
 fn base_url(node: &NodeInfo) -> String {
-    format!("http://{}:{}", node.ip_address, node.port)
+    format!("https://{}:{}", node.ip_address, node.port)
 }
 
 pub(crate) async fn gallery_ids(client: &reqwest::Client, node: &NodeInfo) -> Vec<String> {
@@ -107,7 +107,7 @@ impl TestScenario for PhotosIngressTombstone {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = reqwest::Client::new();
+        let client = crate::insecure_client();
         let data_dir = tempfile::tempdir().context("temp data dir")?;
 
         println!("\nRunning checks:");

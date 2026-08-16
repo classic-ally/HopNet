@@ -15,9 +15,9 @@ use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 
 /// POST /takeout/initiate — start a new takeout for the authenticated user.
 pub async fn initiate_takeout(node: &NodeInfo) -> Result<()> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/takeout/initiate",
+        "https://{}:{}/api/takeout/initiate",
         node.ip_address, node.port
     );
 
@@ -41,8 +41,8 @@ pub async fn initiate_takeout(node: &NodeInfo) -> Result<()> {
 
 /// GET /takeout — list all takeouts for the authenticated user.
 pub async fn list_takeouts(node: &NodeInfo) -> Result<Vec<TakeoutRecord>> {
-    let client = Client::new();
-    let url = format!("http://{}:{}/api/takeout", node.ip_address, node.port);
+    let client = crate::insecure_client();
+    let url = format!("https://{}:{}/api/takeout", node.ip_address, node.port);
 
     let response = client
         .get(&url)
@@ -89,11 +89,11 @@ pub async fn wait_for_takeout_ready(node: &NodeInfo, timeout: Duration) -> Resul
 
 /// GET /takeout/{id}/download — stream the compressed archive bytes.
 pub async fn download_takeout_archive(node: &NodeInfo, takeout_id: &str) -> Result<Vec<u8>> {
-    let client = Client::builder()
+    let client = crate::insecure_client_builder()
         .timeout(Duration::from_secs(120))
         .build()?;
     let url = format!(
-        "http://{}:{}/api/takeout/{}/download",
+        "https://{}:{}/api/takeout/{}/download",
         node.ip_address, node.port, takeout_id
     );
 

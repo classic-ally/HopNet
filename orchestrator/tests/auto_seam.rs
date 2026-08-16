@@ -56,7 +56,7 @@ impl TestScenario for AutoSeam {
 
     async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
         anyhow::ensure!(
             nodes.len() == 6,
             "auto-seam expects a 6-node mesh (it adds the 7th)"

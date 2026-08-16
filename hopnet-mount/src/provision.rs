@@ -15,8 +15,10 @@
 
 use std::path::{Path, PathBuf};
 
-/// Headless nodes bind this fixed port; everything else must be
-/// discovered or configured.
+/// Last-resort fallback. Since RFC-022 a node's plaintext loopback port
+/// is kernel-assigned (discovered via the endpoint file above); this
+/// fixed address only matches the documented dev shape
+/// `HOPNET_DISABLE_TLS=1 HOPNET_HTTP_PORT=34632`.
 pub const DEFAULT_URL: &str = "http://127.0.0.1:34632";
 
 const SS_ATTR_SERVICE: &str = "service";

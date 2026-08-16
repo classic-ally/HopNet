@@ -89,7 +89,7 @@ in
   testScript = ''
     import json
 
-    API = "http://localhost:34632/api"
+    API = "https://localhost:34632/api"  # pinned-HTTPS network surface; -k because the cert is per-node self-signed
     nodes = [node0, node1, node2]
 
     start_all()
@@ -99,12 +99,12 @@ in
         n.wait_for_unit("hopnet.service")
         # Pre-setup GET /setup answers 404 with the node pubkey — HTTP
         # responding at all is readiness.
-        n.wait_until_succeeds(f"curl -s {API}/setup | grep -qE '.'", timeout=120)
+        n.wait_until_succeeds(f"curl -ks {API}/setup | grep -qE '.'", timeout=120)
 
     # --- Mesh formation over the HTTP API (the orchestrator's flow) ---
     setup = json.loads(
         node0.succeed(
-            f"curl -sf -X POST {API}/setup "
+            f"curl -ksf -X POST {API}/setup "
             "-H 'Content-Type: application/json' "
             "-d '{\"username\": \"allison\", \"node_name\": \"node0\"}'"
         )
@@ -118,7 +118,7 @@ in
         # everywhere once replication catches up.
         return json.loads(
             n.succeed(
-                f"curl -sf -X POST {API}/login "
+                f"curl -ksf -X POST {API}/login "
                 "-H 'Content-Type: application/json' "
                 f"-d '{login_body}'"
             )
@@ -127,24 +127,24 @@ in
     auth = f"-H 'Authorization: Bearer {jwt_for(node0)}'"
 
     for i, n in enumerate(nodes[1:], start=1):
-        pubkey = n.succeed(f"curl -s {API}/setup").strip().strip('"')
+        pubkey = n.succeed(f"curl -ks {API}/setup").strip().strip('"')
         assert len(pubkey) == 64, f"node{i} pubkey: {pubkey!r}"
         body = json.dumps({"name": f"node{i}", "owner": 0, "pubkey": pubkey})
         # 504 = iroh discovery still warming; retry through it.
         node0.wait_until_succeeds(
-            f"curl -sf -X POST {API}/nodes {auth} "
+            f"curl -ksf -X POST {API}/nodes {auth} "
             f"-H 'Content-Type: application/json' -d '{body}'",
             timeout=120,
         )
 
     # Heights decide and all three seats fill.
     node0.wait_until_succeeds(
-        f"curl -sf {API}/consensus {auth} | jq -e '.last_decided_height > 0'",
+        f"curl -ksf {API}/consensus {auth} | jq -e '.last_decided_height > 0'",
         timeout=180,
     )
     for n in nodes[1:]:
         n.wait_until_succeeds(
-            f"curl -sf -X POST {API}/login "
+            f"curl -ksf -X POST {API}/login "
             "-H 'Content-Type: application/json' "
             f"-d '{login_body}'",
             timeout=120,
@@ -157,29 +157,29 @@ in
     # node's own staged attestation appearing in committed state.
     for i, n in enumerate(nodes):
         n.wait_until_succeeds(
-            f"curl -sf -X POST {API}/maintenance/upgrade-tick {auths[i]} "
-            f"&& curl -sf {API}/views/upgrade-readiness {auths[i]} "
+            f"curl -ksf -X POST {API}/maintenance/upgrade-tick {auths[i]} "
+            f"&& curl -ksf {API}/views/upgrade-readiness {auths[i]} "
             f"| jq -e '.mesh[] | select(.node_id == {i}) "
             "| .staged == \"${nextVersion}\"'",
             timeout=180,
         )
     node0.wait_until_succeeds(
-        f"curl -sf {API}/views/upgrade-readiness {auth} "
+        f"curl -ksf {API}/views/upgrade-readiness {auth} "
         "| jq -e '(.mesh | length) == 3 and ([.mesh[].staged] | all(. == \"${nextVersion}\"))'",
         timeout=120,
     )
     # The deployment advertises its capabilities.
     node0.succeed(
-        f"curl -sf {API}/views/upgrade-readiness {auth} "
+        f"curl -ksf {API}/views/upgrade-readiness {auth} "
         "| jq -e '.activation.provider == \"nix\" and .activation.auto_activate'"
     )
 
     # --- The upgrade boundary: decide, seal, flip, exit 75, restart ---
     h_before = json.loads(
-        node0.succeed(f"curl -sf {API}/consensus {auth}")
+        node0.succeed(f"curl -ksf {API}/consensus {auth}")
     )["last_decided_height"]
     node0.succeed(
-        f"curl -sf -X POST {API}/consensus/regenesis/start {auth} "
+        f"curl -ksf -X POST {API}/consensus/regenesis/start {auth} "
         "-H 'Content-Type: application/json' "
         "-d '{\"target_version\": \"${nextVersion}\"}'"
     )
@@ -191,7 +191,7 @@ in
     # else).
     for i, n in enumerate(nodes):
         n.wait_until_succeeds(
-            f"curl -sf -X POST {API}/login "
+            f"curl -ksf -X POST {API}/login "
             "-H 'Content-Type: application/json' "
             f"-d '{login_body}'",
             timeout=300,
@@ -200,7 +200,7 @@ in
     auth = auths[0]
     for i, n in enumerate(nodes):
         n.wait_until_succeeds(
-            f"curl -sf {API}/views/regenesis-status {auths[i]} "
+            f"curl -ksf {API}/views/regenesis-status {auths[i]} "
             "| jq -e '.epoch == \"2\" and .phase == \"normal\"'",
             timeout=300,
         )
@@ -216,9 +216,9 @@ in
 
     # The upgraded epoch decides new heights (an attestation re-converging
     # on the new running version is itself traffic).
-    node0.succeed(f"curl -sf -X POST {API}/maintenance/upgrade-tick {auth}")
+    node0.succeed(f"curl -ksf -X POST {API}/maintenance/upgrade-tick {auth}")
     node0.wait_until_succeeds(
-        f"curl -sf {API}/consensus {auth} "
+        f"curl -ksf {API}/consensus {auth} "
         f"| jq -e '.last_decided_height > {h_before}'",
         timeout=120,
     )

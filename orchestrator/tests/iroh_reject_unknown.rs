@@ -35,14 +35,14 @@ impl TestScenario for IrohRejectUnknown {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
 
         println!("\nTesting iroh connection rejection for unknown nodes:");
 
         // Get node list from the first node to obtain pubkeys
         let first_node = &nodes[0];
         let nodes_url = format!(
-            "http://{}:{}/api/nodes",
+            "https://{}:{}/api/nodes",
             first_node.ip_address, first_node.port
         );
 

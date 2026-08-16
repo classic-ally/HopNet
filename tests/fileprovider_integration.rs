@@ -36,6 +36,11 @@ async fn test_fileprovider_integration() -> Result<(), Box<dyn std::error::Error
     println!("🚀 Starting HopNet backend in test mode...");
     let mut backend_process = Command::new("target/debug/hopnet")
         .env("HOPNET_EPHEMERAL_DB", "1") // Use in-memory database for testing
+        // This test exercises FileProvider's loopback surface; pin the
+        // plaintext port to the classic dev address and skip the TLS
+        // listener so the Swift side needs no cert handling.
+        .env("HOPNET_DISABLE_TLS", "1")
+        .env("HOPNET_HTTP_PORT", "34632")
         .spawn()
         .expect("Failed to start backend process");
 

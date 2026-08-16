@@ -31,7 +31,7 @@ struct StorageViewResponse {
 }
 
 async fn fetch_view(client: &Client, node: &NodeInfo) -> Result<StorageViewResponse> {
-    let url = format!("http://{}:{}/api/storage/view", node.ip_address, node.port);
+    let url = format!("https://{}:{}/api/storage/view", node.ip_address, node.port);
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
@@ -61,7 +61,7 @@ impl TestScenario for TierMembership {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
         let num_nodes = nodes.len();
 
         println!("\nRunning tier-membership checks:");
@@ -70,7 +70,7 @@ impl TestScenario for TierMembership {
         // replicated rows to derive from (empty history is also valid —
         // cold tiers, everyone present — but rows exercise the real path).
         let trigger = format!(
-            "http://{}:{}/api/metrics/trigger",
+            "https://{}:{}/api/metrics/trigger",
             nodes[0].ip_address, nodes[0].port
         );
         let trigger_ok = client

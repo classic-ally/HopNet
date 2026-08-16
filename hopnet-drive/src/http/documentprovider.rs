@@ -150,11 +150,14 @@ pub async fn get_item(
 
 /// File download endpoint for Android DocumentProvider
 /// GET /integrations/documentprovider/download?id={uuid}
-/// Returns streaming file content
+/// Returns streaming file content; honors single `bytes=start-[end]`
+/// Range headers (206/416) so the Hop Drive proxy file descriptor can
+/// seek without re-downloading the whole file.
 pub async fn get_download(
     State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
     Query(query): Query<ItemQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response<Body>, StatusCode> {
     let session = session_or_status(&state, user_id).await?;
 
@@ -193,22 +196,62 @@ pub async fn get_download(
         .map(|m| m.to_string())
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    // Use shared file reconstruction logic (handles empty files internally)
-    let stream = crate::download::reconstruct_file_stream(&state, encrypted_path, user_id)
-        .await
-        .map_err(|e| {
+    let requested_range = super::parse_range(&headers);
+
+    // Range-aware reconstruction (handles empty files internally)
+    let download_info = match crate::download::reconstruct_file_range(
+        &state,
+        encrypted_path,
+        user_id,
+        requested_range,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(crate::download::FileReconstructionError::RangeNotSatisfiable(file_size)) => {
+            let response = Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{}", file_size))
+                .body(Body::empty())
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Ok(response);
+        }
+        Err(e) => {
             tracing::error!("Error reconstructing file: {:?}", e);
-            StatusCode::from(e)
-        })?;
+            return Err(StatusCode::from(e));
+        }
+    };
 
     // Build streaming response
-    Response::builder()
+    let mut builder = Response::builder()
         .header(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}\"", filename),
         )
         .header(header::CONTENT_TYPE, mime_type)
-        .body(Body::from_stream(stream))
+        .header(header::ACCEPT_RANGES, "bytes");
+
+    if download_info.is_partial {
+        let range = download_info.range.as_ref().unwrap();
+        let content_length = range.end - range.start + 1;
+        builder = builder
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_LENGTH, content_length)
+            .header(
+                header::CONTENT_RANGE,
+                format!(
+                    "bytes {}-{}/{}",
+                    range.start, range.end, download_info.file_size
+                ),
+            );
+    } else {
+        builder = builder
+            .status(StatusCode::OK)
+            .header(header::CONTENT_LENGTH, download_info.file_size);
+    }
+
+    builder
+        .body(Body::from_stream(download_info.stream))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 

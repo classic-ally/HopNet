@@ -13,8 +13,11 @@ use hopnet::dev_seed;
 )]
 struct Args {
     /// Node base URL (local dev node or an orchestrator mesh node).
-    #[arg(long, default_value = "http://localhost:34632")]
-    base_url: String,
+    /// Defaults to the local node's advertised loopback endpoint
+    /// ($XDG_RUNTIME_DIR/hopnet/endpoint — the plaintext port is
+    /// kernel-assigned now), then the fixed dev convention.
+    #[arg(long)]
+    base_url: Option<String>,
 
     #[arg(long, default_value = "allison")]
     username: String,
@@ -44,14 +47,33 @@ struct Args {
     months: u32,
 }
 
+/// Loopback discovery seam (mirrors hopnet-mount): the node writes its
+/// plaintext loopback URL here because the port is kernel-assigned.
+fn local_endpoint() -> Option<String> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+    let path = std::path::Path::new(&runtime_dir).join("hopnet/endpoint");
+    let url = std::fs::read_to_string(path).ok()?;
+    let url = url.trim();
+    (!url.is_empty()).then(|| url.to_string())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let client = reqwest::Client::new();
+    let base_url = args
+        .base_url
+        .clone()
+        .or_else(local_endpoint)
+        .unwrap_or_else(|| "http://localhost:34632".to_string());
+    // Mesh nodes serve pinned-HTTPS with self-signed certs; a seeding tool
+    // trusts its operator-supplied URL, not the cert chain.
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?;
 
     let passphrase = if args.setup {
         let passphrase =
-            dev_seed::setup_node(&client, &args.base_url, &args.username, &args.node_name).await?;
+            dev_seed::setup_node(&client, &base_url, &args.username, &args.node_name).await?;
         println!("==========================================================");
         println!("  node bootstrapped — SAVE THIS PASSPHRASE:");
         println!("  {passphrase}");
@@ -63,17 +85,17 @@ async fn main() -> anyhow::Result<()> {
 
     println!(
         "logging in as {} at {} (Argon2id — a few seconds)...",
-        args.username, args.base_url
+        args.username, base_url
     );
-    let jwt = dev_seed::login(&client, &args.base_url, &args.username, &passphrase).await?;
+    let jwt = dev_seed::login(&client, &base_url, &args.username, &passphrase).await?;
 
-    dev_seed::enable_sidecar(&client, &args.base_url, &jwt).await?;
+    dev_seed::enable_sidecar(&client, &base_url, &jwt).await?;
     println!("sidecar enabled");
 
     let mut posted = Vec::with_capacity(args.count as usize);
     for index in 0..args.count {
         let photo = dev_seed::generate_photo(args.seed, index, args.months);
-        let result = dev_seed::post_photo(&client, &args.base_url, &jwt, &photo).await?;
+        let result = dev_seed::post_photo(&client, &base_url, &jwt, &photo).await?;
         println!(
             "  [{}/{}] {} ({})",
             index + 1,
@@ -89,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
         posted.len(),
         args.seed,
         args.months,
-        args.base_url
+        base_url
     );
     Ok(())
 }

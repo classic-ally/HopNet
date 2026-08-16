@@ -2,6 +2,8 @@
     import Modal from '../../primitives/Modal.svelte';
     import Button from '../../Button.svelte';
     import QrCode from 'svelte-qrcode';
+    import { authenticatedFetch, API_BASE_URL } from '../../stores';
+    import type { PairingInfoResponse } from '../../types';
 
     interface DeviceKeyModalProps {
         isOpen: boolean;
@@ -19,6 +21,41 @@
 
     let copied = $state(false);
     let qrExpanded = $state(false);
+    let pairing = $state<PairingInfoResponse | null>(null);
+
+    $effect(() => {
+        if (!isOpen) return;
+        authenticatedFetch(`${API_BASE_URL}/devices/pairing-info`)
+            .then(async (r) => {
+                pairing = r.ok ? await r.json() : null;
+            })
+            .catch(() => {
+                pairing = null;
+            });
+    });
+
+    // QR payload v1 (docs/specs/pinned-https.md): everything a client
+    // needs to reach the TLS surface and pin the node's cert. `host` is
+    // what the operator's browser reached this node at — omitted when
+    // that's loopback (Tauri webview / local dev), in which case the
+    // client prompts for it. Falls back to the bare API key when the
+    // node has no TLS listener.
+    const qrValue = $derived.by(() => {
+        if (!pairing?.tls_enabled || !pairing.https_port || !pairing.spki_sha256) {
+            return apiKey;
+        }
+        const host = window.location.hostname;
+        const isLoopback =
+            host === 'localhost' || host === '127.0.0.1' || host === 'tauri.localhost';
+        return JSON.stringify({
+            v: 1,
+            kind: 'hopnet-device',
+            ...(isLoopback ? {} : { host }),
+            port: pairing.https_port,
+            spki: pairing.spki_sha256,
+            token: apiKey
+        });
+    });
 
     async function copyToClipboard() {
         try {
@@ -77,6 +114,20 @@
                     </div>
                 </div>
 
+                <!-- Node TLS fingerprint (manual pairing counterpart of the QR) -->
+                {#if pairing?.tls_enabled && pairing.spki_sha256}
+                    <div>
+                        <p class="text-muted mb-2">Node fingerprint (SPKI SHA-256):</p>
+                        <div class="bg-surface1 border border-overlay1 rounded-lg p-3 font-mono text-sm text-primary break-all">
+                            {pairing.spki_sha256}
+                        </div>
+                    </div>
+                {:else}
+                    <p class="text-muted text-sm">
+                        No TLS listener available — the QR code carries the bare API key only.
+                    </p>
+                {/if}
+
                 <!-- Copy button -->
                 <div class="flex justify-center">
                     <Button
@@ -100,7 +151,7 @@
 
                     {#if qrExpanded}
                         <div class="mt-3 flex justify-center p-4 bg-white rounded-lg">
-                            <QrCode size={150} value={apiKey} />
+                            <QrCode size={200} value={qrValue} />
                         </div>
                     {/if}
                 </div>

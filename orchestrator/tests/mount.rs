@@ -85,7 +85,7 @@ async fn launch_daemon(
                     "mount".to_string(),
                     MOUNTPOINT.to_string(),
                     "--url".to_string(),
-                    "http://127.0.0.1:34632".to_string(),
+                    "http://127.0.0.1:34630".to_string(),
                     "--cache-dir".to_string(),
                     "/tmp/hopnet-mount/cache".to_string(),
                     "--staging-dir".to_string(),
@@ -179,7 +179,7 @@ async fn wait_for_item(
     timeout: Duration,
 ) -> Result<serde_json::Value> {
     let url = format!(
-        "http://{}:{}/api/integrations/mount/lookup",
+        "https://{}:{}/api/integrations/mount/lookup",
         node.ip_address, node.port
     );
     let deadline = Instant::now() + timeout;
@@ -253,7 +253,7 @@ async fn download_via_api(
     }
     let blob_id = item["blob_id"].as_str().context("item has no blob_id")?;
     let url = format!(
-        "http://{}:{}/api/integrations/mount/download",
+        "https://{}:{}/api/integrations/mount/download",
         node.ip_address, node.port
     );
     let resp = client
@@ -284,7 +284,7 @@ impl TestScenario for MountCrossNodeConsistency {
     async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
         let docker = Docker::connect_with_local_defaults()?;
         let node0 = container_name(mesh_id, 0);
         anyhow::ensure!(nodes.len() >= 3, "needs a 3-node mesh");
@@ -293,7 +293,7 @@ impl TestScenario for MountCrossNodeConsistency {
 
         // 1. Register a Mount device through the real registration route.
         let register_url = format!(
-            "http://{}:{}/api/devices/register",
+            "https://{}:{}/api/devices/register",
             nodes[0].ip_address, nodes[0].port
         );
         let api_key = match async {
@@ -493,7 +493,7 @@ impl TestScenario for MountCrossNodeConsistency {
                 .await?;
                 let id = item["id"].as_str().context("item has no id")?;
                 let url = format!(
-                    "http://{}:{}/api/integrations/mount/delete",
+                    "https://{}:{}/api/integrations/mount/delete",
                     nodes[2].ip_address, nodes[2].port
                 );
                 let resp = client

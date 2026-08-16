@@ -29,3 +29,15 @@ pub struct DeviceInfo {
     #[typeshare(serialized_as = "number")]
     pub created_at: i64, // Unix timestamp extracted from UUIDv7
 }
+
+/// API response for GET /devices/pairing-info: what a pairing client needs
+/// to reach this node's TLS surface and pin its certificate
+/// (docs/specs/pinned-https.md). All-None with `tls_enabled: false` when
+/// the node runs loopback-plaintext only.
+#[derive(Debug, Deserialize, Serialize)]
+#[typeshare]
+pub struct PairingInfoResponse {
+    pub tls_enabled: bool,
+    pub https_port: Option<u16>,
+    pub spki_sha256: Option<String>,
+}

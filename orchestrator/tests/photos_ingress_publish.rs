@@ -23,7 +23,7 @@ const COUNT: u32 = 6;
 pub struct PhotosIngressPublish;
 
 fn base_url(node: &NodeInfo) -> String {
-    format!("http://{}:{}", node.ip_address, node.port)
+    format!("https://{}:{}", node.ip_address, node.port)
 }
 
 /// Run the e2e driver; returns its stdout JSON.
@@ -178,7 +178,7 @@ impl TestScenario for PhotosIngressPublish {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = reqwest::Client::new();
+        let client = crate::insecure_client();
         let data_dir = tempfile::tempdir().context("temp data dir")?;
 
         println!("\nRunning checks:");

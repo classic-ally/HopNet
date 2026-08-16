@@ -57,7 +57,9 @@ in
       description = ''
         Node base URL. Left null, the daemon resolves it itself:
         login-stored config, then the node-written endpoint file, then
-        the fixed headless default http://127.0.0.1:34632.
+        the fixed dev-shape default http://127.0.0.1:34632 (only valid
+        for a node run with HOPNET_DISABLE_TLS=1 HOPNET_HTTP_PORT=34632;
+        RFC-022 nodes otherwise bind a kernel-assigned loopback port).
       '';
     };
 

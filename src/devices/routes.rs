@@ -1,6 +1,6 @@
 use super::types::{
-    DeviceInfo, RegisterDevicePayload, RegisterDeviceRequest, RegisterDeviceResponse,
-    RevokeDevicePayload,
+    DeviceInfo, PairingInfoResponse, RegisterDevicePayload, RegisterDeviceRequest,
+    RegisterDeviceResponse, RevokeDevicePayload,
 };
 use crate::consensus::dispatch::create_signed_user_transaction;
 use crate::db::{Blake3Hash, CustomUUID, devices::get_devices_for_user};
@@ -21,8 +21,21 @@ pub fn router(app_state: AppState) -> Router<AppState> {
     Router::new()
         .route("/", get(get_devices))
         .route("/register", post(post_register_device))
+        .route("/pairing-info", get(get_pairing_info))
         .route("/{id}", delete(delete_device))
         .layer(middleware::from_fn_with_state(app_state, auth_middleware))
+}
+
+/// GET /devices/pairing-info
+/// TLS listener facts for the pairing QR: the HTTPS port and the SPKI
+/// fingerprint clients pin (docs/specs/pinned-https.md).
+async fn get_pairing_info() -> Json<PairingInfoResponse> {
+    let info = crate::tls::runtime_info();
+    Json(PairingInfoResponse {
+        tls_enabled: info.is_some(),
+        https_port: info.map(|i| i.https_port),
+        spki_sha256: info.map(|i| i.spki_sha256.clone()),
+    })
 }
 
 /// Core device registration logic. Returns (device_id, api_key).

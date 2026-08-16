@@ -51,7 +51,7 @@ async fn fetch_db_stats(node: &NodeInfo) -> Result<DbStatsClient> {
     // (EADDRNOTAVAIL) after sustained HTTP load takes ~15s of TIME_WAIT to drain.
     // HTTP-level errors (4xx/5xx) are not retried.
     let url = format!(
-        "http://{}:{}/api/debug/db-stats",
+        "https://{}:{}/api/debug/db-stats",
         node.ip_address, node.port
     );
     let mut last_err: Option<anyhow::Error> = None;
@@ -59,7 +59,7 @@ async fn fetch_db_stats(node: &NodeInfo) -> Result<DbStatsClient> {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
-        let send_result = Client::new()
+        let send_result = crate::insecure_client()
             .get(&url)
             .header("Authorization", format!("Bearer {}", node.jwt_token))
             .timeout(Duration::from_secs(10))

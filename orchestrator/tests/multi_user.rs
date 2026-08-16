@@ -23,8 +23,8 @@ pub(crate) fn node_with_token(node: &NodeInfo, token: &str) -> NodeInfo {
 
 /// POST /users to create a new user, returns the generated passphrase.
 pub(crate) async fn create_user(node: &NodeInfo, username: &str) -> Result<String> {
-    let client = Client::new();
-    let url = format!("http://{}:{}/api/users", node.ip_address, node.port);
+    let client = crate::insecure_client();
+    let url = format!("https://{}:{}/api/users", node.ip_address, node.port);
 
     let response = client
         .post(&url)
@@ -54,8 +54,8 @@ pub(crate) async fn login_user(
     username: &str,
     passphrase: &str,
 ) -> Result<String> {
-    let client = Client::new();
-    let url = format!("http://{}:{}/api/login", node.ip_address, node.port);
+    let client = crate::insecure_client();
+    let url = format!("https://{}:{}/api/login", node.ip_address, node.port);
 
     let response = client
         .post(&url)
@@ -87,11 +87,13 @@ pub(crate) async fn try_download_file(
     node: &NodeInfo,
     path: &str,
 ) -> Result<std::result::Result<Vec<u8>, u16>> {
-    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let client = crate::insecure_client_builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
 
     let path_trimmed = path.strip_prefix('/').unwrap_or(path);
     let url = format!(
-        "http://{}:{}/api/files/{}",
+        "https://{}:{}/api/files/{}",
         node.ip_address, node.port, path_trimmed
     );
 

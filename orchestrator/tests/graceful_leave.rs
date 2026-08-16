@@ -30,7 +30,7 @@ pub(crate) struct ViewState {
 
 pub(crate) async fn view_state(client: &Client, node: &NodeInfo, height: i64) -> Result<ViewState> {
     let url = format!(
-        "http://{}:{}/api/consensus/view",
+        "https://{}:{}/api/consensus/view",
         node.ip_address, node.port
     );
     let resp = client
@@ -104,7 +104,7 @@ impl TestScenario for GracefulLeave {
         _flags: &[String],
     ) -> Result<TestResult> {
         let mut result = TestResult::new();
-        let client = Client::new();
+        let client = crate::insecure_client();
 
         anyhow::ensure!(nodes.len() == 3, "graceful-leave expects a 3-node mesh");
         let leaver = &nodes[1];
@@ -134,7 +134,7 @@ impl TestScenario for GracefulLeave {
 
         // 2. Leave: the response returns only after the commit.
         let leave_url = format!(
-            "http://{}:{}/api/consensus/leave",
+            "https://{}:{}/api/consensus/leave",
             leaver.ip_address, leaver.port
         );
         let leave_ok = client

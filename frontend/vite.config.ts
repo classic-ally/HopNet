@@ -11,7 +11,10 @@ const dirname = typeof __dirname !== 'undefined' ? __dirname : path.dirname(file
 // Dev-server proxy target. The frontend itself uses relative URLs in every
 // mode (Tauri webview, browser served from axum static, and vite dev) — the
 // proxy below only matters for `pnpm dev`, where vite serves the SPA and
-// forwards API routes to a separately-running headless backend.
+// forwards API routes to a separately-running headless backend. 34632 is
+// the node's TLS port by default now, so run that backend with the dev
+// convention `HOPNET_DISABLE_TLS=1 HOPNET_HTTP_PORT=34632` to keep this
+// target plaintext (docs/specs/pinned-https.md).
 const devProxyTarget = 'http://localhost:34632';
 
 // https://vite.dev/config/

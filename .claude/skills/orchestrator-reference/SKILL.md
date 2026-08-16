@@ -73,6 +73,7 @@ Pass means **test passed AND no divergence**. The mesh is only deleted when the 
 | `chunked-streaming-performance` | Streaming performance with chunked RS encoding |
 | `restart-persistence` | Data survives node restarts |
 | `device-token-consistency` | Device token management across nodes |
+| `tls-pinned-https` | SPKI-pinned client reaches the API; a mis-pinned client cannot handshake |
 | `documentprovider-write-consistency` | Document provider write APIs (upload, rename, move, delete) |
 | `multi-user-isolation` | User data isolation in multi-user scenarios |
 | `multi-user-sharing` | File sharing between users with share acceptance |
@@ -315,7 +316,7 @@ HOPNET_QUORUM_PROFILE=majority HOPNET_CONSENSUS_TIMEOUT_MS=2000 \
 
 ## Port Mapping
 
-- Internal port: `34632`
+- Internal port: `34632` (pinned HTTPS — self-signed cert, use insecure clients / `curl -k`)
 - Host port (macOS/Podman): `40000 + (slot * 500) + node_id`, where
   `slot = (checkout_slot + mesh_id) % 51` — the starting slot rotates per
   checkout so concurrent worktrees' meshes prefer different port ranges. If

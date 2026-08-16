@@ -97,9 +97,9 @@ pub fn build_archive_with_wrong_first_entry() -> Result<Vec<u8>> {
 /// POST `/takeout/import` with a multipart `archive` field carrying the given
 /// bytes. Caller inspects the returned `Response` for status + body.
 pub async fn upload_import_archive(node: &NodeInfo, bytes: Vec<u8>) -> Result<reqwest::Response> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/takeout/import",
+        "https://{}:{}/api/takeout/import",
         node.ip_address, node.port
     );
     let part = reqwest::multipart::Part::bytes(bytes).file_name("archive.tar.gz");
@@ -120,9 +120,9 @@ async fn initiate_import_status(node: &NodeInfo, bytes: Vec<u8>) -> Result<Statu
 
 /// GET /takeout/import — fetch the user's current import (singleton).
 async fn get_current_import(node: &NodeInfo) -> Result<Option<ImportRecord>> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/takeout/import",
+        "https://{}:{}/api/takeout/import",
         node.ip_address, node.port
     );
     let resp = client
@@ -192,9 +192,9 @@ async fn wait_for_import_status(
 /// GET /takeout/import/paths — owner-node-local per-import path table dump.
 /// 3.7 supersedes with an aggregate-status route reachable from any node.
 pub async fn get_import_paths(node: &NodeInfo) -> Result<Vec<ImportPathRow>> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/takeout/import/paths",
+        "https://{}:{}/api/takeout/import/paths",
         node.ip_address, node.port
     );
     let resp = client
@@ -940,9 +940,9 @@ impl TestScenario for ImportExtractionHappyPath {
 
         // Non-owner nodes should reject the per-path debug route with 404.
         if nodes.len() >= 2 {
-            let client = Client::new();
+            let client = crate::insecure_client();
             let url = format!(
-                "http://{}:{}/api/takeout/import/paths",
+                "https://{}:{}/api/takeout/import/paths",
                 nodes[1].ip_address, nodes[1].port
             );
             let resp = client
@@ -1452,9 +1452,9 @@ impl TestScenario for ImportCreationMixedFailure {
 
 /// GET /takeout/import/status — owner-node-local aggregate counts.
 async fn get_import_status_counts(node: &NodeInfo) -> Result<ImportPathCounts> {
-    let client = Client::new();
+    let client = crate::insecure_client();
     let url = format!(
-        "http://{}:{}/api/takeout/import/status",
+        "https://{}:{}/api/takeout/import/status",
         node.ip_address, node.port
     );
     let resp = client
@@ -1480,8 +1480,8 @@ async fn upload_file_status(
     filename: &str,
     contents: Vec<u8>,
 ) -> Result<StatusCode> {
-    let client = Client::new();
-    let url = format!("http://{}:{}/api/files", node.ip_address, node.port);
+    let client = crate::insecure_client();
+    let url = format!("https://{}:{}/api/files", node.ip_address, node.port);
     let len = contents.len();
     let part = reqwest::multipart::Part::bytes(contents).file_name(filename.to_string());
     let form = reqwest::multipart::Form::new()
@@ -1735,9 +1735,9 @@ impl TestScenario for ImportStatusCounts {
         );
 
         if nodes.len() >= 2 {
-            let client = Client::new();
+            let client = crate::insecure_client();
             let url = format!(
-                "http://{}:{}/api/takeout/import/status",
+                "https://{}:{}/api/takeout/import/status",
                 nodes[1].ip_address, nodes[1].port
             );
             let resp = client
@@ -1781,9 +1781,9 @@ impl TestScenario for ImportResumeAfterRestart {
         // owner BEFORE upload. The bg task will flip status to Importing,
         // seed the path table, then block at the barrier — giving us a
         // deterministic mid-import state to stop on.
-        let client = Client::new();
+        let client = crate::insecure_client();
         let hold_url = format!(
-            "http://{}:{}/api/test/barriers/takeout/before_import_creation_walk/hold",
+            "https://{}:{}/api/test/barriers/takeout/before_import_creation_walk/hold",
             nodes[0].ip_address, nodes[0].port
         );
         let hold_resp = client
