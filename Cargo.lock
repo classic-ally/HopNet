@@ -2838,7 +2838,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet"
-version = "2026.8.3"
+version = "2026.8.4"
 dependencies = [
  "aes-siv",
  "anyhow",
@@ -2923,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-common"
-version = "2026.8.3"
+version = "2026.8.4"
 dependencies = [
  "bincode",
  "blake3",
@@ -2938,7 +2938,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-comms"
-version = "2026.8.3"
+version = "2026.8.4"
 dependencies = [
  "iroh",
  "rand 0.10.1",
@@ -2948,7 +2948,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-consensus"
-version = "2026.8.3"
+version = "2026.8.4"
 dependencies = [
  "arc-malachitebft-core-consensus",
  "arc-malachitebft-core-driver",
@@ -2969,7 +2969,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-drive"
-version = "2026.8.3"
+version = "2026.8.4"
 dependencies = [
  "aes-siv",
  "async-stream",
@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-mount"
-version = "2026.8.3"
+version = "2026.8.4"
 dependencies = [
  "async-stream",
  "bytes",
@@ -3027,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-photos"
-version = "2026.8.3"
+version = "2026.8.4"
 dependencies = [
  "bincode",
  "chacha20poly1305",
@@ -3045,7 +3045,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-photos-core"
-version = "2026.8.3"
+version = "2026.8.4"
 dependencies = [
  "async-trait",
  "bincode",
@@ -3064,7 +3064,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-projection"
-version = "2026.8.3"
+version = "2026.8.4"
 dependencies = [
  "aes-siv",
  "axum",
@@ -3091,7 +3091,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-storage"
-version = "2026.8.3"
+version = "2026.8.4"
 dependencies = [
  "async-stream",
  "bincode",
@@ -3114,7 +3114,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-takeout"
-version = "2026.8.3"
+version = "2026.8.4"
 dependencies = [
  "axum",
  "bincode",

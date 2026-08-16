@@ -12,7 +12,7 @@ exclude = ["crates/ingress-core", "crates/ingress-ffi"]
 # via version.workspace = true (RFC-023), release tags are v{version},
 # the node attests it in consensus, and the epoch boot gate compares it
 # by exact equality. See common/src/version.rs for the integer encoding.
-version = "2026.8.3"
+version = "2026.8.4"
 
 [package]
 name = "hopnet"
