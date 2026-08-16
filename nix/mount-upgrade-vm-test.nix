@@ -267,7 +267,11 @@ in
     target = machine.succeed(f"readlink {PROFILE}").strip()
     assert target == "${hopnet-mount-next}", f"profile: {target!r}"
     prov = json.loads(machine.succeed(f"cat {STAGED}/v{next_version}.json"))
-    assert prov["version"] == next_version and prov["min_node"] == base_code, prov
+    # The interrogated floor is the binary's compiled MIN_NODE constant —
+    # deliberately not pinned here (it moves independently of the
+    # workspace version). The invariant is the anchor lemma's shape:
+    # answered (nonzero) and satisfiable by this node (else no flip).
+    assert prov["version"] == next_version and 0 < prov["min_node"] <= base_code, prov
     # Laziness is the feature: the healthy daemon was never touched.
     assert main_pid() == pid0 and nrestarts() == n0
     assert running_exe() == exe0
