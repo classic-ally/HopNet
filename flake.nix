@@ -393,14 +393,20 @@
         default = hopnet-mount;
       };
 
-      # RFC-021 end-to-end: a declarative relay + 3-node mesh crossing a
-      # real upgrade boundary through the module's profile flip. Heavy
-      # (builds hopnet twice, boots 4 VMs) — run on demand:
+      # RFC-021 / RFC-023 end-to-end VM tests. Heavy (each builds a
+      # second hopnet or hopnet-mount generation and boots VMs) — run
+      # on demand:
       #   nix build .#checks.x86_64-linux.upgrade-vm-test
+      #   nix build .#checks.x86_64-linux.mount-upgrade-vm-test
       checks = forAllSystems (pkgs:
         pkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
           upgrade-vm-test = pkgs.testers.runNixOSTest (
             import ./nix/upgrade-vm-test.nix { inherit self; }
+          );
+          # RFC-023 S3: single-seat node + user-session mount crossing
+          # the stage → flip → exit-75 boundary, plus the hold path.
+          mount-upgrade-vm-test = pkgs.testers.runNixOSTest (
+            import ./nix/mount-upgrade-vm-test.nix { inherit self; }
           );
         });
 

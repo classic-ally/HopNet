@@ -1,6 +1,6 @@
 # RFC-023: hopnet-mount Auto-Upgrade — the Nix Client Channel
 
-**Status**: Draft (2026-08-16)
+**Status**: Implemented (S1–S3 complete, 2026-08-16)
 **Depends on**: RFC-021 (the staging/flip/exit-75 machinery this
 transplants — profile indirection, honest-bytes staging, newest-wins
 seeding), RFC-022 (the signals this consumes — the 426 policy readout,
@@ -216,10 +216,33 @@ Each tracked, not forgotten:
       Held-426 restart loops are damped by RestartSteps 5s→10min.
       Timers are session-scoped without `loginctl enable-linger`; the
       pre-start check covers every login regardless.)*
-- [ ] S3 — end-to-end: a VM or orchestrator scenario proving
+- [x] S3 — end-to-end: a VM or orchestrator scenario proving
       stage → flip → exit 75 → the daemon serves from the new binary,
       and the hold path (nothing compatible → loud held state, no
       restart loop).
+      *(As built, 2026-08-16: a VM, not an orchestrator scenario — the
+      subject IS the systemd machinery (user unit, ExecStartPre
+      through the profile, RestartForceExitStatus=75, the timer),
+      which containers cannot exercise.
+      `nix/mount-upgrade-vm-test.nix`: one machine, single-seat node
+      (quorum(1), local iroh relay, hermetic empty feed for the
+      node's own follower), alice's session started by
+      `loginctl enable-linger` only AFTER provisioning so the first
+      start never crash-loops into the RestartSteps damping. Three
+      mount generations: the flake pin, a real recompile at
+      2026.12.99 (workspace Cargo.toml patched — the node test's
+      pattern, dep artifacts cached), and a shell-stub 2099.2.0 whose
+      `--min-node` 2099.1.1 no node satisfies — stage() only ever
+      interrogates `--version`/`--min-node`, so the hold path needs
+      no third compile. The 426 trigger is a new node-side seam:
+      `HOPNET_MIN_CLIENT_OVERRIDE` (test-mode-gated, RAISE-only via
+      max(), read inside `client_version_gate` so the enforced and
+      advertised minimums cannot diverge) flipped mid-run by a
+      systemd drop-in + node restart. The feed is nginx serving a
+      file the test rewrites between phases. Also fixed here: the
+      NixOS module arm now sets `programs.fuse.enable` — the setuid
+      fusermount3 wrapper the unit PATH already pointed at is not a
+      NixOS default.)*
 
 ## Open Questions
 
