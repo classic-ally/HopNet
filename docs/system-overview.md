@@ -517,7 +517,9 @@ Cross-platform desktop application providing file management and network adminis
       ([RFC-022](specs/client-compat.md), spec 2026-08-16: per-surface
       `min_client` in the RFC-016 manifest, per-request version header
       with mandatory 426 on DeviceToken surfaces, client-side
-      `min_node` health probe; implementation S1–S4 not started)
+      `min_node` health probe; S1 identity shipped 2026-08-16 —
+      workspace CalVer inheritance, helpers in hopnet-common,
+      mount --version; S2–S4 not started)
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
       Network Resilience pane reports margins to the model-checked invariants rather than

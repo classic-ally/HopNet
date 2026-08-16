@@ -238,11 +238,16 @@ Each tracked, not forgotten:
 
 Each PR-sized, landing green:
 
-- [ ] S1 — identity: `[workspace.package]` + `version.workspace =
-      true` across client crates; version-code helpers
-      (`parse_code`/`format_code`/validation) hoist from
-      `src/version.rs` into `hopnet-common`; `hopnet-mount
-      --version` answers the token.
+- [x] S1 — identity (2026-08-16): `[workspace.package]` +
+      `version.workspace = true` across all 10 member crates;
+      pure version-code helpers hoisted to `hopnet-common::version`
+      (node re-exports, call sites unchanged); `hopnet-mount
+      --version` answers the token and `hopnet_mount::version_code()`
+      is the compiled-in code S4's header sends. Nix parity: the
+      mount derivation drops its hardcoded 0.1.0 for the parsed
+      workspace version, with a flake assert guarding crane's silent
+      0.0.1 placeholder fallback (which would otherwise quietly
+      disable the module's newest-wins re-seeding).
 - [ ] S2 — declaration: `Projection::min_client()` +
       `Mount.min_client`; boot-time resolution into the
       surface → minimum map; `assert_projection_registrations`
