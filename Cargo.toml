@@ -6,13 +6,17 @@ members = [".", "common", "hopnet-comms", "hopnet-consensus", "hopnet-storage", 
 # own lockfile; rejoin once iroh drops the prerelease pin.
 exclude = ["crates/ingress-core", "crates/ingress-ffi"]
 
+[workspace.package]
+# CalVer YYYY.M.N (RFC-019 S3): year.month.counter-within-month. This is
+# the SINGLE authoritative version token — every member crate inherits it
+# via version.workspace = true (RFC-022), release tags are v{version},
+# the node attests it in consensus, and the epoch boot gate compares it
+# by exact equality. See common/src/version.rs for the integer encoding.
+version = "2026.8.3"
+
 [package]
 name = "hopnet"
-# CalVer YYYY.M.N (RFC-019 S3): year.month.counter-within-month. This is
-# the SINGLE authoritative version token — release tags are v{version},
-# the node attests it in consensus, and the epoch boot gate compares it
-# by exact equality. See src/version.rs for the integer encoding.
-version = "2026.8.3"
+version.workspace = true
 edition = "2024"
 default-run = "hopnet"
 license = "AGPL-3.0-only"
