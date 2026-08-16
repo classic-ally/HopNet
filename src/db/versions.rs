@@ -27,7 +27,7 @@ pub fn set_node_version_tx(
                 report.node_id,
             ],
         )
-        .map_err(|_| DatabaseError::ProcessingError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
     if updated != 1 {
         // Unreachable in practice: the submitter was signature-verified
         // against nodes before dispatch. Fail loud rather than commit a
@@ -56,7 +56,7 @@ pub fn read_node_version(
     .map(Some)
     .or_else(|e| match e {
         rusqlite::Error::QueryReturnedNoRows => Ok(None),
-        _ => Err(DatabaseError::RecallError),
+        e => Err(DatabaseError::classified(&e, DatabaseError::RecallError)),
     })
 }
 
@@ -81,7 +81,7 @@ pub fn read_mesh_versions(
                     version_attested_height
              FROM nodes ORDER BY node_id",
         )
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
     let rows = stmt
         .query_map([], |row| {
             Ok(MeshNodeVersions {
@@ -92,7 +92,7 @@ pub fn read_mesh_versions(
                 attested_height: row.get::<_, Option<i64>>(4)?.map(height_from_db),
             })
         })
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
     rows.collect::<Result<_, _>>()
-        .map_err(|_| DatabaseError::RecallError)
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))
 }

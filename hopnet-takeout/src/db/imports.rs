@@ -53,7 +53,7 @@ pub fn has_active_import(conn: &rusqlite::Connection, user_id: i32) -> Result<bo
             params![user_id],
             |row| row.get(0),
         )
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
     Ok(count > 0)
 }
 
@@ -88,7 +88,7 @@ pub fn is_import_eligible(
             params![user_id],
             |row| row.get(0),
         )
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
     if blocking_imports > 0 {
         return Ok(false);
     }
@@ -99,7 +99,7 @@ pub fn is_import_eligible(
             params![user_id],
             |row| row.get(0),
         )
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     Ok(inode_count == 0)
 }
@@ -137,7 +137,7 @@ pub fn process_import_creation(
         )
         .map_err(|e| {
             tracing::error!("Failed to insert import record: {:?}", e);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
 
     if execute {
@@ -176,7 +176,7 @@ pub fn process_import_status_update(
         )
         .map_err(|e| {
             tracing::error!("Failed to update import status: {:?}", e);
-            DatabaseError::ProcessingError
+            DatabaseError::classified(&e, DatabaseError::ProcessingError)
         })?;
 
     if rows == 0 {
@@ -232,7 +232,7 @@ pub fn get_current_import_for_user(
                 user_id,
                 e
             );
-            Err(DatabaseError::RecallError)
+            Err(DatabaseError::classified(&e, DatabaseError::RecallError))
         }
     }
 }

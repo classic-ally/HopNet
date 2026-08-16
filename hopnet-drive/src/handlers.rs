@@ -277,7 +277,7 @@ impl TransactionHandler for ShareFileHandler {
                 params![payload.data_block_id],
                 |_| Ok(()),
             )
-            .map_err(|_| DatabaseError::NotFound)?;
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::NotFound))?;
 
         // Validation: recipient exists
         db_tx
@@ -286,7 +286,7 @@ impl TransactionHandler for ShareFileHandler {
                 [payload.recipient_id],
                 |_| Ok(()),
             )
-            .map_err(|_| DatabaseError::NotFound)?;
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::NotFound))?;
 
         // Validation: no duplicate share
         if crate::db::shares::share_exists_for_recipient(
@@ -359,7 +359,7 @@ impl TransactionHandler for AcceptShareHandler {
                 params![payload.encrypted_path, payload.recipient_id],
                 |row| row.get(0),
             )
-            .map_err(|_| DatabaseError::RecallError)?;
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
         if path_exists {
             return Err(DatabaseError::ConflictError);
@@ -378,7 +378,7 @@ impl TransactionHandler for AcceptShareHandler {
             params![file_access_entry.blob_id, file_access_entry.recipient_pubkey.to_vec(), file_access_entry.ephemeral_pubkey.to_vec(), file_access_entry.wrapped_key]
         ).map_err(|e| {
             tracing::error!("Failed to insert blob_access for share accept: {:?}", e);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
 
         // 2. Create parent directories from pre-generated folder inodes
@@ -386,7 +386,7 @@ impl TransactionHandler for AcceptShareHandler {
             db_tx.execute(
                 "INSERT OR IGNORE INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, ?, 1, NULL)",
                 rusqlite::params![folder_id, payload.recipient_id, folder_path],
-            ).map_err(|_| DatabaseError::InsertError)?;
+            ).map_err(|e| DatabaseError::classified(&e, DatabaseError::InsertError))?;
         }
 
         // 3. Insert inode in recipient's namespace
@@ -402,7 +402,7 @@ impl TransactionHandler for AcceptShareHandler {
             )
             .map_err(|e| {
                 tracing::error!("Failed to insert inode for share accept: {:?}", e);
-                DatabaseError::InsertError
+                DatabaseError::classified(&e, DatabaseError::InsertError)
             })?;
 
         // 4. Insert share members for both sender and recipient

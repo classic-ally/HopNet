@@ -12,7 +12,7 @@ pub fn get_nodes(
         Ok(db_lock) => {
             let mut stmt = db_lock
                 .prepare("SELECT node_id, name, owner, pubkey FROM nodes")
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
             let results = stmt.query_map([], |row| {
                 Ok(Node {
                     node_id: row.get(0)?,
@@ -25,10 +25,10 @@ pub fn get_nodes(
             match results {
                 Ok(users) => Ok(users
                     .collect::<Result<_, _>>()
-                    .map_err(|_| DatabaseError::ProcessingError)?),
+                    .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?),
                 Err(e) => {
                     tracing::error!("Failed to execute query in get_nodes: {:?}", e);
-                    Err(DatabaseError::RecordError)
+                    Err(DatabaseError::classified(&e, DatabaseError::RecordError))
                 }
             }
         }
@@ -56,7 +56,7 @@ pub fn get_next_node_id_conn(conn: &rusqlite::Connection) -> Result<i32, Databas
         [],
         |row| row.get::<_, i32>(0),
     )
-    .map_err(|_| DatabaseError::RecallError)
+    .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))
 }
 
 pub fn node_exists(
@@ -71,7 +71,7 @@ pub fn node_exists(
                     params![node_id],
                     |row| row.get(0),
                 )
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
             Ok(count > 0)
         }
         Err(_) => Err(DatabaseError::LockError),
@@ -100,21 +100,21 @@ pub fn insert_node_tx(tx: &rusqlite::Transaction, node: Node) -> Result<i32, Dat
             [],
             |row| row.get::<_, i32>(0),
         )
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     // Insert the new node
     tx.execute(
         "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, ?, ?)",
         params![next_id, node.name, node.owner, node.pubkey],
     )
-    .map_err(|_| DatabaseError::InsertError)?;
+    .map_err(|e| DatabaseError::classified(&e, DatabaseError::InsertError))?;
 
     // Update the sequence for the next node
     tx.execute(
         "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'nodes'",
         [],
     )
-    .map_err(|_| DatabaseError::InsertError)?;
+    .map_err(|e| DatabaseError::classified(&e, DatabaseError::InsertError))?;
 
     Ok(next_id)
 }
@@ -132,19 +132,21 @@ pub fn insert_node_consensus(
         Ok(mut db_lock) => {
             let tx = db_lock
                 .transaction()
-                .map_err(|_| DatabaseError::LockError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::LockError))?;
 
             let node_id = insert_node_tx(&tx, node)?;
 
             // Commit or rollback based on execute flag
             if execute {
-                crate::db::shared::commit_timed(tx).map_err(|_| DatabaseError::InsertError)?;
+                crate::db::shared::commit_timed(tx)
+                    .map_err(|e| DatabaseError::classified(&e, DatabaseError::InsertError))?;
                 tracing::info!(
                     "Node {} registered via consensus (inactive, will activate after catch-up)",
                     node_id
                 );
             } else {
-                tx.rollback().map_err(|_| DatabaseError::LockError)?;
+                tx.rollback()
+                    .map_err(|e| DatabaseError::classified(&e, DatabaseError::LockError))?;
                 tracing::debug!(
                     "Node {} insertion validated successfully (rolled back)",
                     node_id
@@ -167,7 +169,7 @@ pub fn get_all_nodes_as_connection_info(
         Ok(db_lock) => {
             let mut stmt = db_lock
                 .prepare("SELECT node_id, pubkey FROM nodes WHERE node_id != ?")
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             let results = stmt.query_map([exclude_node_id], |row| {
                 Ok(crate::types::NodeConnectionInfo {
@@ -179,10 +181,10 @@ pub fn get_all_nodes_as_connection_info(
             match results {
                 Ok(nodes) => Ok(nodes
                     .collect::<Result<_, _>>()
-                    .map_err(|_| DatabaseError::ProcessingError)?),
+                    .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?),
                 Err(e) => {
                     tracing::error!("Failed to get nodes as connection info: {:?}", e);
-                    Err(DatabaseError::RecordError)
+                    Err(DatabaseError::classified(&e, DatabaseError::RecordError))
                 }
             }
         }

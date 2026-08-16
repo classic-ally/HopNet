@@ -60,7 +60,7 @@ pub fn delete_orphaned_data_blocks_consensus(
                 rusqlite::params![data_block_id],
                 |row| row.get(0),
             )
-            .map_err(|_| DatabaseError::RecallError)?;
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
         if !exists {
             tracing::warn!("Data block {} does not exist, skipping", data_block_id);

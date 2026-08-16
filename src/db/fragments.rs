@@ -36,18 +36,18 @@ pub fn find_orphaned_data_blocks(
 
             let mut stmt = conn
                 .prepare(&query)
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             let data_blocks = stmt
                 .query_map(rusqlite::params![cutoff_uuid, limit], |row| {
                     let data_block_id: CustomUUID = row.get(0)?;
                     Ok(data_block_id)
                 })
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             data_blocks
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| DatabaseError::RecallError)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))
         }
         Err(_) => Err(DatabaseError::LockError),
     }
@@ -158,7 +158,7 @@ pub fn mark_fragments_local_state_batch(
                     "Failed to begin transaction for batch fragment update: {:?}",
                     e
                 );
-                DatabaseError::LockError
+                DatabaseError::classified(&e, DatabaseError::LockError)
             })?;
             // Substrate-owned write (RFC-014 stored_locally invariant) —
             // the host owns only the conn + commit telemetry.
@@ -170,7 +170,7 @@ pub fn mark_fragments_local_state_batch(
                     })?;
             crate::db::shared::commit_timed(tx).map_err(|e| {
                 tracing::error!("Failed to commit batch fragment update: {:?}", e);
-                DatabaseError::InsertError
+                DatabaseError::classified(&e, DatabaseError::InsertError)
             })?;
 
             let state_text = if stored_locally {
@@ -204,7 +204,7 @@ pub fn get_local_fragment_count(
                 )
                 .map_err(|e| {
                     tracing::error!("Error querying local fragment count: {:?}", e);
-                    DatabaseError::RecallError
+                    DatabaseError::classified(&e, DatabaseError::RecallError)
                 })?;
 
             tracing::debug!("Found {} fragments stored locally", count);
@@ -238,20 +238,28 @@ pub fn lookup_disk_fragments(
         );
         let mut stmt = conn
             .prepare(&query)
-            .map_err(|_| DatabaseError::RecallError)?;
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
         let params: Vec<&dyn rusqlite::ToSql> =
             chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
         let mut rows = stmt
             .query(params.as_slice())
-            .map_err(|_| DatabaseError::RecallError)?;
-        while let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
-            let hash: crate::types::Blake3Hash =
-                row.get(0).map_err(|_| DatabaseError::ProcessingError)?;
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?
+        {
+            let hash: crate::types::Blake3Hash = row
+                .get(0)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
             out.insert(
                 hash,
                 DiskFragmentInfo {
-                    blob_id: row.get(1).map_err(|_| DatabaseError::ProcessingError)?,
-                    local_index: row.get(2).map_err(|_| DatabaseError::ProcessingError)?,
+                    blob_id: row.get(1).map_err(|e| {
+                        DatabaseError::classified(&e, DatabaseError::ProcessingError)
+                    })?,
+                    local_index: row.get(2).map_err(|e| {
+                        DatabaseError::classified(&e, DatabaseError::ProcessingError)
+                    })?,
                 },
             );
         }
@@ -277,16 +285,22 @@ pub fn member_holder_counts(
         );
         let mut stmt = conn
             .prepare(&query)
-            .map_err(|_| DatabaseError::RecallError)?;
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
         let params: Vec<&dyn rusqlite::ToSql> =
             chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
         let mut rows = stmt
             .query(params.as_slice())
-            .map_err(|_| DatabaseError::RecallError)?;
-        while let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
-            let hash: crate::types::Blake3Hash =
-                row.get(0).map_err(|_| DatabaseError::ProcessingError)?;
-            let node: i32 = row.get(1).map_err(|_| DatabaseError::ProcessingError)?;
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?
+        {
+            let hash: crate::types::Blake3Hash = row
+                .get(0)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
+            let node: i32 = row
+                .get(1)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
             if node != my_node_id && member_nodes.contains(&node) {
                 *out.entry(hash).or_insert(0) += 1;
             }

@@ -99,7 +99,7 @@ pub fn apply_takeout_creation(
         ]
     ).map_err(|e| {
         tracing::error!("Failed to insert takeout record: {:?}", e);
-        DatabaseError::InsertError
+        DatabaseError::classified(&e, DatabaseError::InsertError)
     })?;
     tracing::debug!("Takeout record inserted successfully");
 
@@ -130,14 +130,14 @@ pub fn has_active_takeout_tx(
                 "SELECT COUNT(*) FROM takeouts WHERE user_id = ? AND expires_at > CURRENT_TIMESTAMP AND status IN (0, 1, 2)",
                 params![uid],
                 |row| row.get(0)
-            ).map_err(|_| DatabaseError::RecallError)?
+            ).map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?
         },
         None => {
             tx.query_row(
                 "SELECT COUNT(*) FROM takeouts WHERE expires_at > CURRENT_TIMESTAMP AND status IN (0, 1, 2)",
                 [],
                 |row| row.get(0)
-            ).map_err(|_| DatabaseError::RecallError)?
+            ).map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?
         }
     };
 
@@ -187,7 +187,7 @@ pub fn get_takeout_by_id(
             match result {
                 Ok(takeout) => Ok(Some(takeout)),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(_) => Err(DatabaseError::RecallError),
+                Err(e) => Err(DatabaseError::classified(&e, DatabaseError::RecallError)),
             }
         }
         Err(_) => Err(DatabaseError::LockError),
@@ -205,7 +205,7 @@ pub fn get_takeouts_by_user(
                 "SELECT id, user_id, owner_node_id, status, expires_at, consensus_height FROM takeouts
                  WHERE user_id = ?
                  ORDER BY id DESC"  // UUIDv7 ordering gives us newest first
-            ).map_err(|_| DatabaseError::RecallError)?;
+            ).map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             let takeout_iter = stmt
                 .query_map(params![user_id], |row| {
@@ -232,11 +232,14 @@ pub fn get_takeouts_by_user(
                         consensus_height: row.get::<_, i64>(5).map(height_from_db)?,
                     })
                 })
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             let mut takeouts = Vec::new();
             for takeout_result in takeout_iter {
-                takeouts.push(takeout_result.map_err(|_| DatabaseError::RecallError)?);
+                takeouts.push(
+                    takeout_result
+                        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+                );
             }
 
             Ok(takeouts)
@@ -274,7 +277,7 @@ pub fn apply_takeout_status_update(
         )
         .map_err(|e| {
             tracing::error!("Failed to check takeout existence: {:?}", e);
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
 
     if !exists {
@@ -290,7 +293,7 @@ pub fn apply_takeout_status_update(
         )
         .map_err(|e| {
             tracing::error!("Failed to update takeout status: {:?}", e);
-            DatabaseError::ProcessingError
+            DatabaseError::classified(&e, DatabaseError::ProcessingError)
         })?;
 
     // Only surface the cleanup trigger during execution phase
@@ -317,7 +320,7 @@ pub fn apply_takeout_status_update(
                 )
                 .map_err(|e| {
                     tracing::error!("Failed to get takeout owner for cleanup: {:?}", e);
-                    DatabaseError::RecallError
+                    DatabaseError::classified(&e, DatabaseError::RecallError)
                 })?;
 
             return Ok(Some(owner_node_id));
@@ -343,7 +346,7 @@ pub(crate) fn get_username(
         |row| row.get(0),
     )
     .optional()
-    .map_err(|_| DatabaseError::RecallError)
+    .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))
 }
 
 /// Clean up files associated with an expired or cancelled takeout
@@ -420,7 +423,7 @@ pub fn cleanup_takeout_table(
                 .execute(&format!("DROP TABLE IF EXISTS {}", temp_table_name), [])
                 .map_err(|e| {
                     tracing::error!("Failed to drop table {}: {:?}", temp_table_name, e);
-                    DatabaseError::ProcessingError
+                    DatabaseError::classified(&e, DatabaseError::ProcessingError)
                 })?;
 
             tracing::debug!("Dropped takeout table: {}", temp_table_name);
@@ -446,14 +449,14 @@ pub fn get_expired_takeouts_needing_status_update(
                 )
                 .map_err(|e| {
                     tracing::error!("Failed to prepare expired takeouts query: {:?}", e);
-                    DatabaseError::ProcessingError
+                    DatabaseError::classified(&e, DatabaseError::ProcessingError)
                 })?;
 
             let takeout_rows = stmt
                 .query_map([], |row| row.get::<_, CustomUUID>(0))
                 .map_err(|e| {
                     tracing::error!("Failed to execute expired takeouts query: {:?}", e);
-                    DatabaseError::ProcessingError
+                    DatabaseError::classified(&e, DatabaseError::ProcessingError)
                 })?;
 
             let mut expired_takeouts = Vec::new();

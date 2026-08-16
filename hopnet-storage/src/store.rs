@@ -58,7 +58,12 @@ pub struct ApplyCtx<'a> {
 pub(crate) fn db_err(what: &'static str) -> impl Fn(rusqlite::Error) -> StorageError {
     move |e| {
         tracing::error!("apply: failed to {what}: {e:?}");
-        StorageError::Io(std::io::Error::other(format!("{what}: {e}")))
+        match e.sqlite_error_code() {
+            Some(
+                code @ (rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked),
+            ) => StorageError::Transient(code),
+            _ => StorageError::Io(std::io::Error::other(format!("{what}: {e}"))),
+        }
     }
 }
 

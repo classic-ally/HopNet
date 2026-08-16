@@ -36,7 +36,7 @@ pub fn insert_library(
                 return DatabaseError::ConflictError;
             }
             tracing::error!("insert shared_libraries {} failed: {e}", library_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -56,7 +56,7 @@ pub fn insert_member(
                 return DatabaseError::ConflictError;
             }
             tracing::error!("insert member ({}, {user_id}) failed: {e}", library_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -73,7 +73,7 @@ pub fn delete_member(
         )
         .map_err(|e| {
             tracing::error!("delete member ({}, {user_id}) failed: {e}", library_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(n > 0)
 }
@@ -109,7 +109,7 @@ pub fn insert_library_key(
         )
         .map_err(|e| {
             tracing::error!("insert library key ({}, {user_id}) failed: {e}", library_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -126,7 +126,7 @@ pub fn delete_library_key(
         )
         .map_err(|e| {
             tracing::error!("delete library key ({}, {user_id}) failed: {e}", library_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -161,7 +161,7 @@ pub fn insert_invite(
                 return DatabaseError::ConflictError;
             }
             tracing::error!("insert invite ({}, {user_id}) failed: {e}", library_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -188,7 +188,7 @@ pub fn get_invite_wrap(
     .optional()
     .map_err(|e| {
         tracing::error!("get invite wrap ({}, {user_id}) failed: {e}", library_id);
-        DatabaseError::RecallError
+        DatabaseError::classified(&e, DatabaseError::RecallError)
     })?
     .map(|(eph, wrapped)| {
         let eph: [u8; 32] = eph.try_into().map_err(|_| {
@@ -212,7 +212,7 @@ pub fn delete_invite(
         )
         .map_err(|e| {
             tracing::error!("delete invite ({}, {user_id}) failed: {e}", library_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(n > 0)
 }
@@ -253,7 +253,7 @@ pub fn insert_metadata_access_grant(
                 "grant metadata access ({}, {user_id}) failed: {e}",
                 grant.photo_id
             );
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -280,7 +280,7 @@ pub fn insert_blob_access_grant(
         )
         .map_err(|e| {
             tracing::error!("grant blob access ({}) failed: {e}", grant.data_block_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -297,7 +297,7 @@ pub fn delete_metadata_access(
         )
         .map_err(|e| {
             tracing::error!("revoke metadata access ({photo_id}, {user_id}) failed: {e}");
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -314,7 +314,7 @@ pub fn delete_blob_access(
         )
         .map_err(|e| {
             tracing::error!("revoke blob access ({data_block_id}) failed: {e}");
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -340,7 +340,7 @@ pub fn upsert_view_change(
         )
         .map_err(|e| {
             tracing::error!("upsert view change ({user_id}, {library_id}) failed: {e}");
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -357,7 +357,7 @@ pub fn delete_view_change(
         )
         .map_err(|e| {
             tracing::error!("delete view change ({user_id}, {library_id}) failed: {e}");
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -377,7 +377,7 @@ pub fn user_x25519_pubkey(
     .optional()
     .map_err(|e| {
         tracing::error!("user pubkey lookup {user_id} failed: {e}");
-        DatabaseError::RecallError
+        DatabaseError::classified(&e, DatabaseError::RecallError)
     })?
     .map(|blob| {
         <[u8; 32]>::try_from(blob).map_err(|_| {
@@ -577,7 +577,7 @@ pub fn own_metadata_wraps(
         )
         .map_err(|e| {
             tracing::error!("own_metadata_wraps prepare: {e}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
     for photo_id in photo_ids {
         let row: Option<(Vec<u8>, Vec<u8>)> = stmt
@@ -585,7 +585,7 @@ pub fn own_metadata_wraps(
             .optional()
             .map_err(|e| {
                 tracing::error!("own_metadata_wraps {photo_id}: {e}");
-                DatabaseError::RecallError
+                DatabaseError::classified(&e, DatabaseError::RecallError)
             })?;
         if let Some((eph, wrapped)) = row {
             let eph: [u8; 32] = eph.try_into().map_err(|_| {
@@ -643,7 +643,7 @@ pub fn library_photos_for_member(
         )
         .map_err(|e| {
             tracing::error!("library_photos_for_member prepare: {e}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
     let rows = stmt
         .query_map(
@@ -652,12 +652,12 @@ pub fn library_photos_for_member(
         )
         .map_err(|e| {
             tracing::error!("library_photos_for_member: {e}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
             tracing::error!("library_photos_for_member collect: {e}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
     Ok(rows)
 }
@@ -684,7 +684,7 @@ fn exists_query(
         .map(|r| r.is_some())
         .map_err(|e| {
             tracing::error!("exists query failed: {e}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })
 }
 
@@ -696,18 +696,18 @@ fn collect_query<T>(
 ) -> Result<Vec<T>, DatabaseError> {
     let mut stmt = conn.prepare(sql).map_err(|e| {
         tracing::error!("collect prepare: {e}");
-        DatabaseError::RecallError
+        DatabaseError::classified(&e, DatabaseError::RecallError)
     })?;
     let rows = stmt
         .query_map(params, map)
         .map_err(|e| {
             tracing::error!("collect query: {e}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
             tracing::error!("collect rows: {e}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
     Ok(rows)
 }

@@ -45,7 +45,7 @@ pub fn insert_incoming_share(
         params![id, data_block_id, sender_id, recipient_id, file_access.to_vec(), display_ephemeral_pubkey.to_vec(), encrypted_display_name.to_vec()]
     ).map_err(|e| {
         tracing::error!("Failed to insert incoming_share {}: {:?}", id, e);
-        DatabaseError::InsertError
+        DatabaseError::classified(&e, DatabaseError::InsertError)
     })?;
     Ok(())
 }
@@ -62,7 +62,7 @@ pub fn get_incoming_shares_for_user(
                  JOIN users u ON s.sender_id = u.user_id
                  WHERE s.recipient_id = ?
                  ORDER BY s.id"
-            ).map_err(|_| DatabaseError::RecallError)?;
+            ).map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             let rows = stmt
                 .query_map([recipient_id], |row| {
@@ -79,10 +79,10 @@ pub fn get_incoming_shares_for_user(
                         row.get::<_, String>(7)?,
                     ))
                 })
-                .map_err(|_| DatabaseError::ProcessingError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
 
             rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|_| DatabaseError::ProcessingError)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))
         }
         Err(_) => Err(DatabaseError::LockError),
     }
@@ -99,7 +99,7 @@ pub fn get_incoming_share_count(
                 [recipient_id],
                 |row| row.get(0),
             )
-            .map_err(|_| DatabaseError::RecallError),
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError)),
         Err(_) => Err(DatabaseError::LockError),
     }
 }
@@ -120,7 +120,7 @@ pub fn get_incoming_share_by_id(
             display_ephemeral_pubkey: row.get(5)?,
             encrypted_display_name: row.get(6)?,
         })
-    ).optional().map_err(|_| DatabaseError::RecallError)
+    ).optional().map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))
 }
 
 pub fn delete_incoming_share(
@@ -134,7 +134,7 @@ pub fn delete_incoming_share(
         )
         .map_err(|e| {
             tracing::error!("Failed to delete incoming_share {}: {:?}", share_id, e);
-            DatabaseError::ProcessingError
+            DatabaseError::classified(&e, DatabaseError::ProcessingError)
         })?;
 
     if rows == 0 {
@@ -161,7 +161,7 @@ pub fn insert_share_members(
                     user_id,
                     e
                 );
-                DatabaseError::InsertError
+                DatabaseError::classified(&e, DatabaseError::InsertError)
             })?;
     }
     Ok(())
@@ -183,7 +183,7 @@ pub fn share_exists_for_recipient(
             params![data_block_id, recipient_id, data_block_id, recipient_id],
             |row| row.get(0),
         )
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     Ok(exists)
 }
@@ -195,14 +195,14 @@ pub fn get_sharers_for_data_block_conn(
 ) -> Result<Vec<i32>, DatabaseError> {
     let mut stmt = conn
         .prepare("SELECT user_id FROM shares WHERE data_block_id = ?")
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     let rows = stmt
         .query_map(params![data_block_id], |row| row.get::<_, i32>(0))
-        .map_err(|_| DatabaseError::ProcessingError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
 
     rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|_| DatabaseError::ProcessingError)
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))
 }
 
 pub fn get_sharers_for_data_block(
@@ -219,7 +219,7 @@ pub fn get_incoming_shares_for_data_block_conn(
 ) -> Result<Vec<IncomingShareRow>, DatabaseError> {
     let mut stmt = conn.prepare(
         "SELECT id, data_block_id, sender_id, recipient_id, file_access, display_ephemeral_pubkey, encrypted_display_name FROM incoming_shares WHERE data_block_id = ?"
-    ).map_err(|_| DatabaseError::RecallError)?;
+    ).map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     let rows = stmt
         .query_map(params![data_block_id], |row| {
@@ -233,10 +233,10 @@ pub fn get_incoming_shares_for_data_block_conn(
                 encrypted_display_name: row.get(6)?,
             })
         })
-        .map_err(|_| DatabaseError::ProcessingError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
 
     rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|_| DatabaseError::ProcessingError)
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))
 }
 
 pub fn get_incoming_shares_for_data_block(
@@ -264,7 +264,7 @@ pub fn update_shares_data_block(
                 new_data_block_id,
                 e
             );
-            DatabaseError::ProcessingError
+            DatabaseError::classified(&e, DatabaseError::ProcessingError)
         })?;
     Ok(())
 }
@@ -287,7 +287,7 @@ pub fn update_incoming_share_data_block(
                 share_id,
                 e
             );
-            DatabaseError::ProcessingError
+            DatabaseError::classified(&e, DatabaseError::ProcessingError)
         })?;
     Ok(())
 }
@@ -310,7 +310,7 @@ pub fn remove_user_from_shares(
                 data_block_id,
                 e
             );
-            DatabaseError::ProcessingError
+            DatabaseError::classified(&e, DatabaseError::ProcessingError)
         })?;
     Ok(())
 }
@@ -333,7 +333,7 @@ pub fn remove_sender_incoming_shares(
                 data_block_id,
                 e
             );
-            DatabaseError::ProcessingError
+            DatabaseError::classified(&e, DatabaseError::ProcessingError)
         })?;
     Ok(())
 }
@@ -351,7 +351,7 @@ pub fn get_data_block_for_inode(
             |row| row.get::<_, Option<CustomUUID>>(0),
         )
         .optional()
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     match row {
         Some(data_id) => Ok(data_id),
@@ -377,7 +377,7 @@ pub fn get_share_details(
                  JOIN users u ON ist.recipient_id = u.user_id
                  WHERE ist.data_block_id = ?",
                 )
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             let rows = stmt
                 .query_map(params![data_block_id, data_block_id], |row| {
@@ -387,10 +387,10 @@ pub fn get_share_details(
                         status: row.get(2)?,
                     })
                 })
-                .map_err(|_| DatabaseError::ProcessingError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
 
             rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|_| DatabaseError::ProcessingError)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))
         }
         Err(_) => Err(DatabaseError::LockError),
     }
