@@ -759,7 +759,10 @@ async fn delete_respects_recursive_and_feeds_changes() {
 /// Take SQLite's write lock from a second, non-pool connection and release
 /// it after `hold` — the moment a mount handler's transaction collides
 /// with "another connection is writing".
-fn hold_write_lock(db_path: &std::path::Path, hold: std::time::Duration) -> std::thread::JoinHandle<()> {
+fn hold_write_lock(
+    db_path: &std::path::Path,
+    hold: std::time::Duration,
+) -> std::thread::JoinHandle<()> {
     let side = rusqlite::Connection::open(db_path).expect("side connection");
     side.execute_batch(
         "BEGIN IMMEDIATE;
