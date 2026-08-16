@@ -13,9 +13,13 @@ fn main() {
 #[cfg(not(target_os = "linux"))]
 fn main() {
     // RFC-022 S1: every client binary answers --version, even the
-    // unsupported-platform stub.
+    // unsupported-platform stub. RFC-023 S1: --min-node likewise.
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("hopnet-mount {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if std::env::args().any(|a| a == "--min-node") {
+        println!("{}", hopnet_mount::min_node_display());
         return;
     }
     eprintln!("hopnet-mount only supports Linux (RFC-018)");
@@ -127,6 +131,13 @@ mod linux {
     }
 
     pub fn run() {
+        // --min-node, the sibling of --version (RFC-023 S1): answered
+        // before clap because Cli requires a subcommand. Its only caller
+        // is the upgrade wrapper interrogating a staged binary.
+        if std::env::args().any(|a| a == "--min-node") {
+            println!("{}", hopnet_mount::min_node_display());
+            return;
+        }
         tracing_subscriber::fmt().init();
         match Cli::parse().command {
             Command::Mount(args) => mount(args),

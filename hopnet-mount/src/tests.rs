@@ -1334,6 +1334,21 @@ fn own_version_is_calver() {
     );
 }
 
+// Impact: the upgrade wrapper (RFC-023) interrogates staged binaries by
+// running --min-node and parsing trimmed stdout as one token; any
+// decoration here would silently break candidate selection.
+// Should: print exactly the bare CalVer token that round-trips back to
+// MIN_NODE.
+#[test]
+fn min_node_display_is_a_bare_parseable_token() {
+    let display = crate::min_node_display();
+    assert_eq!(
+        hopnet_common::version::parse_code(&display),
+        Some(crate::MIN_NODE)
+    );
+    assert!(!display.contains(char::is_whitespace), "{display:?}");
+}
+
 // Should: accept a node at or above MIN_NODE and refuse older ones,
 // naming the node as the remedy in both refusal forms.
 // Should not: accept a version-less (pre-RFC-022) node — zero is not

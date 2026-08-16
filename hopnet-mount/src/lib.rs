@@ -25,6 +25,12 @@ pub fn version_code() -> u32 {
 /// enforced node-side.
 pub const MIN_NODE: u32 = 20260802;
 
+/// What `--min-node` prints (RFC-023 S1): the bare CalVer token, one
+/// trimmed-stdout parse for the wrapper interrogating a staged binary.
+pub fn min_node_display() -> String {
+    hopnet_common::version::format_code(MIN_NODE)
+}
+
 /// The daemon-side half of version negotiation, applied to the health
 /// probe's answer at startup and login. `node_version: 0` is a node
 /// that predates RFC-022 and never reports identity — refused with the
