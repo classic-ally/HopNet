@@ -420,9 +420,17 @@
             pkgs.fuse3
           ];
 
-          shellHook = ''
-            export HOPNET_EPHEMERAL_DB=1
-          '';
+          # No HOPNET_EPHEMERAL_DB export here. It used to be unconditional,
+          # which made every dev-shell node silently disposable — except the
+          # hook does not always run (a shell that loads the derivation
+          # environment without executing it gets `shellHook` as a plain
+          # variable and the flag unset), so nodes were silently durable
+          # instead. Set it per-command when you want a throwaway node:
+          #
+          #   HOPNET_EPHEMERAL_DB=1 cargo run
+          #
+          # Pair it with HOPNET_EPHEMERAL_ROOT to place the disposable tree
+          # somewhere other than $TMPDIR (see src/paths.rs).
         };
       });
     };
