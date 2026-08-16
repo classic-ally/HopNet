@@ -1099,6 +1099,11 @@ fn regenesis_seal_halts_mesh_and_writes_artifact() {
 #[test]
 fn regenesis_transition_restarts_into_epoch_2() {
     let _guard = crate::test_env::lock_env();
+    // The whole leg-1 → boundary → leg-2 flow rides running == target
+    // (restart derivation, boot Gate 1). Pin the claimed version to the
+    // test's hardcoded 20260800 target so a release bump of the real
+    // binary can never flip match into park (broke at 2026.8.1).
+    crate::test_env::set(&_guard, "HOPNET_UPGRADE_VERSION_OVERRIDE", "2026.8.0");
     let data_dir =
         std::env::temp_dir().join(format!("hopnet-transition-e2e-{}", std::process::id()));
     std::fs::create_dir_all(data_dir.join("hopnet")).unwrap();
@@ -1365,6 +1370,10 @@ fn regenesis_transition_restarts_into_epoch_2() {
 #[test]
 fn straggler_rejoins_across_an_epoch_boundary() {
     let _guard = crate::test_env::lock_env();
+    // Crossing and rejoin both require running == the 20260800 target;
+    // pin the claimed version so release bumps cannot break the match
+    // (same seam the orchestrator uses; broke at 2026.8.1).
+    crate::test_env::set(&_guard, "HOPNET_UPGRADE_VERSION_OVERRIDE", "2026.8.0");
     let data_dir = std::env::temp_dir().join(format!("hopnet-rejoin-e2e-{}", std::process::id()));
     std::fs::create_dir_all(data_dir.join("hopnet")).unwrap();
     crate::test_env::set(&_guard, "XDG_DATA_HOME", &data_dir);

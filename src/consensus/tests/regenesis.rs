@@ -523,8 +523,12 @@ fn seal_artifact_written_only_on_hash_match() {
 #[test]
 fn status_view_reports_epoch_and_awaiting_upgrade() {
     // Asserts on `awaiting_upgrade`, which compares the sealed target
-    // against `effective_running_code()` — a leaked override flips it.
+    // against `effective_running_code()` — so pin the claimed version
+    // to the hardcoded 20260800 target (a release bump of the real
+    // binary flipped not-awaiting into awaiting at 2026.8.1), and hold
+    // the lock so no other test's override leaks in.
     let _env = crate::test_env::lock_env();
+    crate::test_env::set(&_env, "HOPNET_UPGRADE_VERSION_OVERRIDE", "2026.8.0");
     let node = MockNode::new(4);
     register_node(&node);
     seat_with_version(&node, 4, 20260800);
