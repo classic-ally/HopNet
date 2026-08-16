@@ -10,7 +10,9 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use chrono::Utc;
 use hopnet_common::Blake3Hash;
-use hopnet_photos_core::dispatch::{LibraryMember, LibraryMembership, UploadedDataBlock, UploadedFragment};
+use hopnet_photos_core::dispatch::{
+    LibraryMember, LibraryMembership, UploadedDataBlock, UploadedFragment,
+};
 use ingress_core::descriptor::MediaType;
 use ingress_core::publish::{
     PublishError, PublishItem, PublishOutcome, PublishResource, Publisher, TombstoneOp,
@@ -217,7 +219,10 @@ fn date_taken_falls_back_to_ingested_at() {
 
     item.sidecar.captured_at = None;
     let asset = map::to_photo_asset(&item).unwrap();
-    assert_eq!(asset.metadata.date_taken, item.sidecar.ingested_at.to_rfc3339());
+    assert_eq!(
+        asset.metadata.date_taken,
+        item.sidecar.ingested_at.to_rfc3339()
+    );
 }
 
 // Should: carry capture metadata (dims, orientation, camera, location)
@@ -380,12 +385,7 @@ async fn start_stub() -> (Arc<Stub>, String) {
             .unwrap()
             .push(("transaction".into(), bearer(&headers)));
         stub.tx_bodies.lock().unwrap().push(body);
-        let status = stub
-            .tx_statuses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(200);
+        let status = stub.tx_statuses.lock().unwrap().pop_front().unwrap_or(200);
         (StatusCode::from_u16(status).unwrap(), "scripted").into_response()
     }
 
@@ -400,7 +400,11 @@ async fn start_stub() -> (Arc<Stub>, String) {
             .push(("resolve".into(), bearer(&headers)));
         let cloud_ids: Vec<String> = body["cloud_ids"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         stub.resolve_seen.lock().unwrap().push(cloud_ids);
         stub.resolve_libraries
@@ -453,7 +457,12 @@ async fn start_stub() -> (Arc<Stub>, String) {
 }
 
 fn call_names(stub: &Stub) -> Vec<String> {
-    stub.calls.lock().unwrap().iter().map(|(n, _)| n.clone()).collect()
+    stub.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect()
 }
 
 // -------------------------------------------------------------- flow tests
@@ -487,7 +496,10 @@ async fn happy_path_streams_bytes_in_order() {
     let bytes = vec![0x5Au8; 8192];
     let item = make_item(
         dir.path(),
-        vec![("original", "jpg", bytes.clone()), ("edited", "jpg", vec![0x66u8; 1024])],
+        vec![
+            ("original", "jpg", bytes.clone()),
+            ("edited", "jpg", vec![0x66u8; 1024]),
+        ],
     );
     let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
     let outcome = publisher.publish(item).await.unwrap();
@@ -495,7 +507,13 @@ async fn happy_path_streams_bytes_in_order() {
     assert_eq!(outcome, PublishOutcome::Published);
     assert_eq!(
         call_names(&stub),
-        vec!["committed", "membership", "data-block", "data-block", "transaction"]
+        vec![
+            "committed",
+            "membership",
+            "data-block",
+            "data-block",
+            "transaction"
+        ]
     );
     for (_, token) in stub.calls.lock().unwrap().iter() {
         assert_eq!(token, "dev.secret");
@@ -522,7 +540,10 @@ async fn ambiguous_submit_resolves_on_next_attempt() {
     stub.tx_statuses.lock().unwrap().push_back(500);
 
     let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
-    let err = publisher.publish(simple_item(dir.path())).await.unwrap_err();
+    let err = publisher
+        .publish(simple_item(dir.path()))
+        .await
+        .unwrap_err();
     assert!(matches!(err, PublishError::Transient(_)), "got {err:?}");
 
     // The node actually committed it (the 500 was after the consensus wait).
@@ -530,7 +551,10 @@ async fn ambiguous_submit_resolves_on_next_attempt() {
     let outcome = publisher.publish(simple_item(dir.path())).await.unwrap();
     assert_eq!(outcome, PublishOutcome::AlreadyPublished);
     // Exactly one transaction post across both attempts.
-    let transactions = call_names(&stub).iter().filter(|n| *n == "transaction").count();
+    let transactions = call_names(&stub)
+        .iter()
+        .filter(|n| *n == "transaction")
+        .count();
     assert_eq!(transactions, 1);
 }
 
@@ -544,8 +568,14 @@ async fn connection_refused_is_unreachable() {
     drop(listener);
 
     let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
-    let err = publisher.publish(simple_item(dir.path())).await.unwrap_err();
-    assert!(matches!(err, PublishError::NodeUnreachable(_)), "got {err:?}");
+    let err = publisher
+        .publish(simple_item(dir.path()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PublishError::NodeUnreachable(_)),
+        "got {err:?}"
+    );
 }
 
 // Impact: a 503 is the node's shed gate (down-adjacent, client owns the
@@ -560,11 +590,20 @@ async fn shedding_parks_but_client_errors_do_not() {
     let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
 
     stub.upload_statuses.lock().unwrap().push_back(503);
-    let err = publisher.publish(simple_item(dir.path())).await.unwrap_err();
-    assert!(matches!(err, PublishError::NodeUnreachable(_)), "got {err:?}");
+    let err = publisher
+        .publish(simple_item(dir.path()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PublishError::NodeUnreachable(_)),
+        "got {err:?}"
+    );
 
     stub.upload_statuses.lock().unwrap().push_back(422);
-    let err = publisher.publish(simple_item(dir.path())).await.unwrap_err();
+    let err = publisher
+        .publish(simple_item(dir.path()))
+        .await
+        .unwrap_err();
     assert!(matches!(err, PublishError::Transient(_)), "got {err:?}");
 }
 
@@ -604,9 +643,15 @@ async fn resolve_maps_wire_to_outcome() {
         .resolve(None, &["c1".into(), "c2".into()])
         .await
         .unwrap();
-    assert_eq!(outcome.responsibility, ingress_core::publish::Responsibility::Other);
+    assert_eq!(
+        outcome.responsibility,
+        ingress_core::publish::Responsibility::Other
+    );
     assert_eq!(outcome.entries.len(), 2);
-    assert_eq!(outcome.entries[0].committed_photo_id.as_deref(), Some(PHOTO_ID));
+    assert_eq!(
+        outcome.entries[0].committed_photo_id.as_deref(),
+        Some(PHOTO_ID)
+    );
     assert_eq!(outcome.entries[1].committed_photo_id, None);
     assert_eq!(outcome.entries[1].fingerprint, "cd34");
     assert_eq!(
@@ -633,7 +678,10 @@ async fn resolve_connection_refused_is_unreachable() {
 
     let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
     let err = publisher.resolve(None, &["c1".into()]).await.unwrap_err();
-    assert!(matches!(err, PublishError::NodeUnreachable(_)), "got {err:?}");
+    assert!(
+        matches!(err, PublishError::NodeUnreachable(_)),
+        "got {err:?}"
+    );
 }
 
 // Impact: the fingerprint is the mesh's only cross-device dedupe key — if
@@ -709,7 +757,10 @@ async fn publish_carries_library_id() {
                 .unwrap()
                 .0;
         assert_eq!(
-            payload.entries[0].library_id.as_ref().map(|l| l.to_string()),
+            payload.entries[0]
+                .library_id
+                .as_ref()
+                .map(|l| l.to_string()),
             Some(MESH.to_string())
         );
     }
@@ -768,7 +819,10 @@ async fn not_responsible_403_classifies_transient() {
     stub.tx_statuses.lock().unwrap().push_back(403);
 
     let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
-    let err = publisher.publish(simple_item(dir.path())).await.unwrap_err();
+    let err = publisher
+        .publish(simple_item(dir.path()))
+        .await
+        .unwrap_err();
     assert!(matches!(err, PublishError::Transient(_)), "got {err:?}");
 }
 

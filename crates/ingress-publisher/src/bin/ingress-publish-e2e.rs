@@ -246,7 +246,10 @@ async fn photo_reports(store: &StateStore) -> Vec<PhotoReport> {
             .map(|r| ResourceReport {
                 r#type: r.resource_type.as_str().to_string(),
                 size_bytes: r.size_bytes.unwrap_or_default(),
-                blake3: r.content_hash.map(|h| h.as_str().to_string()).unwrap_or_default(),
+                blake3: r
+                    .content_hash
+                    .map(|h| h.as_str().to_string())
+                    .unwrap_or_default(),
             })
             .collect();
         reports.push(PhotoReport {

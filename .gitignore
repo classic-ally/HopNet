@@ -6,6 +6,7 @@ gen/
 apple/HopNetFileProvider/.build
 apple/HopNetFileProvider/.swiftpm
 apple/HopNetFileProvider/Sources/HopNetFileProviderExtension/Generated/HopNetTypes.swift
+apple/HopNetFileProvider/Sources/HopNetFileProviderExtension/Generated/HopNetVersion.swift
 .vscode/launch.json
 frontend/src/lib/types.ts
 result

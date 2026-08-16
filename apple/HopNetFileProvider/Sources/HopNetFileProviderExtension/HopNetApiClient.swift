@@ -41,10 +41,13 @@ public enum ApiError: Error, CustomStringConvertible {
     case notFound
     case unauthorized
     case notReady
+    /// RFC-022: the node's version gate refused this build (426).
+    /// Only an extension update clears it — never a credential fix.
+    case upgradeRequired(minClient: UInt32, nodeVersion: UInt32)
     case serverError(String)
     case parseError(String)
     case invalidUrl
-    
+
     public var description: String {
         switch self {
         case .network(let error):
@@ -55,6 +58,8 @@ public enum ApiError: Error, CustomStringConvertible {
             return "Unauthorized - check API key"
         case .notReady:
             return "HopNet not ready - sign in to main app required"
+        case .upgradeRequired(let minClient, let nodeVersion):
+            return "HopNet update required - node \(nodeVersion) accepts clients >= \(minClient)"
         case .serverError(let message):
             return "Server error: \(message)"
         case .parseError(let message):
@@ -74,7 +79,24 @@ public class HopNetApiClient {
     
     public init(config: FileProviderConfig) {
         self.config = config
-        self.session = URLSession.shared
+        // RFC-022: every request carries this build's identity as a
+        // session-wide default header; the node's DeviceToken surfaces
+        // reject header-less requests with 426.
+        let configuration = URLSessionConfiguration.default
+        configuration.httpAdditionalHeaders = [
+            hopNetClientVersionHeader: String(hopNetClientVersionCode)
+        ]
+        self.session = URLSession(configuration: configuration)
+    }
+
+    /// Decode a 426 body into the typed rejection; zeroes when the body
+    /// is unavailable (download responses) or unparseable.
+    private func upgradeRequired(from data: Data?) -> ApiError {
+        if let data,
+           let body = try? JSONDecoder().decode(UpgradeRequiredResponse.self, from: data) {
+            return .upgradeRequired(minClient: body.minClient, nodeVersion: body.nodeVersion)
+        }
+        return .upgradeRequired(minClient: 0, nodeVersion: 0)
     }
     
     // MARK: - Health Check
@@ -103,6 +125,8 @@ public class HopNetApiClient {
                 return healthResponse.status
             case 401:
                 throw ApiError.unauthorized
+            case 426:
+                throw upgradeRequired(from: data)
             case 428:
                 throw ApiError.notReady
             default:
@@ -160,6 +184,8 @@ public class HopNetApiClient {
                 throw ApiError.notFound
             case 401:
                 throw ApiError.unauthorized
+            case 426:
+                throw upgradeRequired(from: data)
             case 428:
                 throw ApiError.notReady
             default:
@@ -214,6 +240,8 @@ public class HopNetApiClient {
                 throw ApiError.unauthorized
             case 404:
                 throw ApiError.notFound
+            case 426:
+                throw upgradeRequired(from: data)
             case 428:
                 throw ApiError.notReady
             default:
@@ -269,6 +297,8 @@ public class HopNetApiClient {
                 throw ApiError.notFound
             case 401:
                 throw ApiError.unauthorized
+            case 426:
+                throw upgradeRequired(from: data)
             case 428:
                 throw ApiError.notReady
             default:
@@ -332,6 +362,8 @@ public class HopNetApiClient {
                 throw ApiError.notFound
             case 409:
                 throw ApiError.serverError("Folder not empty")
+            case 426:
+                throw upgradeRequired(from: data)
             case 428:
                 throw ApiError.notReady
             default:
@@ -421,6 +453,9 @@ public class HopNetApiClient {
                 throw ApiError.notFound
             case 401:
                 throw ApiError.unauthorized
+            case 426:
+                // download(for:) yields a file URL, not a body buffer.
+                throw upgradeRequired(from: nil)
             case 428:
                 throw ApiError.notReady
             default:
@@ -478,6 +513,8 @@ public class HopNetApiClient {
                 throw ApiError.unauthorized
             case 409:
                 throw ApiError.serverError("Item already exists")
+            case 426:
+                throw upgradeRequired(from: data)
             case 428:
                 throw ApiError.notReady
             default:
@@ -574,6 +611,8 @@ public class HopNetApiClient {
                 throw ApiError.serverError("Item not found")
             case 409:
                 throw ApiError.serverError("Naming conflict - item already exists at target location")
+            case 426:
+                throw upgradeRequired(from: data)
             case 428:
                 throw ApiError.notReady
             case 501:
@@ -762,6 +801,8 @@ public class HopNetApiClient {
                 throw ApiError.notFound
             case 401:
                 throw ApiError.unauthorized
+            case 426:
+                throw upgradeRequired(from: data)
             case 428:
                 throw ApiError.notReady
             default:

@@ -44,7 +44,11 @@ impl Publisher for NodePublisher {
         // 1. Confirm-first, EVERY call: a previous ambiguous attempt (submit
         //    timeout, 500 after the consensus wait, daemon crash mid-pass)
         //    may have committed. 404 ⇒ the same photo_id is safe to submit.
-        match self.dispatch.check_committed(item.photo.photo_id.as_str()).await {
+        match self
+            .dispatch
+            .check_committed(item.photo.photo_id.as_str())
+            .await
+        {
             CommitProbe::Committed => return Ok(PublishOutcome::AlreadyPublished),
             CommitProbe::NotCommitted => {}
             CommitProbe::Unreachable(msg) => return Err(PublishError::NodeUnreachable(msg)),
@@ -67,16 +71,14 @@ impl Publisher for NodePublisher {
         //    daemon holds claimed photos inflight for the pass duration.
         let mut byte_sources = Vec::with_capacity(item.resources.len());
         for resource in &item.resources {
-            let kind = hopnet_photos_core::asset::ResourceKind::from_name(
-                resource.resource_type.as_str(),
-            )
-            .expect("mapping validated by to_photo_asset");
-            let file = tokio::fs::File::open(&resource.blob_path).await.map_err(|e| {
-                PublishError::Transient(format!(
-                    "open {}: {e}",
-                    resource.blob_path.display()
-                ))
-            })?;
+            let kind =
+                hopnet_photos_core::asset::ResourceKind::from_name(resource.resource_type.as_str())
+                    .expect("mapping validated by to_photo_asset");
+            let file = tokio::fs::File::open(&resource.blob_path)
+                .await
+                .map_err(|e| {
+                    PublishError::Transient(format!("open {}: {e}", resource.blob_path.display()))
+                })?;
             byte_sources.push((kind, ByteSource::Stream(Box::new(file))));
         }
 
@@ -262,9 +264,12 @@ fn kind_for(
 /// 64 hex chars → the 32-byte fingerprint the payload carries.
 fn parse_fingerprint(hex_str: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(hex_str).map_err(|e| format!("fingerprint not hex: {e}"))?;
-    bytes
-        .try_into()
-        .map_err(|_| format!("fingerprint must be 32 bytes, got {} hex chars", hex_str.len()))
+    bytes.try_into().map_err(|_| {
+        format!(
+            "fingerprint must be 32 bytes, got {} hex chars",
+            hex_str.len()
+        )
+    })
 }
 
 /// Map publish failures onto the queue's retry classes. Ambiguous outcomes
@@ -286,16 +291,13 @@ fn classify(error: PhotosCoreError) -> PublishError {
             // Uploaded blob ids are reconciliation candidates owned by the
             // node's orphan sweep — recorded in the failure message (and thus
             // publish_last_error + the ingest log), never GC'd daemon-side.
-            let context = format!(
-                "partial publish of {photo_id} (uploaded blobs: {uploaded_blob_ids:?})"
-            );
+            let context =
+                format!("partial publish of {photo_id} (uploaded blobs: {uploaded_blob_ids:?})");
             match classify(*source) {
                 PublishError::NodeUnreachable(msg) => {
                     PublishError::NodeUnreachable(format!("{context}: {msg}"))
                 }
-                PublishError::Rejected(msg) => {
-                    PublishError::Rejected(format!("{context}: {msg}"))
-                }
+                PublishError::Rejected(msg) => PublishError::Rejected(format!("{context}: {msg}")),
                 PublishError::Transient(msg) => {
                     PublishError::Transient(format!("{context}: {msg}"))
                 }

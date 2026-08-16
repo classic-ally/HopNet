@@ -13,7 +13,9 @@
 
 use hopnet_common::CustomUUID;
 use hopnet_photos_core::PhotosCoreError;
-use hopnet_photos_core::dispatch::{LibraryMembership, PhotoDispatch, SyncBatch, UploadedDataBlock};
+use hopnet_photos_core::dispatch::{
+    LibraryMembership, PhotoDispatch, SyncBatch, UploadedDataBlock,
+};
 
 pub(crate) const UNREACHABLE_PREFIX: &str = "node-unreachable: ";
 
@@ -57,8 +59,19 @@ pub struct HttpDispatch {
 
 impl HttpDispatch {
     pub fn new(base_url: &str, device_token: &str) -> Result<Self, String> {
+        // RFC-022: every request carries this build's identity. The
+        // ingress crates sit outside the main workspace and cannot
+        // inherit its version; hopnet-common is path-depped from the
+        // same checkout, so ITS compile-time token names the snapshot
+        // these bytes were built from.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            hopnet_common::compat::CLIENT_VERSION_HEADER,
+            reqwest::header::HeaderValue::from(hopnet_common::version::common_version_code()),
+        );
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
+            .default_headers(headers)
             .build()
             .map_err(|e| format!("http client: {e}"))?;
         Ok(Self {
@@ -92,6 +105,22 @@ impl HttpDispatch {
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             // The node's shed gates own the retry (Retry-After) — park class.
             PhotosCoreError::Dispatch(format!("{UNREACHABLE_PREFIX}node shedding load (503)"))
+        } else if status == reqwest::StatusCode::UPGRADE_REQUIRED {
+            // RFC-022 gate refusal: retrying cannot help — park with the
+            // versions named so the operator knows the remedy.
+            let detail =
+                serde_json::from_str::<hopnet_common::compat::UpgradeRequiredResponse>(body)
+                    .map(|b| {
+                        format!(
+                            "node {} requires client >= {}",
+                            hopnet_common::version::format_code(b.node_version),
+                            hopnet_common::version::format_code(b.min_client),
+                        )
+                    })
+                    .unwrap_or_else(|_| format!("unparsed 426 body: {body}"));
+            PhotosCoreError::Dispatch(format!(
+                "{UNREACHABLE_PREFIX}client too old ({detail}) — upgrade the ingress daemon"
+            ))
         } else {
             PhotosCoreError::Dispatch(format!("http {status}: {body}"))
         }

@@ -118,6 +118,14 @@ open class HopNetFileProviderExtensionBase: NSObject, NSFileProviderReplicatedEx
                     fileProviderError = NSFileProviderError(.noSuchItem)
                 case .unauthorized:
                     fileProviderError = NSFileProviderError(.notAuthenticated)
+                case .upgradeRequired:
+                    fileProviderError = NSFileProviderError(
+                        .notAuthenticated,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "HopNet Update Required",
+                            NSLocalizedRecoverySuggestionErrorKey: "Update the HopNet app to continue syncing files."
+                        ]
+                    )
                 case .notReady:
                     fileProviderError = NSFileProviderError(
                         .notAuthenticated,
@@ -290,6 +298,14 @@ open class HopNetFileProviderExtensionBase: NSObject, NSFileProviderReplicatedEx
                     fileProviderError = NSFileProviderError(.noSuchItem)
                 case .unauthorized:
                     fileProviderError = NSFileProviderError(.notAuthenticated)
+                case .upgradeRequired:
+                    fileProviderError = NSFileProviderError(
+                        .notAuthenticated,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "HopNet Update Required",
+                            NSLocalizedRecoverySuggestionErrorKey: "Update the HopNet app to continue syncing files."
+                        ]
+                    )
                 case .notReady:
                     fileProviderError = NSFileProviderError(
                         .notAuthenticated,
@@ -355,6 +371,8 @@ open class HopNetFileProviderExtensionBase: NSObject, NSFileProviderReplicatedEx
                 case .serverError(let message) where message.contains("already exists"):
                     fileProviderError = NSFileProviderError(.filenameCollision)
                 case .unauthorized:
+                    fileProviderError = NSFileProviderError(.notAuthenticated)
+                case .upgradeRequired:
                     fileProviderError = NSFileProviderError(.notAuthenticated)
                 case .notReady:
                     fileProviderError = NSFileProviderError(.serverUnreachable)
@@ -465,6 +483,8 @@ open class HopNetFileProviderExtensionBase: NSObject, NSFileProviderReplicatedEx
                         fileProviderError = NSFileProviderError(.noSuchItem)
                     case .unauthorized:
                         fileProviderError = NSFileProviderError(.notAuthenticated)
+                    case .upgradeRequired:
+                        fileProviderError = NSFileProviderError(.notAuthenticated)
                     case .notReady:
                         fileProviderError = NSFileProviderError(.serverUnreachable)
                     case .serverError(let message) where message.contains("not yet implemented"):
@@ -571,6 +591,8 @@ open class HopNetFileProviderExtensionBase: NSObject, NSFileProviderReplicatedEx
                     fileProviderError = NSFileProviderError(.noSuchItem)
                 case .unauthorized:
                     fileProviderError = NSFileProviderError(.notAuthenticated)
+                case .upgradeRequired:
+                    fileProviderError = NSFileProviderError(.notAuthenticated)
                 case .notReady:
                     fileProviderError = NSFileProviderError(.serverUnreachable)
                 case .serverError(let message) where message.contains("not yet implemented"):
@@ -656,6 +678,14 @@ open class HopNetFileProviderExtensionBase: NSObject, NSFileProviderReplicatedEx
                     fileProviderError = NSFileProviderError(.noSuchItem)
                 case .unauthorized:
                     fileProviderError = NSFileProviderError(.notAuthenticated)
+                case .upgradeRequired:
+                    fileProviderError = NSFileProviderError(
+                        .notAuthenticated,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "HopNet Update Required",
+                            NSLocalizedRecoverySuggestionErrorKey: "Update the HopNet app to continue syncing files."
+                        ]
+                    )
                 case .notReady:
                     fileProviderError = NSFileProviderError(
                         .notAuthenticated,
@@ -776,6 +806,16 @@ class HopNetEnumerator: NSObject, NSFileProviderEnumerator {
                 // Handle specific API errors with appropriate FileProvider errors
                 if let apiError = error as? ApiError {
                     switch apiError {
+                    case .upgradeRequired:
+                        let updateError = NSFileProviderError(
+                            .notAuthenticated,
+                            userInfo: [
+                                NSLocalizedDescriptionKey: "HopNet Update Required",
+                                NSLocalizedRecoverySuggestionErrorKey: "Update the HopNet app to continue syncing files."
+                            ]
+                        )
+                        observer.finishEnumeratingWithError(updateError)
+                        return
                     case .notReady:
                         let setupError = NSFileProviderError(
                             .notAuthenticated,
