@@ -67,7 +67,7 @@
               version = "0.1.0";
               src = ./frontend;
               fetcherVersion = 3;
-              hash = "sha256-JzfiIihYxpXVjFYbVxDaz3jUNJK6RXC3suFje6aMay0=";
+              hash = "sha256-zmhLMMK9TyEH4QURsMhHIEaQz1lLnUir7LwYj5zwpwY=";
             };
 
             nativeBuildInputs = [ pkgs.nodejs pkgs.pnpm_10 pkgs.pnpmConfigHook ];
