@@ -1,7 +1,6 @@
-import presetMini from '@unocss/preset-mini'
 import presetIcons from '@unocss/preset-icons'
 
-import { defineConfig } from 'unocss'
+import { defineConfig, presetWind3 } from 'unocss'
 
 // Font families must stay in sync with the @fontsource-variable imports in
 // src/main.ts and the :root rule in src/app.css. These are self-hosted from
@@ -81,7 +80,16 @@ export default defineConfig({
     },
     presets: [
         presetIcons(),
-        presetMini(),
+        // presetWind3 rather than presetMini: mini is the minimal subset and
+        // omits a good deal of the Tailwind vocabulary these components were
+        // written against. `space-y-*` was the case that surfaced it — 55 call
+        // sites asking for vertical rhythm and getting none, because the rule
+        // was never generated. Nothing warns; the class simply does not exist.
+        // wind3 extends mini, so this is additive: every utility that resolved
+        // before still resolves, and the ones that were silently dead now work.
+        // (wind3 is Tailwind v3 semantics, which is what the existing classes
+        // assume. wind4 tracks Tailwind v4 and is a separate decision.)
+        presetWind3(),
     ],
     theme: {
         colors: themeColors,

@@ -11,7 +11,9 @@
 
 <SetupPane
     title="Create a Network"
-    body="Your username is your identity across the network. The device name identifies this computer to the others."
+    body="Identify yourself and this device."
+    onBack={onBackButton}
+    buttonsClass="flex items-center justify-end gap-3"
 >
     {#snippet features()}
         <EntryRow
@@ -29,11 +31,6 @@
     {/snippet}
 
     {#snippet buttons()}
-        <Button
-            icon="i-carbon-chevron-left"
-            text="Back"
-            onClick={() => {onBackButton()}}
-        />
         <Button
             icon="i-carbon-chevron-right"
             text="Next"

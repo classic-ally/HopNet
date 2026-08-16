@@ -6,6 +6,7 @@
     import Toolbar from '../../primitives/Toolbar.svelte';
     import IncomingSharesList from './IncomingSharesList.svelte';
     import AcceptShareModal from './AcceptShareModal.svelte';
+    import PaneHeader from '../../primitives/PaneHeader.svelte';
 
     export let onToggleSidebar: () => void = () => {};
 
@@ -95,31 +96,31 @@
     {onToggleSidebar}
 />
 
-<div>
-    <h3>Shared With Me</h3>
-    <p class="text-sm text-muted">Files others have shared with you</p>
-</div>
+<PaneHeader title="Shared With Me" subtitle="Files others have shared with you" />
 
-<div class="border-solid border-1 rounded-lg p-3 border-overlay1">
-    {#if error}
-        <div class="text-red p-2 mb-2 border border-red rounded">
-            {error}
-            <button
-                class="ml-2 text-blue underline"
-                onclick={() => loadShares()}
-            >
-                Retry
-            </button>
-        </div>
-    {/if}
+<!-- No Card around the list: each share row is already its own surface, so
+     an outer bg-surface0 would swallow the rows into their own background.
+     The border-only box this replaces drew no background at all — the
+     no-contrast problem Card exists to solve — and contributed nothing over
+     the rows it wrapped. -->
+{#if error}
+    <div class="text-red p-2 mb-2 border border-red rounded">
+        {error}
+        <button
+            class="ml-2 text-blue underline"
+            onclick={() => loadShares()}
+        >
+            Retry
+        </button>
+    </div>
+{/if}
 
-    <IncomingSharesList
-        {shares}
-        {loading}
-        onAccept={handleAcceptClick}
-        onDecline={handleDecline}
-    />
-</div>
+<IncomingSharesList
+    {shares}
+    {loading}
+    onAccept={handleAcceptClick}
+    onDecline={handleDecline}
+/>
 
 <AcceptShareModal
     isOpen={showAcceptModal}

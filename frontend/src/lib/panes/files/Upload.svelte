@@ -2,6 +2,8 @@
     import { API_BASE_URL, tokenStore, currentPathStore } from '../../stores';
     import Button from '../../Button.svelte';
     import Modal from '../../primitives/Modal.svelte';
+    import Breadcrumb from '../../primitives/Breadcrumb.svelte';
+    import { crumbsForFolder } from '../../primitives/crumbs';
 
     // Props for external control
     interface UploadProps {
@@ -223,7 +225,9 @@
 
     {#snippet footer()}
         <div class="flex items-center justify-between">
-            <p class="text-xs text-muted">Upload path: {currentPath}</p>
+            <!-- Where the files land. Read-only for now; the same component
+                 becomes the destination picker once it takes a callback. -->
+            <Breadcrumb segments={crumbsForFolder(currentPath)} ariaLabel="Upload destination" />
             <Button
                 icon="i-carbon-cloud-upload"
                 text={isUploading ? 'Uploading...' : `Upload ${files.length} file${files.length !== 1 ? 's' : ''}`}

@@ -4,7 +4,7 @@
   import { mockManyPhotos, mockPhotos, placeholderDisplay, placeholderThumb } from './fixtures';
 
   const { Story } = defineMeta({
-    title: 'Photos/PhotoGridView',
+    title: 'Panes/Photos/PhotoGridView',
     component: PhotoGridView,
     // These components are dark-only; the main preview offers a light option.
     parameters: { backgrounds: { default: 'dark' } },

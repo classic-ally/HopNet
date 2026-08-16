@@ -189,7 +189,14 @@ impl BlobStreamer for CannedBlob {
 struct TestInit;
 impl r2d2::CustomizeConnection<rusqlite::Connection, rusqlite::Error> for TestInit {
     fn on_acquire(&self, conn: &mut rusqlite::Connection) -> Result<(), rusqlite::Error> {
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // WAL + busy_timeout mirror production (src/db/shared.rs) — the
+        // write-lock contention tests depend on WAL's snapshot-upgrade
+        // semantics, not rollback-journal locking.
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;",
+        )?;
         register_sql_functions(conn)
     }
 }
@@ -747,6 +754,115 @@ async fn delete_respects_recursive_and_feeds_changes() {
         changes.unwrap().deleted_ids.contains(&folder_id),
         "deletion must appear in the delta feed"
     );
+}
+
+/// Take SQLite's write lock from a second, non-pool connection and release
+/// it after `hold` — the moment a mount handler's transaction collides
+/// with "another connection is writing".
+fn hold_write_lock(
+    db_path: &std::path::Path,
+    hold: std::time::Duration,
+) -> std::thread::JoinHandle<()> {
+    let side = rusqlite::Connection::open(db_path).expect("side connection");
+    side.execute_batch(
+        "BEGIN IMMEDIATE;
+         INSERT INTO users (user_id, username) VALUES (4242, 'contender');",
+    )
+    .expect("side connection takes the write lock");
+    std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        side.execute_batch("COMMIT").expect("release write lock");
+    })
+}
+
+// Impact: regression guard for the rsync EIO storm — handler transactions
+// were DEFERRED, so the read-then-write upgrade hit SQLite's
+// deadlock-avoidance path and failed instantly (busy handler bypassed)
+// whenever another connection held the write lock, ~2.5% of sustained
+// writes. The handler must instead take the write lock up front and ride
+// out momentary contention within busy_timeout.
+// Should: complete a rename while a concurrent writer briefly holds the
+// write lock.
+// Should not: return 500 under momentary write-lock contention.
+#[tokio::test]
+async fn modify_succeeds_while_another_writer_holds_the_lock() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let content = b"move me";
+    let (_, file) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", content.len()),
+            Some("old.txt"),
+            content.as_slice(),
+        )],
+    )
+    .await;
+    let file_id = file.unwrap().item.unwrap().id.unwrap();
+
+    let contender = hold_write_lock(
+        &env._db_dir.path().join("test.db"),
+        std::time::Duration::from_millis(400),
+    );
+
+    let (status, renamed) = send_json::<MountMutationResponse>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": file_id, "new_name": "new.txt" }),
+    )
+    .await;
+    contender.join().unwrap();
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rename must survive a briefly held write lock"
+    );
+    assert_eq!(renamed.unwrap().item.unwrap().name, "new.txt");
+}
+
+// Impact: same regression guard as the modify variant — delete was the
+// other handler whose validate transaction upgraded read→write mid-flight.
+// Should: delete an item while a concurrent writer briefly holds the
+// write lock.
+// Should not: return 500 under momentary write-lock contention.
+#[tokio::test]
+async fn delete_succeeds_while_another_writer_holds_the_lock() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let (_, folder) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[("folder_name", None, b"Doomed")],
+    )
+    .await;
+    let folder_id = folder.unwrap().item.unwrap().id.unwrap();
+
+    let contender = hold_write_lock(
+        &env._db_dir.path().join("test.db"),
+        std::time::Duration::from_millis(400),
+    );
+
+    let (status, _) = send_json::<MountMutationResponse>(
+        &app,
+        "DELETE",
+        "/delete",
+        serde_json::json!({ "id": folder_id, "recursive": true }),
+    )
+    .await;
+    contender.join().unwrap();
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "delete must survive a briefly held write lock"
+    );
+    let (status, _) = get_json::<MountItem>(&app, &format!("/item?id={folder_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "item must be gone");
 }
 
 // Should: replace file content strictly — new size and a NEW blob id

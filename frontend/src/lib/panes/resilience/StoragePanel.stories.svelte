@@ -23,7 +23,7 @@
   ];
 
   const { Story } = defineMeta({
-    title: 'Components/StoragePanel',
+    title: 'Panes/Resilience/StoragePanel',
     component: StoragePanel,
     argTypes: { curve: { control: false }, observedLevels: { control: false } }
   });

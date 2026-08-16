@@ -1,31 +1,6 @@
 // Shared formatting utilities for consistent display across components
 
 /**
- * Format date with responsive options based on container width
- * @param dateString ISO date string to format
- * @param containerWidth Width of the container for responsive formatting
- * @returns Formatted date string
- */
-export function formatDateResponsive(dateString: string, containerWidth: number): string {
-    const date = new Date(dateString)
-
-    if (containerWidth < 660) {
-        // Very small content area - date only
-        return date.toLocaleDateString()
-    } else if (containerWidth < 700) {
-        // Small content area - date + time without seconds
-        // Use toLocaleString then remove seconds while preserving locale format
-        const fullString = date.toLocaleString()
-        // This regex removes :XX seconds from various locale formats
-        // Works for formats like "1/1/2024, 1:23:45 PM" or "2024-01-01 13:23:45"
-        return fullString.replace(/:\d{2}(\s*(AM|PM|am|pm))?(\s|$)/, '$1$3')
-    } else {
-        // Large content area - full timestamp
-        return date.toLocaleString()
-    }
-}
-
-/**
  * Format date with standard full timestamp
  * @param dateString ISO date string to format
  * @returns Formatted date string
@@ -48,26 +23,6 @@ export function formatFileSize(sizeString: string | undefined): string {
     if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
     if (size < 1024 * 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`
     return `${(size / 1024 / 1024 / 1024).toFixed(1)} GB`
-}
-
-/**
- * Format ID (UUID) responsively based on container width
- * @param id Full ID string to format
- * @param containerWidth Width of the container for responsive formatting
- * @returns Truncated ID string for display
- */
-export function formatIdResponsive(id: string, containerWidth: number): string {
-    if (containerWidth < 600) {
-        return id.slice(0, 8) + '...'
-    } else if (containerWidth < 800) {
-        return id.slice(0, 13) + '...'
-    } else if (containerWidth < 850) {
-        return id.slice(0, 18) + '...'
-    } else if (containerWidth < 930) {
-        return id.slice(0, 23) + '...'
-    } else {
-        return id // Full ID on large content areas (930px+)
-    }
 }
 
 /**

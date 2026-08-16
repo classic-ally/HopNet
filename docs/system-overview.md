@@ -581,6 +581,7 @@ Consensus-coordinated user data portability — symmetric export (takeout) and i
 - [x] Automated maintenance jobs with batched consensus operations for expiration handling
 - [x] Complete REST API endpoints (initiate, list, download, delete, can-create status)
 - [x] Responsive frontend interface with selection-based bulk operations
+- [x] Archive completeness guard — archiver fails loudly on missing staged entries, file count asserted against manifest before `Ready` (fixed nested-entry truncation where per-directory staging cleanup destroyed unarchived descendants)
 
 **Import (ingest):**
 - [x] Multipart upload with manifest validation + quota enforcement (`POST /takeout/import`)
@@ -596,6 +597,7 @@ Consensus-coordinated user data portability — symmetric export (takeout) and i
 - [ ] **Future**: Profile setup, recovery passphrase verification, multi-device pairing as additional onboarding steps
 
 **Future enhancements:**
+- [ ] Failure-state semantics: import completeness guard before `Completed`; `TakeoutStatus` failure variant for errored exports stuck in `Materializing` (issue #48)
 - [ ] Incremental exports (changes since last takeout)
 - [ ] Selective folder/file export capabilities
 - [ ] Retry-failed-files UI; per-file failure report endpoint

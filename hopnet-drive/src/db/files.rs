@@ -975,3 +975,186 @@ pub fn user_data_size(conn: &rusqlite::Connection, user_id: i32) -> Result<u64, 
 
     Ok(total_size.unwrap_or(0) as u64)
 }
+
+#[cfg(test)]
+mod busy_repro_tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::time::Instant;
+
+    /// Production pragmas, verbatim from `src/db/shared.rs`.
+    fn open(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;",
+        )
+        .expect("pragmas");
+        conn
+    }
+
+    /// Minimal slice of the real schema: just `users`, `inodes` and
+    /// `modification_log`, DDL copied from `db::install_schema`.
+    fn install(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE users (user_id INTEGER PRIMARY KEY, username TEXT NOT NULL);
+             CREATE TABLE inodes (
+                 id       TEXT UNIQUE NOT NULL,
+                 owner_id INTEGER REFERENCES users(user_id) NOT NULL,
+                 path     TEXT NOT NULL,
+                 type     INTEGER NOT NULL CHECK(type IN (0, 1)),
+                 data_id  TEXT,
+                 PRIMARY KEY (owner_id, path)
+             );
+             CREATE TABLE modification_log (
+                 inode_id           TEXT NOT NULL,
+                 owner_id           INTEGER NOT NULL,
+                 old_parent_id      TEXT,
+                 modified_at_height INTEGER NOT NULL,
+                 PRIMARY KEY (inode_id, modified_at_height),
+                 FOREIGN KEY (owner_id) REFERENCES users(user_id)
+             );
+             INSERT INTO users (user_id, username) VALUES (0, 'alice');
+             INSERT INTO inodes (id, owner_id, path, type, data_id)
+                 VALUES ('01a00a85-c5fd-7932-873d-ea011fa2ad4c', 0, '/aa', 1, NULL);",
+        )
+        .expect("schema");
+    }
+
+    // Impact: this is the migration-blocking failure seen in the live
+    // stress test — rsync writing sustained traffic through the mount
+    // gets EIO on ~2.5% of files, scattered, with no structural pattern.
+    // The handler holds a DEFERRED transaction, reads the ancestor list,
+    // then writes; SQLite refuses to promote that read snapshot to a
+    // write lock while another connection is writing, and because
+    // promotion could deadlock it returns SQLITE_BUSY *without* consulting
+    // the busy handler. `busy_timeout = 5000` is therefore never applied.
+    // Should: surface SQLITE_BUSY when another connection holds the write
+    // lock across a deferred read-then-write transaction.
+    // Should not: wait anywhere near the configured 5s busy_timeout before
+    // failing.
+    #[test]
+    fn ancestor_logging_busies_immediately_despite_busy_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.db");
+        install(&open(&path));
+
+        let writer = open(&path);
+        let mut victim = open(&path);
+
+        // Another connection holds the write lock, as consensus apply or a
+        // concurrent mount request would.
+        writer
+            .execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO users (user_id, username) VALUES (1, 'bob');",
+            )
+            .expect("writer takes the write lock");
+
+        // The handler's transaction: DEFERRED, so the SELECT inside
+        // get_all_ancestor_folders pins a read snapshot before any write.
+        let tx = victim.transaction().expect("deferred tx");
+        let started = Instant::now();
+        let result = log_ancestor_modifications(&tx, "/aa/bb/cc.txt", 0, 42);
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "expected the ancestor write to fail while another writer holds the lock"
+        );
+        assert!(
+            elapsed.as_millis() < 500,
+            "busy_timeout was bypassed, so this must fail fast; took {elapsed:?}"
+        );
+    }
+
+    // Impact: pins the exact SQLite failure mode behind the
+    // ProcessingError the handler surfaces, so a change that swaps
+    // DEFERRED for IMMEDIATE (or adds a retry) has an assertion naming
+    // what it fixed.
+    // Should: report DatabaseBusy specifically, not a generic failure.
+    // Should not: fail on the read half, which WAL permits concurrently.
+    #[test]
+    fn the_ancestor_write_failure_is_specifically_sqlite_busy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.db");
+        install(&open(&path));
+
+        let writer = open(&path);
+        let mut victim = open(&path);
+
+        writer
+            .execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO users (user_id, username) VALUES (1, 'bob');",
+            )
+            .expect("writer takes the write lock");
+
+        let tx = victim.transaction().expect("deferred tx");
+
+        // The read that pins the snapshot succeeds — WAL permits
+        // concurrent readers.
+        let ancestors =
+            get_all_ancestor_folders(&tx, "/aa/bb/cc.txt", 0).expect("read half succeeds");
+        assert_eq!(ancestors.len(), 1, "the '/aa' folder resolves as ancestor");
+
+        // The write half is what cannot proceed.
+        let err = tx
+            .execute(
+                "INSERT OR IGNORE INTO modification_log (inode_id, owner_id, old_parent_id, modified_at_height) VALUES (?, ?, ?, ?)",
+                params![&ancestors[0], 0, None::<CustomUUID>, 42i64],
+            )
+            .expect_err("write must be refused");
+
+        match err {
+            rusqlite::Error::SqliteFailure(e, _) => assert_eq!(
+                e.code,
+                rusqlite::ErrorCode::DatabaseBusy,
+                "expected DatabaseBusy, got {:?}",
+                e.code
+            ),
+            other => panic!("expected SqliteFailure, got {other:?}"),
+        }
+    }
+
+    // Impact: this is the fix, expressed as a test. The failure is NOT
+    // lock exhaustion — at ~0.4 writes/sec a 5s busy_timeout would never
+    // expire. It is SQLite's deadlock-avoidance path: a DEFERRED
+    // transaction that has already read cannot be promoted to a writer
+    // while another writer holds the lock, so SQLite returns BUSY
+    // immediately and never consults the busy handler. Taking the write
+    // lock up front (IMMEDIATE) makes the busy handler apply again, which
+    // is what turns a hard failure back into a bounded wait.
+    // Should: succeed under identical contention when the transaction
+    // takes the write lock up front rather than upgrading into it.
+    #[test]
+    fn taking_the_write_lock_up_front_survives_the_same_contention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.db");
+        install(&open(&path));
+
+        let writer = open(&path);
+        let mut victim = open(&path);
+
+        writer
+            .execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO users (user_id, username) VALUES (1, 'bob');",
+            )
+            .expect("writer takes the write lock");
+
+        // Release the lock shortly, as a real consensus apply would.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            writer.execute_batch("COMMIT").expect("writer commits");
+        });
+
+        // IMMEDIATE blocks at BEGIN, where the busy handler DOES apply,
+        // so this waits for the lock instead of failing outright.
+        let tx = victim
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("immediate tx waits for the writer rather than erroring");
+
+        log_ancestor_modifications(&tx, "/aa/bb/cc.txt", 0, 42)
+            .expect("ancestor logging succeeds once the lock is held up front");
+        tx.commit().expect("commit");
+    }
+}

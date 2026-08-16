@@ -3,6 +3,8 @@
     import Button from '../../Button.svelte';
     import Modal from '../../primitives/Modal.svelte';
     import TextInput from '../../primitives/TextInput.svelte';
+    import Breadcrumb from '../../primitives/Breadcrumb.svelte';
+    import { crumbsForFolder } from '../../primitives/crumbs';
 
     // Props for external control
     interface CreateFolderProps {
@@ -153,7 +155,10 @@
 
     {#snippet footer()}
         <div class="flex items-center justify-between">
-            <p class="text-xs text-muted">Create in: {currentPath}</p>
+            <!-- Where the folder is created. Read-only for now; the same
+                 component becomes the destination picker once it takes a
+                 callback. -->
+            <Breadcrumb segments={crumbsForFolder(currentPath)} ariaLabel="New folder destination" />
             <Button
                 icon="i-carbon-folder-add"
                 text={isCreating ? 'Creating...' : 'Create Folder'}
