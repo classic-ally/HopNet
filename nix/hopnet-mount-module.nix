@@ -286,6 +286,12 @@ in
             }
           ];
           environment.systemPackages = [ cfg.package ];
+          # fusermount3 must be the setuid wrapper for unprivileged
+          # mounting; unitPath already fronts /run/wrappers/bin, but the
+          # wrappers only exist when the fuse program module is on — NOT
+          # a NixOS default. (The HM arm cannot do this: the host may
+          # not be NixOS.)
+          programs.fuse.enable = true;
           security.wrappers = lib.mkIf cfg.allowPassthrough {
             hopnet-mount = {
               source = "${cfg.package}/bin/hopnet-mount";
