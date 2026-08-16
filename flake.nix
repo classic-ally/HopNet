@@ -116,13 +116,21 @@
 
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
+          # The workspace version — the single version authority
+          # (RFC-019 S3), read from [workspace.package] via crane. The
+          # assert guards crane's silent "0.0.1" placeholder fallback:
+          # that value would never win the module's newest-wins sort -V,
+          # so flake bumps would quietly stop re-seeding the profile.
+          hopnetVersion =
+            let v = (craneLib.crateNameFromCargoToml { src = ./.; }).version;
+            in assert builtins.match "[0-9]{4}[.][0-9]+[.][0-9]+" v != null; v;
+
           hopnet = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
             pname = "hopnet";
-            # Version inherited from Cargo.toml — the single version
-            # authority (RFC-019 S3). Other derivations' hardcoded
-            # versions are store-path cosmetic only.
-            inherit (craneLib.crateNameFromCargoToml { src = ./.; }) version;
+            # Other derivations' hardcoded versions are store-path
+            # cosmetic only.
+            version = hopnetVersion;
 
             preBuild = ''
               mkdir -p frontend/dist
@@ -144,7 +152,8 @@
           hopnet-mount = craneLib.buildPackage (mountArgs // {
             cargoArtifacts = craneLib.buildDepsOnly mountArgs;
             pname = "hopnet-mount";
-            version = "0.1.0";
+            # Clients share the workspace identity token (RFC-022 S1).
+            version = hopnetVersion;
             meta.mainProgram = "hopnet-mount";
           });
 
