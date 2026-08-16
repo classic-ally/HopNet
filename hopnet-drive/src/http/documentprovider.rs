@@ -199,24 +199,28 @@ pub async fn get_download(
     let requested_range = super::parse_range(&headers);
 
     // Range-aware reconstruction (handles empty files internally)
-    let download_info =
-        match crate::download::reconstruct_file_range(&state, encrypted_path, user_id, requested_range)
-            .await
-        {
-            Ok(info) => info,
-            Err(crate::download::FileReconstructionError::RangeNotSatisfiable(file_size)) => {
-                let response = Response::builder()
-                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                    .header(header::CONTENT_RANGE, format!("bytes */{}", file_size))
-                    .body(Body::empty())
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                return Ok(response);
-            }
-            Err(e) => {
-                tracing::error!("Error reconstructing file: {:?}", e);
-                return Err(StatusCode::from(e));
-            }
-        };
+    let download_info = match crate::download::reconstruct_file_range(
+        &state,
+        encrypted_path,
+        user_id,
+        requested_range,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(crate::download::FileReconstructionError::RangeNotSatisfiable(file_size)) => {
+            let response = Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{}", file_size))
+                .body(Body::empty())
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Ok(response);
+        }
+        Err(e) => {
+            tracing::error!("Error reconstructing file: {:?}", e);
+            return Err(StatusCode::from(e));
+        }
+    };
 
     // Build streaming response
     let mut builder = Response::builder()

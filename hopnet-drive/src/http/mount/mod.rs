@@ -331,14 +331,9 @@ pub async fn get_changes(
         .unchecked_transaction()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let (items, deleted_ids) = db::mount::changes_since(
-        &tx,
-        user_id,
-        since,
-        &session.siv_key,
-        &session.siv_nonce,
-    )
-    .map_err(status_of)?;
+    let (items, deleted_ids) =
+        db::mount::changes_since(&tx, user_id, since, &session.siv_key, &session.siv_nonce)
+            .map_err(status_of)?;
 
     let height = db::current_height(&tx).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 

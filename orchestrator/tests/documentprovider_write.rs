@@ -208,8 +208,8 @@ impl TestScenario for DocumentProviderWriteConsistency {
         {
             let content = test_content.as_bytes();
             let len = content.len();
-            let ranged_ok = check_ranged_downloads(&client, &nodes[1], &api_key, &file_id, content)
-                .await;
+            let ranged_ok =
+                check_ranged_downloads(&client, &nodes[1], &api_key, &file_id, content).await;
             match ranged_ok {
                 Ok(()) => print_and_add_check(
                     &mut result,
@@ -929,8 +929,14 @@ async fn check_ranged_downloads(
     anyhow::ensure!(body == content[8..], "open-ended range bytes mismatch");
 
     // Range starting at EOF: 416 with the total size, empty body.
-    let (status, content_range, _, body) =
-        download_range(client, node, api_key, item_id, Some(&format!("bytes={len}-"))).await?;
+    let (status, content_range, _, body) = download_range(
+        client,
+        node,
+        api_key,
+        item_id,
+        Some(&format!("bytes={len}-")),
+    )
+    .await?;
     anyhow::ensure!(
         status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE,
         "EOF range: {status}"

@@ -239,10 +239,7 @@ mod tests {
         let on_disk = std::fs::read_to_string(tls_dir.join(CERT_FILE)).unwrap();
         let der = first_cert_der(&on_disk).unwrap();
         let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
-        assert_eq!(
-            identity.spki_sha256,
-            spki_sha256_hex(cert.public_key().raw)
-        );
+        assert_eq!(identity.spki_sha256, spki_sha256_hex(cert.public_key().raw));
     }
 
     // Should: produce distinct identities for distinct nodes (fresh keypair

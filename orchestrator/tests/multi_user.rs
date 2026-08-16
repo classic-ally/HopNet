@@ -87,7 +87,9 @@ pub(crate) async fn try_download_file(
     node: &NodeInfo,
     path: &str,
 ) -> Result<std::result::Result<Vec<u8>, u16>> {
-    let client = crate::insecure_client_builder().timeout(Duration::from_secs(10)).build()?;
+    let client = crate::insecure_client_builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
 
     let path_trimmed = path.strip_prefix('/').unwrap_or(path);
     let url = format!(

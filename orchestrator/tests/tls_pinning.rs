@@ -27,9 +27,7 @@ struct RegisterDeviceResponse {
 }
 
 mod pin {
-    use rustls::client::danger::{
-        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-    };
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::crypto::{
         WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature,
     };
@@ -155,14 +153,11 @@ impl TestScenario for PinnedTlsAccess {
 
         let spki_ok = pairing.tls_enabled
             && pairing.https_port.is_some()
-            && pairing
-                .spki_sha256
-                .as_deref()
-                .is_some_and(|s| {
-                    s.len() == 64
-                        && s.chars()
-                            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-                });
+            && pairing.spki_sha256.as_deref().is_some_and(|s| {
+                s.len() == 64
+                    && s.chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            });
         print_and_add_check(
             &mut result,
             Check {
