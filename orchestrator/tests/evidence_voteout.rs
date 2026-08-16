@@ -98,7 +98,7 @@ impl TestScenario for EvidenceDrivesVoteout {
             .unwrap_or(victim.node_id as i32);
 
         // 2. Kill the victim.
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
         let stop_ok = stop_node(&docker, mesh_id, victim.node_id).await.is_ok();
         let t_kill = Instant::now();
         print_and_add_check(

@@ -55,7 +55,7 @@ async fn decided_height(node: &NodeInfo) -> Result<u64> {
 /// (jwt_or_rpc middleware short-circuits on a Bearer header) — poll loops
 /// would silently read 401 as "not caught up".
 async fn refresh_jwt(node: &mut NodeInfo, mesh_id: u32) -> Result<()> {
-    let docker = Docker::connect_with_local_defaults()?;
+    let docker = crate::sys::connect()?;
     node.jwt_token = crate::get_jwt_token(
         &docker,
         mesh_id,
@@ -166,7 +166,7 @@ impl TestScenario for ConsensusLeaderDown {
         let mut result = TestResult::new();
         let start = Instant::now();
         anyhow::ensure!(nodes.len() >= 3, "needs a 3-node mesh");
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
 
         // The mesh is idle (on-demand heights) — read the pending proposer.
         let (height, proposer, decided_before) = consensus_status(&nodes[0]).await?;
@@ -273,7 +273,7 @@ impl TestScenario for ConsensusLaggingCatchUp {
         let mut result = TestResult::new();
         let start = Instant::now();
         anyhow::ensure!(nodes.len() >= 3, "needs a 3-node mesh");
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
 
         let mut laggard = nodes.last().unwrap().clone();
 
@@ -358,7 +358,7 @@ impl TestScenario for ConsensusBftQuorumLoss {
         let mut result = TestResult::new();
         let start = Instant::now();
         anyhow::ensure!(nodes.len() >= 4, "needs a 4-node BFT mesh");
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
 
         let decided_before = decided_height(&nodes[0]).await?;
         // Kill two of four: quorum(4) = 3 (BFT), so two down loses quorum.

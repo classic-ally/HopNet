@@ -40,6 +40,19 @@ pub fn detect_socket_path() -> Result<String> {
     anyhow::bail!("No container runtime socket found. Please install Docker or Podman.")
 }
 
+/// Connect to the detected container runtime socket — the podman-aware
+/// sibling of `Docker::connect_with_local_defaults()`, which hardcodes
+/// the docker socket and fails on rootless-podman hosts. Tests must use
+/// this, matching main()'s own connection.
+pub fn connect() -> Result<Docker> {
+    let socket_path = detect_socket_path()?;
+    Ok(Docker::connect_with_unix(
+        socket_path.strip_prefix("unix://").unwrap_or(&socket_path),
+        120,
+        bollard::API_DEFAULT_VERSION,
+    )?)
+}
+
 /// Detect which container runtime we're connected to
 pub async fn detect_runtime(docker: &Docker) -> Result<ContainerRuntime> {
     let version = docker.version().await?;

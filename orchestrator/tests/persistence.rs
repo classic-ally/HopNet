@@ -280,7 +280,7 @@ impl TestScenario for RestartPersistence {
         }
 
         // Step 4: Stop node 1
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
         match stop_node(&docker, mesh_id, nodes[1].node_id).await {
             Ok(_) => {
                 print_and_add_check(
@@ -374,7 +374,7 @@ impl TestScenario for RestartPersistence {
         }
 
         // Step 7: Get fresh JWT token for restarted node (JWT keys are regenerated on startup)
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
         let fresh_jwt = match crate::get_jwt_token(
             &docker,
             mesh_id,

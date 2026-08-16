@@ -163,7 +163,7 @@ impl TestScenario for ChunkedStreamingPerformance {
         let mut result = TestResult::new();
 
         // Create Docker client for memory monitoring
-        let docker = Docker::connect_with_local_defaults()
+        let docker = crate::sys::connect()
             .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {}", e))?;
 
         println!("\nRunning checks:");

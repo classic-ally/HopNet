@@ -285,7 +285,7 @@ impl TestScenario for MountCrossNodeConsistency {
         let start = Instant::now();
         let mut result = TestResult::new();
         let client = super::device_client();
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
         let node0 = container_name(mesh_id, 0);
         anyhow::ensure!(nodes.len() >= 3, "needs a 3-node mesh");
 

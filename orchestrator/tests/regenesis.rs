@@ -410,7 +410,7 @@ impl TestScenario for RegenesisRestart {
     async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
         anyhow::ensure!(nodes.len() == 3, "regenesis-restart expects a 3-node mesh");
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
 
         println!("\nRunning regenesis-restart checks:");
 
@@ -656,7 +656,7 @@ impl TestScenario for RegenesisAwaitingUpgrade {
             nodes.len() == 3,
             "regenesis-awaiting-upgrade expects a 3-node mesh"
         );
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
         const TARGET: &str = "2026.8.1";
 
         println!("\nRunning regenesis-awaiting-upgrade checks:");
@@ -866,7 +866,7 @@ impl TestScenario for RegenesisNixActivation {
             nodes.len() == 3,
             "regenesis-nix-activation expects a 3-node mesh"
         );
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
         const TARGET: &str = "2026.8.1";
         const DATA: &str = "/root/.local/share/hopnet";
 
@@ -1160,7 +1160,7 @@ impl TestScenario for StragglerRejoin {
     async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
         anyhow::ensure!(nodes.len() == 3, "straggler-rejoin expects a 3-node mesh");
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
 
         println!("\nRunning straggler-rejoin checks:");
 
@@ -1302,7 +1302,7 @@ impl TestScenario for DivergedNodeRebuild {
             nodes.len() == 3,
             "diverged-node-rebuild expects a 3-node mesh"
         );
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
 
         println!("\nRunning diverged-node-rebuild checks:");
 
@@ -1447,7 +1447,7 @@ impl TestScenario for RegenesisRollback {
         const TARGET: &str = "2026.8.1";
         let mut result = TestResult::new();
         anyhow::ensure!(nodes.len() == 3, "regenesis-rollback expects a 3-node mesh");
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
 
         println!("\nRunning regenesis-rollback checks:");
 

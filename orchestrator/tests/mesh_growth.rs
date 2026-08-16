@@ -76,7 +76,7 @@ impl TestScenario for MeshGrowth {
         let mut result = TestResult::new();
         let client = crate::insecure_client();
         anyhow::ensure!(nodes.len() == 3, "mesh-growth expects a 3-node mesh");
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
 
         println!("\nRunning mesh-growth checks:");
 

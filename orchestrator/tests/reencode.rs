@@ -152,7 +152,7 @@ impl TestScenario for ReencodeAfterDeparture {
             .filter(|f| f.nodes_with_fragment.contains(&(victim.node_id as i32)))
             .map(|f| f.local_index)
             .collect();
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
         let stop_ok = stop_node(&docker, mesh_id, victim.node_id).await.is_ok();
         print_and_add_check(
             &mut result,

@@ -1859,7 +1859,7 @@ impl TestScenario for ImportResumeAfterRestart {
             },
         );
 
-        let docker = bollard::Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
         if let Err(e) =
             crate::tests::persistence::stop_node(&docker, mesh_id, nodes[0].node_id).await
         {

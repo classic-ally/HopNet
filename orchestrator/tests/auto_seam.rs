@@ -61,7 +61,7 @@ impl TestScenario for AutoSeam {
             nodes.len() == 6,
             "auto-seam expects a 6-node mesh (it adds the 7th)"
         );
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
 
         println!("\nRunning auto-seam checks:");
 

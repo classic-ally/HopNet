@@ -118,7 +118,7 @@ impl TestScenario for EvidenceObserve {
         );
 
         // 2. Kill node 2.
-        let docker = Docker::connect_with_local_defaults()?;
+        let docker = crate::sys::connect()?;
         let victim = &nodes[2];
         let stop_ok = stop_node(&docker, mesh_id, victim.node_id).await.is_ok();
         print_and_add_check(

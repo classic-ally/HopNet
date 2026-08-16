@@ -97,7 +97,7 @@ impl TestScenario for ClientVersionSkew {
         // 4. Node-too-old, refused CLIENT-side: recreate node 0 claiming
         // an ancient version, then run the real daemon in its container
         // and require the named min_node refusal on stderr.
-        let docker = Docker::connect_with_local_defaults().context("docker connect")?;
+        let docker = crate::sys::connect().context("docker connect")?;
         super::regenesis::recreate_node_with_env(
             &docker,
             mesh_id,
