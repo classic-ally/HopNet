@@ -300,6 +300,7 @@ pub trait ProjectionExporter: Send + Sync {
 /// projection only declares the class. Both classes insert
 /// `Extension<i32>` (the authenticated user id) that projection routers
 /// and the write gate read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AuthClass {
     /// The host's JWT session auth (browser/API surface).
     UserJwt,
@@ -316,6 +317,10 @@ pub struct Mount {
     pub prefix: &'static str,
     pub auth: AuthClass,
     pub router: axum::Router,
+    /// Per-surface override of the projection-wide minimum (RFC-022):
+    /// the effective minimum client version code for this surface is
+    /// `self.min_client.or(projection.min_client())`.
+    pub min_client: Option<u32>,
 }
 
 /// A projection's static manifest (RFC-016 Stage 3): the single object a
@@ -427,6 +432,18 @@ pub trait Projection: Send + Sync {
     /// Default: none.
     fn node_local_tables(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    // RFC-022 additions:
+
+    /// Projection-wide default: the oldest client version code every
+    /// surface of this projection supports — the coverage backstop; a
+    /// [`Mount::min_client`] overrides it per surface. None = no
+    /// declaration, which is legal only for surfaces that are not
+    /// `DeviceToken`-authed: a `DeviceToken` mount resolving to None at
+    /// both levels fails the host's coverage assertion at boot.
+    fn min_client(&self) -> Option<u32> {
+        None
     }
 }
 

@@ -99,6 +99,10 @@ impl hopnet_projection::Projection for DriveProjection {
         })
     }
 
+    fn min_client(&self) -> Option<u32> {
+        Some(MIN_CLIENT)
+    }
+
     fn mounts(
         &self,
         caps: &hopnet_projection::host::HostCapabilities,
@@ -109,27 +113,39 @@ impl hopnet_projection::Projection for DriveProjection {
                 prefix: "/files",
                 auth: AuthClass::UserJwt,
                 router: http::files::router(caps.clone()),
+                min_client: None,
             },
             Mount {
                 prefix: "/shares",
                 auth: AuthClass::UserJwt,
                 router: http::shares::router(caps.clone()),
+                min_client: None,
             },
             Mount {
                 prefix: "/integrations/fileprovider",
                 auth: AuthClass::DeviceToken,
                 router: http::fileprovider::router(caps.clone()),
+                min_client: None,
             },
             Mount {
                 prefix: "/integrations/documentprovider",
                 auth: AuthClass::DeviceToken,
                 router: http::documentprovider::router(caps.clone()),
+                min_client: None,
             },
             Mount {
                 prefix: "/integrations/mount",
                 auth: AuthClass::DeviceToken,
                 router: http::mount::router(caps.clone()),
+                min_client: None,
             },
         ]
     }
 }
+
+/// RFC-022: the oldest client version code this projection's surfaces
+/// accept — the projection-wide backstop; no surface overrides it today.
+/// 2026.8.2, the pre-flag-day floor: header-less older clients are
+/// rejected by the mandatory-header rule regardless, so this only needs
+/// to admit every header-sending build.
+const MIN_CLIENT: u32 = 20260802;

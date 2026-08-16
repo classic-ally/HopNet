@@ -703,6 +703,11 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // projection's mounts()/exporter(); built once, cheap clones.
             let host_caps = capabilities::build_capabilities(&app_state);
 
+            // RFC-022 coverage tripwire (post-caps sibling of the RFC-015
+            // one at boot): fail-stop if any DeviceToken surface ships
+            // without a resolved minimum client version.
+            projections::assert_client_compat_coverage(&host_caps);
+
             // Takeout service state (RFC-015 Stage D5b): registered
             // projection translators (drive today; photos registers here
             // later) + host hooks, over the same DriveHost seam impls.

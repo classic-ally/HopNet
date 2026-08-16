@@ -100,8 +100,16 @@ layering).
 - Effective minimum for a surface: the mount's `min_client` if set,
   else the projection's.
 - A `DeviceToken` mount resolving to neither is a boot-tripwire
-  failure (`assert_projection_registrations` grows the check) —
-  versioning is a precondition of the auth class, not an option.
+  failure — versioning is a precondition of the auth class, not an
+  option. As built (S2): a sibling assertion
+  (`projections::assert_client_compat_coverage`) that runs right
+  after capabilities construction, because the RFC-015 tripwire runs
+  before AppState exists and cannot walk `mounts()`. Host-owned
+  DeviceToken surfaces (RFC-018 S8 statfs, the photos client
+  dispatch) cannot escape coverage just because no manifest declares
+  them: they carry named minimums in
+  `projections::HOST_DEVICE_TOKEN_MIN_CLIENT` — the
+  `storage_host::TX_FUNCTIONS` precedent.
 - The host flattens the result into a surface → minimum map at boot,
   beside the existing registry loops. Clients only ever see resolved
   values: declaration is hierarchical for coverage and devex,
@@ -248,11 +256,15 @@ Each PR-sized, landing green:
       workspace version, with a flake assert guarding crane's silent
       0.0.1 placeholder fallback (which would otherwise quietly
       disable the module's newest-wins re-seeding).
-- [ ] S2 — declaration: `Projection::min_client()` +
-      `Mount.min_client`; boot-time resolution into the
-      surface → minimum map; `assert_projection_registrations`
-      grows the DeviceToken-coverage tripwire; drive declares its
-      minimums.
+- [x] S2 — declaration (2026-08-16): `Projection::min_client()`
+      (default None, trait tail) + `Mount.min_client`; drive declares
+      the projection-wide floor 20260802 (2026.8.2 — pre-flag-day,
+      safe because header-less clients are rejected regardless), all
+      five mounts inherit. Coverage tripwire landed as the post-caps
+      sibling `assert_client_compat_coverage` (see Declaration), with
+      host-owned DeviceToken surfaces covered via
+      `HOST_DEVICE_TOKEN_MIN_CLIENT`; registry test
+      `device_token_surfaces_all_declare_minimums` pins it in CI.
 - [ ] S3 — node enforcement: the header layer on `DeviceToken`
       mounts with the 426 shape; health payloads gain the node
       version code; registry test walks every `DeviceToken` mount
