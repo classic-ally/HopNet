@@ -339,14 +339,25 @@ Each PR-sized, landing green:
       S4 keeps the 426 handler UX, `min_node`, and the remaining
       clients. Registry + gate tests in `src/client_compat.rs`;
       end-to-end 426 shape asserted in the mount stack suite.
-- [ ] S4 — clients + end-to-end: mount sends the header, gains the
-      standardized 426 handler and the `min_node` probe at startup
-      and watch-reconnect; fileprovider appex, documentprovider,
-      and photo ingress learn the header; orchestrator test
-      `client-version-skew` (stale client cleanly 426'd at the
-      probe, current client passes, node-too-old refused
-      client-side). This is the flag-day release: every surface's
-      initial minimum is S4's own version.
+- [x] S4 — clients + end-to-end (2026-08-16): mount gains the typed
+      `TransportError::UpgradeRequired` (426 bodies parsed at every
+      transport site), `MIN_NODE`/`check_node_version` at the
+      preflight (both `mount` and `login`), and the watch loop's
+      hold-not-spin handler (loud once, max-backoff re-probe, clears
+      on reconnect); `health()` returns `HealthReport` carrying
+      `node_version`. As-built notes: the appex identity is a
+      generated Swift constant from the workspace version
+      (00-generate script) with a configured URLSession default
+      header and an `.upgradeRequired` ApiError case; the photo
+      ingress publisher takes its identity from hopnet-common's own
+      compiled token (excluded-workspace crates path-dep it from the
+      same checkout) and classifies 426 as park; the Android
+      documentprovider is a NO-OP (pure local mock, no HTTP); the
+      orchestrator was itself a header-less client broken by S3 —
+      its device-token calls now ride a shared `device_client()`.
+      Orchestrator test `client-version-skew` covers header-less /
+      stale / current probes plus the client-side min_node refusal
+      via a node claiming 2020.1.1.
 
 ## Open Questions
 
