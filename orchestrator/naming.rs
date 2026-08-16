@@ -6,10 +6,9 @@
 //! let alone delete — each other's images, containers, networks, or volumes.
 //!
 //! The orchestrator is a `[[bin]]` of the root `hopnet` package, so
-//! `CARGO_MANIFEST_DIR` is the checkout root itself.
-
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+//! `CARGO_MANIFEST_DIR` is the checkout root itself — and the same hash names
+//! the disposable data directories in `hopnet::paths`, which is where it now
+//! lives.
 
 /// Label stamped on every relay/node container and volume. Deletion filters
 /// require it to match [`checkout_hash`], so resources created by another
@@ -17,24 +16,8 @@ use std::sync::OnceLock;
 /// untouchable.
 pub const CHECKOUT_LABEL: &str = "hopnet.checkout";
 
-fn checkout_root() -> PathBuf {
-    let raw = Path::new(env!("CARGO_MANIFEST_DIR"));
-    std::fs::canonicalize(raw).unwrap_or_else(|_| raw.to_path_buf())
-}
-
-/// First 8 hex chars of blake3 of the canonicalized path.
-fn hash_of_path(p: &Path) -> String {
-    let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    blake3::hash(canon.as_os_str().as_encoded_bytes()).to_hex()[..8].to_string()
-}
-
 /// Stable per-checkout hash. `HOPNET_ORCH_HASH` overrides (test/escape hatch).
-pub fn checkout_hash() -> &'static str {
-    static HASH: OnceLock<String> = OnceLock::new();
-    HASH.get_or_init(|| {
-        std::env::var("HOPNET_ORCH_HASH").unwrap_or_else(|_| hash_of_path(&checkout_root()))
-    })
-}
+pub use hopnet::paths::checkout_hash;
 
 /// Image ref used for container creation AND written into the loaded
 /// archive's RepoTags by `load-image`. `HOPNET_ORCH_IMAGE` overrides.
@@ -128,23 +111,6 @@ mod tests {
         assert!(!is_ours("hopnet-orchestrator-0-0"));
         assert!(!is_ours("hopnet-ffffffff-0-0"));
         assert_eq!(mesh_id_of("hopnet-orchestrator-0-0"), None);
-    }
-
-    // Impact: the hash is the isolation boundary between checkouts — equal
-    //         hashes for distinct paths would silently merge two agents'
-    //         namespaces.
-    // Should: hash distinct directories to distinct values, and the same
-    //         directory (directly or via symlink) to the same value.
-    #[test]
-    fn path_hash_distinguishes_and_canonicalizes() {
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
-        assert_ne!(hash_of_path(a.path()), hash_of_path(b.path()));
-        assert_eq!(hash_of_path(a.path()), hash_of_path(a.path()));
-
-        let link = b.path().join("link");
-        std::os::unix::fs::symlink(a.path(), &link).unwrap();
-        assert_eq!(hash_of_path(&link), hash_of_path(a.path()));
     }
 
     // Should: shape the prefix as hopnet-<8 lowercase hex>-.

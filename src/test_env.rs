@@ -37,6 +37,11 @@ const GUARDED: &[&str] = &[
     "XDG_DATA_HOME",
     "HOPNET_UPGRADE_VERSION_OVERRIDE",
     "HOPNET_UPGRADE_STAGED_OVERRIDE",
+    // The disposable-node seams (`crate::paths`). They resolve against the
+    // same directory tree as `XDG_DATA_HOME`, so they share its lock.
+    "HOPNET_EPHEMERAL_DB",
+    "HOPNET_EPHEMERAL_ROOT",
+    "HOPNET_FRAGMENTS_DIR",
     // The RFC-021 nix-provider deployment contract (nix_provider.rs).
     "HOPNET_UPGRADE_PROVIDER",
     "HOPNET_UPGRADE_NIX_BIN",

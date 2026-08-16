@@ -46,13 +46,10 @@ pub fn runtime_info() -> Option<&'static TlsRuntimeInfo> {
     RUNTIME.get()
 }
 
-/// `{data}/hopnet/tls`, resolved the same way other data-dir tenants do
-/// (parent of the database path; see src/regenesis/rpc.rs).
+/// `{data}/hopnet/tls` for a durable node; inside the disposable tree for an
+/// ephemeral one, which therefore presents a fresh SPKI on every boot.
 pub fn default_tls_dir() -> PathBuf {
-    Path::new(&crate::db::shared::get_database_path())
-        .parent()
-        .expect("database path has a parent")
-        .join("tls")
+    crate::paths::tls_dir()
 }
 
 pub fn spki_sha256_hex(spki_der: &[u8]) -> String {

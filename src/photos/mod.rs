@@ -9,16 +9,8 @@ use std::sync::Arc;
 use hopnet_photos_core::sidecar::SidecarDb;
 use hopnet_storage::crypto::StaticRecipient;
 
-fn sidecar_db_dir() -> std::path::PathBuf {
-    let main_db = crate::db::shared::get_database_path();
-    std::path::Path::new(&main_db)
-        .parent()
-        .expect("database path has no parent directory")
-        .to_path_buf()
-}
-
 pub(crate) fn sidecar_db_path(user_id: i32) -> std::path::PathBuf {
-    sidecar_db_dir().join(format!("photos_sidecar_{}.sqlite", user_id))
+    crate::paths::data_dir().join(format!("photos_sidecar_{}.sqlite", user_id))
 }
 
 pub struct UserSidecarState {

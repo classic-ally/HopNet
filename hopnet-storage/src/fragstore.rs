@@ -9,9 +9,38 @@ use crate::error::StorageError;
 use hopnet_common::Blake3Hash;
 use std::fs;
 use std::io;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
-/// Get the XDG data directory for storing fragments
+/// Set by the host at startup for a disposable node, so the fragment store
+/// lands in the same throwaway tree as the rest of that node's state.
+///
+/// This lives here rather than in the host's path module because three
+/// callers resolve the directory directly instead of reading it off
+/// `AppState` (the storage job runner, twice, and the regenesis boot
+/// reconcile). Routing them through one override is what stops an
+/// "ephemeral" node writing blobs into a real user's data directory.
+static DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Install the override. Idempotent-by-first-write; later calls are ignored.
+pub fn set_dir_override(dir: PathBuf) {
+    let _ = DIR_OVERRIDE.set(dir);
+}
+
+/// Where fragments live, in precedence order: the host's override, an
+/// explicit `HOPNET_FRAGMENTS_DIR`, then `$XDG_DATA_HOME/hopnet/fragments`.
+///
+/// `HOPNET_FRAGMENTS_DIR` is deliberately separate from the database's
+/// location: blobs are large and belong wherever the operator has room,
+/// which is not necessarily where the metadata goes.
 pub fn get_fragments_dir() -> Result<String, StorageError> {
+    if let Some(dir) = DIR_OVERRIDE.get() {
+        return Ok(dir.to_string_lossy().into_owned());
+    }
+    if let Some(dir) = std::env::var_os("HOPNET_FRAGMENTS_DIR") {
+        return Ok(PathBuf::from(dir).to_string_lossy().into_owned());
+    }
+
     let data_dir = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
         format!(
             "{}/.local/share",
@@ -19,9 +48,7 @@ pub fn get_fragments_dir() -> Result<String, StorageError> {
         )
     });
 
-    let fragments_dir = format!("{}/hopnet/fragments", data_dir);
-    println!("Using fragments directory: {}", fragments_dir);
-    Ok(fragments_dir)
+    Ok(format!("{}/hopnet/fragments", data_dir))
 }
 
 /// Create 2-level directory structure for a fragment hash

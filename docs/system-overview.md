@@ -707,6 +707,13 @@ PhotoKit→HopNet on-ramp daemon (personal + iCloud Shared Photo Library). Bytes
 - **Documentation**: Markdown
 - **Testing**: Rust unit/integration tests, manual UI testing
 - **Deployment**: Native binary distribution
+- **Node storage locations**: every path a node writes to resolves through
+  `src/paths.rs` — database and regenesis artifacts, TLS identity, and the
+  fragment store, each with its own override. `HOPNET_EPHEMERAL_DB=1` routes
+  all three into a disposable per-checkout, per-process tree under
+  `HOPNET_EPHEMERAL_ROOT` (default `$TMPDIR`), reaped by the next ephemeral
+  node via an flock'd owner file. Nothing derives its location from the
+  database path.
 
 ## Development Roadmap
 

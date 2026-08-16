@@ -33,18 +33,20 @@ pub static DB_COUNTERS: DbCounters = DbCounters::new();
 /// site is unchanged.
 pub use hopnet_projection::dbstats::{COMMIT_LATENCY_US, commit_timed};
 
-/// Get the XDG data directory for storing the database
+/// The database file inside the node's data directory.
+///
+/// Resolution lives in [`crate::paths`]; this is the one derived name.
+/// Nothing else should reach for `.parent()` of the result — that habit is
+/// what let an "ephemeral" node scatter TLS material and photos sidecars
+/// through a real user's data directory.
 pub fn get_database_path() -> String {
-    let data_dir = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-        format!(
-            "{}/.local/share",
-            std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
-        )
-    });
-
-    let db_dir = format!("{}/hopnet", data_dir);
-    let db_path = format!("{}/database.db", db_dir);
-    tracing::info!("Using database path: {}", db_path);
+    let db_path = crate::paths::data_dir()
+        .join("database.db")
+        .to_string_lossy()
+        .into_owned();
+    // Called from request handlers and a 30s retry loop, so DEBUG: the
+    // resolved locations are logged once at startup instead.
+    tracing::debug!("Using database path: {}", db_path);
     db_path
 }
 

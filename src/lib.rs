@@ -25,6 +25,7 @@ pub mod metrics;
 pub mod net;
 pub mod nodes;
 pub mod passphrase;
+pub mod paths;
 pub mod photo_ingress;
 pub mod photos;
 pub mod photos_host;

@@ -110,6 +110,28 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     // projection's cross-crate inventory registrations.
     assert_projection_registrations();
 
+    // Resolve where this node's state lives BEFORE anything reads a path.
+    // The TLS block below is the first reader, and it used to run ~80 lines
+    // ahead of the ephemeral decision — which is how an "ephemeral" node came
+    // to leave cert material in the real data directory.
+    //
+    // The guard removes the tree on clean shutdown; held until run_server
+    // returns.
+    let _ephemeral = if paths::ephemeral_requested() {
+        let guard = paths::init_ephemeral().expect("create ephemeral data directory");
+        tracing::info!(root = %guard.root().display(), "ephemeral node: disposable state tree");
+        Some(guard)
+    } else {
+        None
+    };
+    tracing::info!(
+        data_dir = %paths::data_dir().display(),
+        tls_dir = %paths::tls_dir().display(),
+        fragments_dir = %storage_host::functions::get_fragments_dir().unwrap_or_default(),
+        ephemeral = _ephemeral.is_some(),
+        "node storage locations resolved"
+    );
+
     // Pinned-HTTPS listener: the node's only network surface. Bound BEFORE
     // the plaintext listener so a kernel-assigned loopback port can never
     // land on the TLS port and shadow it (the wildcard bind wins first).
@@ -211,29 +233,14 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
 
-    // Check if ephemeral database mode is requested (for testing)
-    let use_ephemeral_db = std::env::var("HOPNET_EPHEMERAL_DB").is_ok();
-
     // Set by a boundary gate refusal below; consumed once comms exist.
     let mut rebuild_from_peers = false;
-    let pool = if use_ephemeral_db {
-        tracing::info!("Using ephemeral in-memory database (HOPNET_EPHEMERAL_DB set)");
-        // Use shared-cache URI so all pool connections see the same in-memory DB
-        let manager = SqliteConnectionManager::file("file::memory:?cache=shared");
-        Pool::builder()
-            .max_size(db::DB_POOL_MAX_SIZE)
-            // Checkout waits are sub-ms in normal operation; r2d2's 30s
-            // default turns burst overload into a runtime livelock (a blocking
-            // get() parks a tokio worker — enough concurrent waiters park ALL
-            // workers, and each freed conn goes to another parked waiter).
-            // Fail fast instead so overload sheds as 500s and the runtime
-            // keeps polling accept loops and the consensus queue.
-            .connection_timeout(std::time::Duration::from_secs(2))
-            .connection_customizer(Box::new(db::shared::SqliteInitializer))
-            .build(manager)
-            .unwrap()
-    } else {
-        // Get database path and ensure directory exists
+    let pool = {
+        // One code path for durable and disposable nodes alike — an ephemeral
+        // node is a real SQLite file inside a throwaway directory, not a
+        // `file::memory:?cache=shared` pool. Shared-cache has no WAL and falls
+        // back to table-level locking, so the in-memory variant was the more
+        // lock-prone of the two while claiming to be the light one.
         let db_path = db::shared::get_database_path();
         let db_file_exists = db::shared::database_exists(&db_path);
 
@@ -288,8 +295,12 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         let manager = SqliteConnectionManager::file(&db_path);
         let pool = Pool::builder()
             .max_size(db::DB_POOL_MAX_SIZE)
-            // See the ephemeral-pool builder above: fail checkout fast so
-            // burst overload cannot park every tokio worker for 30s waves.
+            // Checkout waits are sub-ms in normal operation; r2d2's 30s
+            // default turns burst overload into a runtime livelock (a blocking
+            // get() parks a tokio worker — enough concurrent waiters park ALL
+            // workers, and each freed conn goes to another parked waiter).
+            // Fail fast instead so overload sheds as 500s and the runtime
+            // keeps polling accept loops and the consensus queue.
             .connection_timeout(std::time::Duration::from_secs(2))
             .connection_customizer(Box::new(db::shared::SqliteInitializer))
             .build(manager)
@@ -299,14 +310,12 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         pool
     };
 
-    // Check if database schema is initialized
+    // Check if database schema is initialized. An ephemeral node needs no
+    // special case: its directory is new, so this is false on its own.
     let conn = pool.get().unwrap();
 
-    let schema_initialized = if use_ephemeral_db {
-        false // Ephemeral database always needs initialization
-    } else {
-        db::shared::is_schema_initialized(&conn).expect("Failed to check schema status")
-    };
+    let schema_initialized =
+        db::shared::is_schema_initialized(&conn).expect("Failed to check schema status");
 
     let init_result = if schema_initialized {
         tracing::info!("Loading existing database schema");

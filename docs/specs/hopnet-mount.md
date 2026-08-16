@@ -421,7 +421,12 @@ implements that contract. Each slice is PR-sized and lands green.
 Testing mirrors RFC-010: `HOPNET_EPHEMERAL_DB=1`, a test-mode route
 minting a throwaway device token, poke counters (the signal-count
 pattern); integration tests against a live mountpoint; pjdfstest subset
-later. The poke-invalidation suite from the Architecture section is the
+later. `HOPNET_EPHEMERAL_DB=1` puts the node's whole state tree —
+database, TLS identity and fragment store — under
+`$HOPNET_EPHEMERAL_ROOT/hopnet-<checkout>/<pid>` (see `src/paths.rs`),
+so a test node never touches the developer's real data directory. The
+daemon's own staging directory is deliberately not moved: it is a
+separate process and takes `--staging-dir`. The poke-invalidation suite from the Architecture section is the
 load-bearing one and lands with S4, deliberately before the content
 machinery.
 
