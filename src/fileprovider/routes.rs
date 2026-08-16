@@ -20,12 +20,35 @@ use hopnet_common::fileprovider::TestResponse;
 /// design: clients probe readiness before any token exists, and these
 /// cannot live inside a DeviceToken projection mount (auth wraps the
 /// whole router). Same handler for every integration — readiness is a
-/// node property, not a per-surface one.
-pub fn health_router() -> axum::Router<AppState> {
+/// node property, not a per-surface one. Each route is individually
+/// version-gated with its surface's resolved minimum (RFC-022 S3): the
+/// probe is where a stale client learns it is stale, before any user
+/// action — a version gate is not auth.
+pub fn health_router(caps: &hopnet_projection::host::HostCapabilities) -> axum::Router<AppState> {
+    use crate::client_compat::{SurfaceCompat, client_version_gate, resolved_min};
     use axum::routing::get;
+    let gate = |surface: &'static str| {
+        axum::middleware::from_fn_with_state(
+            SurfaceCompat {
+                surface,
+                min_client: resolved_min(caps, surface),
+            },
+            client_version_gate,
+        )
+    };
     axum::Router::new()
-        .route("/fileprovider/health", get(get_health))
-        .route("/mount/health", get(get_health))
+        .route(
+            "/fileprovider/health",
+            get(get_health).layer(gate("/integrations/fileprovider")),
+        )
+        .route(
+            "/documentprovider/health",
+            get(get_health).layer(gate("/integrations/documentprovider")),
+        )
+        .route(
+            "/mount/health",
+            get(get_health).layer(gate("/integrations/mount")),
+        )
 }
 
 /// Mount statfs (RFC-018 S8) — host-owned like health, but AUTHED: the
@@ -53,26 +76,17 @@ pub async fn get_mount_statfs(
 /// Returns ready if database setup is completed, not_ready otherwise
 pub async fn get_health(State(app_state): State<AppState>) -> impl axum::response::IntoResponse {
     // Check if database setup is completed using the same pattern as /setup
-    match db::setup::get_initial_setup(app_state.db_pool.get()) {
-        Ok(StatusCode::OK) => {
-            // Database is initialized, FileProvider can operate
-            Json(HealthResponse {
-                status: HealthStatus::Ready,
-            })
-        }
-        Ok(StatusCode::NOT_FOUND) => {
-            // Database is not initialized, FileProvider cannot operate
-            Json(HealthResponse {
-                status: HealthStatus::NotReady,
-            })
-        }
-        Ok(_) | Err(_) => {
-            // Database error, FileProvider cannot operate
-            Json(HealthResponse {
-                status: HealthStatus::NotReady,
-            })
-        }
-    }
+    let status = match db::setup::get_initial_setup(app_state.db_pool.get()) {
+        Ok(StatusCode::OK) => HealthStatus::Ready,
+        // Not initialized, or database error: FileProvider cannot operate
+        Ok(_) | Err(_) => HealthStatus::NotReady,
+    };
+    Json(HealthResponse {
+        status,
+        // RFC-022 S3: the probe carries the node's identity — what the
+        // client's min_node check reads.
+        node_version: crate::version::effective_running_code(),
+    })
 }
 
 /// Test endpoint for FileProvider testing - only available in test mode

@@ -38,7 +38,11 @@ mod linux {
     use hopnet_mount::vfs::MountCore;
 
     #[derive(Parser)]
-    #[command(name = "hopnet-mount", version, about = "Mount the HopNet drive (RFC-018)")]
+    #[command(
+        name = "hopnet-mount",
+        version,
+        about = "Mount the HopNet drive (RFC-018)"
+    )]
     struct Cli {
         #[command(subcommand)]
         command: Command,

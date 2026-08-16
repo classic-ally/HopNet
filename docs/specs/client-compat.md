@@ -160,7 +160,14 @@ x-hopnet-client-version: 20260802
 `GET {prefix}/health` (the RFC-018 mount and fileprovider contract,
 made mandatory; a registry test walks the mounts and expects it to
 answer). The version layer covers it like any route, which makes it
-the consumer-lifecycle anchor:
+the consumer-lifecycle anchor. As built (S3): probes stay HOST-side
+and unauthenticated (RFC-018's own constraint — auth wraps whole
+routers, so health cannot live inside a DeviceToken mount) but each
+health route is individually version-gated with its surface's
+resolved minimum; documentprovider and `/photos/client` gained the
+probes they lacked, and statfs — one route, same consumer — is
+probed via the mount surface's health. The pinned surface→probe
+pairing lives in the `client_compat` registry test.
 
 - On startup and on watch-reconnect, the client probes health with
   its header. One round trip settles both policies before any user
@@ -265,10 +272,19 @@ Each PR-sized, landing green:
       host-owned DeviceToken surfaces covered via
       `HOST_DEVICE_TOKEN_MIN_CLIENT`; registry test
       `device_token_surfaces_all_declare_minimums` pins it in CI.
-- [ ] S3 — node enforcement: the header layer on `DeviceToken`
-      mounts with the 426 shape; health payloads gain the node
-      version code; registry test walks every `DeviceToken` mount
-      and expects `{prefix}/health` to answer.
+- [x] S3 — node enforcement (2026-08-16): `client_version_gate`
+      wraps every `DeviceToken` surface (manifest mounts via the
+      restructured loop, statfs and photos-client via their host
+      table entries), gate OUTERMOST so 426 precedes auth; the 426
+      body (`UpgradeRequiredResponse`) and header constant live in
+      `hopnet_common::compat` and are typeshared. Health payloads
+      carry `node_version` (`#[serde(default)]` — 0 = pre-RFC-022
+      node); documentprovider + photos-client probes added. Pulled
+      forward from S4 by necessity: the mount transport sends the
+      header as a reqwest default (stack tests break otherwise) —
+      S4 keeps the 426 handler UX, `min_node`, and the remaining
+      clients. Registry + gate tests in `src/client_compat.rs`;
+      end-to-end 426 shape asserted in the mount stack suite.
 - [ ] S4 — clients + end-to-end: mount sends the header, gains the
       standardized 426 handler and the `min_node` probe at startup
       and watch-reconnect; fileprovider appex, documentprovider,

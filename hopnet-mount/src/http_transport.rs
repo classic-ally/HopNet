@@ -23,6 +23,18 @@ use crate::transport::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Every request carries this build's identity (RFC-022 S3): the node's
+/// version gate rejects header-less requests on DeviceToken surfaces, so
+/// the header rides as a client-wide default rather than per call site.
+fn version_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        hopnet_common::compat::CLIENT_VERSION_HEADER,
+        reqwest::header::HeaderValue::from(crate::version_code()),
+    );
+    headers
+}
+
 pub struct HttpTransport {
     client: reqwest::Client,
     /// Connect-timeout only — content uploads and consensus waits outlive
@@ -37,10 +49,12 @@ impl HttpTransport {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            .default_headers(version_headers())
             .build()
             .map_err(|e| TransportError::Protocol(e.to_string()))?;
         let upload_client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .default_headers(version_headers())
             .build()
             .map_err(|e| TransportError::Protocol(e.to_string()))?;
         Ok(HttpTransport {
@@ -266,6 +280,7 @@ impl NodeTransport for HttpTransport {
             // liveness is the watch loop's job (heartbeat-bounded).
             let client = reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
+                .default_headers(version_headers())
                 .build()
                 .map_err(|e| TransportError::Protocol(e.to_string()))?;
             let response = client

@@ -133,6 +133,10 @@ objc2-service-management = "0.3.2"
 # Security framework for keychain access
 security-framework = "3.3.0"
 
+[dev-dependencies]
+# oneshot router tests (RFC-022 client_compat registry test)
+tower = { version = "0.5.2", features = ["util"] }
+
 [build-dependencies]
 tauri-build = { version = "2.3.1", optional = true }
 

@@ -79,10 +79,25 @@ async fn boot_node() -> NodeGuard {
     panic!("node did not come up on port {port}");
 }
 
+/// Raw reqwest client carrying this build's version header (RFC-022 S3):
+/// DeviceToken surfaces 426 header-less requests, so every harness-side
+/// raw call rides the same identity the transport sends by default.
+fn versioned_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        hopnet_common::compat::CLIENT_VERSION_HEADER,
+        reqwest::header::HeaderValue::from(hopnet_mount::version_code()),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
+}
+
 /// Runs /setup, mints a device token via the test route, and returns
 /// (api_key, jwt) for transport auth and JWT seeding respectively.
 async fn provision(node: &NodeGuard) -> (String, String) {
-    let client = reqwest::Client::new();
+    let client = versioned_client();
 
     let setup: serde_json::Value = client
         .post(format!("{}/api/setup", node.base()))
@@ -351,7 +366,7 @@ async fn mutations_are_strict_read_your_writes() {
     let node = boot_node().await;
     let (api_key, _jwt) = provision(&node).await;
     let transport = HttpTransport::new(&node.base(), &api_key).unwrap();
-    let client = reqwest::Client::new();
+    let client = versioned_client();
     let base = format!("{}/api/integrations/mount", node.base());
 
     // Create folder — strict.
@@ -912,10 +927,12 @@ async fn fuse_mount_smoke_against_live_node() {
 
 // Impact: statfs is the surface `df` and every file manager reads; the
 // numbers must come from the mesh capacity definitions and the route
-// must be closed to the unauthenticated.
+// must be closed to the unauthenticated and to unversioned clients.
 // Should: return capacity numbers through the transport with a valid
 // device token.
-// Should not: answer statfs without a device token.
+// Should not: answer statfs without a client version header (426, the
+// RFC-022 gate, before auth) or without a device token (401, after the
+// gate passes).
 #[tokio::test]
 async fn statfs_route_is_authed_and_shaped() {
     let node = boot_node().await;
@@ -928,15 +945,35 @@ async fn statfs_route_is_authed_and_shaped() {
     // capacity math itself is unit-tested in src/db/resilience.rs.
     assert_eq!(info.used_bytes, 0, "fresh node has no placed user data");
 
-    let bare = reqwest::Client::new()
-        .get(format!("{}/api/integrations/mount/statfs", node.base()))
+    let statfs_url = format!("{}/api/integrations/mount/statfs", node.base());
+    let unversioned = reqwest::Client::new()
+        .get(&statfs_url)
         .send()
         .await
-        .expect("unauthenticated statfs request");
+        .expect("unversioned statfs request");
     assert_eq!(
-        bare.status(),
+        unversioned.status().as_u16(),
+        426,
+        "statfs must version-gate before anything else"
+    );
+    let body: serde_json::Value = unversioned.json().await.expect("426 body is JSON");
+    assert_eq!(body["surface"], "/api/integrations/mount/statfs");
+    assert!(body["min_client"].as_u64().is_some());
+    assert!(body["node_version"].as_u64().is_some());
+
+    let unauthed = reqwest::Client::new()
+        .get(&statfs_url)
+        .header(
+            hopnet_common::compat::CLIENT_VERSION_HEADER,
+            hopnet_mount::version_code(),
+        )
+        .send()
+        .await
+        .expect("versioned but unauthenticated statfs request");
+    assert_eq!(
+        unauthed.status(),
         reqwest::StatusCode::UNAUTHORIZED,
-        "statfs must sit behind device-token auth"
+        "statfs must still sit behind device-token auth"
     );
 }
 

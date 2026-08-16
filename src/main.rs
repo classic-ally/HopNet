@@ -850,34 +850,65 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             let api_routes = Router::new()
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
-                .nest("/integrations", fileprovider::routes::health_router())
+                .nest(
+                    "/integrations",
+                    fileprovider::routes::health_router(&host_caps),
+                )
                 // Host-owned mount statfs (RFC-018 S8): the capacity math
                 // lives host-side (views::resilience), so this one route
                 // can't ride the drive-owned projection mount — but it
                 // wears the same device-token auth. A literal route, not a
                 // second nest at the projection's prefix: two nests at one
                 // path conflict, a static route beside a nest does not.
+                // Version gate outermost (RFC-022 S3): a stale client gets
+                // 426 before any auth/DB work.
                 .route(
                     "/integrations/mount/statfs",
-                    get(fileprovider::routes::get_mount_statfs).layer(
-                        middleware::from_fn_with_state(
+                    get(fileprovider::routes::get_mount_statfs)
+                        .layer(middleware::from_fn_with_state(
                             app_state.clone(),
                             devices::auth::device_token_auth_middleware,
-                        ),
-                    ),
+                        ))
+                        .layer(middleware::from_fn_with_state(
+                            client_compat::SurfaceCompat {
+                                surface: "/api/integrations/mount/statfs",
+                                min_client: client_compat::host_min(
+                                    "/api/integrations/mount/statfs",
+                                ),
+                            },
+                            client_compat::client_version_gate,
+                        )),
                 )
                 .nest("/devices", devices::routes::router(app_state.clone()))
                 // Thin-client photos dispatch surface (photo-ingress daemon):
                 // device-token auth class, host-mounted because the handlers
                 // close over AppState (photos declares no projection mounts).
+                // Its version-gated probe is the literal route below (the
+                // statfs precedent: a static route beside a nest).
                 .nest(
                     "/photos/client",
-                    photos::routes::device_router(app_state.clone()).layer(
-                        middleware::from_fn_with_state(
+                    photos::routes::device_router(app_state.clone())
+                        .layer(middleware::from_fn_with_state(
                             app_state.clone(),
                             devices::auth::device_token_auth_middleware,
-                        ),
-                    ),
+                        ))
+                        .layer(middleware::from_fn_with_state(
+                            client_compat::SurfaceCompat {
+                                surface: "/api/photos/client",
+                                min_client: client_compat::host_min("/api/photos/client"),
+                            },
+                            client_compat::client_version_gate,
+                        )),
+                )
+                .route(
+                    "/photos/client/health",
+                    get(fileprovider::routes::get_health).layer(middleware::from_fn_with_state(
+                        client_compat::SurfaceCompat {
+                            surface: "/api/photos/client",
+                            min_client: client_compat::host_min("/api/photos/client"),
+                        },
+                        client_compat::client_version_gate,
+                    )),
                 )
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
@@ -900,22 +931,41 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // host and projection alike — then goes under the /api nest
             // below.
             let mut api_routes: Router<()> = api_routes.with_state(app_state.clone());
-            for mount in projections::manifests()
-                .iter()
-                .flat_map(|m| m.mounts(&host_caps))
-            {
-                let routed = match mount.auth {
-                    hopnet_projection::AuthClass::UserJwt => mount.router.layer(
-                        middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware),
-                    ),
-                    hopnet_projection::AuthClass::DeviceToken => {
-                        mount.router.layer(middleware::from_fn_with_state(
-                            app_state.clone(),
-                            devices::auth::device_token_auth_middleware,
-                        ))
-                    }
-                };
-                api_routes = api_routes.nest(mount.prefix, routed);
+            for m in projections::manifests() {
+                for mount in m.mounts(&host_caps) {
+                    let routed = match mount.auth {
+                        hopnet_projection::AuthClass::UserJwt => {
+                            mount.router.layer(middleware::from_fn_with_state(
+                                app_state.clone(),
+                                auth::auth_middleware,
+                            ))
+                        }
+                        hopnet_projection::AuthClass::DeviceToken => {
+                            // RFC-022 S3: version gate outermost — a stale
+                            // client is told to upgrade (426) before any
+                            // auth/DB work. Resolution per S2; the coverage
+                            // assertion above guarantees it succeeds.
+                            let min_client = mount
+                                .min_client
+                                .or(m.min_client())
+                                .expect("coverage asserted after build_capabilities");
+                            mount
+                                .router
+                                .layer(middleware::from_fn_with_state(
+                                    app_state.clone(),
+                                    devices::auth::device_token_auth_middleware,
+                                ))
+                                .layer(middleware::from_fn_with_state(
+                                    client_compat::SurfaceCompat {
+                                        surface: mount.prefix,
+                                        min_client,
+                                    },
+                                    client_compat::client_version_gate,
+                                ))
+                        }
+                    };
+                    api_routes = api_routes.nest(mount.prefix, routed);
+                }
             }
 
             // Overload shedding, two gates, both answering 503 + Retry-After

@@ -1,4 +1,5 @@
 // HopNet Common Types Library
+pub mod compat;
 pub mod db;
 pub mod devices;
 pub mod documentprovider;
