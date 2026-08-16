@@ -51,8 +51,13 @@
         onRowDblClick?: (row: Row) => void,
         /** Extra classes per row/tile — selected highlight, folder emphasis. */
         rowClass?: (row: Row) => string,
-        /** false when the pane hosts its own search (Browse's breadcrumb bar). */
-        toolbar?: boolean,
+        /**
+         * true renders the built-in search + toolbarExtras row; false renders
+         * no row at all; a Snippet puts pane-owned chrome (Browse's breadcrumb
+         * and navigation) inside the row, so it sits within the tile rather
+         * than floating above it.
+         */
+        toolbar?: boolean | Snippet,
         toolbarExtras?: Snippet,
         searchPlaceholder?: string,
         loading?: boolean,
@@ -113,7 +118,11 @@
 </script>
 
 <Card padding={false}>
-    {#if toolbar && (table.searchEnabled || toolbarExtras)}
+    {#if typeof toolbar === 'function'}
+        <div class="flex items-center gap-2 p-2 border-b border-surface1">
+            {@render toolbar()}
+        </div>
+    {:else if toolbar && (table.searchEnabled || toolbarExtras)}
         <div class="flex items-center gap-2 p-2 border-b border-surface1">
             {#if table.searchEnabled}
                 <input

@@ -216,6 +216,30 @@
 
 <Story name="Pagination" template={pagination} />
 
+<!-- A pane handing its own chrome into the toolbar row, so navigation sits
+     inside the tile instead of floating above it (Browse's case). -->
+{#snippet paneChrome()}
+  <button class="border border-overlay1 text-muted rounded-md p-1 bg-transparent cursor-pointer hover:text-primary">
+    <span class="i-carbon-home w-4 h-4 block"></span>
+  </button>
+  <span class="text-subtitle text-sm font-mono">/ fragments / staged</span>
+{/snippet}
+
+{#snippet customToolbar()}
+  <div class="min-h-screen bg-crust p-6">
+    <Table
+      state={paginationState()}
+      toolbar={paneChrome}
+      columns={[
+        { id: 'name', header: 'Name', sortField: 'name', preset: 'name', field: 'name' },
+        { id: 'owner', header: 'Owner', preset: 'status', field: 'owner' }
+      ]}
+    />
+  </div>
+{/snippet}
+
+<Story name="Custom Toolbar" template={customToolbar} />
+
 {#snippet demoTile(row, ctx)}
   <div class="flex flex-col items-center gap-1 {ctx.selected ? 'ring-2 ring-mauve rounded-lg' : ''}">
     <span class="{getFileIcon('File', row.name, 'detail')} text-4xl text-muted" aria-hidden="true"></span>
