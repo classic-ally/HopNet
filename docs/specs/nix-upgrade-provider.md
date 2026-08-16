@@ -4,7 +4,9 @@
 **Depends on**: RFC-019 (the upgrade-provider seam, `node_staged_version`
 attestations, the awaiting-upgrade park, exit-75 restart derivation)
 **Related**: RFC-020 (module versioning — what an upgrade means);
-`.forgejo/workflows/release-macos.yml` (the release channel this rides)
+`.forgejo/workflows/release-macos.yml` (the release channel this
+rides); RFC-023 (the mount client channel transplanting this
+machinery, 2026-08-16)
 
 ## Motivation
 

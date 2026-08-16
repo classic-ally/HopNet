@@ -10,7 +10,8 @@ client)
 establishment carries versions)
 **Related**: RFC-020 (module versioning — the replay axis, fenced off
 in Non-Goals); RFC-021 (the node upgrade channel, deliberately
-untouched); RFC-011 (photos — the second client surface, arriving)
+untouched); RFC-011 (photos — the second client surface, arriving);
+RFC-023 (the mount auto-upgrade wrapper consuming this RFC's signals)
 
 ## Motivation
 
@@ -253,6 +254,9 @@ Each tracked, not forgotten:
   header from mutating into ad-hoc capability sniffing.
 
 ## Deferred: rollout coupling (informative)
+
+**Discharged by [RFC-023](mount-upgrade.md)** (2026-08-16), which
+specifies the wrapper against exactly this contract.
 
 How the mount's future auto-upgrade should consume this RFC's
 signals — recorded so the client-channel RFC inherits the contract
