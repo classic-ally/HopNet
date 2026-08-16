@@ -168,11 +168,11 @@ mod linux {
             }
         };
         let url = provision::resolve_url(args.url.as_deref(), &Paths::from_env());
-        let outcome = hopnet_mount::upgrade::run_with(
-            &env,
-            &url,
-            &hopnet_mount::upgrade::default_releases_url(),
-        );
+        let releases_url = env
+            .release_url
+            .clone()
+            .unwrap_or_else(hopnet_mount::upgrade::default_releases_url);
+        let outcome = hopnet_mount::upgrade::run_with(&env, &url, &releases_url);
         println!("{}", outcome.line());
     }
 

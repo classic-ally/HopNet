@@ -19,6 +19,7 @@ pub const ENV_PROFILE: &str = "HOPNET_MOUNT_UPGRADE_PROFILE";
 pub const ENV_STAGE_DIR: &str = "HOPNET_MOUNT_UPGRADE_STAGE_DIR";
 pub const ENV_FLAKE_REF: &str = "HOPNET_MOUNT_UPGRADE_FLAKE_REF";
 pub const ENV_NIX_BIN: &str = "HOPNET_MOUNT_UPGRADE_NIX_BIN";
+pub const ENV_RELEASE_URL: &str = "HOPNET_MOUNT_UPGRADE_RELEASE_URL";
 
 /// Deployment shape from env (RFC-023's contract, mirroring the node's:
 /// deployment shape, not policy). The two paths are REQUIRED — the S2
@@ -29,6 +30,9 @@ pub struct UpgradeEnv {
     pub stage_dir: PathBuf,
     pub flake_ref: String,
     pub nix_bin: PathBuf,
+    /// Feed endpoint override (the node's HOPNET_UPGRADE_RELEASE_URL
+    /// mirrored); None derives from the repository field at the caller.
+    pub release_url: Option<String>,
 }
 
 impl UpgradeEnv {
@@ -51,6 +55,7 @@ impl UpgradeEnv {
             nix_bin: get(ENV_NIX_BIN)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("nix")),
+            release_url: get(ENV_RELEASE_URL),
         })
     }
 
@@ -599,6 +604,7 @@ mod tests {
             stage_dir: dir.join("staged"),
             flake_ref: "git+https://example.invalid/HopNet.git".into(),
             nix_bin: dir.join("fake-nix"),
+            release_url: None,
         }
     }
 
@@ -752,6 +758,23 @@ mod tests {
             env.profile,
             PathBuf::from("/run/user/1000/hopnet/mount-profile")
         );
+    }
+
+    // Should: read HOPNET_MOUNT_UPGRADE_RELEASE_URL into release_url and
+    // leave it None when absent (the caller derives the default lazily).
+    #[test]
+    fn upgrade_env_reads_optional_release_url() {
+        let base = HashMap::from([(ENV_PROFILE, "/p"), (ENV_STAGE_DIR, "/s")]);
+        let env = UpgradeEnv::from_lookup(|k| base.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(env.release_url, None);
+
+        let with_url = HashMap::from([
+            (ENV_PROFILE, "/p"),
+            (ENV_STAGE_DIR, "/s"),
+            (ENV_RELEASE_URL, "http://relay/releases"),
+        ]);
+        let env = UpgradeEnv::from_lookup(|k| with_url.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(env.release_url.as_deref(), Some("http://relay/releases"));
     }
 
     // ---- probe classification ----
