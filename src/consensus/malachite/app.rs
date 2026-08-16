@@ -549,6 +549,15 @@ pub fn build_value(
                 Err(reason) => {
                     let _ = db_tx.execute_batch(&format!("ROLLBACK TO {sp}"));
                     let _ = db_tx.execute_batch(&format!("RELEASE {sp}"));
+                    // The submitter sees this verbatim as TxSubmitError::Rejected,
+                    // which the mount routes map to 409 -> EEXIST. Silent until
+                    // now, which made a transient rejection indistinguishable
+                    // from a genuine name conflict at the client.
+                    tracing::warn!(
+                        height = height.0,
+                        function = %tx.rpc.function,
+                        "preflight rejected transaction: {reason}"
+                    );
                     failed.push((*i, reason));
                 }
             }

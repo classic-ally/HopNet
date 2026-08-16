@@ -156,6 +156,38 @@ impl TxGateway for TimeoutTx {
     }
 }
 
+/// Every submission comes back as `Rejected` carrying a transient
+/// storage reason — the shape `build_value`'s preflight produces when a
+/// handler trips over `SQLITE_BUSY` (app.rs stringifies every handler
+/// error into the rejected list without classifying it).
+struct BusyRejectTx;
+impl BusyRejectTx {
+    /// Verbatim shape of a stringified rusqlite busy error as it reaches
+    /// the rejected list via `format!("{e:?}")`.
+    const REASON: &'static str =
+        "InsertError(SqliteFailure(Error { code: DatabaseBusy, extended_code: 5 }, \
+         Some(\"database is locked\")))";
+}
+impl TxGateway for BusyRejectTx {
+    fn submit_batch(&self, txs: Vec<TxSpec>) -> BoxFuture<'_, Vec<Result<(), TxSubmitError>>> {
+        Box::pin(async move {
+            txs.iter()
+                .map(|_| Err(TxSubmitError::Rejected(Self::REASON.to_string())))
+                .collect()
+        })
+    }
+    fn submit_batch_decided(
+        &self,
+        txs: Vec<TxSpec>,
+    ) -> BoxFuture<'_, Vec<Result<u64, TxSubmitError>>> {
+        Box::pin(async move {
+            txs.iter()
+                .map(|_| Err(TxSubmitError::Rejected(Self::REASON.to_string())))
+                .collect()
+        })
+    }
+}
+
 struct AllowWrites;
 impl WriteAdmission for AllowWrites {
     fn check_write(&self, _user_id: i32) -> BoxFuture<'_, Result<(), WriteCheckError>> {
@@ -688,6 +720,68 @@ async fn modify_renames_and_moves() {
     let (status, found) = get_json::<MountItem>(&app, "/lookup?name=new.txt").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(found.unwrap().id, Some(file_id));
+}
+
+// Impact: 409 is the destination-occupied verdict, and hopnet-mount turns
+// it into EEXIST (vfs.rs map_create_err -> fuse.rs). A transient SQLITE_BUSY
+// on the proposer's preflight reaches this route as TxSubmitError::Rejected
+// — build_value stringifies every handler error into its rejected list
+// without classifying it — so a momentary lock collision is reported to the
+// kernel as "the destination already exists". rsync believes that and drops
+// the file: two were lost this way during a live migration, to a destination
+// that provably did not exist.
+// Should: refuse to answer a transient consensus rejection with 409 when the
+// destination name is vacant.
+// Should not: report a storage condition as a namespace conflict.
+#[tokio::test]
+async fn transient_rejection_is_not_reported_as_a_name_conflict() {
+    let mut env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let content = b"rsync temp";
+    let (_, file) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", content.len()),
+            Some(".final.txt.ZqfPGx"),
+            content.as_slice(),
+        )],
+    )
+    .await;
+    let file_id = file.unwrap().item.unwrap().id.unwrap();
+
+    // The destination is vacant — nothing has ever been created at this
+    // name, which is exactly the rsync temp->final rename.
+    let (status, _) = get_json::<MountItem>(&app, "/lookup?name=final.txt").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "precondition: the rename destination is vacant"
+    );
+
+    // Every submission now comes back as a transient storage rejection.
+    env.state.txs = Arc::new(BusyRejectTx);
+    let app = env.app();
+
+    let (status, _) = send_json::<MountMutationResponse>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": file_id, "new_name": "final.txt" }),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        StatusCode::CONFLICT,
+        "a transient storage rejection must not be reported as a name conflict: \
+         the mount maps 409 to EEXIST and rsync drops the file"
+    );
+    assert!(
+        status.is_server_error(),
+        "expected a retryable server-side status, got {status}"
+    );
 }
 
 // Should: refuse deleting a non-empty folder without recursive, delete it
