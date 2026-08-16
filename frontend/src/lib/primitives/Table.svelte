@@ -117,13 +117,17 @@
     })
 </script>
 
-<Card padding={false}>
+<!-- flex column + a scrolling body: as a flex child in the pane the Card
+     shrinks below its content, and its overflow-hidden then clipped the
+     rows outright. Bounding the body instead keeps the toolbar and the
+     pager in place while the rows scroll. -->
+<Card padding={false} className="flex flex-col min-h-0">
     {#if typeof toolbar === 'function'}
-        <div class="flex items-center gap-2 p-2 border-b border-surface1">
+        <div class="flex items-center gap-2 p-2 border-b border-surface1 flex-shrink-0">
             {@render toolbar()}
         </div>
     {:else if toolbar && (table.searchEnabled || toolbarExtras)}
-        <div class="flex items-center gap-2 p-2 border-b border-surface1">
+        <div class="flex items-center gap-2 p-2 border-b border-surface1 flex-shrink-0">
             {#if table.searchEnabled}
                 <input
                     class="flex-1 min-w-0 bg-transparent text-primary border-overlay0 border-2 rounded-md p-1"
@@ -155,7 +159,7 @@
             {#if typeof empty === 'string'}{empty}{:else}{@render empty()}{/if}
         </div>
     {:else if view === 'grid'}
-        <div class="grid gap-2 p-2" style="grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr))">
+        <div class="grid gap-2 p-2 flex-1 min-h-0 overflow-auto" style="grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr))">
             {#each table.rows as row (table.keyOf(row))}
                 <button
                     type="button"
@@ -168,7 +172,7 @@
             {/each}
         </div>
     {:else}
-        <div class="overflow-x-auto" bind:clientWidth={containerWidth}>
+        <div class="flex-1 min-h-0 overflow-auto" bind:clientWidth={containerWidth}>
             <table
                 class="hn-table {densityClass}"
                 style="width: {containerWidth && totalWidth > containerWidth ? `${totalWidth}px` : '100%'}; min-width: {minTableWidth}px"
@@ -249,7 +253,7 @@
     {/if}
 
     {#if footer && !error && !loading && table.total > 0}
-        <div class="flex items-center justify-between gap-2 p-2 border-t border-surface1 text-sm text-subtitle">
+        <div class="flex items-center justify-between gap-2 p-2 border-t border-surface1 text-sm text-subtitle flex-shrink-0">
             <span>{rangeLabel}</span>
             <div class="flex items-center gap-2">
                 {#if table.rowsPerPage > 0}
