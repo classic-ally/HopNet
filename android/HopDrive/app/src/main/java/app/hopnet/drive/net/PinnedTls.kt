@@ -65,6 +65,10 @@ fun buildPinnedClient(pairing: Pairing): OkHttpClient {
         .addInterceptor { chain ->
             val request = chain.request().newBuilder()
                 .header("Authorization", "Bearer ${pairing.token}")
+                .header(
+                    CLIENT_VERSION_HEADER,
+                    app.hopnet.drive.BuildConfig.HOPNET_CLIENT_VERSION_CODE.toString()
+                )
                 .build()
             val started = System.nanoTime()
             val label = "${request.method} ${request.url.encodedPath}"
