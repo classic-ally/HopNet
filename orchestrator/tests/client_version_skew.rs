@@ -1,4 +1,4 @@
-//! RFC-022 S4 end-to-end: the client-version skew scenarios. A stale
+//! RFC-023 S4 end-to-end: the client-version skew scenarios. A stale
 //! (or header-less) client is cleanly 426'd at the health probe with the
 //! structured body; a current client passes and reads the node's
 //! version; a node claiming a version older than the mount's MIN_NODE is

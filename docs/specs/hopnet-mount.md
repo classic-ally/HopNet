@@ -5,9 +5,9 @@
 RFC-015/016 (projection modularity + host API), RFC-009 (Apple FileProvider,
 as architectural precedent)
 **Related**: issue #23 (storage-layer blob pinning — deferred, out of scope)
-**Amended by**: RFC-022 (client compatibility — the version header,
+**Amended by**: RFC-023 (client compatibility — the version header,
 standardized 426 handling, and the `min_node` health probe,
-2026-08-16); RFC-023 (auto-upgrade — profile-symlink lifecycle and the
+2026-08-16); RFC-024 (auto-upgrade — profile-symlink lifecycle and the
 upgrade wrapper, 2026-08-16)
 
 ## Motivation

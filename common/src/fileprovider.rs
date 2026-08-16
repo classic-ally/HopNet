@@ -17,8 +17,8 @@ pub enum HealthStatus {
 #[typeshare]
 pub struct HealthResponse {
     pub status: HealthStatus,
-    /// The node's CalVer code (RFC-022 S3) — what a client's `min_node`
-    /// check reads at its probe. `0` = a pre-RFC-022 node that never
+    /// The node's CalVer code (RFC-023 S3) — what a client's `min_node`
+    /// check reads at its probe. `0` = a pre-RFC-023 node that never
     /// sent the field.
     #[serde(default)]
     pub node_version: u32,

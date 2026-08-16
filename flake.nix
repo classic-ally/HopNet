@@ -152,7 +152,7 @@
           hopnet-mount = craneLib.buildPackage (mountArgs // {
             cargoArtifacts = craneLib.buildDepsOnly mountArgs;
             pname = "hopnet-mount";
-            # Clients share the workspace identity token (RFC-022 S1).
+            # Clients share the workspace identity token (RFC-023 S1).
             version = hopnetVersion;
             meta.mainProgram = "hopnet-mount";
           });
@@ -393,7 +393,7 @@
         default = hopnet-mount;
       };
 
-      # RFC-021 / RFC-023 end-to-end VM tests. Heavy (each builds a
+      # RFC-021 / RFC-024 end-to-end VM tests. Heavy (each builds a
       # second hopnet or hopnet-mount generation and boots VMs) — run
       # on demand:
       #   nix build .#checks.x86_64-linux.upgrade-vm-test
@@ -403,7 +403,7 @@
           upgrade-vm-test = pkgs.testers.runNixOSTest (
             import ./nix/upgrade-vm-test.nix { inherit self; }
           );
-          # RFC-023 S3: single-seat node + user-session mount crossing
+          # RFC-024 S3: single-seat node + user-session mount crossing
           # the stage → flip → exit-75 boundary, plus the hold path.
           mount-upgrade-vm-test = pkgs.testers.runNixOSTest (
             import ./nix/mount-upgrade-vm-test.nix { inherit self; }

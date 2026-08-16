@@ -1,4 +1,4 @@
-# RFC-022: Client API Compatibility — CalVer Identity and Session-Time Skew Enforcement
+# RFC-023: Client API Compatibility — CalVer Identity and Session-Time Skew Enforcement
 
 **Status**: Draft (2026-08-16)
 **Depends on**: RFC-012 (device-token session establishment — the
@@ -11,7 +11,7 @@ establishment carries versions)
 **Related**: RFC-020 (module versioning — the replay axis, fenced off
 in Non-Goals); RFC-021 (the node upgrade channel, deliberately
 untouched); RFC-011 (photos — the second client surface, arriving);
-RFC-023 (the mount auto-upgrade wrapper consuming this RFC's signals)
+RFC-024 (the mount auto-upgrade wrapper consuming this RFC's signals)
 
 ## Motivation
 
@@ -255,7 +255,7 @@ Each tracked, not forgotten:
 
 ## Deferred: rollout coupling (informative)
 
-**Discharged by [RFC-023](mount-upgrade.md)** (2026-08-16), which
+**Discharged by [RFC-024](mount-upgrade.md)** (2026-08-16), which
 specifies the wrapper against exactly this contract.
 
 How the mount's future auto-upgrade should consume this RFC's
@@ -336,14 +336,14 @@ Each PR-sized, landing green:
       table entries), gate OUTERMOST so 426 precedes auth; the 426
       body (`UpgradeRequiredResponse`) and header constant live in
       `hopnet_common::compat` and are typeshared. Health payloads
-      carry `node_version` (`#[serde(default)]` — 0 = pre-RFC-022
+      carry `node_version` (`#[serde(default)]` — 0 = pre-RFC-023
       node); documentprovider + photos-client probes added. Pulled
       forward from S4 by necessity: the mount transport sends the
       header as a reqwest default (stack tests break otherwise) —
       S4 keeps the 426 handler UX, `min_node`, and the remaining
       clients. Registry + gate tests in `src/client_compat.rs`;
       end-to-end 426 shape asserted in the mount stack suite.
-      *(RFC-023 S3 addition, 2026-08-16: `HOPNET_MIN_CLIENT_OVERRIDE`,
+      *(RFC-024 S3 addition, 2026-08-16: `HOPNET_MIN_CLIENT_OVERRIDE`,
       a test-mode-only seam inside the gate — raises the effective
       minimum (never lowers: `max()` over the compiled value) and is
       advertised in the 426 body, so the mount-upgrade VM test can

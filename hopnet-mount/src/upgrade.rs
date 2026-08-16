@@ -1,4 +1,4 @@
-//! The auto-upgrade wrapper (RFC-023 S1): `hopnet-mount upgrade`, one
+//! The auto-upgrade wrapper (RFC-024 S1): `hopnet-mount upgrade`, one
 //! shot. Reads the node's half of the skew window from a header-less
 //! probe (the 426 policy readout), follows the Forgejo release feed
 //! with the forward walk, stages nix builds of release tags with
@@ -21,7 +21,7 @@ pub const ENV_FLAKE_REF: &str = "HOPNET_MOUNT_UPGRADE_FLAKE_REF";
 pub const ENV_NIX_BIN: &str = "HOPNET_MOUNT_UPGRADE_NIX_BIN";
 pub const ENV_RELEASE_URL: &str = "HOPNET_MOUNT_UPGRADE_RELEASE_URL";
 
-/// Deployment shape from env (RFC-023's contract, mirroring the node's:
+/// Deployment shape from env (RFC-024's contract, mirroring the node's:
 /// deployment shape, not policy). The two paths are REQUIRED — the S2
 /// module provides them; paths are never guessed.
 #[derive(Debug, Clone)]
@@ -76,7 +76,7 @@ pub fn default_flake_ref() -> String {
     release_feed::flake_ref(env!("CARGO_PKG_REPOSITORY"))
 }
 
-/// RFC-021's provenance record plus the RFC-023 fourth field: the staged
+/// RFC-021's provenance record plus the RFC-024 fourth field: the staged
 /// binary's interrogated `--min-node`, so no tag is questioned twice.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct Provenance {
@@ -96,7 +96,7 @@ pub struct Readout {
 #[derive(Debug, PartialEq)]
 pub enum Probe {
     Policy(Readout),
-    /// A node that predates RFC-022 (or reports below this build's own
+    /// A node that predates RFC-023 (or reports below this build's own
     /// MIN_NODE on an ungated 200) — no policy to read, nothing to walk.
     NodeTooOld {
         node_version: u32,
@@ -107,7 +107,7 @@ pub enum Probe {
 
 /// Pure classification of the probe's answer. A gated node always 426s a
 /// header-less request, and the structured body carries both halves; a
-/// 200 means an UNGATED (pre-RFC-022) node, useful only if it somehow
+/// 200 means an UNGATED (pre-RFC-023) node, useful only if it somehow
 /// reports a version this build accepts (then with no min_client policy).
 pub fn parse_probe(status: u16, body: &[u8]) -> Probe {
     match status {
@@ -350,7 +350,7 @@ fn binary_min_node(link: &Path) -> u32 {
     answer.unwrap_or_else(|| {
         tracing::warn!(
             bin = %bin.display(),
-            "staged binary does not answer --min-node (pre-RFC-023 release); assuming 0"
+            "staged binary does not answer --min-node (pre-RFC-024 release); assuming 0"
         );
         0
     })
@@ -365,7 +365,7 @@ pub struct Walk {
     pub hold: Option<String>,
 }
 
-/// The forward walk (RFC-023). `current` is the profile binary's own
+/// The forward walk (RFC-024). `current` is the profile binary's own
 /// version code (None = no profile yet). Every advance is backed by
 /// staged, verified, interrogated bytes; the walk stops at the first
 /// incompatibility and holds there.
@@ -491,7 +491,7 @@ pub fn current_version(profile: &Path) -> Option<u32> {
     parse_code(stdout.split_whitespace().last()?)
 }
 
-/// The exit-75 crash-loop guard (RFC-023 S2): true only when a profile
+/// The exit-75 crash-loop guard (RFC-024 S2): true only when a profile
 /// binary exists, answers `--version`, and its code differs from this
 /// build's own. Missing/broken profile → false — a unit could not have
 /// restarted through it anyway, and exiting 75 with an unchanged
@@ -548,7 +548,7 @@ pub fn run_with(env: &UpgradeEnv, node_url: &str, releases_url: &str) -> Outcome
                 why: format!(
                     "node reports {} — upgrade the node",
                     if node_version == 0 {
-                        "no version (pre-RFC-022)".to_string()
+                        "no version (pre-RFC-023)".to_string()
                     } else {
                         format_code(node_version)
                     }
@@ -804,7 +804,7 @@ mod tests {
         );
     }
 
-    // Should: hold on a 200 whose node_version is 0 (pre-RFC-022) or
+    // Should: hold on a 200 whose node_version is 0 (pre-RFC-023) or
     // below this build's MIN_NODE.
     // Should not: read an ungated 200 as a policy admitting an upgrade.
     #[test]

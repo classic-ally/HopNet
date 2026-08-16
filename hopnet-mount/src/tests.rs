@@ -1319,7 +1319,7 @@ async fn read_calls_counter_tracks_daemon_reads() {
     assert_eq!(core.read_calls(), before + 2);
 }
 
-// Impact: the client version header (RFC-022 S4) sends this code; a
+// Impact: the client version header (RFC-023 S4) sends this code; a
 // non-CalVer token would make the mount unable to pass any versioned
 // surface, so failing at build/test time beats failing at every request.
 // Should: parse the crate's own version token as CalVer and round-trip
@@ -1334,7 +1334,7 @@ fn own_version_is_calver() {
     );
 }
 
-// Impact: the upgrade wrapper (RFC-023) interrogates staged binaries by
+// Impact: the upgrade wrapper (RFC-024) interrogates staged binaries by
 // running --min-node and parsing trimmed stdout as one token; any
 // decoration here would silently break candidate selection.
 // Should: print exactly the bare CalVer token that round-trips back to
@@ -1351,7 +1351,7 @@ fn min_node_display_is_a_bare_parseable_token() {
 
 // Should: accept a node at or above MIN_NODE and refuse older ones,
 // naming the node as the remedy in both refusal forms.
-// Should not: accept a version-less (pre-RFC-022) node — zero is not
+// Should not: accept a version-less (pre-RFC-023) node — zero is not
 // "unknown, assume fine", it is "too old to say".
 #[test]
 fn node_version_check_matrix() {
@@ -1365,7 +1365,7 @@ fn node_version_check_matrix() {
     let older = crate::check_node_version(&report(20250101)).unwrap_err();
     assert!(older.contains("upgrade the node"), "{older}");
     let unversioned = crate::check_node_version(&report(0)).unwrap_err();
-    assert!(unversioned.contains("pre-RFC-022"), "{unversioned}");
+    assert!(unversioned.contains("pre-RFC-023"), "{unversioned}");
     assert!(unversioned.contains("upgrade the node"), "{unversioned}");
 }
 
@@ -1406,7 +1406,7 @@ async fn scripted_gate_refusal_is_typed_and_clearable() {
     assert_eq!(report.node_version, 20990101);
 }
 
-// ---------- RFC-023 S2: the activation coupling ----------
+// ---------- RFC-024 S2: the activation coupling ----------
 
 #[derive(Default)]
 struct RecordingCoupling {

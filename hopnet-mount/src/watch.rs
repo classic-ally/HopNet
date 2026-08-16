@@ -30,7 +30,7 @@ impl KernelInvalidator for NullInvalidator {
     fn inval_inode(&self, _ino: u64) {}
 }
 
-/// Daemon-side activation coupling (RFC-023 S2), fired from inside the
+/// Daemon-side activation coupling (RFC-024 S2), fired from inside the
 /// standardized 426 handler. Implementations MUST NOT block — the
 /// watcher task calls these inline; spawn internally.
 pub trait UpgradeCoupling: Send + Sync {
@@ -68,12 +68,12 @@ pub struct Watcher {
     transport: Arc<dyn NodeTransport>,
     invalidator: Arc<dyn KernelInvalidator>,
     anchor: Height,
-    /// Sticky RFC-022 S4 state (the passthrough-disarm pattern): set on
+    /// Sticky RFC-023 S4 state (the passthrough-disarm pattern): set on
     /// the first UpgradeRequired so the standardized handler logs the
     /// versions loudly ONCE and later rejections stay quiet; cleared by
     /// the next successful connect (a node rollback un-strands us).
     upgrade_required: bool,
-    /// RFC-023 S2 activation coupling; None = unmanaged install, the
+    /// RFC-024 S2 activation coupling; None = unmanaged install, the
     /// hold stays a log-only state.
     coupling: Option<Arc<dyn UpgradeCoupling>>,
 }
@@ -94,13 +94,13 @@ impl Watcher {
         }
     }
 
-    /// Attach the RFC-023 activation coupling (managed deployments).
+    /// Attach the RFC-024 activation coupling (managed deployments).
     pub fn with_upgrade_coupling(mut self, coupling: Arc<dyn UpgradeCoupling>) -> Self {
         self.coupling = Some(coupling);
         self
     }
 
-    /// The standardized 426 handler (RFC-022 S4): loud once, quiet
+    /// The standardized 426 handler (RFC-023 S4): loud once, quiet
     /// after — never generic transport noise. Returns true if `e` was
     /// an UpgradeRequired.
     fn note_upgrade_required(&mut self, e: &crate::transport::TransportError) -> bool {

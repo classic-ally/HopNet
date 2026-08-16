@@ -514,7 +514,7 @@ Cross-platform desktop application providing file management and network adminis
       FUSE inside a node container and proves kernel IO converges across
       the mesh (2026-08-01). Remaining: S10 desktop polish/packaging)
 - [ ] Client API compatibility — CalVer identity + skew enforcement
-      ([RFC-022](specs/client-compat.md), spec 2026-08-16: per-surface
+      ([RFC-023](specs/client-compat.md), spec 2026-08-16: per-surface
       `min_client` in the RFC-016 manifest, per-request version header
       with mandatory 426 on DeviceToken surfaces, client-side
       `min_node` health probe; all slices S1–S4 shipped 2026-08-16 —
@@ -524,7 +524,7 @@ Cross-platform desktop application providing file management and network adminis
       client-side 426 handling + min_node across mount/appex/ingress,
       and the `client-version-skew` orchestrator test)
 - [x] Mount auto-upgrade — the nix client channel
-      ([RFC-023](specs/mount-upgrade.md), spec 2026-08-16: follower
+      ([RFC-024](specs/mount-upgrade.md), spec 2026-08-16: follower
       forward-walk selection with the anchor lemma, hopnet-mount
       upgrade wrapper on timer/ExecStartPre/426 triggers,
       profile-symlink activation with exit 75; S1+S2 shipped

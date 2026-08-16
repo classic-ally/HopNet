@@ -59,7 +59,7 @@ pub struct HttpDispatch {
 
 impl HttpDispatch {
     pub fn new(base_url: &str, device_token: &str) -> Result<Self, String> {
-        // RFC-022: every request carries this build's identity. The
+        // RFC-023: every request carries this build's identity. The
         // ingress crates sit outside the main workspace and cannot
         // inherit its version; hopnet-common is path-depped from the
         // same checkout, so ITS compile-time token names the snapshot
@@ -106,7 +106,7 @@ impl HttpDispatch {
             // The node's shed gates own the retry (Retry-After) — park class.
             PhotosCoreError::Dispatch(format!("{UNREACHABLE_PREFIX}node shedding load (503)"))
         } else if status == reqwest::StatusCode::UPGRADE_REQUIRED {
-            // RFC-022 gate refusal: retrying cannot help — park with the
+            // RFC-023 gate refusal: retrying cannot help — park with the
             // versions named so the operator knows the remedy.
             let detail =
                 serde_json::from_str::<hopnet_common::compat::UpgradeRequiredResponse>(body)

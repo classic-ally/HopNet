@@ -1,11 +1,11 @@
-# RFC-023: hopnet-mount Auto-Upgrade — the Nix Client Channel
+# RFC-024: hopnet-mount Auto-Upgrade — the Nix Client Channel
 
 **Status**: Implemented (S1–S3 complete, 2026-08-16)
 **Depends on**: RFC-021 (the staging/flip/exit-75 machinery this
 transplants — profile indirection, honest-bytes staging, newest-wins
-seeding), RFC-022 (the signals this consumes — the 426 policy readout,
+seeding), RFC-023 (the signals this consumes — the 426 policy readout,
 versioned health probes, `MIN_NODE`, the upgrade-required daemon state)
-**Amends**: RFC-022 (discharges the "Deferred: rollout coupling"
+**Amends**: RFC-023 (discharges the "Deferred: rollout coupling"
 sketch); RFC-018 (the mount's lifecycle gains the upgrade path)
 **Related**: `nix/hopnet-mount-module.nix` + `nix/hopnet-module.nix`
 (the unit definitions this reshapes and mirrors);
@@ -13,7 +13,7 @@ sketch); RFC-018 (the mount's lifecycle gains the upgrade path)
 
 ## Motivation
 
-RFC-022 made client↔node skew visible and enforceable: a stale mount
+RFC-023 made client↔node skew visible and enforceable: a stale mount
 now fails loudly at its probe with the versions named, instead of
 silently running buggy code. What it deliberately did not do is
 provide an auto-upgrade mechanism for mismatched versions — a 426'd
@@ -25,7 +25,7 @@ activate whenever they like, provided they meet the constraints:
 
 - **Compatible with the pointed-at node** — the candidate's `min_node`
   satisfied by the node, the candidate's version satisfying the node's
-  `min_client` (the RFC-022 skew window).
+  `min_client` (the RFC-023 skew window).
 - **Honest bytes** — only staged bytes whose own `--version` answers
   the release tag are ever activated (RFC-021 rule 1).
 - **Restart-safe** — a mount restart is user-visible (open file
@@ -42,7 +42,7 @@ deployment class (Non-Goals), not this wrapper's concern.
 
 The wrapper learns the node's half of the skew window from ONE
 unauthenticated request — a header-less probe of the mount surface's
-health route answers 426 with `{min_client, node_version}` (RFC-022's
+health route answers 426 with `{min_client, node_version}` (RFC-023's
 structured body as a policy readout). The candidate's half — its
 compiled `min_node` — comes from the staged binary itself
 (`hopnet-mount --min-node`, the sibling of `--version`), recorded in
@@ -88,7 +88,7 @@ poll the release feed, run the forward walk (stage → verify →
 interrogate → record provenance), and finish with at most one atomic
 temp-link + rename of the profile symlink. The flip is the wrapper's
 ONLY output; it never touches the running daemon — systemd is the sole
-coordinator (RFC-022's coupling sketch, discharged).
+coordinator (RFC-023's coupling sketch, discharged).
 
 Staging a tag is RFC-021's recipe pointed at the mount package:
 

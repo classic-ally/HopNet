@@ -1,7 +1,7 @@
 //! Node version identity (RFC-019 S3).
 //!
 //! The pure CalVer code helpers live in `hopnet_common::version`
-//! (RFC-022 — clients need them too) and are re-exported here so the
+//! (RFC-023 — clients need them too) and are re-exported here so the
 //! node's `crate::version::` call sites read naturally. This module
 //! keeps what is node-only: the compile-time identity readers and the
 //! test-mode override seams.

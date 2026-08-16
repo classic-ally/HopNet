@@ -90,7 +90,7 @@ pub fn default_flake_ref() -> String {
     hopnet_common::release_feed::flake_ref(env!("CARGO_PKG_REPOSITORY"))
 }
 
-// The refs/tags/ namespace lesson travels with the helper (RFC-023 hoist).
+// The refs/tags/ namespace lesson travels with the helper (RFC-024 hoist).
 pub use hopnet_common::release_feed::tag_ref;
 
 /// What `stage` records beside the out-link: enough to re-verify at

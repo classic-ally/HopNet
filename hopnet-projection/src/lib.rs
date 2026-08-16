@@ -317,7 +317,7 @@ pub struct Mount {
     pub prefix: &'static str,
     pub auth: AuthClass,
     pub router: axum::Router,
-    /// Per-surface override of the projection-wide minimum (RFC-022):
+    /// Per-surface override of the projection-wide minimum (RFC-023):
     /// the effective minimum client version code for this surface is
     /// `self.min_client.or(projection.min_client())`.
     pub min_client: Option<u32>,
@@ -434,7 +434,7 @@ pub trait Projection: Send + Sync {
         &[]
     }
 
-    // RFC-022 additions:
+    // RFC-023 additions:
 
     /// Projection-wide default: the oldest client version code every
     /// surface of this projection supports — the coverage backstop; a

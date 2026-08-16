@@ -1,8 +1,8 @@
-//! Client version enforcement (RFC-022 S3).
+//! Client version enforcement (RFC-023 S3).
 //!
 //! Every DeviceToken surface is wrapped in [`client_version_gate`],
 //! which compares the client's self-declared identity header against the
-//! surface's resolved minimum (RFC-022 S2 declarations) — one integer
+//! surface's resolved minimum (RFC-023 S2 declarations) — one integer
 //! comparison, no I/O. Rejection is `426 Upgrade Required` with a
 //! structured body ([`hopnet_common::compat::UpgradeRequiredResponse`]),
 //! deliberately distinct from 401/403: a version rejection must never
@@ -25,7 +25,7 @@ pub struct SurfaceCompat {
     pub min_client: u32,
 }
 
-/// Test-mode-only RAISE of a surface's minimum (RFC-023 S3's VM seam):
+/// Test-mode-only RAISE of a surface's minimum (RFC-024 S3's VM seam):
 /// `HOPNET_MIN_CLIENT_OVERRIDE` holding a CalVer token raises the
 /// compiled minimum via max() — it can never lower one, so a stray
 /// variable cannot disable skew enforcement. Malformed tokens are
@@ -56,7 +56,7 @@ fn effective_min(compiled: u32) -> u32 {
 /// The version gate. Missing, malformed, and too-old identities are all
 /// rejected the same way: device tokens exist for separate-lifecycle
 /// binaries, so an unversioned request on this auth class is exactly the
-/// invisible skew RFC-022 exists to kill.
+/// invisible skew RFC-023 exists to kill.
 pub async fn client_version_gate(
     State(cfg): State<SurfaceCompat>,
     req: Request,
@@ -84,7 +84,7 @@ pub async fn client_version_gate(
     }
 }
 
-/// Resolved minimum for a manifest-declared mount prefix (RFC-022 S2
+/// Resolved minimum for a manifest-declared mount prefix (RFC-023 S2
 /// rule: mount override, else projection default). Panics on an unknown
 /// or undeclared prefix — [`crate::projections::assert_client_compat_coverage`]
 /// has already guaranteed every DeviceToken mount resolves, so a miss
@@ -123,7 +123,7 @@ mod tests {
 
     /// Surface → health path pairing pinned for the registry walk: a
     /// future DeviceToken surface that ships without a probe fails this
-    /// list by omission (RFC-022: the probe is the consumer-lifecycle
+    /// list by omission (RFC-023: the probe is the consumer-lifecycle
     /// anchor).
     const PROBED_SURFACES: &[(&str, &str)] = &[
         (

@@ -21,7 +21,7 @@ pub fn manifests() -> &'static [&'static dyn Projection] {
 }
 
 /// DeviceToken-authed surfaces the host mounts OUTSIDE the manifest
-/// system (RFC-022): (full prefix, min_client). The named sibling of
+/// system (RFC-023): (full prefix, min_client). The named sibling of
 /// the tripwire's `storage_host::handlers::TX_FUNCTIONS` check —
 /// host-owned surfaces must not escape the coverage rule just because
 /// no manifest declares them. S3's enforcement layer reads minimums
@@ -35,7 +35,7 @@ pub const HOST_DEVICE_TOKEN_MIN_CLIENT: &[(&str, u32)] = &[
     ("/api/photos/client", 20260802),
 ];
 
-/// RFC-022 coverage assertion — the post-capabilities sibling of
+/// RFC-023 coverage assertion — the post-capabilities sibling of
 /// `assert_projection_registrations` (which runs before AppState exists
 /// and so cannot walk `mounts()`): every `DeviceToken` surface, manifest
 /// or host-owned, must resolve a valid minimum client version. Versioning
@@ -53,7 +53,7 @@ pub fn assert_client_compat_coverage(caps: &hopnet_projection::host::HostCapabil
             let code = resolved.unwrap_or_else(|| {
                 panic!(
                     "{} mount '{}' is DeviceToken-authed but resolves no min_client \
-                     (neither the mount nor the projection declares one) — RFC-022 \
+                     (neither the mount nor the projection declares one) — RFC-023 \
                      makes versioning a precondition of the auth class",
                     m.name(),
                     mount.prefix
@@ -79,7 +79,7 @@ pub fn assert_client_compat_coverage(caps: &hopnet_projection::host::HostCapabil
 mod tests {
     use super::*;
 
-    // Impact: coverage is what turns RFC-022's "versioning is a
+    // Impact: coverage is what turns RFC-023's "versioning is a
     // precondition of the DeviceToken auth class" from aspiration into
     // mechanics — a new DeviceToken surface with no declaration must
     // fail here (and at boot), not ship unversioned and recreate the

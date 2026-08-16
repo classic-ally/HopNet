@@ -51,7 +51,7 @@ const GUARDED: &[&str] = &[
     "HOPNET_UPGRADE_FLAKE_REF",
     "HOPNET_UPGRADE_AUTO_STAGE",
     "HOPNET_UPGRADE_AUTO_ACTIVATE",
-    // The RFC-023 S3 min-client raise seam (client_compat.rs).
+    // The RFC-024 S3 min-client raise seam (client_compat.rs).
     "HOPNET_MIN_CLIENT_OVERRIDE",
 ];
 

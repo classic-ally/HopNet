@@ -41,7 +41,7 @@ public enum ApiError: Error, CustomStringConvertible {
     case notFound
     case unauthorized
     case notReady
-    /// RFC-022: the node's version gate refused this build (426).
+    /// RFC-023: the node's version gate refused this build (426).
     /// Only an extension update clears it — never a credential fix.
     case upgradeRequired(minClient: UInt32, nodeVersion: UInt32)
     case serverError(String)
@@ -79,7 +79,7 @@ public class HopNetApiClient {
     
     public init(config: FileProviderConfig) {
         self.config = config
-        // RFC-022: every request carries this build's identity as a
+        // RFC-023: every request carries this build's identity as a
         // session-wide default header; the node's DeviceToken surfaces
         // reject header-less requests with 426.
         let configuration = URLSessionConfiguration.default

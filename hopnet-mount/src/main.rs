@@ -12,8 +12,8 @@ fn main() {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    // RFC-022 S1: every client binary answers --version, even the
-    // unsupported-platform stub. RFC-023 S1: --min-node likewise.
+    // RFC-023 S1: every client binary answers --version, even the
+    // unsupported-platform stub. RFC-024 S1: --min-node likewise.
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("hopnet-mount {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -59,7 +59,7 @@ mod linux {
         Mount(MountArgs),
         /// Validate and store a device token for this user
         Login(LoginArgs),
-        /// Stage and activate the newest node-compatible release (RFC-023)
+        /// Stage and activate the newest node-compatible release (RFC-024)
         Upgrade(UpgradeArgs),
     }
 
@@ -142,7 +142,7 @@ mod linux {
     }
 
     pub fn run() {
-        // --min-node, the sibling of --version (RFC-023 S1): answered
+        // --min-node, the sibling of --version (RFC-024 S1): answered
         // before clap because Cli requires a subcommand. Its only caller
         // is the upgrade wrapper interrogating a staged binary.
         if std::env::args().any(|a| a == "--min-node") {
@@ -157,7 +157,7 @@ mod linux {
         }
     }
 
-    /// One wrapper run (RFC-023 S1). Every operational outcome exits 0
+    /// One wrapper run (RFC-024 S1). Every operational outcome exits 0
     /// with one stdout line — S2's ExecStartPre must never block a
     /// mount start; only a missing env contract is a real error.
     fn upgrade(args: UpgradeArgs) {
@@ -189,7 +189,7 @@ mod linux {
     /// restart through the freshly flipped profile.
     const EXIT_CODE_RESTART: i32 = 75;
 
-    /// The RFC-023 S2 activation coupling: entered() spawns one
+    /// The RFC-024 S2 activation coupling: entered() spawns one
     /// `hopnet-mount upgrade` child (current_exe, env inherited — the
     /// unit's HOPNET_MOUNT_UPGRADE_* flows through); both hooks end by
     /// evaluating the exit-75 gate and firing the restart Notify. The
@@ -262,11 +262,11 @@ mod linux {
     }
 
     /// Readiness preflight (RFC-018): distinguish "not running" from
-    /// "running, not set up" instead of mounting into EIO. RFC-022 S4:
+    /// "running, not set up" instead of mounting into EIO. RFC-023 S4:
     /// the same probe settles both version policies before any user
     /// action — the node's gate answers 426 if THIS build is too old,
     /// and the report's node_version is checked against MIN_NODE.
-    /// RFC-023 S2: `stale_profile` (mount only, never login — exit 75
+    /// RFC-024 S2: `stale_profile` (mount only, never login — exit 75
     /// means nothing outside the unit) turns a 426 into exit 75 when the
     /// profile already holds different bytes: a flip landed between the
     /// pre-start wrapper run and this exec, restart into it.
@@ -430,7 +430,7 @@ mod linux {
         let rt = runtime();
         let paths = Paths::from_env();
 
-        // The RFC-023 deployment contract, when the unit provides it; an
+        // The RFC-024 deployment contract, when the unit provides it; an
         // unmanaged install runs with the coupling disarmed and the 426
         // hold stays a log-only state.
         let upgrade_env = match hopnet_mount::upgrade::UpgradeEnv::from_env() {
@@ -543,7 +543,7 @@ mod linux {
         }
 
         // Watch loop (RFC-018 S4): pokes → delta sync → kernel busting.
-        // RFC-023 S2: managed installs couple the loop's 426 hold to the
+        // RFC-024 S2: managed installs couple the loop's 426 hold to the
         // upgrade wrapper and the exit-75 restart request.
         let restart = Arc::new(tokio::sync::Notify::new());
         let invalidator = Arc::new(hopnet_mount::fuse::FuserInvalidator(session.notifier()));
@@ -560,7 +560,7 @@ mod linux {
         rt.spawn(watcher.run());
 
         // systemd stops with SIGTERM; interactive use sends SIGINT. The
-        // third arm is the RFC-023 activation request — the exit belongs
+        // third arm is the RFC-024 activation request — the exit belongs
         // to the binary, AFTER the clean unmount below.
         let restart_requested = rt.block_on(async {
             let mut sigterm =

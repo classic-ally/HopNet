@@ -1,6 +1,6 @@
 # RFC-012: Device Token Session Bootstrap
 
-**Amended by**: RFC-022 (client compatibility — device-token requests
+**Amended by**: RFC-023 (client compatibility — device-token requests
 carry the client version; per-surface health probes, 2026-08-16)
 
 ## Abstract

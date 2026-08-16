@@ -66,9 +66,9 @@ pub enum Health {
     NotReady,
 }
 
-/// The health probe's full answer (RFC-022 S4): readiness plus the
+/// The health probe's full answer (RFC-023 S4): readiness plus the
 /// node's identity, the value the daemon's `min_node` check reads.
-/// `node_version: 0` = a pre-RFC-022 node that never sent the field.
+/// `node_version: 0` = a pre-RFC-023 node that never sent the field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthReport {
     pub status: Health,
@@ -89,7 +89,7 @@ pub enum TransportError {
     /// Consensus wait timed out — outcome UNKNOWN; callers must not
     /// assume either applied or not.
     OutcomeUnknown,
-    /// The node's version gate refused this client (RFC-022): the
+    /// The node's version gate refused this client (RFC-023): the
     /// surface's minimum is newer than this build. Not retryable —
     /// only an upgrade clears it.
     UpgradeRequired {
@@ -246,7 +246,7 @@ pub trait NodeTransport: Send + Sync {
     ) -> BoxFuture<'_, Result<Height, TransportError>>;
 
     /// Node readiness — distinguishes "not running" from "not set up" —
-    /// plus the node's version identity (RFC-022 S4).
+    /// plus the node's version identity (RFC-023 S4).
     fn health(&self) -> BoxFuture<'_, Result<HealthReport, TransportError>>;
 
     /// Mesh-level capacity numbers for statfs — node-side definitions

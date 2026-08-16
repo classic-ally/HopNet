@@ -4,7 +4,7 @@
 # unit attrs vs NixOS serviceConfig) and where the package lands
 # (home.packages vs environment.systemPackages).
 #
-# RFC-023 S2: with upgrade.enable (the default) the unit execs through
+# RFC-024 S2: with upgrade.enable (the default) the unit execs through
 # a self-owned profile symlink, seeds it newest-wins from the flake
 # pin, checks for releases before every start and on a ~6-hourly
 # timer, and restarts a 426'd daemon into the flipped profile via
@@ -21,7 +21,7 @@ let
     then cfg.mountpoint
     else "%h/${cfg.mountpoint}";
 
-  # The RFC-023 indirection, under the daemon's own data-dir default
+  # The RFC-024 indirection, under the daemon's own data-dir default
   # (~/.local/share/hopnet). %h expands in unit directives ONLY —
   # never inside script files, which is why the seed script below
   # reads the path from its environment instead.
@@ -52,7 +52,7 @@ let
   # bounding the pre-start upgrade run.
   unitPath = "/run/wrappers/bin:${lib.makeBinPath [ pkgs.fuse3 pkgs.git pkgs.coreutils ]}";
 
-  # The RFC-023 deployment contract plus TLS trust for the feed/probe,
+  # The RFC-024 deployment contract plus TLS trust for the feed/probe,
   # shared by the mount service and the follower timer's oneshot.
   upgradeEnv =
     [
@@ -110,7 +110,7 @@ let
   timerExec = "${profile}/bin/hopnet-mount upgrade${upgradeArgs}";
 
   description = "HopNet drive FUSE mount (RFC-018)";
-  followerDescription = "HopNet mount release follower (RFC-023)";
+  followerDescription = "HopNet mount release follower (RFC-024)";
 
   # RestartForceExitStatus: exit 75 is the activation request (the
   # node's RFC-019 S6 convention) — restarted even if the Restart=
@@ -177,7 +177,7 @@ in
         type = lib.types.bool;
         default = true;
         description = ''
-          RFC-023 auto-upgrade: exec through a self-owned profile
+          RFC-024 auto-upgrade: exec through a self-owned profile
           symlink, seed it newest-wins from the flake pin, check for
           releases before every start and on a ~6-hourly timer, and let
           a 426'd daemon restart itself into the flipped profile

@@ -703,7 +703,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // projection's mounts()/exporter(); built once, cheap clones.
             let host_caps = capabilities::build_capabilities(&app_state);
 
-            // RFC-022 coverage tripwire (post-caps sibling of the RFC-015
+            // RFC-023 coverage tripwire (post-caps sibling of the RFC-015
             // one at boot): fail-stop if any DeviceToken surface ships
             // without a resolved minimum client version.
             projections::assert_client_compat_coverage(&host_caps);
@@ -860,7 +860,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 // wears the same device-token auth. A literal route, not a
                 // second nest at the projection's prefix: two nests at one
                 // path conflict, a static route beside a nest does not.
-                // Version gate outermost (RFC-022 S3): a stale client gets
+                // Version gate outermost (RFC-023 S3): a stale client gets
                 // 426 before any auth/DB work.
                 .route(
                     "/integrations/mount/statfs",
@@ -941,7 +941,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                             ))
                         }
                         hopnet_projection::AuthClass::DeviceToken => {
-                            // RFC-022 S3: version gate outermost — a stale
+                            // RFC-023 S3: version gate outermost — a stale
                             // client is told to upgrade (426) before any
                             // auth/DB work. Resolution per S2; the coverage
                             // assertion above guarantees it succeeds.

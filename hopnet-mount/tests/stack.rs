@@ -79,7 +79,7 @@ async fn boot_node() -> NodeGuard {
     panic!("node did not come up on port {port}");
 }
 
-/// Raw reqwest client carrying this build's version header (RFC-022 S3):
+/// Raw reqwest client carrying this build's version header (RFC-023 S3):
 /// DeviceToken surfaces 426 header-less requests, so every harness-side
 /// raw call rides the same identity the transport sends by default.
 fn versioned_client() -> reqwest::Client {
@@ -214,7 +214,7 @@ async fn http_transport_full_read_contract() {
 
     let report = transport.health().await.unwrap();
     assert_eq!(report.status, Health::Ready);
-    // RFC-022 S4: the probe carries the node's identity for min_node.
+    // RFC-023 S4: the probe carries the node's identity for min_node.
     assert!(hopnet_common::version::code_is_valid(report.node_version));
 
     let root = transport.item(ItemId::Root).await.unwrap().unwrap();
@@ -934,7 +934,7 @@ async fn fuse_mount_smoke_against_live_node() {
 // Should: return capacity numbers through the transport with a valid
 // device token.
 // Should not: answer statfs without a client version header (426, the
-// RFC-022 gate, before auth) or without a device token (401, after the
+// RFC-023 gate, before auth) or without a device token (401, after the
 // gate passes).
 #[tokio::test]
 async fn statfs_route_is_authed_and_shaped() {

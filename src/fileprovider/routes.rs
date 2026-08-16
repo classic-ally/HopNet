@@ -21,7 +21,7 @@ use hopnet_common::fileprovider::TestResponse;
 /// cannot live inside a DeviceToken projection mount (auth wraps the
 /// whole router). Same handler for every integration — readiness is a
 /// node property, not a per-surface one. Each route is individually
-/// version-gated with its surface's resolved minimum (RFC-022 S3): the
+/// version-gated with its surface's resolved minimum (RFC-023 S3): the
 /// probe is where a stale client learns it is stale, before any user
 /// action — a version gate is not auth.
 pub fn health_router(caps: &hopnet_projection::host::HostCapabilities) -> axum::Router<AppState> {
@@ -83,7 +83,7 @@ pub async fn get_health(State(app_state): State<AppState>) -> impl axum::respons
     };
     Json(HealthResponse {
         status,
-        // RFC-022 S3: the probe carries the node's identity — what the
+        // RFC-023 S3: the probe carries the node's identity — what the
         // client's min_node check reads.
         node_version: crate::version::effective_running_code(),
     })

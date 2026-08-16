@@ -143,7 +143,7 @@ impl hopnet_projection::Projection for DriveProjection {
     }
 }
 
-/// RFC-022: the oldest client version code this projection's surfaces
+/// RFC-023: the oldest client version code this projection's surfaces
 /// accept — the projection-wide backstop; no surface overrides it today.
 /// 2026.8.2, the pre-flag-day floor: header-less older clients are
 /// rejected by the mandatory-header rule regardless, so this only needs

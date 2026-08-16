@@ -92,7 +92,7 @@ struct MockState {
     /// node-unreachable arm of the daemon's last-known-value cache).
     statfs: Option<StatfsInfo>,
     /// When Some((min_client, node_version)), watch/health/changes
-    /// answer the RFC-022 gate's refusal — the stale-client scenario.
+    /// answer the RFC-023 gate's refusal — the stale-client scenario.
     upgrade_required: Option<(u32, u32)>,
     /// Version the mock node reports in its health payload.
     node_version: u32,
@@ -377,7 +377,7 @@ impl MockHandle {
         self.state.lock().expect("mock poisoned").statfs = info;
     }
 
-    /// Script the RFC-022 gate refusing this client: watch/health/
+    /// Script the RFC-023 gate refusing this client: watch/health/
     /// changes answer UpgradeRequired{min_client, node_version} until
     /// cleared with None (the "node accepts us again" transition).
     pub fn set_upgrade_required(&self, gate: Option<(u32, u32)>) {
@@ -783,7 +783,7 @@ impl NodeTransport for MockTransport {
     }
 }
 
-/// The scripted RFC-022 refusal, if armed.
+/// The scripted RFC-023 refusal, if armed.
 fn scripted_upgrade_required(state: &MockState) -> Option<TransportError> {
     state.upgrade_required.map(
         |(min_client, node_version)| TransportError::UpgradeRequired {

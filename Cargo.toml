@@ -9,7 +9,7 @@ exclude = ["crates/ingress-core", "crates/ingress-ffi"]
 [workspace.package]
 # CalVer YYYY.M.N (RFC-019 S3): year.month.counter-within-month. This is
 # the SINGLE authoritative version token — every member crate inherits it
-# via version.workspace = true (RFC-022), release tags are v{version},
+# via version.workspace = true (RFC-023), release tags are v{version},
 # the node attests it in consensus, and the epoch boot gate compares it
 # by exact equality. See common/src/version.rs for the integer encoding.
 version = "2026.8.3"
@@ -134,7 +134,7 @@ objc2-service-management = "0.3.2"
 security-framework = "3.3.0"
 
 [dev-dependencies]
-# oneshot router tests (RFC-022 client_compat registry test)
+# oneshot router tests (RFC-023 client_compat registry test)
 tower = { version = "0.5.2", features = ["util"] }
 
 [build-dependencies]

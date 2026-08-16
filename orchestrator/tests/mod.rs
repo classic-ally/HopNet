@@ -667,7 +667,7 @@ pub fn list_test_names() -> Vec<&'static str> {
 // Helper Functions
 // ============================================================================
 
-/// Client for DeviceToken surfaces (RFC-022 S4): carries the version
+/// Client for DeviceToken surfaces (RFC-023 S4): carries the version
 /// header as a default, since the node's gate 426s header-less
 /// requests, atop the trust-the-boundary TLS posture every
 /// orchestrator client shares (pinned-https). The orchestrator's

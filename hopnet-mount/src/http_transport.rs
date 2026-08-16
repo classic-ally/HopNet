@@ -23,7 +23,7 @@ use crate::transport::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Every request carries this build's identity (RFC-022 S3): the node's
+/// Every request carries this build's identity (RFC-023 S3): the node's
 /// version gate rejects header-less requests on DeviceToken surfaces, so
 /// the header rides as a client-wide default rather than per call site.
 fn version_headers() -> reqwest::header::HeaderMap {
@@ -155,7 +155,7 @@ pub(crate) fn item_from_wire(wire: MountItem) -> Item {
 
 /// Map a non-success response to its typed error, consuming the body
 /// when the status warrants it: a 426 carries the node's structured
-/// `UpgradeRequiredResponse` (RFC-022 S4), which becomes the typed
+/// `UpgradeRequiredResponse` (RFC-023 S4), which becomes the typed
 /// `UpgradeRequired` — never a generic protocol error. Anything else
 /// stays `Protocol("unexpected status ...")`.
 async fn reject(response: reqwest::Response) -> TransportError {

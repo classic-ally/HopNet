@@ -1,6 +1,6 @@
 //! Forgejo release-feed parsing and flake-ref derivation, shared by every
 //! upgrade channel (the node's provider, RFC-021; the mount wrapper,
-//! RFC-023). Pure: fetching stays in the leaf crates, and the
+//! RFC-024). Pure: fetching stays in the leaf crates, and the
 //! `env!("CARGO_PKG_REPOSITORY")` evaluations stay leaf-side so each
 //! binary derives from its own repository field.
 

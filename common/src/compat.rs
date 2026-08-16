@@ -1,4 +1,4 @@
-//! Client API compatibility wire contract (RFC-022 S3).
+//! Client API compatibility wire contract (RFC-023 S3).
 //!
 //! Shared between the node's version-enforcement layer and every client
 //! that must recognize a version rejection. Version values are the
@@ -9,7 +9,7 @@ use typeshare::typeshare;
 
 /// Header carrying the client's identity (its CalVer code) on every
 /// request to a DeviceToken surface: `x-hopnet-client-version: 20260802`.
-/// Identity only — acceptance policy lives at each end (RFC-022).
+/// Identity only — acceptance policy lives at each end (RFC-023).
 pub const CLIENT_VERSION_HEADER: &str = "x-hopnet-client-version";
 
 /// Body of a `426 Upgrade Required` version rejection. Distinct from

@@ -1,4 +1,4 @@
-//! CalVer version codes (RFC-019 S3, shared per RFC-022).
+//! CalVer version codes (RFC-019 S3, shared per RFC-023).
 //!
 //! The version scheme is CalVer `YYYY.M.N` — year, month, counter-within-
 //! month — with the workspace Cargo.toml as the single authoritative
@@ -11,7 +11,7 @@
 //!
 //! These are the pure code helpers; each binary reads its own identity
 //! via `env!("CARGO_PKG_VERSION")` in its own crate (the node in
-//! `src/version.rs`, clients per RFC-022) so the token always names the
+//! `src/version.rs`, clients per RFC-023) so the token always names the
 //! bytes actually compiled.
 
 /// The workspace CalVer code hopnet-common itself was compiled from.
@@ -19,11 +19,11 @@
 /// workspace version; they path-dep this crate from the same checkout,
 /// so its compile-time token IS the monorepo snapshot they were built
 /// from. Panics on a non-CalVer token — the same boot invariant every
-/// binary enforces (RFC-022 S1).
+/// binary enforces (RFC-023 S1).
 pub fn common_version_code() -> u32 {
     let version = env!("CARGO_PKG_VERSION");
     parse_code(version).unwrap_or_else(|| {
-        panic!("hopnet-common version {version:?} is not CalVer YYYY.M.N (RFC-022)")
+        panic!("hopnet-common version {version:?} is not CalVer YYYY.M.N (RFC-023)")
     })
 }
 
