@@ -18,6 +18,8 @@
     import { fetchUsers, shareFile, fetchShareDetails, unshareFile, type UserInfo } from '../../api/shares'
     import type { ShareParticipant } from '../../types'
     import PaneHeader from '../../primitives/PaneHeader.svelte'
+    import Breadcrumb from '../../primitives/Breadcrumb.svelte'
+    import { crumbsForFolder } from '../../primitives/crumbs'
     import { router, browseUrlFor, folderFromBrowseUrl } from '../../router.svelte'
 
     let { onToggleSidebar = () => {} }: { onToggleSidebar?: () => void } = $props()
@@ -188,26 +190,10 @@
         }
     }
 
-    // Parse current path into clickable breadcrumb segments
-    const pathSegments = $derived.by(() => {
-        if (currentPath === '/') {
-            return []
-        }
-
-        const segments = currentPath.split('/').filter(segment => segment.length > 0)
-        const breadcrumbs = []
-
-        let buildPath = ''
-        for (const segment of segments) {
-            buildPath += '/' + segment
-            breadcrumbs.push({
-                name: segment,
-                path: buildPath
-            })
-        }
-
-        return breadcrumbs
-    })
+    // Crumbs carry real hrefs now that folders are URLs, so a folder can be
+    // middle-clicked into a new tab; Breadcrumb hands plain clicks to
+    // navigateToPath and leaves modified ones to the browser.
+    const crumbs = $derived(crumbsForFolder(currentPath, browseUrlFor))
 
     function closePreview() {
         showPreview = false
@@ -256,7 +242,13 @@
 
     $effect(() => {
         const folder = currentPath
-        if (!$tokenStore) return
+        if (!$tokenStore) {
+            // Nothing to fetch and nothing pending: without this the pane sits
+            // on its initial loading state forever instead of showing that it
+            // has no rows.
+            loading = false
+            return
+        }
 
         // A hand-typed or trailing-slash URL is rewritten to its canonical
         // form first, so '/browse/a/' and '/browse/a//b' cannot become extra
@@ -560,28 +552,23 @@
     </div>
 {/if}
 
-<!-- Navigation breadcrumb -->
-<div class="flex items-center gap-2 p-2">
+<!--
+    Navigation lives in the Table's toolbar slot, so it sits inside the tile
+    with the rows rather than floating above it.
+-->
+{#snippet navigationRow()}
     <button
-        class="border-1 border-overlay1 text-muted rounded-md p-1 cursor-pointer bg-transparent hover:text-primary hover:border-mauve hover:bg-surface0 disabled:opacity-50 disabled:cursor-not-allowed"
+        class="border border-overlay1 text-muted rounded-md p-1 cursor-pointer bg-transparent hover:text-primary hover:border-mauve hover:bg-surface0 disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
         onclick={toggleSearchBar}
-        aria-label={showSearchBar ? "Close search" : "Open search"}
+        aria-label={showSearchBar ? 'Close search' : 'Open search'}
         disabled={loading}
     >
         <div class="{showSearchBar ? 'i-carbon-close' : 'i-carbon-search'} w-4 h-4"></div>
     </button>
     {#if !showSearchBar}
-        <button
-            class="border-1 border-overlay1 text-muted rounded-md p-1 cursor-pointer bg-transparent hover:text-primary hover:border-mauve hover:bg-surface0 disabled:opacity-50 disabled:cursor-not-allowed"
-            onclick={navigateToRoot}
-            aria-label="Navigate to root"
-            disabled={loading || currentPath === '/'}
-        >
-            <div class="i-carbon-home w-4 h-4"></div>
-        </button>
         {#if currentPath !== '/'}
             <button
-                class="border-1 border-overlay1 text-muted rounded-md p-1 cursor-pointer bg-transparent hover:text-primary hover:border-mauve hover:bg-surface0 disabled:opacity-50 disabled:cursor-not-allowed"
+                class="border border-overlay1 text-muted rounded-md p-1 cursor-pointer bg-transparent hover:text-primary hover:border-mauve hover:bg-surface0 disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
                 onclick={navigateUp}
                 aria-label="Navigate up a folder"
                 disabled={loading}
@@ -589,11 +576,11 @@
                 <div class="i-carbon-chevron-up w-4 h-4"></div>
             </button>
         {/if}
-        <span class="text-subtitle text-sm font-mono">{#if currentPath === '/'}<span class="text-primary">/</span>{:else}{#each pathSegments as segment, i}<span class="text-muted">/</span>{#if i === pathSegments.length - 1}<span class="text-primary">{segment.name}</span>{:else}<span class="text-blue hover:text-primary hover:underline cursor-pointer transition-colors" onclick={() => navigateToPath(segment.path)}>{segment.name}</span>{/if}{/each}{/if}</span>
+        <Breadcrumb segments={crumbs} onNavigate={navigateToPath} />
     {:else}
         <!-- Search input when search bar is open; drives the table state. -->
         <input
-            class="flex-1 bg-transparent text-primary border-overlay0 border-2 rounded-md p-1"
+            class="flex-1 min-w-0 bg-transparent text-primary border-overlay0 border-2 rounded-md p-1"
             type="text"
             placeholder="Search in {currentPath}"
             bind:value={table.search}
@@ -601,7 +588,7 @@
             autofocus
         >
     {/if}
-</div>
+{/snippet}
 
 {#snippet typeCell(row: FileItem)}
     <div class="{getFileIcon(row.inode_type === InodeType.Folder ? 'Folder' : 'File', getFileName(row.path), 'list')} w-4 h-4 text-muted"></div>
@@ -644,7 +631,7 @@
     view={viewMode}
     gridItem={fileTile}
     selection="pointer"
-    toolbar={false}
+    toolbar={navigationRow}
     onRowClick={handleItemClick}
     onRowDblClick={handleItemDoubleClick}
     rowClass={rowClasses}
