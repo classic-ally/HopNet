@@ -342,7 +342,7 @@ public class HopNetApiClient {
         }
         
         do {
-            let (_, response) = try await session.data(for: request)
+            let (data, response) = try await session.data(for: request)
             
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw ApiError.serverError("Invalid response type")
@@ -497,7 +497,7 @@ public class HopNetApiClient {
         logger.debug("Creating item: \(filename) in \(parentItemIdentifier)")
         
         do {
-            let (_, response) = try await session.data(for: request)
+            let (data, response) = try await session.data(for: request)
             
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw ApiError.serverError("Invalid response type")
