@@ -518,7 +518,11 @@ Cross-platform desktop application providing file management and network adminis
       CAP_SYS_ADMIN wrapper in the NixOS module). Cross-node regression
       guard: orchestrator test `mount-cross-node-consistency` mounts via
       FUSE inside a node container and proves kernel IO converges across
-      the mesh (2026-08-01). Remaining: S10 desktop polish/packaging)
+      the mesh (2026-08-01). Cache hardening 2026-08-16: descriptors and
+      per-blob states are LRU-bounded, so tree-sweeping reads (migration
+      verification, grep -r, backups) no longer exhaust RLIMIT_NOFILE
+      and wedge reads into silent EIO. Remaining: S10 desktop
+      polish/packaging)
 - [ ] Client API compatibility — CalVer identity + skew enforcement
       ([RFC-023](specs/client-compat.md), spec 2026-08-16: per-surface
       `min_client` in the RFC-016 manifest, per-request version header

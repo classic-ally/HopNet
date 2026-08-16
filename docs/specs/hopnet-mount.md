@@ -383,7 +383,13 @@ implements that contract. Each slice is PR-sized and lands green.
       test suite (2026-07-30; includes the modification-height stamping
       fix — deciding block height, not lagging last_decided)
 - [x] S5 — content reads: sparse cache, whole-file fast path,
-      snapshot-at-open, disk-pressure eviction (2026-07-30)
+      snapshot-at-open, disk-pressure eviction (2026-07-30; 2026-08-16
+      hardening: master fds and per-blob states are LRU-bounded — the
+      cache previously held one fd per distinct blob for the daemon
+      lifetime and wedged all new reads into silent EIO once the stock
+      1024 RLIMIT_NOFILE filled, ~1000 distinct files in one lifetime;
+      open() failures in the cache path now log with errno diagnosis,
+      and the systemd units set LimitNOFILE=65536 as stopgap headroom)
 - [x] S6 — submit-and-wait-decided + strict mutation routes (node-side)
       (2026-07-30). The pipeline's per-tx oneshot already waited for the
       local commit on the proposer path; S6 threads the decided height

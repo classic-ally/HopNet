@@ -469,6 +469,8 @@ mod linux {
             policy: hopnet_mount::cache::EvictionPolicy::default_min_free(
                 hopnet_mount::cache::DEFAULT_SEGMENT_SIZE,
             ),
+            max_open_files: hopnet_mount::cache::DEFAULT_MAX_OPEN_FILES,
+            max_blobs: hopnet_mount::cache::DEFAULT_MAX_BLOBS,
         };
         let cache = match hopnet_mount::cache::CacheManager::new(cache_config, transport.clone()) {
             Ok(cache) => Arc::new(cache),

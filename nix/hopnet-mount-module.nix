@@ -240,6 +240,9 @@ in
               ExecStart = execStart;
               Restart = "on-failure";
               RestartSec = 5;
+              # Stopgap headroom over the 1024 soft default; the daemon
+              # additionally bounds its own cache descriptors (LRU).
+              LimitNOFILE = 65536;
               Environment = serviceEnv;
             } // lib.optionalAttrs cfg.upgrade.enable upgradeServiceBits;
             Install.WantedBy = [ "default.target" ];
@@ -306,6 +309,9 @@ in
               ExecStart = execStart;
               Restart = "on-failure";
               RestartSec = 5;
+              # Stopgap headroom over the 1024 soft default; the daemon
+              # additionally bounds its own cache descriptors (LRU).
+              LimitNOFILE = 65536;
               Environment = serviceEnv;
             } // lib.optionalAttrs cfg.upgrade.enable upgradeServiceBits;
             wantedBy = [ "default.target" ];

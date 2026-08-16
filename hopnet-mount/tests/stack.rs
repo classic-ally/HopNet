@@ -633,6 +633,8 @@ async fn fuse_mount_smoke_against_live_node() {
                 root: cache_dir.path().join("content"),
                 segment_size: hopnet_mount::cache::DEFAULT_SEGMENT_SIZE,
                 policy: hopnet_mount::cache::EvictionPolicy::MaxBytes { bytes: 1 << 30 },
+                max_open_files: hopnet_mount::cache::DEFAULT_MAX_OPEN_FILES,
+                max_blobs: hopnet_mount::cache::DEFAULT_MAX_BLOBS,
             },
             transport.clone() as Arc<dyn NodeTransport>,
         )
@@ -1021,6 +1023,8 @@ async fn passthrough_smoke_against_live_node() {
                 root: cache_dir.path().join("content"),
                 segment_size: SEGMENT,
                 policy: hopnet_mount::cache::EvictionPolicy::MaxBytes { bytes: 1 << 30 },
+                max_open_files: hopnet_mount::cache::DEFAULT_MAX_OPEN_FILES,
+                max_blobs: hopnet_mount::cache::DEFAULT_MAX_BLOBS,
             },
             transport.clone() as Arc<dyn NodeTransport>,
         )

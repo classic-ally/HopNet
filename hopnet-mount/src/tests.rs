@@ -499,6 +499,28 @@ fn setup_cached(
     segment_size: u64,
     policy: EvictionPolicy,
 ) -> (Arc<MountCore>, MockHandle, tempfile::TempDir) {
+    let (core, handle, _cache, dir) = setup_cached_with_caps(
+        segment_size,
+        policy,
+        crate::cache::DEFAULT_MAX_OPEN_FILES,
+        crate::cache::DEFAULT_MAX_BLOBS,
+    );
+    (core, handle, dir)
+}
+
+/// `setup_cached` with explicit descriptor/blob-state caps, also
+/// handing back the cache so tests can assert on its gauges.
+fn setup_cached_with_caps(
+    segment_size: u64,
+    policy: EvictionPolicy,
+    max_open_files: usize,
+    max_blobs: usize,
+) -> (
+    Arc<MountCore>,
+    MockHandle,
+    Arc<CacheManager>,
+    tempfile::TempDir,
+) {
     let (transport, handle) = MockTransport::new();
     let dir = tempfile::tempdir().expect("cache tempdir");
     let cache = Arc::new(
@@ -507,13 +529,15 @@ fn setup_cached(
                 root: dir.path().join("content"),
                 segment_size,
                 policy,
+                max_open_files,
+                max_blobs,
             },
             transport.clone(),
         )
         .expect("cache"),
     );
-    let core = Arc::new(MountCore::new(transport, DEFAULT_TTL).with_cache(cache));
-    (core, handle, dir)
+    let core = Arc::new(MountCore::new(transport, DEFAULT_TTL).with_cache(cache.clone()));
+    (core, handle, cache, dir)
 }
 
 fn read_blob_calls(handle: &MockHandle) -> Vec<(u64, u64)> {
@@ -576,7 +600,12 @@ fn cache_fd_census(root: &std::path::Path) -> usize {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn distinct_blob_reads_do_not_accumulate_fds() {
-    let (core, handle, dir) = setup_cached(64, EvictionPolicy::MaxBytes { bytes: 1 << 20 });
+    let (core, handle, _cache, dir) = setup_cached_with_caps(
+        64,
+        EvictionPolicy::MaxBytes { bytes: 1 << 20 },
+        4,
+        crate::cache::DEFAULT_MAX_BLOBS,
+    );
     for i in 0..20u8 {
         let name = format!("file-{i}.bin");
         let content = vec![i; 64];
@@ -591,6 +620,120 @@ async fn distinct_blob_reads_do_not_accumulate_fds() {
         "{census} cache fds held after 20 distinct blob reads — \
          descriptors must not scale with distinct blobs"
     );
+}
+
+// Should: keep at most `max_open_files` master descriptors open while
+// serving reads of many more distinct blobs, every read exact.
+#[tokio::test]
+async fn descriptor_lru_bounds_open_files() {
+    let (core, handle, cache, _dir) = setup_cached_with_caps(
+        64,
+        EvictionPolicy::MaxBytes { bytes: 1 << 20 },
+        4,
+        crate::cache::DEFAULT_MAX_BLOBS,
+    );
+    for i in 0..16u8 {
+        let name = format!("f{i}.bin");
+        let content = vec![i ^ 0x5a; 64];
+        handle.add_file_with_content(ItemId::Root, &name, &content);
+        let node = core.lookup(ROOT_INO, &name).await.unwrap();
+        let fh = core.open(node.ino).await.unwrap();
+        assert_eq!(core.read(fh, 0, 64).await.unwrap(), content);
+        let open = cache.open_file_count();
+        assert!(open <= 4, "{open} master fds open, cap is 4");
+    }
+}
+
+// Impact: the blobs map once grew monotonically — one held fd each —
+// with every distinct blob ever read in a daemon lifetime; this is the
+// bound the map silently lacked.
+// Should: fully evict coldest quiescent blob states past `max_blobs`.
+// Should: refetch and serve exact bytes when a pruned blob is re-read.
+#[tokio::test]
+async fn blob_states_bounded_and_rereadable_after_prune() {
+    let (core, handle, cache, _dir) = setup_cached_with_caps(
+        64,
+        EvictionPolicy::MaxBytes { bytes: 1 << 20 },
+        crate::cache::DEFAULT_MAX_OPEN_FILES,
+        8,
+    );
+    let first_content = vec![0xa7u8; 64];
+    handle.add_file_with_content(ItemId::Root, "first.bin", &first_content);
+    let first = core.lookup(ROOT_INO, "first.bin").await.unwrap();
+    let first_fh = core.open(first.ino).await.unwrap();
+    assert_eq!(core.read(first_fh, 0, 64).await.unwrap(), first_content);
+
+    for i in 0..32u8 {
+        let name = format!("g{i}.bin");
+        let content = vec![i; 64];
+        handle.add_file_with_content(ItemId::Root, &name, &content);
+        let node = core.lookup(ROOT_INO, &name).await.unwrap();
+        let fh = core.open(node.ino).await.unwrap();
+        assert_eq!(core.read(fh, 0, 64).await.unwrap(), content);
+    }
+    let states = cache.blob_count();
+    assert!(states <= 8, "{states} blob states live, cap is 8");
+
+    // The coldest blob was pruned long ago; a re-read must transparently
+    // recreate its state and refetch.
+    assert_eq!(core.read(first_fh, 0, 64).await.unwrap(), first_content);
+}
+
+// Impact: a punched page behind a passthrough backing fd faults in as
+// zeros with no daemon in the loop — silent corruption, strictly worse
+// than a loud EIO. The S9 pin invariant must survive descriptor and
+// blob-state pressure.
+// Should: keep a pinned blob's state resident and its bytes intact
+// while both caps force eviction all around it.
+// Should not: evict or prune a blob while its passthrough pin is held.
+#[tokio::test]
+async fn pinned_backing_survives_descriptor_and_state_pressure() {
+    let (core, handle, cache, _dir) =
+        setup_cached_with_caps(64, EvictionPolicy::MaxBytes { bytes: 1 << 20 }, 2, 4);
+    let content: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(3)).collect();
+    handle.add_file_with_content(ItemId::Root, "pinned.bin", &content);
+    let node = core.lookup(ROOT_INO, "pinned.bin").await.unwrap();
+    let fh = core.open(node.ino).await.unwrap();
+    assert_eq!(core.read(fh, 0, 64).await.unwrap(), content);
+    let backing = core.backing_for(fh).expect("complete blob must back");
+
+    for i in 0..12u8 {
+        let name = format!("p{i}.bin");
+        let noise = vec![i | 0x80; 64];
+        handle.add_file_with_content(ItemId::Root, &name, &noise);
+        let n = core.lookup(ROOT_INO, &name).await.unwrap();
+        let h = core.open(n.ino).await.unwrap();
+        assert_eq!(core.read(h, 0, 64).await.unwrap(), noise);
+    }
+
+    let states = cache.blob_count();
+    assert!(states <= 4, "{states} blob states live, cap is 4");
+    let mut through_pin = vec![0u8; 64];
+    {
+        use std::os::unix::fs::FileExt;
+        backing
+            .file
+            .read_exact_at(&mut through_pin, 0)
+            .expect("pinned backing fd must stay readable");
+    }
+    assert_eq!(
+        through_pin, content,
+        "pinned blob's bytes must survive eviction pressure unpunched"
+    );
+}
+
+// Should: name the descriptor limit in plain terms when a cache-file
+// open hits EMFILE/ENFILE, so the operator learns the mount is
+// resource-limited, not corrupted.
+#[test]
+fn open_error_classifier_names_fd_limit() {
+    // 24 = EMFILE, 23 = ENFILE.
+    for errno in [23, 24] {
+        let msg = crate::cache::describe_open_error(&std::io::Error::from_raw_os_error(errno));
+        assert!(msg.contains("descriptor limit"), "errno {errno}: {msg}");
+    }
+    let enoent = crate::cache::describe_open_error(&std::io::Error::from_raw_os_error(2));
+    assert!(!enoent.contains("descriptor limit"), "{enoent}");
 }
 
 // Should: coalesce concurrent reads of one segment into exactly one
@@ -748,6 +891,8 @@ fn setup_writable() -> (Arc<MountCore>, MockHandle, tempfile::TempDir) {
                 root: dir.path().join("content"),
                 segment_size: 64,
                 policy: EvictionPolicy::MaxBytes { bytes: 1 << 20 },
+                max_open_files: crate::cache::DEFAULT_MAX_OPEN_FILES,
+                max_blobs: crate::cache::DEFAULT_MAX_BLOBS,
             },
             transport.clone(),
         )
