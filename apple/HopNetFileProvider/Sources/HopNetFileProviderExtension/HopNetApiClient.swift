@@ -94,7 +94,7 @@ public class HopNetApiClient {
     private func upgradeRequired(from data: Data?) -> ApiError {
         if let data,
            let body = try? JSONDecoder().decode(UpgradeRequiredResponse.self, from: data) {
-            return .upgradeRequired(minClient: body.minClient, nodeVersion: body.nodeVersion)
+            return .upgradeRequired(minClient: body.min_client, nodeVersion: body.node_version)
         }
         return .upgradeRequired(minClient: 0, nodeVersion: 0)
     }
