@@ -3,7 +3,7 @@
   import ValidatorPool from './ValidatorPool.svelte';
 
   const { Story } = defineMeta({
-    title: 'Components/ValidatorPool',
+    title: 'Panes/Resilience/ValidatorPool',
     component: ValidatorPool,
     argTypes: {
       seated: {

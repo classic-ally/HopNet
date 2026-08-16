@@ -98,6 +98,7 @@
                             Username
                         </label>
                         <TextInput
+                            id="username"
                             value={username}
                             placeholder="e.g., alice"
                             disabled={loading}

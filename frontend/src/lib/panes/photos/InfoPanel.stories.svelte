@@ -4,7 +4,7 @@
   import { mockDetail } from './fixtures';
 
   const { Story } = defineMeta({
-    title: 'Photos/InfoPanel',
+    title: 'Panes/Photos/InfoPanel',
     component: InfoPanel,
     // These components are dark-only; the main preview offers a light option.
     parameters: { backgrounds: { default: 'dark' } },

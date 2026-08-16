@@ -134,7 +134,7 @@
   ];
 
   const { Story } = defineMeta({
-    title: 'Components/FaultToleranceChart',
+    title: 'Panes/Resilience/FaultToleranceChart',
     component: FaultToleranceChart,
     argTypes: {
       data: {

@@ -4,13 +4,14 @@
     import EntryRow from '../../EntryRow.svelte';
     import StatusSpinner from '../../primitives/StatusSpinner.svelte';
     import { mergeStatusWords, WHIMSY, GENESIS, AUTH } from '../../primitives/statusWords';
-    import { API_BASE_URL } from '../../stores';
+    import { liveSetupApi, TRANSPORT_FAILURE, type SetupApi } from '../../api/setup';
 
     export let username: string;
     export let computername: string;
 
     export let onBackButton: () => void;
     export let onSetupComplete: (passphrase: string) => void;
+    export let api: SetupApi = liveSetupApi;
 
     let isLoading = false;
     let errorMessage = '';
@@ -21,39 +22,24 @@
         isLoading = true;
         errorMessage = '';
 
-        try {
-            const setupData = {
-                username: username,
-                node_name: computername,
-            };
-
-            const response = await fetch(`${API_BASE_URL}/setup`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(setupData)
-            });
-
-            if (response.ok) {
-                const data = await response.json();
-                console.log('Setup completed successfully');
-                onSetupComplete(data.passphrase);
-            } else {
-                throw new Error(`Setup failed with status: ${response.status}`);
-            }
-        } catch (error) {
-            console.error('Setup error:', error);
-            errorMessage = error instanceof Error ? error.message : 'Setup failed. Please try again.';
-        } finally {
-            isLoading = false;
+        const result = await api.createNetwork(username, computername);
+        if (result.ok) {
+            onSetupComplete(result.passphrase);
+        } else if (result.status === TRANSPORT_FAILURE) {
+            errorMessage = result.detail ?? 'Setup failed. Please try again.';
+        } else {
+            errorMessage = `Setup failed with status: ${result.status}`;
         }
+
+        isLoading = false;
     }
 </script>
 
 <SetupPane
     title="Confirm Selections"
     body="Creating new network as follows:"
+    onBack={onBackButton}
+    buttonsClass="flex items-center justify-end gap-3"
 >
     {#snippet features()}
         <EntryRow
@@ -79,12 +65,6 @@
     {/snippet}
 
     {#snippet buttons()}
-        <Button
-            icon="i-carbon-chevron-left"
-            text="Back"
-            onClick={() => {onBackButton()}}
-            disabled={isLoading}
-        />
         <Button
             icon="i-carbon-save"
             text="Save"

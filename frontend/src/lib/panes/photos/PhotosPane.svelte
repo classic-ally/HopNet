@@ -215,7 +215,7 @@
             >
                 <span class="i-carbon-menu text-lg"></span>
             </button>
-            <h3 class="font-semibold text-primary">Photos</h3>
+            <h3 class="text-lg font-semibold">Photos</h3>
             {#if enabled && cursor != null}
                 <span class="text-xs text-muted">synced to height {cursor}</span>
             {/if}

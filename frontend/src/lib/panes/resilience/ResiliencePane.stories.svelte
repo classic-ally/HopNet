@@ -3,7 +3,7 @@
   import ResiliencePane from './ResiliencePane.svelte';
 
   const { Story } = defineMeta({
-    title: 'Panes/ResiliencePane',
+    title: 'Panes/Resilience/ResiliencePane',
     component: ResiliencePane,
     parameters: {
       layout: 'fullscreen',

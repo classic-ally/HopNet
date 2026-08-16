@@ -84,22 +84,14 @@
 
     <!-- Prev / next -->
     {#if hasPrev}
-      <button
-        class="absolute left-2 top-1/2 -translate-y-1/2 z-10 p-2 rounded-full bg-surface0/70 hover:bg-surface1 text-text"
-        onclick={prev}
-        aria-label="Previous"
-      >
-        <span class="i-carbon-chevron-left text-2xl"></span>
-      </button>
+      <div class="absolute left-2 top-1/2 -translate-y-1/2 z-10">
+        <Button icon="i-carbon-chevron-left" text="Previous" variant="compact" onClick={prev} />
+      </div>
     {/if}
     {#if hasNext}
-      <button
-        class="absolute right-2 top-1/2 -translate-y-1/2 z-10 p-2 rounded-full bg-surface0/70 hover:bg-surface1 text-text"
-        onclick={next}
-        aria-label="Next"
-      >
-        <span class="i-carbon-chevron-right text-2xl"></span>
-      </button>
+      <div class="absolute right-2 top-1/2 -translate-y-1/2 z-10">
+        <Button icon="i-carbon-chevron-right" text="Next" variant="compact" onClick={next} />
+      </div>
     {/if}
 
     {#key current.photo_id}
@@ -112,32 +104,32 @@
           {#if videoUrl(current.photo_id)}
             <!-- svelte-ignore a11y_media_has_caption -->
             <video
-              class="stage-media"
+              class="max-h-[85vh] max-w-full object-contain rounded-lg"
               controls
               autoplay
               poster={displayUrl(current.photo_id)}
               src={videoUrl(current.photo_id)}
             ></video>
           {:else}
-            <div class="stage-wait text-muted">
-              <span class="i-carbon-circle-dash text-3xl spin"></span>
+            <div class="grid place-items-center w-48 h-48 text-muted">
+              <span class="i-carbon-circle-dash text-3xl animate-spin"></span>
             </div>
           {/if}
         {:else if failedId === current.photo_id}
-          <div class="stage-wait text-muted flex-col gap-2">
+          <div class="grid place-items-center gap-2 w-48 h-48 text-muted">
             <span class="i-carbon-no-image text-3xl"></span>
             <span class="text-sm">preview unavailable — download below</span>
           </div>
         {:else if displayUrl(current.photo_id)}
           <img
-            class="stage-media"
+            class="max-h-[85vh] max-w-full object-contain rounded-lg"
             src={displayUrl(current.photo_id)}
             alt=""
             onerror={() => (failedId = current.photo_id)}
           />
         {:else}
-          <div class="stage-wait text-muted">
-            <span class="i-carbon-circle-dash text-3xl spin"></span>
+          <div class="grid place-items-center w-48 h-48 text-muted">
+            <span class="i-carbon-circle-dash text-3xl animate-spin"></span>
           </div>
         {/if}
       </div>
@@ -151,27 +143,3 @@
     </div>
   {/if}
 </div>
-
-<style>
-  /* object-fit + viewport clamp in scoped CSS (presetMini ships neither). */
-  .stage-media {
-    max-height: 85vh;
-    max-width: 100%;
-    object-fit: contain;
-    border-radius: 0.5rem;
-  }
-  .stage-wait {
-    display: grid;
-    place-items: center;
-    width: 12rem;
-    height: 12rem;
-  }
-  .spin {
-    animation: spin 1s linear infinite;
-  }
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
-</style>

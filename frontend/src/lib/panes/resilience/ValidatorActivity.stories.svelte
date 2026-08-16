@@ -29,7 +29,7 @@
   }
 
   const { Story } = defineMeta({
-    title: 'Components/ValidatorActivity',
+    title: 'Panes/Resilience/ValidatorActivity',
     component: ValidatorActivity,
     argTypes: {
       v: {

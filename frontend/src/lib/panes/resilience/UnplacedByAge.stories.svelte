@@ -3,7 +3,7 @@
   import UnplacedByAge from './UnplacedByAge.svelte';
 
   const { Story } = defineMeta({
-    title: 'Components/UnplacedByAge',
+    title: 'Panes/Resilience/UnplacedByAge',
     component: UnplacedByAge,
     argTypes: {
       buckets: {

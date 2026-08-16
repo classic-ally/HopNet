@@ -5,7 +5,7 @@
   import { mockBuckets, mockManyPhotos, placeholderDisplay, placeholderThumb } from './fixtures';
 
   const { Story } = defineMeta({
-    title: 'Photos/MonthHistogram',
+    title: 'Panes/Photos/MonthHistogram',
     component: MonthHistogram,
     // These components are dark-only; the main preview offers a light option.
     parameters: { backgrounds: { default: 'dark' } },

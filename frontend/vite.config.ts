@@ -28,6 +28,30 @@ export default defineConfig({
   },
   test: {
     projects: [{
+      // Logic tests: no real browser, so they run anywhere `pnpm` runs.
+      //
+      // happy-dom is not decoration. Vitest picks its transform from the
+      // environment — `node` gets the SSR transform, which compiles runes
+      // against Svelte's *server* runtime, where $effect is a no-op and a
+      // $derived computes once and never invalidates again. Tests then read
+      // stale values and pass or fail for reasons that have nothing to do
+      // with the code. A DOM environment selects the web transform and the
+      // client runtime, which is what makes TableState testable at all.
+      extends: true,
+      test: {
+        name: 'unit',
+        environment: 'happy-dom',
+        include: ['src/**/*.test.ts'],
+      },
+      resolve: {
+        conditions: ['browser'],
+      },
+      ssr: {
+        resolve: {
+          conditions: ['browser'],
+        },
+      },
+    }, {
       extends: true,
       plugins: [
       // The plugin will run tests for the stories defined in your Storybook config
@@ -42,7 +66,11 @@ export default defineConfig({
           headless: true,
           provider: 'playwright',
           instances: [{
-            browser: 'chromium'
+            browser: 'chromium',
+            // Playwright's bundled chromium has no usable shared libraries on
+            // NixOS; CHROME_BIN (set by the dev shell) points at the nixpkgs
+            // build instead. Undefined elsewhere, where the bundle is fine.
+            launch: { executablePath: process.env.CHROME_BIN },
           }]
         },
         setupFiles: ['.storybook/vitest.setup.ts']

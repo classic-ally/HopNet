@@ -6,6 +6,13 @@
         type?: 'text' | 'password' | 'email' | 'number';
         mode?: 'desktop' | 'mobile';
         className?: string;
+        /// Target for a sibling `<label for=…>`. Without this, callers that
+        /// write a label get no association at all.
+        id?: string;
+        /// Accessible name for the inputs a visible label would crowd out —
+        /// a placeholder is not a label.
+        ariaLabel?: string;
+        maxlength?: number;
         oninput?: (event: Event) => void;
         onkeydown?: (event: KeyboardEvent) => void;
     }
@@ -17,6 +24,9 @@
         type = 'text',
         mode = 'desktop',
         className = '',
+        id,
+        ariaLabel,
+        maxlength,
         oninput,
         onkeydown
     }: TextInputProps = $props();
@@ -41,6 +51,9 @@
     {type}
     {placeholder}
     {disabled}
+    {id}
+    {maxlength}
+    aria-label={ariaLabel}
     bind:value={internalValue}
     oninput={(e) => {
         if (oninput) oninput(e);

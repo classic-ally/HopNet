@@ -1,26 +1,26 @@
 <script lang="ts">
-    import { TableHandler, ThSort, Datatable } from '@vincjo/datatables'
     import { tokenStore, API_BASE_URL, refreshTriggerStore, authenticatedFetch } from '../../stores'
     import { onMount } from 'svelte'
     import type { FileItem } from '../../types'
-    import { InodeType } from '../../types'
-    import { formatFileSize, getFileIcon, formatDateForContainer, getFileName } from '../../utils/formatters'
-    import { tableColumns, recentsBrowserColumns } from '../../utils/tableColumns'
+    import { formatFileSize, getFileIcon, getFileName } from '../../utils/formatters'
     import FilePreview from '../../Interface/FilePreview.svelte'
     import Toolbar from '../../primitives/Toolbar.svelte'
+    import Table from '../../primitives/Table.svelte'
+    import { TableState } from '../../primitives/tableState.svelte'
+    import DateCell from '../../primitives/DateCell.svelte'
+    import PaneHeader from '../../primitives/PaneHeader.svelte'
 
-    export let onToggleSidebar: () => void = () => {};
+    let { onToggleSidebar = () => {} }: { onToggleSidebar?: () => void } = $props()
 
-    let files: FileItem[] = []
-    let loading = true
-    let error = ''
-    let showPreview = false
-    let previewFile: FileItem | null = null
-    let previewFileIndex = 0
+    let fileCount = $state(0)
+    let loading = $state(true)
+    let error = $state('')
+    let showPreview = $state(false)
+    let previewFile = $state<FileItem | null>(null)
+    let previewFileIndex = $state(0)
 
-    const table = new TableHandler(files, {
-        rowsPerPage: 50,
-    })
+    // The fetch is capped at 50, so no pagination — the footer just counts.
+    const table = new TableState<FileItem>([])
 
     function getParentPath(fullPath: string): string {
         const lastSlash = fullPath.lastIndexOf('/')
@@ -43,8 +43,8 @@
 
             if (response.ok) {
                 const data = await response.json()
-                files = data
-                table.setRows(files)
+                table.setRows(data)
+                fileCount = data.length
             } else {
                 error = `Failed to fetch recent files: ${response.status} ${response.statusText}`
             }
@@ -55,8 +55,8 @@
         }
     }
 
-    function handleItemClick(item: FileItem) {
-        const fileIndex = table.rows.findIndex(row => row.path === item.path)
+    function handleItemDblClick(item: FileItem) {
+        const fileIndex = table.rows.findIndex((row) => row.path === item.path)
         if (fileIndex !== -1) {
             previewFileIndex = fileIndex
             previewFile = item
@@ -81,202 +81,77 @@
         fetchRecentFiles()
     })
 
-    $: if ($tokenStore) {
-        fetchRecentFiles()
-    }
+    // Refetch when the token changes (login/logout).
+    $effect(() => {
+        if ($tokenStore) fetchRecentFiles()
+    })
 
-    $: if ($refreshTriggerStore > 0) {
-        fetchRecentFiles()
-    }
+    $effect(() => {
+        if ($refreshTriggerStore > 0) fetchRecentFiles()
+    })
 </script>
 
-<Toolbar
-    leftElements={[]}
-    centerElements={[]}
-    rightElements={[]}
-    {onToggleSidebar}
+<Toolbar leftElements={[]} centerElements={[]} rightElements={[]} {onToggleSidebar} />
+
+<PaneHeader title="Recents" subtitle={`${fileCount} recently modified ${fileCount === 1 ? 'file' : 'files'}`} />
+
+{#snippet typeCell(row: FileItem)}
+    <div class="{getFileIcon('File', getFileName(row.path), 'list')} w-4 h-4 text-muted"></div>
+{/snippet}
+
+{#snippet nameCell(row: FileItem)}
+    {getFileName(row.path)}{#if row.shared_with_count && row.shared_with_count > 0}<span
+            class="inline-flex items-center gap-0.5 ml-2 align-middle text-xs text-mauve"
+            title="Shared with {row.shared_with_count}"
+        ><span class="i-carbon-share w-3 h-3"></span>{row.shared_with_count}</span>{/if}
+{/snippet}
+
+{#snippet locationCell(row: FileItem)}
+    <span class="text-sm text-muted font-mono">{getParentPath(row.path)}</span>
+{/snippet}
+
+{#snippet sizeCell(row: FileItem)}
+    <span class="text-sm text-muted font-mono">{formatFileSize(row.file_size)}</span>
+{/snippet}
+
+{#snippet modifiedCell(row: FileItem)}
+    <span class="text-sm text-muted"><DateCell date={row.modification_date} /></span>
+{/snippet}
+
+<Table
+    state={table}
+    selection="pointer"
+    onRowDblClick={handleItemDblClick}
+    {loading}
+    loadingText="Loading recent files..."
+    {error}
+    onRetry={fetchRecentFiles}
+    empty="No recent files to display"
+    columns={[
+        { id: 'type', sortField: 'inode_type', preset: 'icon', cell: typeCell },
+        { id: 'name', header: 'Name', sortField: 'path', preset: 'name', cell: nameCell },
+        { id: 'location', header: 'Location', sortField: 'path', preset: 'path', cell: locationCell },
+        {
+            id: 'size',
+            header: 'Size',
+            sortField: 'file_size',
+            sortValue: (r) => parseInt(r.file_size ?? '0'),
+            preset: 'size',
+            align: 'right',
+            cell: sizeCell
+        },
+        { id: 'modified', header: 'Modified', sortField: 'modification_date', preset: 'date', cell: modifiedCell }
+    ]}
 />
 
-<div>
-    <h3>Recents</h3>
-    <p class="text-sm text-muted">{files.length} recently modified {files.length === 1 ? 'file' : 'files'}</p>
-</div>
-
-<div class="border-solid border-1 rounded-lg p-1 border-overlay1">
-    {#if error}
-        <div class="text-red p-2 mb-2 border border-red rounded">
-            {error}
-            <button class="ml-2 text-blue underline" onclick={() => fetchRecentFiles()}>Retry</button>
-        </div>
-    {/if}
-
-    {#if loading}
-        <div class="text-muted p-4 text-center">Loading recent files...</div>
-    {:else}
-        <div class="table-wrapper">
-        <Datatable {table}>
-            <table use:tableColumns={recentsBrowserColumns} class="recents-table">
-                <thead>
-                    <tr class="text-subtitle">
-                        <ThSort {table} field="inode_type">Type</ThSort>
-                        <ThSort {table} field="path">Name</ThSort>
-                        <ThSort {table} field="path">Location</ThSort>
-                        <ThSort {table} field="file_size">Size</ThSort>
-                        <ThSort {table} field="modification_date">Modified</ThSort>
-                    </tr>
-                </thead>
-                <tbody>
-                    {#each table.rows as row}
-                        {@const modFormats = row.modification_date ? formatDateForContainer(row.modification_date) : null}
-                        <tr
-                            class="text-left cursor-pointer hover:bg-surface0"
-                            ondblclick={() => handleItemClick(row)}
-                        >
-                            <td class="w-8">
-                                <div class="{getFileIcon('File', getFileName(row.path), 'list')} w-4 h-4 text-muted"></div>
-                            </td>
-                            <td>{getFileName(row.path)}{#if row.shared_with_count && row.shared_with_count > 0}<span class="share-badge" title="Shared with {row.shared_with_count}"><span class="i-carbon-share w-3 h-3"></span><span class="share-count">{row.shared_with_count}</span></span>{/if}</td>
-                            <td class="text-sm text-muted font-mono">{getParentPath(row.path)}</td>
-                            <td class="text-sm text-muted text-right font-mono">{formatFileSize(row.file_size)}</td>
-                            <td class="date-cell text-sm text-muted">
-                                {#if modFormats}
-                                    <span class="date-full">{modFormats.full}</span>
-                                    <span class="date-time">{modFormats.dateTime}</span>
-                                    <span class="date-only">{modFormats.dateOnly}</span>
-                                {:else}
-                                    -
-                                {/if}
-                            </td>
-                        </tr>
-                    {:else}
-                        <tr>
-                            <td colspan="5" class="text-center text-muted p-4">
-                                No recent files to display
-                            </td>
-                        </tr>
-                    {/each}
-                </tbody>
-            </table>
-        </Datatable>
-        </div>
-    {/if}
-</div>
-
 {#if showPreview && previewFile}
+    <!-- The list handed to the preview is the sorted view the index was
+         computed against — the unsorted fetch order used to desync them. -->
     <FilePreview
         file={previewFile}
-        fileList={files}
+        fileList={table.rows}
         currentIndex={previewFileIndex}
         onClose={closePreview}
         onNavigate={handlePreviewNavigation}
     />
 {/if}
-
-<style>
-    .table-wrapper {
-        overflow-x: auto;
-        overflow-y: visible;
-    }
-
-    .recents-table {
-        table-layout: fixed;
-        width: 100%;
-    }
-
-    .recents-table td {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-    }
-
-    /* Hide text in type column header */
-    .recents-table :global(th:nth-child(1)) {
-        text-indent: -9999px;
-        overflow: hidden;
-        position: relative;
-        text-align: center;
-    }
-
-    .recents-table :global(th:nth-child(1) > *) {
-        position: relative;
-        left: 50%;
-        transform: translateX(calc(-50% - 4px));
-        padding-left: 0 !important;
-    }
-
-    :global(.padding-normal) td,
-    :global(.padding-normal) :global(th) {
-        padding: 8px 12px !important;
-    }
-
-    :global(.padding-compact) td,
-    :global(.padding-compact) :global(th) {
-        padding: 6px 8px !important;
-    }
-
-    :global(.padding-mini) td,
-    :global(.padding-mini) :global(th) {
-        padding: 4px 4px !important;
-    }
-
-    tbody tr:hover {
-        background-color: #313244 !important;
-    }
-
-    :global(footer) {
-        border-top: none !important;
-    }
-
-    :global(aside) {
-        color: #bac2de !important;
-    }
-
-    :global(.date-cell .date-only),
-    :global(.date-cell .date-time) {
-        display: none;
-    }
-    :global(.date-cell .date-full) {
-        display: inline;
-    }
-
-    :global(.date-compact .date-cell .date-full) {
-        display: none;
-    }
-    :global(.date-compact .date-cell .date-time) {
-        display: inline;
-    }
-
-    :global(.date-mini .date-cell .date-full),
-    :global(.date-mini .date-cell .date-time) {
-        display: none;
-    }
-    :global(.date-mini .date-cell .date-only) {
-        display: inline;
-    }
-
-    :global(td) {
-        border: 1px solid #313244 !important;
-    }
-
-    :global(th) {
-        border-bottom: 1px solid #313244 !important;
-    }
-
-    .share-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 2px;
-        margin-left: 8px;
-        color: #cba6f7;
-        background: transparent;
-        border: none;
-        vertical-align: middle;
-        padding: 0;
-        font-size: 0.7rem;
-    }
-
-    .share-count {
-        font-size: 0.7rem;
-        line-height: 1;
-    }
-</style>

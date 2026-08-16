@@ -6,6 +6,7 @@
     import ConsensusPanel from './ConsensusPanel.svelte';
     import Toolbar from '../../primitives/Toolbar.svelte';
     import type { ToolbarItem } from '../../primitives/Toolbar.svelte';
+    import PaneHeader from '../../primitives/PaneHeader.svelte';
 
     export let onToggleSidebar: () => void = () => {};
 
@@ -107,24 +108,17 @@
 
 <Toolbar leftElements={[]} centerElements={[]} {rightElements} {onToggleSidebar} />
 
-<div>
-    <h3>Network Resilience</h3>
-    <p class="text-sm text-muted">Observed durability and consensus state</p>
-</div>
+<PaneHeader title="Network Resilience" subtitle="Observed durability and consensus state" />
 
 {#if error}
     <div class="text-red bg-surface0 border border-red rounded p-3 my-3">{error}</div>
 {/if}
 
 {#if consensusProps && storageProps}
+    <!-- The panels are Cards; they bring their own surface and border. -->
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div class="border-solid border-1 rounded-lg border-overlay1">
-            <StoragePanel {...storageProps} />
-        </div>
-
-        <div class="border-solid border-1 rounded-lg border-overlay1">
-            <ConsensusPanel {...consensusProps} />
-        </div>
+        <StoragePanel {...storageProps} />
+        <ConsensusPanel {...consensusProps} />
     </div>
 {:else if loading}
     <div class="text-subtitle text-sm py-8 text-center">Loading…</div>
