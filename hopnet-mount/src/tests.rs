@@ -1318,3 +1318,18 @@ async fn read_calls_counter_tracks_daemon_reads() {
     core.read(fh, 0, 6).await.unwrap();
     assert_eq!(core.read_calls(), before + 2);
 }
+
+// Impact: the client version header (RFC-022 S4) sends this code; a
+// non-CalVer token would make the mount unable to pass any versioned
+// surface, so failing at build/test time beats failing at every request.
+// Should: parse the crate's own version token as CalVer and round-trip
+// it through format_code.
+#[test]
+fn own_version_is_calver() {
+    let code = crate::version_code();
+    assert!(hopnet_common::version::code_is_valid(code));
+    assert_eq!(
+        hopnet_common::version::format_code(code),
+        env!("CARGO_PKG_VERSION")
+    );
+}

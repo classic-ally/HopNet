@@ -12,6 +12,12 @@ fn main() {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
+    // RFC-022 S1: every client binary answers --version, even the
+    // unsupported-platform stub.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("hopnet-mount {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     eprintln!("hopnet-mount only supports Linux (RFC-018)");
     std::process::exit(1);
 }
@@ -32,7 +38,7 @@ mod linux {
     use hopnet_mount::vfs::MountCore;
 
     #[derive(Parser)]
-    #[command(name = "hopnet-mount", about = "Mount the HopNet drive (RFC-018)")]
+    #[command(name = "hopnet-mount", version, about = "Mount the HopNet drive (RFC-018)")]
     struct Cli {
         #[command(subcommand)]
         command: Command,
