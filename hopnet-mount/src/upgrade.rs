@@ -477,11 +477,11 @@ fn flip(profile: &Path, target: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
-/// The wrapper's current position: the profile binary's own `--version`
-/// answer — honest bytes, not bookkeeping, so a module-seeded profile
-/// (which has no provenance record) reads correctly. None when the
-/// profile is missing or broken.
-fn current_version(profile: &Path) -> Option<u32> {
+/// The profile binary's own `--version` answer — honest bytes, not
+/// bookkeeping, so a module-seeded profile (which has no provenance
+/// record) reads correctly. None when the profile is missing or broken.
+/// Blocking (execs the profile binary).
+pub fn current_version(profile: &Path) -> Option<u32> {
     let out = std::process::Command::new(profile.join("bin/hopnet-mount"))
         .arg("--version")
         .output()
@@ -489,6 +489,16 @@ fn current_version(profile: &Path) -> Option<u32> {
         .filter(|out| out.status.success())?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     parse_code(stdout.split_whitespace().last()?)
+}
+
+/// The exit-75 crash-loop guard (RFC-023 S2): true only when a profile
+/// binary exists, answers `--version`, and its code differs from this
+/// build's own. Missing/broken profile → false — a unit could not have
+/// restarted through it anyway, and exiting 75 with an unchanged
+/// profile would restart into the same 426 forever. Blocking (execs
+/// the profile binary) — call off the async workers.
+pub fn profile_differs(profile: &Path) -> bool {
+    matches!(current_version(profile), Some(v) if v != crate::version_code())
 }
 
 /// One `upgrade` run's terminal state. Every variant here is an exit-0
@@ -1140,6 +1150,36 @@ mod tests {
         assert!(!flip(&profile, &a).unwrap(), "already-current is a no-op");
         assert!(flip(&profile, &b).unwrap());
         assert_eq!(std::fs::read_link(&profile).unwrap(), b);
+    }
+
+    // Impact: this gate is THE crash-loop guard — exit 75 with an
+    // unchanged profile would restart into the same 426 forever.
+    // Should: answer true only for a readable profile whose --version
+    // differs from this build's own code.
+    // Should not: fire for a missing profile, a broken binary, or a
+    // profile already at this build's version.
+    #[test]
+    fn profile_differs_gate_matrix() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        assert!(!profile_differs(&profile), "missing profile must not fire");
+
+        let own = hopnet_common::version::format_code(crate::version_code());
+        let same = plant_store(dir.path(), "same", &own, None);
+        std::os::unix::fs::symlink(&same, &profile).unwrap();
+        assert!(!profile_differs(&profile), "own version must not fire");
+
+        let newer = plant_store(dir.path(), "newer", "2099.1.0", None);
+        let _ = std::fs::remove_file(&profile);
+        std::os::unix::fs::symlink(&newer, &profile).unwrap();
+        assert!(profile_differs(&profile), "differing version must fire");
+
+        let broken = dir.path().join("store-broken");
+        std::fs::create_dir_all(broken.join("bin")).unwrap();
+        write_script(&broken.join("bin/hopnet-mount"), "#!/bin/sh\nexit 1\n");
+        let _ = std::fs::remove_file(&profile);
+        std::os::unix::fs::symlink(&broken, &profile).unwrap();
+        assert!(!profile_differs(&profile), "broken binary must not fire");
     }
 
     // ---- end-to-end against fake node + fake feed + fake nix ----

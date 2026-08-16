@@ -29,6 +29,7 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     use clap::{Parser, Subcommand};
@@ -183,12 +184,98 @@ mod linux {
             .expect("tokio runtime")
     }
 
+    /// Exit 75 is the restart request (the node's RFC-019 S6 convention);
+    /// the unit's RestartForceExitStatus=75 turns it into an immediate
+    /// restart through the freshly flipped profile.
+    const EXIT_CODE_RESTART: i32 = 75;
+
+    /// The RFC-023 S2 activation coupling: entered() spawns one
+    /// `hopnet-mount upgrade` child (current_exe, env inherited — the
+    /// unit's HOPNET_MOUNT_UPGRADE_* flows through); both hooks end by
+    /// evaluating the exit-75 gate and firing the restart Notify. The
+    /// exit itself belongs to the binary — main's select owns it, so the
+    /// unmount stays clean.
+    struct RestartCoupling {
+        profile: PathBuf,
+        url: String,
+        restart: Arc<tokio::sync::Notify>,
+        /// One child at a time: a clear→re-enter flap must not pile up
+        /// nix builds. Arc so the worker thread clears it on completion.
+        upgrading: Arc<AtomicBool>,
+    }
+
+    fn check_restart_gate(profile: &Path, restart: &tokio::sync::Notify) {
+        if hopnet_mount::upgrade::profile_differs(profile) {
+            tracing::info!("profile flipped while upgrade-required; requesting restart");
+            restart.notify_one();
+        }
+    }
+
+    impl hopnet_mount::watch::UpgradeCoupling for RestartCoupling {
+        fn entered(&self) {
+            if self
+                .upgrading
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return;
+            }
+            // current_exe resolves /proc/self/exe to the real store path,
+            // not the profile symlink — correct: the running (old) binary's
+            // `upgrade` subcommand is exactly what should run.
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(e) => {
+                    tracing::warn!("cannot locate own binary for upgrade run: {e}");
+                    self.upgrading.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+            // A detached thread, not a runtime task: the child is a
+            // one-shot that can build for minutes, and events here are
+            // ≥30s apart. Env is inherited, so the unit's
+            // HOPNET_MOUNT_UPGRADE_* contract flows through.
+            let url = self.url.clone();
+            let profile = self.profile.clone();
+            let restart = self.restart.clone();
+            let upgrading = self.upgrading.clone();
+            std::thread::spawn(move || {
+                match std::process::Command::new(&exe)
+                    .args(["upgrade", "--url", &url])
+                    .status()
+                {
+                    Ok(status) => tracing::info!(%status, "upgrade run finished"),
+                    Err(e) => tracing::warn!("upgrade run failed to spawn: {e}"),
+                }
+                upgrading.store(false, Ordering::SeqCst);
+                check_restart_gate(&profile, &restart);
+            });
+        }
+
+        fn still_held(&self) {
+            // Blocking gate read (execs the profile binary) — off the
+            // watcher task.
+            let profile = self.profile.clone();
+            let restart = self.restart.clone();
+            std::thread::spawn(move || check_restart_gate(&profile, &restart));
+        }
+    }
+
     /// Readiness preflight (RFC-018): distinguish "not running" from
     /// "running, not set up" instead of mounting into EIO. RFC-022 S4:
     /// the same probe settles both version policies before any user
     /// action — the node's gate answers 426 if THIS build is too old,
     /// and the report's node_version is checked against MIN_NODE.
-    fn preflight(rt: &tokio::runtime::Runtime, transport: &HttpTransport, url: &str) {
+    /// RFC-023 S2: `stale_profile` (mount only, never login — exit 75
+    /// means nothing outside the unit) turns a 426 into exit 75 when the
+    /// profile already holds different bytes: a flip landed between the
+    /// pre-start wrapper run and this exec, restart into it.
+    fn preflight(
+        rt: &tokio::runtime::Runtime,
+        transport: &HttpTransport,
+        url: &str,
+        stale_profile: Option<&Path>,
+    ) {
         match rt.block_on(transport.health()) {
             Ok(report) => {
                 if let Err(why) = hopnet_mount::check_node_version(&report) {
@@ -204,6 +291,10 @@ mod linux {
                 }
             }
             Err(e @ TransportError::UpgradeRequired { .. }) => {
+                if stale_profile.is_some_and(hopnet_mount::upgrade::profile_differs) {
+                    eprintln!("{e} — profile already flipped, restarting into it");
+                    std::process::exit(EXIT_CODE_RESTART);
+                }
                 eprintln!("{e} — upgrade hopnet-mount");
                 std::process::exit(1);
             }
@@ -256,7 +347,7 @@ mod linux {
                 std::process::exit(1);
             }
         };
-        preflight(&rt, &transport, &url);
+        preflight(&rt, &transport, &url, None);
 
         // One authed read proves the token before anything is stored.
         match rt.block_on(transport.item(ItemId::Root)) {
@@ -339,6 +430,17 @@ mod linux {
         let rt = runtime();
         let paths = Paths::from_env();
 
+        // The RFC-023 deployment contract, when the unit provides it; an
+        // unmanaged install runs with the coupling disarmed and the 426
+        // hold stays a log-only state.
+        let upgrade_env = match hopnet_mount::upgrade::UpgradeEnv::from_env() {
+            Ok(env) => Some(env),
+            Err(e) => {
+                tracing::debug!("unmanaged install; upgrade coupling disarmed: {e}");
+                None
+            }
+        };
+
         let mut url = String::new();
         let transport: Arc<dyn NodeTransport> = if args.mock {
             MockTransport::with_demo_tree()
@@ -352,7 +454,12 @@ mod linux {
                     std::process::exit(1);
                 }
             };
-            preflight(&rt, &transport, &url);
+            preflight(
+                &rt,
+                &transport,
+                &url,
+                upgrade_env.as_ref().map(|env| env.profile.as_path()),
+            );
             Arc::new(transport)
         };
 
@@ -436,23 +543,44 @@ mod linux {
         }
 
         // Watch loop (RFC-018 S4): pokes → delta sync → kernel busting.
+        // RFC-023 S2: managed installs couple the loop's 426 hold to the
+        // upgrade wrapper and the exit-75 restart request.
+        let restart = Arc::new(tokio::sync::Notify::new());
         let invalidator = Arc::new(hopnet_mount::fuse::FuserInvalidator(session.notifier()));
-        rt.spawn(
-            hopnet_mount::watch::Watcher::new(core.clone(), transport.clone(), invalidator).run(),
-        );
+        let mut watcher =
+            hopnet_mount::watch::Watcher::new(core.clone(), transport.clone(), invalidator);
+        if let (false, Some(env)) = (args.mock, &upgrade_env) {
+            watcher = watcher.with_upgrade_coupling(Arc::new(RestartCoupling {
+                profile: env.profile.clone(),
+                url: url.clone(),
+                restart: restart.clone(),
+                upgrading: Arc::new(AtomicBool::new(false)),
+            }));
+        }
+        rt.spawn(watcher.run());
 
-        // systemd stops with SIGTERM; interactive use sends SIGINT.
-        rt.block_on(async {
+        // systemd stops with SIGTERM; interactive use sends SIGINT. The
+        // third arm is the RFC-023 activation request — the exit belongs
+        // to the binary, AFTER the clean unmount below.
+        let restart_requested = rt.block_on(async {
             let mut sigterm =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .expect("sigterm handler");
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = sigterm.recv() => {}
+                _ = tokio::signal::ctrl_c() => false,
+                _ = sigterm.recv() => false,
+                _ = restart.notified() => true,
             }
         });
         drop(session);
         provision::remove_conn_record(&data_dir);
+        if restart_requested {
+            tracing::info!(
+                code = EXIT_CODE_RESTART,
+                "unmounted; restarting into the flipped profile"
+            );
+            std::process::exit(EXIT_CODE_RESTART);
+        }
         tracing::info!("unmounted");
     }
 }

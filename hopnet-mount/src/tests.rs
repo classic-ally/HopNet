@@ -1405,3 +1405,119 @@ async fn scripted_gate_refusal_is_typed_and_clearable() {
     assert_eq!(report.status, Health::Ready);
     assert_eq!(report.node_version, 20990101);
 }
+
+// ---------- RFC-023 S2: the activation coupling ----------
+
+#[derive(Default)]
+struct RecordingCoupling {
+    entered: std::sync::atomic::AtomicUsize,
+    still_held: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::watch::UpgradeCoupling for RecordingCoupling {
+    fn entered(&self) {
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn still_held(&self) {
+        self.still_held
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl RecordingCoupling {
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.entered.load(std::sync::atomic::Ordering::SeqCst),
+            self.still_held.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+}
+
+// Impact: entered() is what turns a dark 426'd mount into an upgrade
+// attempt; firing more than once per entry would pile up nix builds.
+// Should: fire entered() exactly once when the hold begins and
+// still_held() on subsequent refusals while it persists.
+// Should not: fire either hook again after the hold clears, until a
+// NEW hold begins — the clear re-arms the one-shot.
+#[tokio::test]
+async fn coupling_fires_once_per_hold_and_rearms_after_clear() {
+    let (transport, handle) = MockTransport::new();
+    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+    let coupling = Arc::new(RecordingCoupling::default());
+    let invalidator = Arc::new(RecordingInvalidator::default());
+    tokio::spawn(
+        Watcher::new(
+            core,
+            transport as Arc<dyn NodeTransport>,
+            invalidator.clone(),
+        )
+        .with_upgrade_coupling(coupling.clone())
+        .run(),
+    );
+    assert!(
+        wait_until(2000, || handle.watch_connected()
+            && !changes_calls(&handle).is_empty())
+        .await,
+        "watcher never connected + synced"
+    );
+
+    handle.set_upgrade_required(Some((20990100, 20990101)));
+    handle.poke();
+    assert!(
+        wait_until(2000, || coupling.counts().0 == 1).await,
+        "entered() never fired: {:?}",
+        coupling.counts()
+    );
+
+    handle.poke();
+    assert!(
+        wait_until(2000, || coupling.counts().1 >= 1).await,
+        "still_held() never fired: {:?}",
+        coupling.counts()
+    );
+    assert_eq!(coupling.counts().0, 1, "entered() must stay one-shot");
+
+    // Clear, then force the reconnect that re-arms the one-shot (the
+    // flag clears only at a successful watch() connect).
+    let syncs_before = changes_calls(&handle).len();
+    handle.set_upgrade_required(None);
+    handle.drop_watch();
+    assert!(
+        wait_until(2000, || changes_calls(&handle).len() > syncs_before).await,
+        "watcher never resynced after the clear"
+    );
+    let (entered, held) = coupling.counts();
+    assert_eq!(entered, 1, "no hook may fire outside a hold");
+
+    handle.set_upgrade_required(Some((20990100, 20990101)));
+    handle.poke();
+    assert!(
+        wait_until(2000, || coupling.counts().0 == 2).await,
+        "a NEW hold must re-fire entered(): {:?}",
+        coupling.counts()
+    );
+    let _ = held;
+}
+
+// Should: run the watch loop identically when no coupling is attached
+// (unmanaged installs) — the hold stays a log-only state and the loop
+// resyncs after the gate clears.
+#[tokio::test]
+async fn watcher_without_coupling_holds_quietly() {
+    let (transport, handle) = MockTransport::new();
+    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+    spawn_watcher(core, transport, &handle).await;
+
+    handle.set_upgrade_required(Some((20990100, 20990101)));
+    handle.poke();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let syncs_before = changes_calls(&handle).len();
+    handle.set_upgrade_required(None);
+    handle.drop_watch();
+    assert!(
+        wait_until(2000, || changes_calls(&handle).len() > syncs_before).await,
+        "watcher must resync once the gate clears"
+    );
+}

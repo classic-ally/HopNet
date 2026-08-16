@@ -30,6 +30,19 @@ impl KernelInvalidator for NullInvalidator {
     fn inval_inode(&self, _ino: u64) {}
 }
 
+/// Daemon-side activation coupling (RFC-023 S2), fired from inside the
+/// standardized 426 handler. Implementations MUST NOT block — the
+/// watcher task calls these inline; spawn internally.
+pub trait UpgradeCoupling: Send + Sync {
+    /// The false→true transition of the held state: spawn ONE wrapper
+    /// run. A later clear (node accepts us again) re-arms this for the
+    /// next entry.
+    fn entered(&self);
+    /// Every subsequent refusal while held (~BACKOFF_MAX cadence):
+    /// re-evaluate the exit-75 gate — a timer flip may have landed.
+    fn still_held(&self);
+}
+
 /// Heartbeats arrive every ~15 s (server keepalive); ~3 missed = dead.
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(45);
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
@@ -60,6 +73,9 @@ pub struct Watcher {
     /// versions loudly ONCE and later rejections stay quiet; cleared by
     /// the next successful connect (a node rollback un-strands us).
     upgrade_required: bool,
+    /// RFC-023 S2 activation coupling; None = unmanaged install, the
+    /// hold stays a log-only state.
+    coupling: Option<Arc<dyn UpgradeCoupling>>,
 }
 
 impl Watcher {
@@ -74,7 +90,14 @@ impl Watcher {
             invalidator,
             anchor: ANCHOR_INIT,
             upgrade_required: false,
+            coupling: None,
         }
+    }
+
+    /// Attach the RFC-023 activation coupling (managed deployments).
+    pub fn with_upgrade_coupling(mut self, coupling: Arc<dyn UpgradeCoupling>) -> Self {
+        self.coupling = Some(coupling);
+        self
     }
 
     /// The standardized 426 handler (RFC-022 S4): loud once, quiet
@@ -86,9 +109,15 @@ impl Watcher {
         }
         if self.upgrade_required {
             tracing::debug!("still awaiting client upgrade: {e}");
+            if let Some(coupling) = &self.coupling {
+                coupling.still_held();
+            }
         } else {
             self.upgrade_required = true;
             tracing::error!("{e} — hopnet-mount must be upgraded; holding until it is");
+            if let Some(coupling) = &self.coupling {
+                coupling.entered();
+            }
         }
         true
     }
