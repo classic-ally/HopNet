@@ -93,6 +93,7 @@
                         Device Name
                     </label>
                     <TextInput
+                        id="device-name"
                         value={deviceName}
                         placeholder="e.g., My Android Phone"
                         disabled={loading}

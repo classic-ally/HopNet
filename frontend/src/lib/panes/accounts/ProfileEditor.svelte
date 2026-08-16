@@ -1,6 +1,9 @@
 <script lang="ts">
     import { currentUserStore, refreshCurrentUser } from '../../stores';
     import { updateProfile } from '../../api/accounts';
+    import Button from '../../Button.svelte';
+    import Card from '../../primitives/Card.svelte';
+    import TextInput from '../../primitives/TextInput.svelte';
     import AvatarCropModal from './AvatarCropModal.svelte';
 
     interface Props {
@@ -64,53 +67,60 @@
 </script>
 
 {#if $currentUserStore}
-<div class="border-solid border-1 rounded-lg p-3 border-overlay1">
-    <h3 class="mb-2 text-lg font-semibold">My Profile</h3>
+<Card title="My Profile" subtitle={$currentUserStore.username} icon="i-carbon-user-avatar">
     <div class="flex gap-4 items-start">
-        <div class="flex flex-col items-center gap-1 flex-shrink-0">
-            <button
-                class="w-16 h-16 rounded-full overflow-hidden border-2 border-overlay1 hover:border-mauve transition-colors cursor-pointer bg-surface0 flex items-center justify-center"
-                onclick={() => isAvatarModalOpen = true}
+        <!-- One control, not two: the avatar and its caption both opened the
+             crop modal, so they are a single button with a bigger hit area. -->
+        <button
+            type="button"
+            class="flex flex-col items-center gap-1 flex-shrink-0 bg-transparent border-none p-0 cursor-pointer group
+                   focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-mauve rounded"
+            onclick={() => isAvatarModalOpen = true}
+        >
+            <span
+                class="w-16 h-16 rounded-full overflow-hidden border-2 border-solid border-overlay1 bg-surface1
+                       group-hover:border-mauve transition-colors flex items-center justify-center"
             >
                 {#if avatarSrc}
-                    <img src={avatarSrc} alt="Avatar" class="w-full h-full object-cover" />
+                    <img src={avatarSrc} alt="" class="w-full h-full object-cover" />
                 {:else}
-                    <div class="i-carbon-user w-8 h-8 text-muted"></div>
+                    <span class="i-carbon-user w-8 h-8 text-muted" aria-hidden="true"></span>
                 {/if}
-            </button>
-            <button
-                class="text-xs text-muted hover:text-primary cursor-pointer bg-transparent border-none"
-                onclick={() => isAvatarModalOpen = true}
-            >Change</button>
-        </div>
-        <div class="flex-1 space-y-2">
-            <div class="text-sm text-muted">{$currentUserStore.username}</div>
+            </span>
+            <span class="text-xs text-muted group-hover:text-primary transition-colors">Change</span>
+        </button>
+        <div class="flex-1 min-w-0 space-y-2">
+            <!-- TextInput is w-full, so the halves are sized by these
+                 wrappers rather than by fighting its own width class. -->
             <div class="flex gap-2">
-                <input
-                    class="flex-1 bg-transparent text-primary border-overlay0 border-2 border-solid rounded-md p-1 text-sm"
-                    type="text"
-                    placeholder="First name"
-                    bind:value={editFirstName}
-                    maxlength={32}
-                    disabled={profileSaving}
-                />
-                <input
-                    class="flex-1 bg-transparent text-primary border-overlay0 border-2 border-solid rounded-md p-1 text-sm"
-                    type="text"
-                    placeholder="Last name"
-                    bind:value={editLastName}
-                    maxlength={32}
-                    disabled={profileSaving}
-                />
+                <div class="flex-1 min-w-0">
+                    <TextInput
+                        ariaLabel="First name"
+                        placeholder="First name"
+                        value={editFirstName}
+                        maxlength={32}
+                        disabled={profileSaving}
+                        oninput={(e) => editFirstName = (e.target as HTMLInputElement).value}
+                    />
+                </div>
+                <div class="flex-1 min-w-0">
+                    <TextInput
+                        ariaLabel="Last name"
+                        placeholder="Last name"
+                        value={editLastName}
+                        maxlength={32}
+                        disabled={profileSaving}
+                        oninput={(e) => editLastName = (e.target as HTMLInputElement).value}
+                    />
+                </div>
             </div>
             <div class="flex gap-2 items-center">
-                <button
-                    class="text-sm px-2 py-1 rounded bg-surface0 border border-overlay1 text-primary hover:bg-overlay0 transition-colors disabled:opacity-50"
-                    onclick={handleProfileSave}
+                <Button
+                    icon="i-carbon-save"
+                    text={profileSaving ? 'Saving...' : 'Update'}
+                    onClick={handleProfileSave}
                     disabled={profileSaving}
-                >
-                    {profileSaving ? 'Saving...' : 'Update'}
-                </button>
+                />
                 {#if profileSuccess}
                     <span class="text-sm text-green">{profileSuccess}</span>
                 {/if}
@@ -120,7 +130,7 @@
             </div>
         </div>
     </div>
-</div>
+</Card>
 {/if}
 
 <AvatarCropModal
