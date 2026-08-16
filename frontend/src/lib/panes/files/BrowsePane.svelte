@@ -18,13 +18,13 @@
     import { fetchUsers, shareFile, fetchShareDetails, unshareFile, type UserInfo } from '../../api/shares'
     import type { ShareParticipant } from '../../types'
     import PaneHeader from '../../primitives/PaneHeader.svelte'
+    import { router, browseUrlFor, folderFromBrowseUrl } from '../../router.svelte'
 
     let { onToggleSidebar = () => {} }: { onToggleSidebar?: () => void } = $props()
 
     let fileCount = $state(0)
     let loading = $state(true)
     let error = $state('')
-    let pathHistory: string[] = ['/'] // Track navigation history
     let showPreview = $state(false)
     let previewFile = $state<FileItem | null>(null)
     let previewFileIndex = $state(0)
@@ -53,7 +53,10 @@
     let shareDetailsFileName = $state('')
     let shareDetailsInodeId = $state('')
 
-    const currentPath = $derived($currentPathStore)
+    // The URL owns the browsed folder, so a directory can be bookmarked and
+    // browser back/forward walks the folders you visited. currentPathStore
+    // stays as the downstream channel to the Upload and CreateFolder modals.
+    const currentPath = $derived(folderFromBrowseUrl(router.path))
 
     // Pointer selection: policy lives here (single / ctrl-toggle / shift-range),
     // the Table only reports clicks and paints rowClass.
@@ -86,7 +89,6 @@
                 const data = await response.json()
                 table.setRows(data)
                 fileCount = data.length
-                currentPathStore.set(path)
             } else {
                 error = `Failed to fetch files: ${response.status} ${response.statusText}`
                 console.error('Failed to fetch files:', response.status)
@@ -136,10 +138,7 @@
 
     function handleItemDoubleClick(item: FileItem) {
         if (item.inode_type === InodeType.Folder) {
-            // Navigate into the folder
-            pathHistory.push(currentPath)
-            navigateReset()
-            fetchFiles(item.path)
+            navigateToPath(item.path)
         } else if (item.inode_type === InodeType.File) {
             // Find the index of this file in the file-only list (respects sorting/filtering)
             const fileIndex = fileOnlyList.findIndex(row => row.path === item.path)
@@ -163,17 +162,12 @@
         if (currentPath !== '/') {
             const segments = currentPath.split('/').filter(segment => segment.length > 0)
             segments.pop() // Remove the last segment
-            const parentPath = segments.length > 0 ? '/' + segments.join('/') : '/'
-            pathHistory.push(currentPath) // Add current to history
-            navigateReset()
-            fetchFiles(parentPath)
+            navigateToPath(segments.length > 0 ? '/' + segments.join('/') : '/')
         }
     }
 
     function navigateToRoot() {
-        pathHistory = ['/']
-        navigateReset()
-        fetchFiles('/')
+        navigateToPath('/')
     }
 
     function toggleSearchBar() {
@@ -184,11 +178,13 @@
         }
     }
 
+    /**
+     * Every folder change goes through the URL — one history entry per folder,
+     * so back walks up the trail. The effect below does the fetching.
+     */
     function navigateToPath(targetPath: string) {
         if (targetPath !== currentPath) {
-            pathHistory.push(currentPath)
-            navigateReset()
-            fetchFiles(targetPath)
+            router.navigate(browseUrlFor(targetPath))
         }
     }
 
@@ -230,8 +226,6 @@
     const fileOnlyList = $derived(table.rows.filter(row => row.inode_type === InodeType.File))
 
     onMount(() => {
-        fetchFiles()
-
         // Track shift key state for preventing text selection
         const handleKeyDown = (e: KeyboardEvent) => {
             if (e.key === 'Shift') {
@@ -253,13 +247,37 @@
         }
     })
 
-    // Refetch when the token changes (login/logout). The path is untracked:
-    // navigation already fetches, so tracking it here would double-fetch.
+    // Folder is fetched from exactly one place: whatever the URL says, plus a
+    // login. Everything the effect writes is untracked, and it never reads
+    // currentPathStore, so there is no cycle. lastFetched is a plain let —
+    // invisible to the reactive graph — and absorbs the extra run that the
+    // canonicalising replace() below causes.
+    let lastFetched: string | null = null
+
     $effect(() => {
-        if ($tokenStore) untrack(() => fetchFiles(currentPath))
+        const folder = currentPath
+        if (!$tokenStore) return
+
+        // A hand-typed or trailing-slash URL is rewritten to its canonical
+        // form first, so '/browse/a/' and '/browse/a//b' cannot become extra
+        // history entries that make the back button look broken.
+        const canonical = browseUrlFor(folder)
+        if (router.path !== canonical) {
+            untrack(() => router.replace(canonical))
+            return
+        }
+
+        if (lastFetched === folder) return
+        lastFetched = folder
+
+        untrack(() => {
+            currentPathStore.set(folder)
+            navigateReset()
+            void fetchFiles(folder)
+        })
     })
 
-    // Refetch when a refresh is triggered (uploads, folder creation, shares).
+    // Refetch in place when a write completes (uploads, folder creation, shares).
     $effect(() => {
         if ($refreshTriggerStore > 0) untrack(() => fetchFiles(currentPath))
     })
