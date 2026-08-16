@@ -23,6 +23,12 @@ an audit found a view-change safety hole. See RFC-013 for the full design
 - [x] On-demand heights: idle meshes are fully quiescent; wake on local work or peer messages
 - [x] Decided-value sync (replaces view catch-up); trusted height-0 join bootstrap
 - [x] Event-driven transaction queue (PendingPool + engine driver, proposer forwarding)
+- [x] Transient-storage-error classification (2026-08-16): `DatabaseError::Transient`
+      threaded from the DB layers through every handler crate; SQLITE_BUSY during the
+      proposer's preflight restages the transaction (bounded, then 503) instead of
+      rejecting it (the 409→EEXIST rsync data-loss path), and block validation returns
+      Undetermined + retries on a bounded IMMEDIATE transaction instead of voting
+      Invalid (ends the false SyncInvalid determinism alarms)
 - [x] Deterministic simulation + seeded fault fuzzing (200-seed safety corpus, wake-rule tests)
 - [x] Validator set management with height-based activation
 - [x] Performance metrics integration for node reliability (latency + throughput measurement complete)
