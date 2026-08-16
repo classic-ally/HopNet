@@ -55,6 +55,11 @@ pub struct Watcher {
     transport: Arc<dyn NodeTransport>,
     invalidator: Arc<dyn KernelInvalidator>,
     anchor: Height,
+    /// Sticky RFC-022 S4 state (the passthrough-disarm pattern): set on
+    /// the first UpgradeRequired so the standardized handler logs the
+    /// versions loudly ONCE and later rejections stay quiet; cleared by
+    /// the next successful connect (a node rollback un-strands us).
+    upgrade_required: bool,
 }
 
 impl Watcher {
@@ -68,7 +73,24 @@ impl Watcher {
             transport,
             invalidator,
             anchor: ANCHOR_INIT,
+            upgrade_required: false,
         }
+    }
+
+    /// The standardized 426 handler (RFC-022 S4): loud once, quiet
+    /// after — never generic transport noise. Returns true if `e` was
+    /// an UpgradeRequired.
+    fn note_upgrade_required(&mut self, e: &crate::transport::TransportError) -> bool {
+        if !matches!(e, crate::transport::TransportError::UpgradeRequired { .. }) {
+            return false;
+        }
+        if self.upgrade_required {
+            tracing::debug!("still awaiting client upgrade: {e}");
+        } else {
+            self.upgrade_required = true;
+            tracing::error!("{e} — hopnet-mount must be upgraded; holding until it is");
+        }
+        true
     }
 
     /// One delta sync: changes(anchor) → apply → fire invalidations →
@@ -108,9 +130,15 @@ impl Watcher {
             match self.transport.watch().await {
                 Ok(mut stream) => {
                     backoff = BACKOFF_INITIAL;
+                    if self.upgrade_required {
+                        self.upgrade_required = false;
+                        tracing::info!("node accepts this client again; resuming");
+                    }
                     // Cover the gap between (re)connect and the first poke.
                     if let Err(e) = self.sync().await {
-                        tracing::warn!("post-connect sync failed: {e}");
+                        if !self.note_upgrade_required(&e) {
+                            tracing::warn!("post-connect sync failed: {e}");
+                        }
                     }
                     loop {
                         match tokio::time::timeout(LIVENESS_TIMEOUT, stream.next()).await {
@@ -122,7 +150,9 @@ impl Watcher {
                                         .await
                                 {}
                                 if let Err(e) = self.sync().await {
-                                    tracing::warn!("poke sync failed: {e}");
+                                    if !self.note_upgrade_required(&e) {
+                                        tracing::warn!("poke sync failed: {e}");
+                                    }
                                 }
                             }
                             Ok(Some(crate::transport::WatchEvent::Heartbeat)) => {}
@@ -138,7 +168,13 @@ impl Watcher {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("watch connect failed: {e}; retrying in {backoff:?}");
+                    if self.note_upgrade_required(&e) {
+                        // Hold, don't spin: re-probe at the max cadence
+                        // until the wrapper (or operator) upgrades us.
+                        backoff = BACKOFF_MAX;
+                    } else {
+                        tracing::warn!("watch connect failed: {e}; retrying in {backoff:?}");
+                    }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(BACKOFF_MAX);
                 }

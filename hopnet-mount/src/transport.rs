@@ -66,6 +66,15 @@ pub enum Health {
     NotReady,
 }
 
+/// The health probe's full answer (RFC-022 S4): readiness plus the
+/// node's identity, the value the daemon's `min_node` check reads.
+/// `node_version: 0` = a pre-RFC-022 node that never sent the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthReport {
+    pub status: Health,
+    pub node_version: u32,
+}
+
 #[derive(Debug)]
 pub enum TransportError {
     /// Node unreachable or the connection failed mid-request.
@@ -80,6 +89,14 @@ pub enum TransportError {
     /// Consensus wait timed out — outcome UNKNOWN; callers must not
     /// assume either applied or not.
     OutcomeUnknown,
+    /// The node's version gate refused this client (RFC-022): the
+    /// surface's minimum is newer than this build. Not retryable —
+    /// only an upgrade clears it.
+    UpgradeRequired {
+        surface: String,
+        min_client: u32,
+        node_version: u32,
+    },
 }
 
 impl std::fmt::Display for TransportError {
@@ -90,6 +107,16 @@ impl std::fmt::Display for TransportError {
             TransportError::Unauthorized => write!(f, "credentials rejected"),
             TransportError::Conflict => write!(f, "conflicts with current state"),
             TransportError::OutcomeUnknown => write!(f, "consensus wait timed out"),
+            TransportError::UpgradeRequired {
+                surface,
+                min_client,
+                node_version,
+            } => write!(
+                f,
+                "client too old for {surface}: node {} requires >= {}",
+                hopnet_common::version::format_code(*node_version),
+                hopnet_common::version::format_code(*min_client),
+            ),
         }
     }
 }
@@ -218,8 +245,9 @@ pub trait NodeTransport: Send + Sync {
         recursive: bool,
     ) -> BoxFuture<'_, Result<Height, TransportError>>;
 
-    /// Node readiness — distinguishes "not running" from "not set up".
-    fn health(&self) -> BoxFuture<'_, Result<Health, TransportError>>;
+    /// Node readiness — distinguishes "not running" from "not set up" —
+    /// plus the node's version identity (RFC-022 S4).
+    fn health(&self) -> BoxFuture<'_, Result<HealthReport, TransportError>>;
 
     /// Mesh-level capacity numbers for statfs — node-side definitions
     /// (tolerance-constrained total, observed used), never local disk.

@@ -12,8 +12,8 @@ use std::time::SystemTime;
 use hopnet_common::CustomUUID;
 
 use crate::transport::{
-    BoxFuture, Cursor, Health, Height, Item, ItemId, ItemKind, NodeTransport, Page, StatfsInfo,
-    TransportError,
+    BoxFuture, Cursor, Health, HealthReport, Height, Item, ItemId, ItemKind, NodeTransport, Page,
+    StatfsInfo, TransportError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +91,11 @@ struct MockState {
     /// Scripted statfs numbers; None = statfs fails Unavailable (the
     /// node-unreachable arm of the daemon's last-known-value cache).
     statfs: Option<StatfsInfo>,
+    /// When Some((min_client, node_version)), watch/health/changes
+    /// answer the RFC-022 gate's refusal — the stale-client scenario.
+    upgrade_required: Option<(u32, u32)>,
+    /// Version the mock node reports in its health payload.
+    node_version: u32,
 }
 
 impl MockState {
@@ -136,6 +141,8 @@ impl MockTransport {
                 total_bytes: 100 * 1024 * 1024 * 1024,
                 used_bytes: 25 * 1024 * 1024 * 1024,
             }),
+            upgrade_required: None,
+            node_version: crate::version_code(),
         }));
         (
             Arc::new(MockTransport {
@@ -370,6 +377,18 @@ impl MockHandle {
         self.state.lock().expect("mock poisoned").statfs = info;
     }
 
+    /// Script the RFC-022 gate refusing this client: watch/health/
+    /// changes answer UpgradeRequired{min_client, node_version} until
+    /// cleared with None (the "node accepts us again" transition).
+    pub fn set_upgrade_required(&self, gate: Option<(u32, u32)>) {
+        self.state.lock().expect("mock poisoned").upgrade_required = gate;
+    }
+
+    /// Script the node's reported version (the min_node input).
+    pub fn set_node_version(&self, code: u32) {
+        self.state.lock().expect("mock poisoned").node_version = code;
+    }
+
     /// Page size for enumerate — small values force multi-page listings.
     pub fn set_page_size(&self, n: usize) {
         self.state.lock().expect("mock poisoned").page_size = n.max(1);
@@ -480,6 +499,9 @@ impl NodeTransport for MockTransport {
         Box::pin(async move {
             let mut state = state.lock().expect("mock poisoned");
             state.calls.push(CallRecord::Changes { since });
+            if let Some(err) = scripted_upgrade_required(&state) {
+                return Err(err);
+            }
 
             // Latest journal entry per id, strictly after `since` — the
             // same semantics as the node's modification_log query.
@@ -515,6 +537,9 @@ impl NodeTransport for MockTransport {
         Box::pin(async move {
             let mut state = state.lock().expect("mock poisoned");
             state.calls.push(CallRecord::Watch);
+            if let Some(err) = scripted_upgrade_required(&state) {
+                return Err(err);
+            }
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             state.watch_tx = Some(tx);
             Ok(
@@ -730,15 +755,18 @@ impl NodeTransport for MockTransport {
         })
     }
 
-    fn health(&self) -> BoxFuture<'_, Result<Health, TransportError>> {
+    fn health(&self) -> BoxFuture<'_, Result<HealthReport, TransportError>> {
         let state = self.state.clone();
         Box::pin(async move {
-            state
-                .lock()
-                .expect("mock poisoned")
-                .calls
-                .push(CallRecord::Health);
-            Ok(Health::Ready)
+            let mut locked = state.lock().expect("mock poisoned");
+            locked.calls.push(CallRecord::Health);
+            if let Some(err) = scripted_upgrade_required(&locked) {
+                return Err(err);
+            }
+            Ok(HealthReport {
+                status: Health::Ready,
+                node_version: locked.node_version,
+            })
         })
     }
 
@@ -753,6 +781,17 @@ impl NodeTransport for MockTransport {
             }
         })
     }
+}
+
+/// The scripted RFC-022 refusal, if armed.
+fn scripted_upgrade_required(state: &MockState) -> Option<TransportError> {
+    state.upgrade_required.map(
+        |(min_client, node_version)| TransportError::UpgradeRequired {
+            surface: "/integrations/mount".to_string(),
+            min_client,
+            node_version,
+        },
+    )
 }
 
 fn child_by_name(state: &MockState, parent: &ItemId, name: &str) -> Option<ItemId> {

@@ -1333,3 +1333,60 @@ fn own_version_is_calver() {
         env!("CARGO_PKG_VERSION")
     );
 }
+
+// Should: accept a node at or above MIN_NODE and refuse older ones,
+// naming the node as the remedy in both refusal forms.
+// Should not: accept a version-less (pre-RFC-022) node — zero is not
+// "unknown, assume fine", it is "too old to say".
+#[test]
+fn node_version_check_matrix() {
+    use crate::transport::{Health, HealthReport};
+    let report = |node_version| HealthReport {
+        status: Health::Ready,
+        node_version,
+    };
+    assert!(crate::check_node_version(&report(crate::MIN_NODE)).is_ok());
+    assert!(crate::check_node_version(&report(crate::MIN_NODE + 1)).is_ok());
+    let older = crate::check_node_version(&report(20250101)).unwrap_err();
+    assert!(older.contains("upgrade the node"), "{older}");
+    let unversioned = crate::check_node_version(&report(0)).unwrap_err();
+    assert!(unversioned.contains("pre-RFC-022"), "{unversioned}");
+    assert!(unversioned.contains("upgrade the node"), "{unversioned}");
+}
+
+// Impact: the typed variant is what separates "hold until upgraded"
+// from ordinary transport noise — if a gate refusal ever degrades to a
+// generic Protocol error again, the daemon would retry forever instead
+// of surfacing the standardized upgrade-required state.
+// Should: surface a scripted gate refusal as the typed UpgradeRequired
+// on the watch, changes, and health paths, and report the scripted
+// node version through the health report once cleared.
+#[tokio::test]
+async fn scripted_gate_refusal_is_typed_and_clearable() {
+    use crate::transport::{Health, NodeTransport, TransportError};
+    let (transport, handle) = MockTransport::new();
+    handle.set_upgrade_required(Some((20990100, 20990100)));
+
+    for err in [
+        transport.watch().await.err().unwrap(),
+        transport.changes(0).await.err().unwrap(),
+        transport.health().await.err().unwrap(),
+    ] {
+        assert!(
+            matches!(
+                err,
+                TransportError::UpgradeRequired {
+                    min_client: 20990100,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    handle.set_upgrade_required(None);
+    handle.set_node_version(20990101);
+    let report = transport.health().await.unwrap();
+    assert_eq!(report.status, Health::Ready);
+    assert_eq!(report.node_version, 20990101);
+}

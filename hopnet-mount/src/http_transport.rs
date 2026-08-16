@@ -16,8 +16,8 @@ use hopnet_common::mount::{
 use hopnet_common::CustomUUID;
 
 use crate::transport::{
-    BoxFuture, Changes, Cursor, Health, Height, Item, ItemId, ItemKind, Mutated, NodeTransport,
-    Page, StatfsInfo, TransportError, WatchEvent, WatchStream,
+    BoxFuture, Changes, Cursor, Health, HealthReport, Height, Item, ItemId, ItemKind, Mutated,
+    NodeTransport, Page, StatfsInfo, TransportError, WatchEvent, WatchStream,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -153,6 +153,29 @@ pub(crate) fn item_from_wire(wire: MountItem) -> Item {
     }
 }
 
+/// Map a non-success response to its typed error, consuming the body
+/// when the status warrants it: a 426 carries the node's structured
+/// `UpgradeRequiredResponse` (RFC-022 S4), which becomes the typed
+/// `UpgradeRequired` — never a generic protocol error. Anything else
+/// stays `Protocol("unexpected status ...")`.
+async fn reject(response: reqwest::Response) -> TransportError {
+    let status = response.status();
+    if status == reqwest::StatusCode::UPGRADE_REQUIRED {
+        return match response
+            .json::<hopnet_common::compat::UpgradeRequiredResponse>()
+            .await
+        {
+            Ok(body) => TransportError::UpgradeRequired {
+                surface: body.surface,
+                min_client: body.min_client,
+                node_version: body.node_version,
+            },
+            Err(e) => TransportError::Protocol(format!("426 with unreadable body: {e}")),
+        };
+    }
+    TransportError::Protocol(format!("unexpected status {status}"))
+}
+
 /// Shared mutation-response handling: strict-route status mapping, then
 /// MountMutationResponse → Mutated.
 async fn parse_mutation(response: reqwest::Response) -> Result<Mutated, TransportError> {
@@ -172,9 +195,7 @@ async fn parse_mutation(response: reqwest::Response) -> Result<Mutated, Transpor
         return Err(TransportError::Protocol("item gone".to_string()));
     }
     if !status.is_success() {
-        return Err(TransportError::Protocol(format!(
-            "unexpected status {status}"
-        )));
+        return Err(reject(response).await);
     }
     let wire = response
         .json::<hopnet_common::mount::MountMutationResponse>()
@@ -189,11 +210,8 @@ async fn parse_mutation(response: reqwest::Response) -> Result<Mutated, Transpor
 async fn parse_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, TransportError> {
-    let status = response.status();
-    if !status.is_success() {
-        return Err(TransportError::Protocol(format!(
-            "unexpected status {status}"
-        )));
+    if !response.status().is_success() {
+        return Err(reject(response).await);
     }
     response
         .json::<T>()
@@ -291,10 +309,7 @@ impl NodeTransport for HttpTransport {
                 .map_err(map_reqwest_err)?;
             let response = check_status(response)?;
             if !response.status().is_success() {
-                return Err(TransportError::Protocol(format!(
-                    "unexpected status {}",
-                    response.status()
-                )));
+                return Err(reject(response).await);
             }
 
             // Minimal SSE parse over the byte stream: `data:` lines are
@@ -361,9 +376,7 @@ impl NodeTransport for HttpTransport {
                     return Err(TransportError::Protocol("blob gone".to_string()));
                 }
                 if !status.is_success() {
-                    return Err(TransportError::Protocol(format!(
-                        "unexpected status {status}"
-                    )));
+                    return Err(reject(response).await);
                 }
                 let body = response.bytes().await.map_err(map_reqwest_err)?;
                 return Ok(body.to_vec());
@@ -506,7 +519,7 @@ impl NodeTransport for HttpTransport {
         })
     }
 
-    fn health(&self) -> BoxFuture<'_, Result<Health, TransportError>> {
+    fn health(&self) -> BoxFuture<'_, Result<HealthReport, TransportError>> {
         Box::pin(async move {
             // Unauthenticated by design — probeable before any token exists.
             let response = self
@@ -516,9 +529,12 @@ impl NodeTransport for HttpTransport {
                 .await
                 .map_err(map_reqwest_err)?;
             let wire = parse_json::<HealthResponse>(response).await?;
-            Ok(match wire.status {
-                HealthStatus::Ready => Health::Ready,
-                HealthStatus::NotReady => Health::NotReady,
+            Ok(HealthReport {
+                status: match wire.status {
+                    HealthStatus::Ready => Health::Ready,
+                    HealthStatus::NotReady => Health::NotReady,
+                },
+                node_version: wire.node_version,
             })
         })
     }

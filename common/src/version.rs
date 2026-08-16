@@ -14,6 +14,19 @@
 //! `src/version.rs`, clients per RFC-022) so the token always names the
 //! bytes actually compiled.
 
+/// The workspace CalVer code hopnet-common itself was compiled from.
+/// Excluded-workspace clients (crates/ingress-*) cannot inherit the
+/// workspace version; they path-dep this crate from the same checkout,
+/// so its compile-time token IS the monorepo snapshot they were built
+/// from. Panics on a non-CalVer token — the same boot invariant every
+/// binary enforces (RFC-022 S1).
+pub fn common_version_code() -> u32 {
+    let version = env!("CARGO_PKG_VERSION");
+    parse_code(version).unwrap_or_else(|| {
+        panic!("hopnet-common version {version:?} is not CalVer YYYY.M.N (RFC-022)")
+    })
+}
+
 /// Parse a CalVer string (`YYYY.M.N`, optionally `v`-prefixed as release
 /// tags are) into its code. None for anything malformed — including
 /// out-of-range month/counter and non-CalVer legacy tags.

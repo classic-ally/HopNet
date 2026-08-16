@@ -142,12 +142,27 @@ mod linux {
     }
 
     /// Readiness preflight (RFC-018): distinguish "not running" from
-    /// "running, not set up" instead of mounting into EIO.
+    /// "running, not set up" instead of mounting into EIO. RFC-022 S4:
+    /// the same probe settles both version policies before any user
+    /// action — the node's gate answers 426 if THIS build is too old,
+    /// and the report's node_version is checked against MIN_NODE.
     fn preflight(rt: &tokio::runtime::Runtime, transport: &HttpTransport, url: &str) {
         match rt.block_on(transport.health()) {
-            Ok(Health::Ready) => {}
-            Ok(Health::NotReady) => {
-                eprintln!("node at {url} is running but not set up");
+            Ok(report) => {
+                if let Err(why) = hopnet_mount::check_node_version(&report) {
+                    eprintln!("{why}");
+                    std::process::exit(1);
+                }
+                match report.status {
+                    Health::Ready => {}
+                    Health::NotReady => {
+                        eprintln!("node at {url} is running but not set up");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Err(e @ TransportError::UpgradeRequired { .. }) => {
+                eprintln!("{e} — upgrade hopnet-mount");
                 std::process::exit(1);
             }
             Err(e) => {

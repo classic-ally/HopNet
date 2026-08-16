@@ -212,7 +212,10 @@ async fn http_transport_full_read_contract() {
     let (api_key, jwt) = provision(&node).await;
     let transport = HttpTransport::new(&node.base(), &api_key).unwrap();
 
-    assert_eq!(transport.health().await.unwrap(), Health::Ready);
+    let report = transport.health().await.unwrap();
+    assert_eq!(report.status, Health::Ready);
+    // RFC-022 S4: the probe carries the node's identity for min_node.
+    assert!(hopnet_common::version::code_is_valid(report.node_version));
 
     let root = transport.item(ItemId::Root).await.unwrap().unwrap();
     assert_eq!(root.id, ItemId::Root);

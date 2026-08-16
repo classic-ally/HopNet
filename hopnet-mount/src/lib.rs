@@ -9,13 +9,41 @@
 
 /// This build's CalVer identity as its numeric code (RFC-022 S1): the
 /// workspace version compiled into THIS crate, the value the client
-/// version header (S4) sends. Panics if the token is not CalVer — the
+/// version header sends. Panics if the token is not CalVer — the
 /// same boot invariant the node enforces; a client that cannot state
 /// its identity could never pass a versioned surface anyway.
 pub fn version_code() -> u32 {
     let version = env!("CARGO_PKG_VERSION");
     hopnet_common::version::parse_code(version).unwrap_or_else(|| {
         panic!("Cargo.toml version {version:?} is not CalVer YYYY.M.N (RFC-022 S1)")
+    })
+}
+
+/// Oldest node release this build accepts (RFC-022 S4): the newest
+/// release whose surfaces provide every endpoint this daemon calls.
+/// The other half of the skew window — the node's `min_client` — is
+/// enforced node-side.
+pub const MIN_NODE: u32 = 20260802;
+
+/// The daemon-side half of version negotiation, applied to the health
+/// probe's answer at startup and login. `node_version: 0` is a node
+/// that predates RFC-022 and never reports identity — refused with the
+/// remedy named, since no client-side action can fix a stale NODE.
+pub fn check_node_version(report: &transport::HealthReport) -> Result<(), String> {
+    if report.node_version >= MIN_NODE {
+        return Ok(());
+    }
+    let required = hopnet_common::version::format_code(MIN_NODE);
+    Err(if report.node_version == 0 {
+        format!(
+            "node reports no version (pre-RFC-022) but this client requires \
+             node >= {required} — upgrade the node"
+        )
+    } else {
+        format!(
+            "node {} is older than required {required} — upgrade the node",
+            hopnet_common::version::format_code(report.node_version)
+        )
     })
 }
 
