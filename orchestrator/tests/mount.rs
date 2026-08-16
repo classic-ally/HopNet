@@ -62,7 +62,7 @@ async fn exec_capture(docker: &Docker, container: &str, script: &str) -> Result<
 
 /// Launch the mount daemon (detached from the test's control flow; its
 /// stderr is drained into `log` — the only diagnostics channel we have).
-async fn launch_daemon(
+pub(crate) async fn launch_daemon(
     docker: &Docker,
     container: &str,
     api_key: &str,
@@ -284,7 +284,7 @@ impl TestScenario for MountCrossNodeConsistency {
     async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = crate::insecure_client();
+        let client = super::device_client();
         let docker = Docker::connect_with_local_defaults()?;
         let node0 = container_name(mesh_id, 0);
         anyhow::ensure!(nodes.len() >= 3, "needs a 3-node mesh");

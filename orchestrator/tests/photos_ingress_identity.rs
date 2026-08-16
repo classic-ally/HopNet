@@ -149,7 +149,7 @@ impl TestScenario for PhotosIngressIdentity {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = crate::insecure_client();
+        let client = super::device_client();
         let dir_a = tempfile::tempdir().context("dir a")?;
         let dir_b = tempfile::tempdir().context("dir b")?;
 

@@ -78,7 +78,7 @@ impl TestScenario for DeviceTokenSessionBootstrap {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = crate::insecure_client();
+        let client = super::device_client();
 
         println!("\nRunning device token session bootstrap checks:");
 
@@ -370,7 +370,7 @@ impl TestScenario for FileProviderDeviceTokenAuth {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = crate::insecure_client();
+        let client = super::device_client();
 
         println!("\nRunning FileProvider device token auth checks:");
 

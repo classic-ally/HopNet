@@ -12,6 +12,7 @@ pub mod files;
 
 // Test implementations
 mod auto_seam;
+mod client_version_skew;
 mod consensus_queue;
 mod db_pragma_bench;
 mod device_tokens;
@@ -356,6 +357,11 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
+        "client-version-skew" => {
+            client_version_skew::ClientVersionSkew
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "eviction-under-pressure" => {
             eviction::EvictionUnderPressure
                 .run(mesh_id, nodes, flags)
@@ -614,6 +620,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "consensus-barrier-proposal-hold",
         "metrics-collection",
         "mount-cross-node-consistency",
+        "client-version-skew",
         "tier-membership",
         "eviction-under-pressure",
         "re-encode-after-departure",
@@ -659,6 +666,26 @@ pub fn list_test_names() -> Vec<&'static str> {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Client for DeviceToken surfaces (RFC-022 S4): carries the version
+/// header as a default, since the node's gate 426s header-less
+/// requests, atop the trust-the-boundary TLS posture every
+/// orchestrator client shares (pinned-https). The orchestrator's
+/// identity is the workspace version it was built from — the same
+/// code the nodes under test run.
+pub fn device_client() -> Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    let code = hopnet_common::version::parse_code(env!("CARGO_PKG_VERSION"))
+        .expect("workspace version is CalVer");
+    headers.insert(
+        hopnet_common::compat::CLIENT_VERSION_HEADER,
+        reqwest::header::HeaderValue::from(code),
+    );
+    crate::insecure_client_builder()
+        .default_headers(headers)
+        .build()
+        .expect("device client")
+}
 
 /// Get the maximum consensus view across all nodes
 /// Polls all nodes in parallel and returns the highest view number

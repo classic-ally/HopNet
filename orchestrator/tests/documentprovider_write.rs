@@ -54,7 +54,7 @@ impl TestScenario for DocumentProviderWriteConsistency {
     ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
-        let client = crate::insecure_client();
+        let client = super::device_client();
 
         println!("\nRunning DocumentProvider write API checks:");
 

@@ -291,7 +291,11 @@ pub async fn recreate_node_with_env(
 
 /// Re-resolve one node's address (containers change IP/port on recreate)
 /// and mint a fresh JWT (the signing key rolls every boot).
-async fn reauth_node(docker: &Docker, mesh_id: u32, node: &NodeInfo) -> Result<NodeInfo> {
+pub(crate) async fn reauth_node(
+    docker: &Docker,
+    mesh_id: u32,
+    node: &NodeInfo,
+) -> Result<NodeInfo> {
     let runtime = crate::sys::detect_runtime(docker).await?;
     let addrs = crate::get_external_addresses(docker, mesh_id, runtime).await?;
     let (_, ip, port) = addrs
