@@ -96,7 +96,7 @@
 
     <span
         aria-hidden="true"
-        class="size-4 shrink-0 rounded-sm border border-solid grid place-items-center transition-colors {boxState}
+        class="size-4 shrink-0 rounded-sm border grid place-items-center transition-colors {boxState}
                peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-mauve"
     >
         {#if indeterminate}

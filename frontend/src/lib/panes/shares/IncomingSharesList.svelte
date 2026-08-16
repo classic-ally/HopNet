@@ -1,5 +1,6 @@
 <script lang="ts">
     import Button from '../../Button.svelte';
+    import Card from '../../primitives/Card.svelte';
     import type { IncomingShareResponse } from '../../types';
     import { writesGatedStore, WRITES_GATED_TOOLTIP } from '../../stores';
 
@@ -45,7 +46,11 @@
 {:else}
     <div class="space-y-2">
         {#each shares as share}
-            <div class="bg-surface0 border border-overlay0 rounded-lg p-3 flex items-center justify-between gap-3">
+            <!-- A headerless Card: the row owned Card's exact background,
+                 border and radius by hand, so it takes them from the
+                 primitive instead. padding=false because the row supplies
+                 its own p-3 alongside the flex layout. -->
+            <Card padding={false} className="p-3 flex items-center justify-between gap-3">
                 <div class="flex-1 min-w-0">
                     <div class="flex items-center gap-2">
                         <div class="i-carbon-document w-4 h-4 text-muted flex-shrink-0"></div>
@@ -71,7 +76,7 @@
                         tooltip={gated ? WRITES_GATED_TOOLTIP : 'Decline share'}
                     />
                 </div>
-            </div>
+            </Card>
         {/each}
     </div>
 {/if}

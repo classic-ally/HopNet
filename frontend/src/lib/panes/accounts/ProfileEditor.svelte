@@ -78,7 +78,7 @@
             onclick={() => isAvatarModalOpen = true}
         >
             <span
-                class="w-16 h-16 rounded-full overflow-hidden border-2 border-solid border-overlay1 bg-surface1
+                class="w-16 h-16 rounded-full overflow-hidden border-2 border-overlay1 bg-surface1
                        group-hover:border-mauve transition-colors flex items-center justify-center"
             >
                 {#if avatarSrc}
