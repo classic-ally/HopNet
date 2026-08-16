@@ -29,6 +29,7 @@ pub enum TakeoutMaterializationError {
     Consensus(String),
     Serialization(String),
     Archive(std::io::Error),
+    IncompleteArchive { expected: u64, archived: u64 },
 }
 
 impl std::fmt::Display for TakeoutMaterializationError {
@@ -40,6 +41,11 @@ impl std::fmt::Display for TakeoutMaterializationError {
                 write!(f, "Serialization error: {}", e)
             }
             TakeoutMaterializationError::Archive(e) => write!(f, "Archive error: {}", e),
+            TakeoutMaterializationError::IncompleteArchive { expected, archived } => write!(
+                f,
+                "Archive incomplete: {} files archived of {} promised by the manifest",
+                archived, expected
+            ),
         }
     }
 }
@@ -249,7 +255,7 @@ pub async fn execute_takeout_materialization(
     );
 
     // Create the archive and clean up staging files
-    let archive_size = crate::archive::create_archive(
+    let archive_stats = crate::archive::create_archive(
         &manifest_bytes,
         archive_entries,
         &archive_path,
@@ -257,10 +263,24 @@ pub async fn execute_takeout_materialization(
     )
     .map_err(TakeoutMaterializationError::Archive)?;
 
+    // A takeout whose archive cannot contain what its manifest promises must
+    // never reach Ready — a truncated archive that announces itself complete
+    // is silent data loss on restore.
+    let expected_files = success_rows
+        .iter()
+        .filter(|row| row.kind == EntryKind::File)
+        .count() as u64;
+    if archive_stats.files_archived != expected_files {
+        return Err(TakeoutMaterializationError::IncompleteArchive {
+            expected: expected_files,
+            archived: archive_stats.files_archived,
+        });
+    }
+
     tracing::info!(
         "Archive created successfully for takeout {}: {} bytes at {}",
         takeout_id,
-        archive_size,
+        archive_stats.total_bytes,
         archive_path
     );
 
