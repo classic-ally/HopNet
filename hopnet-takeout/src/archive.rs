@@ -405,4 +405,69 @@ mod tests {
             }
         }
     }
+
+    /// Impact: this is the silent-total-data-loss bug. A real 592-file, 3.5GB
+    /// takeout produced a 53KB archive holding 3 entries, reported Ready, and
+    /// carried a manifest still promising 3,509,810,146 bytes. Every operator
+    /// signal said success. Restoring it would have yielded almost nothing —
+    /// and it is the mechanism by which decommissioning a source NAS on the
+    /// strength of a "successful" takeout loses everything.
+    /// Should: archive a file nested beneath a directory entry.
+    /// Should not: let a directory's post-append cleanup remove descendants
+    /// that have not been archived yet.
+    #[test]
+    fn nested_entries_survive_directory_source_deletion() {
+        let temp_dir = TempDir::new().unwrap();
+        let staging = temp_dir.path().join("staging");
+        let nested = staging.join("drive/Documents/High School");
+        fs::create_dir_all(&nested).unwrap();
+
+        let nested_file = nested.join("essay.txt");
+        File::create(&nested_file)
+            .unwrap()
+            .write_all(b"nested content")
+            .unwrap();
+
+        // Entry order as export.rs builds it: every folder row and every file
+        // row, unsorted — create_archive does its own directories-first sort.
+        let entries = vec![
+            ArchiveEntry {
+                staging_path: staging.join("drive/Documents").to_string_lossy().into(),
+                archive_path: "drive/Documents".to_string(),
+                is_directory: true,
+            },
+            ArchiveEntry {
+                staging_path: nested.to_string_lossy().into(),
+                archive_path: "drive/Documents/High School".to_string(),
+                is_directory: true,
+            },
+            ArchiveEntry {
+                staging_path: nested_file.to_string_lossy().into(),
+                archive_path: "drive/Documents/High School/essay.txt".to_string(),
+                is_directory: false,
+            },
+        ];
+
+        let archive_path = temp_dir.path().join("out.tar.gz");
+        create_archive(
+            br#"{"version":2}"#,
+            entries,
+            archive_path.to_str().unwrap(),
+            true, // delete_source_files — what export.rs passes in production
+        )
+        .unwrap();
+
+        let gz = GzDecoder::new(File::open(&archive_path).unwrap());
+        let mut ar = Archive::new(gz);
+        let paths: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            paths.contains(&"drive/Documents/High School/essay.txt".to_string()),
+            "nested file missing from archive; got {paths:?}"
+        );
+    }
 }
