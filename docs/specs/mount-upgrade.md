@@ -194,10 +194,28 @@ Each tracked, not forgotten:
       the build, so re-runs cost a cache hit. The current position is
       read from the profile binary's own `--version` — honest bytes,
       works for module-seeded profiles with no provenance.)*
-- [ ] S2 — module reshape + activation: profile `ExecStart`,
+- [x] S2 — module reshape + activation: profile `ExecStart`,
       newest-wins seeding, `RestartForceExitStatus=75`,
       `ExecStartPre` run + phase-offset timer; daemon exit-75 gate
       and the one-shot spawn on entering upgrade-required.
+      *(As built, 2026-08-16: `HOPNET_MOUNT_UPGRADE_RELEASE_URL`
+      joined the env contract — the follower poll is
+      deployment-shapeable, and S3's fake feed needs it. The timer is
+      `03,09,15,21:00` + 30 min jitter — maximally distant from the
+      node's {0,6,12,18}h tick. `upgrade.enable` (default on) is
+      mutually exclusive with `allowPassthrough`: security.wrappers
+      copies the binary at activation, so the wrapped path can never
+      follow a flip. The seed script reads the profile path from the
+      unit environment because `%h` expands in unit directives only.
+      The one-shot is once per ENTRY into the held state — a clear
+      (node accepts us again) re-arms it; an AtomicBool keeps the
+      spawned wrapper to one child at a time. The daemon's exit
+      belongs to the binary: the coupling fires a Notify, main's
+      signal select exits 75 only after the clean unmount. Preflight
+      mirrors the gate on the start path (mount only, never login).
+      Held-426 restart loops are damped by RestartSteps 5s→10min.
+      Timers are session-scoped without `loginctl enable-linger`; the
+      pre-start check covers every login regardless.)*
 - [ ] S3 — end-to-end: a VM or orchestrator scenario proving
       stage → flip → exit 75 → the daemon serves from the new binary,
       and the hold path (nothing compatible → loud held state, no
