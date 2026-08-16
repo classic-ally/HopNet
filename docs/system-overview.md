@@ -714,6 +714,18 @@ PhotoKit→HopNet on-ramp daemon (personal + iCloud Shared Photo Library). Bytes
   `HOPNET_EPHEMERAL_ROOT` (default `$TMPDIR`), reaped by the next ephemeral
   node via an flock'd owner file. Nothing derives its location from the
   database path.
+- **Splitting storage across disks**: `HOPNET_DATA_DIR` (database, WAL,
+  regenesis artifacts, photos sidecars) and `HOPNET_FRAGMENTS_DIR` (bulk
+  content-addressed blobs) resolve independently, so a validator can keep the
+  latency-critical database on fast storage while blobs stay on a bulk pool.
+  Every synced database write gates the consensus round the node proposes: an
+  fsync costs ~146 ms on spinning ZFS against ~0.55 ms on NVMe, which clients
+  see as multi-second file operations whenever that node is proposer. The nix
+  module exposes this as `services.hopnet.fragmentsDir`, defaulting under
+  `dataDir` so existing deployments are unchanged. A boot guard refuses to
+  start when the database claims locally-stored fragments but the store is
+  missing or empty — the failure it prevents is a node starting before its
+  bulk filesystem mounts and writing blobs to the wrong disk.
 
 ## Development Roadmap
 

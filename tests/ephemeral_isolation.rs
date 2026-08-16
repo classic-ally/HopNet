@@ -140,3 +140,47 @@ fn negative_flag_value_leaves_the_node_durable() {
         "=0 must not create a disposable tree"
     );
 }
+
+// Impact: a validator whose database sits on spinning storage costs the whole
+//         mesh latency on every round it proposes — ~146 ms per fsync against
+//         ~0.55 ms on NVMe, seen by clients as multi-second file operations.
+//         The fix is to put the database on fast storage and leave the bulk
+//         blobs on the big pool, which only works if a DURABLE node resolves
+//         the two independently.
+// Should: put the database under HOPNET_DATA_DIR and fragments under
+//         HOPNET_FRAGMENTS_DIR, on a node that is not ephemeral.
+// Should not: place either one inside the other's directory.
+#[test]
+fn durable_node_splits_database_and_fragment_store() {
+    let fast = tempfile::tempdir().unwrap();
+    let bulk = tempfile::tempdir().unwrap();
+    let port = free_port();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_hopnet"))
+        .env("HOPNET_DATA_DIR", fast.path())
+        .env("HOPNET_FRAGMENTS_DIR", bulk.path())
+        .env("HOPNET_HTTP_PORT", port.to_string())
+        .env("HOPNET_TEST_MODE", "1")
+        .env("HOPNET_DISABLE_TLS", "1")
+        .env_remove("HOPNET_EPHEMERAL_DB")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn hopnet");
+    let _guard = NodeGuard(child);
+
+    assert!(
+        wait_for_db(&fast.path().join("database.db")),
+        "database belongs under HOPNET_DATA_DIR, found: {:?}",
+        entries(fast.path())
+    );
+    assert!(
+        !bulk.path().join("database.db").exists(),
+        "database must not follow the fragment store"
+    );
+    assert!(
+        !fast.path().join("fragments").exists(),
+        "fragment store must not be re-derived under the data dir: {:?}",
+        entries(fast.path())
+    );
+}

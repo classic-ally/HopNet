@@ -41,6 +41,7 @@ const GUARDED: &[&str] = &[
     // same directory tree as `XDG_DATA_HOME`, so they share its lock.
     "HOPNET_EPHEMERAL_DB",
     "HOPNET_EPHEMERAL_ROOT",
+    "HOPNET_DATA_DIR",
     "HOPNET_FRAGMENTS_DIR",
     // The RFC-021 nix-provider deployment contract (nix_provider.rs).
     "HOPNET_UPGRADE_PROVIDER",

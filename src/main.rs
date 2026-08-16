@@ -359,6 +359,16 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Failed to get fragments directory, using current directory");
                 "./hopnet/fragments".to_string()
             });
+            // BEFORE create_dir_all: creating the directory is exactly the
+            // damage this guards against when the store's filesystem is not
+            // mounted yet.
+            if let Err(detail) = storage_host::functions::check_fragment_store_present(
+                &conn,
+                &fragments_dir,
+                &paths::data_dir(),
+            ) {
+                return Err(detail.into());
+            }
             std::fs::create_dir_all(&fragments_dir).expect("Failed to create fragments directory");
 
             // Create the comms transport: host-injected peer directory (the

@@ -94,11 +94,21 @@ fn xdg_data_home() -> PathBuf {
 }
 
 /// The node's own directory: database, regenesis artifacts, photos sidecars.
+///
+/// `HOPNET_DATA_DIR` moves it without touching `XDG_DATA_HOME`. That matters
+/// because `XDG_DATA_HOME` steers three things across two processes — this
+/// directory, the fragment-store fallback, and `hopnet-mount`'s staging
+/// directory — so using it to put the database on a small fast disk would drag
+/// in-flight upload bytes along. The database is small, randomly written and
+/// gates consensus latency; the other two are bulk.
 pub fn data_dir() -> PathBuf {
-    match installed() {
-        Some(p) => p.data_dir.clone(),
-        None => xdg_data_home().join("hopnet"),
+    if let Some(p) = installed() {
+        return p.data_dir.clone();
     }
+    if let Some(dir) = std::env::var_os("HOPNET_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+    xdg_data_home().join("hopnet")
 }
 
 /// Pinned-HTTPS identity material (RFC-022). Ephemeral nodes get a fresh
@@ -287,11 +297,57 @@ mod tests {
     #[test]
     fn data_dir_follows_xdg_when_not_overridden() {
         let guard = crate::test_env::lock_env();
+        crate::test_env::remove(&guard, "HOPNET_DATA_DIR");
         crate::test_env::set(&guard, "XDG_DATA_HOME", "/tmp/hopnet-paths-a");
         assert_eq!(data_dir(), PathBuf::from("/tmp/hopnet-paths-a/hopnet"));
         crate::test_env::set(&guard, "XDG_DATA_HOME", "/tmp/hopnet-paths-b");
         assert_eq!(data_dir(), PathBuf::from("/tmp/hopnet-paths-b/hopnet"));
         assert_eq!(tls_dir(), PathBuf::from("/tmp/hopnet-paths-b/hopnet/tls"));
+    }
+
+    // Impact: a validator whose database sits on spinning storage costs the
+    //         whole mesh latency on every round it proposes (~146 ms per
+    //         fsync vs ~0.55 ms on NVMe, measured). Splitting the small
+    //         random writes onto fast storage while bulk blobs stay on the
+    //         big pool is the fix, and it only works if the two locations
+    //         resolve independently on the DURABLE path — not just under
+    //         ephemeral mode, where the override already separates them.
+    // Should: resolve the database under HOPNET_DATA_DIR and fragments under
+    //         HOPNET_FRAGMENTS_DIR with no ephemeral override installed.
+    // Should not: let either variable disturb the other's location.
+    #[test]
+    fn durable_database_and_fragments_resolve_independently() {
+        let guard = crate::test_env::lock_env();
+        crate::test_env::remove(&guard, "HOPNET_EPHEMERAL_DB");
+        crate::test_env::set(&guard, "XDG_DATA_HOME", "/tmp/hopnet-split-xdg");
+        crate::test_env::set(&guard, "HOPNET_DATA_DIR", "/tmp/hopnet-split-fast");
+        crate::test_env::set(&guard, "HOPNET_FRAGMENTS_DIR", "/tmp/hopnet-split-bulk");
+
+        assert_eq!(data_dir(), PathBuf::from("/tmp/hopnet-split-fast"));
+        assert_eq!(
+            crate::db::shared::get_database_path(),
+            "/tmp/hopnet-split-fast/database.db"
+        );
+        assert_eq!(
+            hopnet_storage::fragstore::get_fragments_dir().unwrap(),
+            "/tmp/hopnet-split-bulk"
+        );
+        // TLS follows the database, not the blobs.
+        assert_eq!(tls_dir(), PathBuf::from("/tmp/hopnet-split-fast/tls"));
+    }
+
+    // Should: prefer HOPNET_DATA_DIR over XDG_DATA_HOME.
+    // Should: fall back to XDG_DATA_HOME when it is unset, so existing
+    //         deployments that set only XDG_DATA_HOME are unaffected.
+    #[test]
+    fn data_dir_override_takes_precedence_over_xdg() {
+        let guard = crate::test_env::lock_env();
+        crate::test_env::set(&guard, "XDG_DATA_HOME", "/tmp/hopnet-prec-xdg");
+        crate::test_env::set(&guard, "HOPNET_DATA_DIR", "/tmp/hopnet-prec-explicit");
+        assert_eq!(data_dir(), PathBuf::from("/tmp/hopnet-prec-explicit"));
+
+        crate::test_env::remove(&guard, "HOPNET_DATA_DIR");
+        assert_eq!(data_dir(), PathBuf::from("/tmp/hopnet-prec-xdg/hopnet"));
     }
 
     // Impact: SIGTERM and `std::process::exit` both end the process without

@@ -56,7 +56,38 @@ in
     dataDir = lib.mkOption {
       type = lib.types.path;
       default = "/var/lib/hopnet";
-      description = "Data directory: SQLite database, fragment storage, the exec profile and staged generations.";
+      description = ''
+        Data directory: SQLite database, fragment storage, the exec profile
+        and staged generations. Set `fragmentsDir` to move bulk storage
+        elsewhere and leave only the latency-sensitive database here.
+      '';
+    };
+
+    fragmentsDir = lib.mkOption {
+      type = lib.types.path;
+      default = "${cfg.dataDir}/hopnet/fragments";
+      defaultText = lib.literalExpression ''"''${cfg.dataDir}/hopnet/fragments"'';
+      description = ''
+        Where content-addressed fragments live. The default is exactly where
+        they land today, so no existing deployment moves on upgrade.
+
+        Split this onto bulk storage when `dataDir` is on a fast disk. The
+        database is small and randomly written, and every synced write gates
+        the consensus round this node proposes — on spinning ZFS an fsync
+        costs ~146 ms against ~0.55 ms on NVMe, which shows up directly as
+        multi-second file operations for every client in the mesh. Fragments
+        are bulk, sequential and latency-insensitive.
+
+        Migrating an existing node: stop it, move everything EXCEPT
+        `hopnet/fragments` to the new `dataDir`, point `fragmentsDir` at the
+        old location, rebuild, start. Note the doubled path segment in the
+        default — fragments live at `<dataDir>/hopnet/fragments`, not
+        `<dataDir>/fragments`. Getting it wrong is caught at boot: the node
+        refuses to start when the database claims fragments the store does
+        not have.
+
+        Must not be under `/home`: the unit sets `ProtectHome = true`.
+      '';
     };
 
     relayUrl = lib.mkOption {
@@ -136,7 +167,12 @@ in
 
       environment = {
         RUST_LOG = cfg.logLevel;
+        # Resolves the node's own directory to ${dataDir}/hopnet. Deliberately
+        # NOT HOPNET_DATA_DIR: that variable takes the directory verbatim, so
+        # switching would move every existing deployment's database up one
+        # level.
         XDG_DATA_HOME = cfg.dataDir;
+        HOPNET_FRAGMENTS_DIR = cfg.fragmentsDir;
         # nix evaluation/fetch caches as the service user.
         XDG_CACHE_HOME = "${cfg.dataDir}/.cache";
         SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
@@ -181,13 +217,26 @@ in
         PrivateTmp = true;
         # The daemon socket needs write for connect(2); staging builds go
         # through the daemon, never a local chroot store.
-        ReadWritePaths = [
+        ReadWritePaths = lib.unique [
           cfg.dataDir
+          cfg.fragmentsDir
           "/nix/var/nix/daemon-socket"
         ];
       };
 
-      unitConfig.RequiresMountsFor = [ cfg.dataDir ];
+      # Both paths, because they can be separate filesystems. Without the
+      # fragments entry the node may start before its bulk storage is
+      # mounted, create the store directory on whatever sits under the
+      # mountpoint, and write fragments there — where they vanish beneath
+      # the real filesystem once it arrives.
+      unitConfig.RequiresMountsFor = lib.unique [ cfg.dataDir cfg.fragmentsDir ];
     };
+
+    # `users.users.hopnet.createHome` only covers dataDir, so a fragment
+    # store outside it would not exist and the node could not create it
+    # against a root-owned parent.
+    systemd.tmpfiles.rules =
+      lib.optional (!lib.hasPrefix "${toString cfg.dataDir}/" (toString cfg.fragmentsDir))
+        "d ${cfg.fragmentsDir} 0700 hopnet hopnet - -";
   };
 }
