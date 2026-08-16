@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use ed25519_dalek::SigningKey;
 use malachitebft_core_consensus::Params;
-use malachitebft_core_types::{Round, Validity, ValuePayload};
+use malachitebft_core_types::{Round, ValuePayload};
 
 use hopnet_consensus::codec::WireCommitCertificate;
 use hopnet_consensus::config::{MalachiteThresholds, QuorumProfile};
