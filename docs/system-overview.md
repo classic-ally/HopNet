@@ -523,12 +523,13 @@ Cross-platform desktop application providing file management and network adminis
       every DeviceToken surface with versioned health probes, typed
       client-side 426 handling + min_node across mount/appex/ingress,
       and the `client-version-skew` orchestrator test)
-- [ ] Mount auto-upgrade — the nix client channel
+- [~] Mount auto-upgrade — the nix client channel
       ([RFC-023](specs/mount-upgrade.md), spec 2026-08-16: follower
       forward-walk selection with the anchor lemma, hopnet-mount
       upgrade wrapper on timer/ExecStartPre/426 triggers,
-      profile-symlink activation with exit 75; slices S1–S3 not
-      started)
+      profile-symlink activation with exit 75; S1 shipped 2026-08-16 —
+      `--min-node` + the `upgrade` subcommand with feed logic hoisted
+      to hopnet-common; S2 module/activation and S3 end-to-end next)
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
       Network Resilience pane reports margins to the model-checked invariants rather than

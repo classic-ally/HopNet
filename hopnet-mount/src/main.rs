@@ -58,6 +58,8 @@ mod linux {
         Mount(MountArgs),
         /// Validate and store a device token for this user
         Login(LoginArgs),
+        /// Stage and activate the newest node-compatible release (RFC-023)
+        Upgrade(UpgradeArgs),
     }
 
     #[derive(clap::Args)]
@@ -108,6 +110,14 @@ mod linux {
         token_file: Option<PathBuf>,
     }
 
+    #[derive(clap::Args)]
+    struct UpgradeArgs {
+        /// Node base URL (default: login config > node endpoint file >
+        /// http://127.0.0.1:34632)
+        #[arg(long)]
+        url: Option<String>,
+    }
+
     /// `$XDG_DATA_HOME/hopnet` — durable per-user daemon state (staging
     /// lives under it; the crash-cleanup connection record beside it).
     fn default_data_dir() -> PathBuf {
@@ -142,7 +152,28 @@ mod linux {
         match Cli::parse().command {
             Command::Mount(args) => mount(args),
             Command::Login(args) => login(args),
+            Command::Upgrade(args) => upgrade(args),
         }
+    }
+
+    /// One wrapper run (RFC-023 S1). Every operational outcome exits 0
+    /// with one stdout line — S2's ExecStartPre must never block a
+    /// mount start; only a missing env contract is a real error.
+    fn upgrade(args: UpgradeArgs) {
+        let env = match hopnet_mount::upgrade::UpgradeEnv::from_env() {
+            Ok(env) => env,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+        let url = provision::resolve_url(args.url.as_deref(), &Paths::from_env());
+        let outcome = hopnet_mount::upgrade::run_with(
+            &env,
+            &url,
+            &hopnet_mount::upgrade::default_releases_url(),
+        );
+        println!("{}", outcome.line());
     }
 
     fn runtime() -> tokio::runtime::Runtime {

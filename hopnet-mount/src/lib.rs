@@ -69,5 +69,8 @@ pub mod fuse;
 #[cfg(target_os = "linux")]
 pub mod provision;
 
+#[cfg(target_os = "linux")]
+pub mod upgrade;
+
 #[cfg(test)]
 mod tests;

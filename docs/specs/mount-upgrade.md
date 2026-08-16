@@ -176,10 +176,24 @@ Each tracked, not forgotten:
 
 ## Implementation Slices
 
-- [ ] S1 — `hopnet-mount --min-node` + the `upgrade` subcommand:
+- [x] S1 — `hopnet-mount --min-node` + the `upgrade` subcommand:
       feed poll, policy readout, forward walk, staging with
       provenance, atomic flip; tested against a fake nix and a fake
       feed (the RFC-021 provider test pattern).
+      *(As built, 2026-08-16: pure feed/ref logic hoisted to
+      `common/src/release_feed.rs` — the node re-imports, so the
+      refs/tags lesson lives once. `--min-node` prints the bare CalVer
+      token via a pre-clap intercept (Cli requires a subcommand); a
+      staged binary that cannot answer it — a pre-S1 release — records
+      `min_node: 0`, loudly, safe because such a release only appears
+      at or below the anchor. Every operational outcome exits 0 with
+      one greppable line (`upgraded:`/`current:`/`held at:`/`offline:`)
+      so S2's ExecStartPre never blocks a start; only a missing env
+      contract exits 1. No permanent-refusal record on disk: wrong
+      bytes never gain provenance, and the nix store itself memoizes
+      the build, so re-runs cost a cache hit. The current position is
+      read from the profile binary's own `--version` — honest bytes,
+      works for module-seeded profiles with no provenance.)*
 - [ ] S2 — module reshape + activation: profile `ExecStart`,
       newest-wins seeding, `RestartForceExitStatus=75`,
       `ExecStartPre` run + phase-offset timer; daemon exit-75 gate
