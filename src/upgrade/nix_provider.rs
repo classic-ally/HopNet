@@ -85,25 +85,13 @@ impl NixEnv {
 }
 
 /// Base flake ref derived from the crate's repository field — the release
-/// page and the staged source stay the same single upstream. The `.git`
-/// suffix matches the form the deployments' flake inputs already use.
+/// page and the staged source stay the same single upstream.
 pub fn default_flake_ref() -> String {
-    let repository = env!("CARGO_PKG_REPOSITORY");
-    if repository.ends_with(".git") {
-        format!("git+{repository}")
-    } else {
-        format!("git+{repository}.git")
-    }
+    hopnet_common::release_feed::flake_ref(env!("CARGO_PKG_REPOSITORY"))
 }
 
-/// The flake ref for a release tag. `refs/tags/` is NOT decoration: nix
-/// resolves a bare `?ref=X` under `refs/heads/`, so a release tag asked
-/// for by name fails with "couldn't find remote ref refs/heads/vX" — which
-/// is exactly how the first real staging attempt died, on all three nodes
-/// at once, with the fake `nix` in every test happily ignoring the ref.
-pub fn tag_ref(flake_ref: &str, version: &str) -> String {
-    format!("{flake_ref}?ref=refs/tags/v{version}")
-}
+// The refs/tags/ namespace lesson travels with the helper (RFC-023 hoist).
+pub use hopnet_common::release_feed::tag_ref;
 
 /// What `stage` records beside the out-link: enough to re-verify at
 /// activation time that the bytes being activated are the ones THIS node
@@ -559,22 +547,6 @@ pub(crate) mod tests {
 
         let err = try_activate_with(&env, 20260900).unwrap_err();
         assert!(err.contains("disabled"), "{err}");
-    }
-
-    // Impact: the tag ref is the one string in the provider that only a
-    // real nix and a real forge can validate — every test here and the VM
-    // test stub the nix binary, so a wrong ref namespace sails through all
-    // of them and dies on the first genuine release. It did: nix resolves a
-    // bare `?ref=X` under refs/heads, so `?ref=v2026.8.1` asked for a
-    // BRANCH and all three nodes failed with "couldn't find remote ref
-    // refs/heads/v2026.8.1".
-    // Should: address a release tag under refs/tags.
-    #[test]
-    fn tag_ref_addresses_the_tag_namespace() {
-        assert_eq!(
-            tag_ref("git+https://example.invalid/HopNet.git", "2026.8.1"),
-            "git+https://example.invalid/HopNet.git?ref=refs/tags/v2026.8.1"
-        );
     }
 
     // Should: resolve the deployment contract from env only when the

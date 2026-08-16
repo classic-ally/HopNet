@@ -9,6 +9,7 @@ pub mod height;
 pub mod mount;
 pub mod photo_ingress;
 pub mod quorum;
+pub mod release_feed;
 pub mod setup;
 pub mod shares;
 pub mod snapshot;

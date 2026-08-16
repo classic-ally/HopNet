@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use serde::Deserialize;
+use hopnet_common::release_feed::{self, ForgejoRelease};
 
 use super::{AvailableVersion, ProviderError, ProviderReport, UpgradeProvider};
 
@@ -33,62 +33,21 @@ impl GitReleaseProvider {
     /// field: {instance}/api/v1/repos/{owner}/{repo}/releases (the same
     /// endpoints the release workflow publishes through).
     pub fn default_releases_url() -> String {
-        let repository = env!("CARGO_PKG_REPOSITORY");
-        let (instance, path) = repository
-            .rsplit_once('/')
-            .and_then(|(rest, repo)| {
-                rest.rsplit_once('/')
-                    .map(|(instance, owner)| (instance.to_string(), format!("{owner}/{repo}")))
-            })
-            .expect("CARGO_PKG_REPOSITORY is {instance}/{owner}/{repo}");
-        format!("{instance}/api/v1/repos/{path}/releases")
+        release_feed::releases_url(env!("CARGO_PKG_REPOSITORY"))
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ForgejoRelease {
-    tag_name: String,
-    #[serde(default)]
-    prerelease: bool,
-    #[serde(default)]
-    draft: bool,
-}
-
-/// Pure translation of a Forgejo releases payload: drafts dropped, the
-/// tag's leading 'v' stripped, prerelease from the flag or a '-' in the
-/// version, staged ALWAYS false (v1 reports available-but-unstaged
-/// only), newest first — CalVer tokens by integer code descending, then
-/// non-CalVer legacy tags lexicographically descending.
+/// Feed entries as the node reports them: staged ALWAYS false here (v1
+/// reports available-but-unstaged only; the nix provider re-marks).
 fn parse_releases(releases: Vec<ForgejoRelease>) -> Vec<AvailableVersion> {
-    let mut available: Vec<AvailableVersion> = releases
+    release_feed::parse_releases(releases)
         .into_iter()
-        .filter(|r| !r.draft)
-        .map(|r| {
-            let version = r
-                .tag_name
-                .strip_prefix('v')
-                .unwrap_or(&r.tag_name)
-                .to_string();
-            let prerelease = r.prerelease || version.contains('-');
-            AvailableVersion {
-                version,
-                staged: false,
-                prerelease,
-            }
+        .map(|r| AvailableVersion {
+            version: r.version,
+            staged: false,
+            prerelease: r.prerelease,
         })
-        .collect();
-    available.sort_by(|a, b| {
-        match (
-            crate::version::parse_code(&a.version),
-            crate::version::parse_code(&b.version),
-        ) {
-            (Some(a), Some(b)) => b.cmp(&a),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => b.version.cmp(&a.version),
-        }
-    });
-    available
+        .collect()
 }
 
 impl UpgradeProvider for GitReleaseProvider {
@@ -137,20 +96,14 @@ impl UpgradeProvider for GitReleaseProvider {
 mod tests {
     use super::*;
 
-    // Should: parse a canned Forgejo releases payload — drafts dropped,
-    // the 'v' prefix stripped, prerelease from the flag or a '-' in the
-    // version, staged always false (v1 reports available-but-unstaged
-    // only), newest first with legacy non-CalVer tags after every
-    // CalVer token.
+    // Should: map every feed entry to an unstaged AvailableVersion —
+    // staging claims are the nix provider's to make, never the feed's.
     #[test]
-    fn parses_canned_releases_payload() {
+    fn maps_releases_to_unstaged_available_versions() {
         let releases: Vec<ForgejoRelease> = serde_json::from_str(
             r#"[
-                {"tag_name": "v0.1.0-rc.2", "prerelease": false},
-                {"tag_name": "v2026.8.0"},
-                {"tag_name": "v2026.9.0", "draft": true},
                 {"tag_name": "v2026.8.1", "prerelease": true},
-                {"tag_name": "v0.1.0-rc.1"}
+                {"tag_name": "v2026.8.0"}
             ]"#,
         )
         .unwrap();
@@ -167,16 +120,6 @@ mod tests {
                     version: "2026.8.0".into(),
                     staged: false,
                     prerelease: false,
-                },
-                AvailableVersion {
-                    version: "0.1.0-rc.2".into(),
-                    staged: false,
-                    prerelease: true, // '-' in the version
-                },
-                AvailableVersion {
-                    version: "0.1.0-rc.1".into(),
-                    staged: false,
-                    prerelease: true,
                 },
             ]
         );
