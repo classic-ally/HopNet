@@ -61,6 +61,12 @@ impl From<hopnet_storage::StorageError> for FileError {
             hopnet_storage::StorageError::Host(msg) => {
                 FileError::StorageError(std::io::Error::other(msg))
             }
+            // Consensus-path callers classify Transient before it reaches
+            // FileError; the HTTP upload paths that land here treat it as
+            // any other storage failure (retried by upload_staged).
+            hopnet_storage::StorageError::Transient(code) => FileError::StorageError(
+                std::io::Error::other(format!("transient database contention: {code:?}")),
+            ),
         }
     }
 }

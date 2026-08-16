@@ -9,9 +9,9 @@
 use crate::consensus::malachite::app::{HopNetApplication, to_engine_transactions};
 use crate::consensus::tests::{MockNetwork, MockUser};
 use crate::consensus::types::Transactions;
-use hopnet_consensus::Validity;
 use hopnet_consensus::context::Height;
 use hopnet_consensus::store::SqliteStorage;
+use hopnet_consensus::traits::ValidationVerdict;
 use hopnet_consensus::traits::{Application, ValidationOrigin};
 use hopnet_consensus::types as engine;
 
@@ -24,7 +24,7 @@ type PoolStorage = SqliteStorage<r2d2::PooledConnection<r2d2_sqlite::SqliteConne
 pub(super) fn validate_at_height_1(
     app_state: &crate::AppState,
     txs: Vec<crate::consensus::types::Transaction>,
-) -> Validity {
+) -> ValidationVerdict {
     let engine_txs = to_engine_transactions(&Transactions(txs)).expect("transaction bridge");
 
     let mut conn = app_state.db_pool.get().expect("pool");
@@ -88,7 +88,7 @@ fn test_forged_node_signature() {
 
     assert_eq!(
         validate_at_height_1(&node0.app_state, vec![forged_tx]),
-        Validity::Invalid,
+        ValidationVerdict::Invalid,
         "Block with forged node signature must be rejected"
     );
 }
@@ -147,7 +147,7 @@ fn test_forged_user_signature() {
 
     assert_eq!(
         validate_at_height_1(&node.app_state, vec![forged_tx]),
-        Validity::Invalid,
+        ValidationVerdict::Invalid,
         "Block with forged user signature must be rejected"
     );
 }
@@ -192,7 +192,7 @@ fn test_one_invalid_tx_rejects_block() {
 
     assert_eq!(
         validate_at_height_1(&node0.app_state, transactions),
-        Validity::Invalid,
+        ValidationVerdict::Invalid,
         "Block containing one forged transaction must be rejected wholesale"
     );
 }

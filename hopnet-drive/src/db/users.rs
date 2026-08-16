@@ -37,7 +37,7 @@ pub fn get_recipient_by_username(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     match row {
         Some((user_id, blob)) => Ok(Some(RecipientUser {
@@ -62,7 +62,7 @@ pub fn user_exists(
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
             Ok(row.is_some())
         }
         Err(_) => Err(DatabaseError::LockError),
@@ -85,7 +85,7 @@ pub fn blob_access_for_user_with_conn(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     let pubkey = match blob {
         Some(blob) => pubkey_from_blob(blob)?,

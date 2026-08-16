@@ -12,12 +12,12 @@ use std::ops::DerefMut;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
+use hopnet_consensus::Round;
 use hopnet_consensus::codec::WireCommitCertificate;
 use hopnet_consensus::context::{Height, HopNetValidatorSet, Validator};
 use hopnet_consensus::store::SqliteStorage;
-use hopnet_consensus::traits::{Application, ApplyError, ValidationOrigin};
+use hopnet_consensus::traits::{Application, ApplyError, ValidationOrigin, ValidationVerdict};
 use hopnet_consensus::types as engine;
-use hopnet_consensus::{Round, Validity};
 
 use crate::AppState;
 use crate::DISPATCH_TABLE;
@@ -81,13 +81,14 @@ impl HopNetApplication {
         block: &engine::Block,
         db_tx: &rusqlite::Transaction<'_>,
         origin: ValidationOrigin,
-    ) -> Result<(), String> {
+    ) -> Result<(), ValidateFailure> {
         block.verify().map_err(|e| format!("block hash: {e:?}"))?;
         if block.data.height != height.0 {
             return Err(format!(
                 "height mismatch: block {} vs consensus {}",
                 block.data.height, height.0
-            ));
+            )
+            .into());
         }
 
         // Solo-block rule (RFC-CONSENSUS-002 membership transitions;
@@ -126,7 +127,8 @@ impl HopNetApplication {
                 return Err(format!(
                     "regenesis commit seal_height {} != block height {}",
                     commit.seal_height, block.data.height
-                ));
+                )
+                .into());
             }
             // The target must be the one THIS node has committed from
             // `regenesis_start`. Deterministic and safe at both origins:
@@ -142,7 +144,8 @@ impl HopNetApplication {
                 return Err(format!(
                     "regenesis commit target {} != committed target {:?}",
                     commit.target_version_code, committed_target
-                ));
+                )
+                .into());
             }
             if origin == ValidationOrigin::Live {
                 // Vote-iff-match (Rule-8, RFC-013 precedent): recompute
@@ -165,7 +168,8 @@ impl HopNetApplication {
                         "vote-iff-match: local artifact {} != proposed {}",
                         local.to_hex(),
                         hopnet_common::Blake3Hash::from_bytes(commit.snapshot_hash).to_hex()
-                    ));
+                    )
+                    .into());
                 }
                 // Own-drain check: refuse to seal past work this node has
                 // accepted but not yet seen decided (one dissenting vote,
@@ -176,7 +180,8 @@ impl HopNetApplication {
                         "own pool not drained (staged {}, inflight {}): refusing to seal",
                         pool.staged_len(),
                         pool.inflight_len()
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -224,7 +229,7 @@ impl HopNetApplication {
                 if let Some(created_at) = tx.nonce.extract_timestamp()
                     && now - created_at > MAX_TRANSACTION_AGE
                 {
-                    return Err(format!("stale transaction {}", tx.rpc.function));
+                    return Err(format!("stale transaction {}", tx.rpc.function).into());
                 }
                 let committed = dedup
                     .exists([tx.nonce.to_string()])
@@ -252,13 +257,48 @@ impl HopNetApplication {
             }
         }
 
-        // Handler dry-run (execute=false) — deterministic, both origins.
+        // Handler dry-run (execute=false) — deterministic, both origins,
+        // EXCEPT for transient storage contention, which is node-local and
+        // non-deterministic: it must surface as Undetermined, never as a
+        // verdict (the ":258 deterministic" assumption this used to violate).
         let candidate_height = height.0;
         for tx in old_txs.0.iter() {
-            process_transaction(tx, &self.app_state, false, candidate_height, db_tx)
-                .map_err(|e| format!("handler validation ({}): {e:?}", tx.rpc.function))?;
+            process_transaction(tx, &self.app_state, false, candidate_height, db_tx).map_err(
+                |e| match e {
+                    crate::db::DatabaseError::Transient(code) => ValidateFailure::Transient(
+                        format!("handler validation ({}): {code:?}", tx.rpc.function),
+                    ),
+                    other => ValidateFailure::Semantic(format!(
+                        "handler validation ({}): {other:?}",
+                        tx.rpc.function
+                    )),
+                },
+            )?;
         }
         Ok(())
+    }
+}
+
+/// Why validate_inner could not accept a block: a semantic judgement
+/// (deterministic, safe to vote on) vs a transient node-local storage
+/// condition (not a judgement at all — the host retries it).
+#[derive(Debug)]
+enum ValidateFailure {
+    Transient(String),
+    Semantic(String),
+}
+
+// Every legacy string error inside validate_inner is a semantic judgement;
+// only the classified handler dry-run produces Transient.
+impl From<String> for ValidateFailure {
+    fn from(reason: String) -> Self {
+        ValidateFailure::Semantic(reason)
+    }
+}
+
+impl From<&str> for ValidateFailure {
+    fn from(reason: &str) -> Self {
+        ValidateFailure::Semantic(reason.to_string())
     }
 }
 
@@ -282,12 +322,18 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         block: &engine::Block,
         tx: &mut rusqlite::Transaction<'_>,
         origin: ValidationOrigin,
-    ) -> Validity {
+    ) -> ValidationVerdict {
         match self.validate_inner(height, block, tx, origin) {
-            Ok(()) => Validity::Valid,
-            Err(reason) => {
+            Ok(()) => ValidationVerdict::Valid,
+            Err(ValidateFailure::Transient(reason)) => {
+                // Not a verdict: the host retries this on an IMMEDIATE
+                // transaction before anything reaches a vote.
+                tracing::warn!(height = height.0, "validation undetermined: {reason}");
+                ValidationVerdict::Undetermined(reason)
+            }
+            Err(ValidateFailure::Semantic(reason)) => {
                 tracing::warn!(height = height.0, "block rejected: {reason}");
-                Validity::Invalid
+                ValidationVerdict::Invalid
             }
         }
     }
@@ -420,8 +466,9 @@ pub fn check_solo_membership<'a>(
 
 pub struct BuiltValue {
     pub block: engine::Block,
-    /// (index into `candidates`, reason) for transactions dropped by preflight.
-    pub rejected: Vec<(usize, String)>,
+    /// (index into `candidates`, typed verdict) for transactions dropped by
+    /// preflight — see [`crate::consensus::queue::RejectReason`] for routing.
+    pub rejected: Vec<(usize, crate::consensus::queue::RejectReason)>,
     /// Candidate indices deferred by the solo-block rule (restage, don't
     /// reject: they are valid, just not allowed to share this block).
     pub deferred: Vec<usize>,
@@ -448,7 +495,7 @@ pub fn build_value(
     let mut survivors: Vec<(usize, &crate::consensus::types::Transaction)> = Vec::new();
     for (i, tx) in candidates.iter().enumerate() {
         if committed.contains(&tx.nonce.to_string()) {
-            rejected.push((i, "already committed".into()));
+            rejected.push((i, crate::consensus::queue::RejectReason::AlreadyCommitted));
         } else {
             survivors.push((i, tx));
         }
@@ -501,12 +548,20 @@ pub fn build_value(
                         tx.submitter.id,
                     )
             {
-                failed.push((*i, format!("membership guard: {reason}")));
+                failed.push((
+                    *i,
+                    crate::consensus::queue::RejectReason::Permanent(format!(
+                        "membership guard: {reason}"
+                    )),
+                ));
                 continue;
             }
             let sp = format!("preflight_{slot}");
             if db_tx.execute_batch(&format!("SAVEPOINT {sp}")).is_err() {
-                failed.push((*i, "savepoint error".to_string()));
+                failed.push((
+                    *i,
+                    crate::consensus::queue::RejectReason::Permanent("savepoint error".into()),
+                ));
                 continue;
             }
             let verdict = match DISPATCH_TABLE.get(tx.rpc.function.as_str()) {
@@ -536,11 +591,23 @@ pub fn build_value(
                         notifier: &notifier,
                         work: &scheduler,
                     };
-                    handler
-                        .process(&meta, false, &ctx, &db_tx)
-                        .map_err(|e| format!("{e:?}"))
+                    // Classification seam: a transient storage error is not a
+                    // verdict on the transaction — it restages instead of
+                    // reaching the submitter as TxSubmitError::Rejected (409).
+                    handler.process(&meta, false, &ctx, &db_tx).map_err(|e| {
+                        use crate::consensus::queue::RejectReason;
+                        match e {
+                            crate::db::DatabaseError::Transient(code) => {
+                                RejectReason::Transient(format!("{code:?}"))
+                            }
+                            other => RejectReason::Permanent(format!("{other:?}")),
+                        }
+                    })
                 }
-                None => Err(format!("no handler: {}", tx.rpc.function)),
+                None => Err(crate::consensus::queue::RejectReason::Permanent(format!(
+                    "no handler: {}",
+                    tx.rpc.function
+                ))),
             };
             match verdict {
                 Ok(()) => {
@@ -549,6 +616,16 @@ pub fn build_value(
                 Err(reason) => {
                     let _ = db_tx.execute_batch(&format!("ROLLBACK TO {sp}"));
                     let _ = db_tx.execute_batch(&format!("RELEASE {sp}"));
+                    // A Permanent reason reaches the submitter verbatim as
+                    // TxSubmitError::Rejected, which the mount routes map to
+                    // 409 -> EEXIST; Transient restages. Silent until now,
+                    // which made a transient rejection indistinguishable
+                    // from a genuine name conflict at the client.
+                    tracing::warn!(
+                        height = height.0,
+                        function = %tx.rpc.function,
+                        "preflight dropped transaction: {reason:?}"
+                    );
                     failed.push((*i, reason));
                 }
             }

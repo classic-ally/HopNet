@@ -30,7 +30,7 @@ fn log_ancestor_modifications(
         ).map_err(|e| {
             tracing::error!("Failed to log ancestor modification for path {} ancestor {}: {:?}",
                            path, ancestor_id, e);
-            DatabaseError::ProcessingError
+            DatabaseError::classified(&e, DatabaseError::ProcessingError)
         })?;
     }
     tracing::debug!(
@@ -76,7 +76,7 @@ pub fn get_files(
 
             let mut stmt = db_lock
                 .prepare(query)
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
             let like_path = format!("{}/%", path);
             let not_like_path = format!("{}/%", like_path);
             tracing::debug!(
@@ -114,11 +114,11 @@ pub fn get_files(
                         })
                     },
                 )
-                .map_err(|_| DatabaseError::ProcessingError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
 
             Ok(files
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| DatabaseError::ProcessingError)?)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?)
         }
         Err(e) => {
             tracing::error!("Database connection error in get_files: {:?}", e);
@@ -168,7 +168,7 @@ pub fn get_recent_files(
 
             let mut stmt = db_lock
                 .prepare(query)
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             let files = stmt
                 .query_map(params![owner_id, owner_id, owner_id, limit], |row| {
@@ -195,11 +195,11 @@ pub fn get_recent_files(
                         shared_with_count: Some(shared_with_count as u32),
                     })
                 })
-                .map_err(|_| DatabaseError::ProcessingError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
 
             Ok(files
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| DatabaseError::ProcessingError)?)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?)
         }
         Err(e) => {
             tracing::error!("Database connection error in get_recent_files: {:?}", e);
@@ -224,7 +224,10 @@ pub fn insert_files(
         )
         .map_err(|e| {
             tracing::error!("apply_blob_insert failed: id={} error={e}", op.blob_id);
-            DatabaseError::InsertError
+            match e {
+                hopnet_storage::StorageError::Transient(code) => DatabaseError::Transient(code),
+                _ => DatabaseError::InsertError,
+            }
         })?;
     }
 
@@ -257,7 +260,7 @@ pub fn insert_files(
                 params![inode_id, owner_id, inode.path, inode.inode_type, data_id]
             ).map_err(|e| {
                 tracing::error!("Failed to insert folder inode: id={} owner_id={} path={:?} error={:?}", inode_id, owner_id, inode.path, e);
-                DatabaseError::InsertError
+                DatabaseError::classified(&e, DatabaseError::InsertError)
             })?;
             if rows > 0 {
                 log_modification(
@@ -285,7 +288,7 @@ pub fn insert_files(
                         inode.inode_type,
                         e
                     );
-                    DatabaseError::InsertError
+                    DatabaseError::classified(&e, DatabaseError::InsertError)
                 })?;
             log_modification(
                 db_tx,
@@ -331,14 +334,14 @@ pub fn find_missing_parents(
 
     // Create temp table with ancestor paths
     tx.execute("CREATE TEMP TABLE temp_ancestor_paths (path TEXT)", [])
-        .map_err(|_| DatabaseError::InsertError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::InsertError))?;
 
     for ancestor in &all_ancestors {
         tx.execute(
             "INSERT INTO temp_ancestor_paths VALUES (?)",
             params![ancestor],
         )
-        .map_err(|_| DatabaseError::InsertError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::InsertError))?;
     }
 
     // Find ancestors that don't exist as inodes
@@ -350,20 +353,21 @@ pub fn find_missing_parents(
          WHERE i.path IS NULL
          ORDER BY tap.path",
         )
-        .map_err(|_| DatabaseError::ProcessingError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
 
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|_| DatabaseError::ProcessingError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
 
     let mut missing_parents = Vec::new();
     for row in rows {
-        missing_parents.push(row.map_err(|_| DatabaseError::ProcessingError)?);
+        missing_parents
+            .push(row.map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?);
     }
 
     // Clean up temp table
     tx.execute("DROP TABLE temp_ancestor_paths", [])
-        .map_err(|_| DatabaseError::ProcessingError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
 
     Ok(missing_parents)
 }
@@ -387,7 +391,7 @@ pub fn delete_files(
             params![path, format!("{}/%", path), user_id],
             |row| row.get(0),
         )
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     if item_count == 0 {
         return Err(DatabaseError::NotFound);
@@ -414,7 +418,7 @@ pub fn delete_files(
         params![height_to_db(current_height), path, format!("{}/%", path), user_id]
     ).map_err(|e| {
         tracing::error!("Failed to log modifications for deletion: {:?}", e);
-        DatabaseError::ProcessingError
+        DatabaseError::classified(&e, DatabaseError::ProcessingError)
     })?;
 
     tracing::debug!(
@@ -427,14 +431,14 @@ pub fn delete_files(
     {
         let mut data_ids_stmt = db_tx.prepare(
             "SELECT DISTINCT data_id FROM inodes WHERE (path = ? OR path LIKE ?) AND owner_id = ? AND data_id IS NOT NULL"
-        ).map_err(|_| DatabaseError::RecallError)?;
+        ).map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
         let data_ids: Vec<CustomUUID> = data_ids_stmt
             .query_map(params![path, format!("{}/%", path), user_id], |row| {
                 row.get::<_, CustomUUID>(0)
             })
-            .map_err(|_| DatabaseError::ProcessingError)?
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| DatabaseError::ProcessingError)?;
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
 
         for data_block_id in &data_ids {
             crate::db::shares::remove_user_from_shares(db_tx, data_block_id, user_id)?;
@@ -448,7 +452,7 @@ pub fn delete_files(
             "DELETE FROM inodes WHERE (path = ? OR path LIKE ?) AND owner_id = ?",
             params![path, format!("{}/%", path), user_id],
         )
-        .map_err(|_| DatabaseError::ProcessingError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
 
     tracing::debug!(
         "Deleted files at path {} for user {} using shared transaction",
@@ -486,7 +490,7 @@ pub fn modify_item(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     let (item_type, current_encrypted_path) = match item_info {
         Some((itype, path)) => (itype, path),
@@ -535,7 +539,7 @@ pub fn modify_item(
                 params![new_path, user_id, inode_id],
                 |row| row.get(0),
             )
-            .map_err(|_| DatabaseError::RecallError)?;
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
         if new_exists {
             return Err(DatabaseError::ConflictError); // Path already occupied
@@ -549,7 +553,7 @@ pub fn modify_item(
                         "UPDATE inodes SET path = ? WHERE path = ? AND owner_id = ?",
                         params![new_path, current_encrypted_path, user_id],
                     )
-                    .map_err(|_| DatabaseError::ProcessingError)?
+                    .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?
             }
             hopnet_common::InodeType::Folder => {
                 // For folders: update the folder and all descendants
@@ -568,7 +572,7 @@ pub fn modify_item(
                             format!("{}/%", current_encrypted_path)
                         ],
                     )
-                    .map_err(|_| DatabaseError::ProcessingError)?
+                    .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?
             }
         };
 
@@ -596,7 +600,7 @@ pub fn modify_item(
                 |row| row.get::<_, Option<CustomUUID>>(0),
             )
             .optional()
-            .map_err(|_| DatabaseError::RecallError)?
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?
             .unwrap_or(None);
 
         // Substrate half: register the new blob (skipped for cleared content)
@@ -611,7 +615,10 @@ pub fn modify_item(
                     "modify_item: apply_blob_insert failed: id={} error={e}",
                     op.blob_id
                 );
-                DatabaseError::InsertError
+                match e {
+                    hopnet_storage::StorageError::Transient(code) => DatabaseError::Transient(code),
+                    _ => DatabaseError::InsertError,
+                }
             })?;
         }
 
@@ -635,7 +642,7 @@ pub fn modify_item(
                     user_id,
                     e
                 );
-                DatabaseError::ProcessingError
+                DatabaseError::classified(&e, DatabaseError::ProcessingError)
             })?;
 
         tracing::debug!(
@@ -666,7 +673,7 @@ pub fn modify_item(
                     params![new_data_id, old_data, user_id, old_data]
                 ).map_err(|e| {
                     tracing::error!("modify_item: Failed to propagate data_id to other sharers: {:?}", e);
-                    DatabaseError::ProcessingError
+                    DatabaseError::classified(&e, DatabaseError::ProcessingError)
                 })?;
                 tracing::debug!(
                     "modify_item: Propagated content update to {} other sharers' inodes",
@@ -683,14 +690,16 @@ pub fn modify_item(
                         .prepare(
                             "SELECT id, owner_id, path FROM inodes WHERE data_id = ? AND owner_id != ?",
                         )
-                        .map_err(|_| DatabaseError::RecallError)?;
+                        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
                     let affected: Vec<(CustomUUID, i32, String)> = stmt
                         .query_map(params![nid, user_id], |row| {
                             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                         })
-                        .map_err(|_| DatabaseError::ProcessingError)?
+                        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?
                         .collect::<Result<Vec<_>, _>>()
-                        .map_err(|_| DatabaseError::ProcessingError)?;
+                        .map_err(|e| {
+                            DatabaseError::classified(&e, DatabaseError::ProcessingError)
+                        })?;
                     for (affected_inode_id, affected_owner_id, affected_path) in &affected {
                         log_modification(
                             db_tx,
@@ -773,7 +782,7 @@ pub fn get_file_fragments(
                         Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?))
                     })
                 })
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             if !file_exists {
                 return Err(DatabaseError::RecallError); // File doesn't exist
@@ -800,7 +809,7 @@ pub fn get_file_fragments(
                     params![encrypted_path],
                     |row| row.get(0),
                 )
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             let manifest = hopnet_storage::store::blob_manifest(&db_lock, &data_block_id)
                 .map_err(|e| {
@@ -839,14 +848,14 @@ fn get_all_ancestor_folders(
          WHERE owner_id = ? AND type = 1 AND ? LIKE path || '/%'
          ORDER BY LENGTH(path) DESC",
         )
-        .map_err(|_| DatabaseError::ProcessingError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
 
     let rows = stmt
         .query_map(params![owner_id, path], |row| row.get::<_, CustomUUID>(0))
-        .map_err(|_| DatabaseError::ProcessingError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
 
     let ancestors: Result<Vec<_>, _> = rows.collect();
-    ancestors.map_err(|_| DatabaseError::ProcessingError)
+    ancestors.map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))
 }
 
 /// Extract parent folder's inode_id from a path
@@ -870,7 +879,10 @@ fn get_parent_id(
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None), // Parent folder doesn't exist
         Err(e) => {
             tracing::error!("Error looking up parent folder for path {}: {:?}", path, e);
-            Err(DatabaseError::ProcessingError)
+            Err(DatabaseError::classified(
+                &e,
+                DatabaseError::ProcessingError,
+            ))
         }
     }
 }
@@ -893,7 +905,7 @@ pub fn log_modification(
     ).map_err(|e| {
         tracing::error!("Failed to log modification for inode_id {} at height {}: {:?}",
                        inode_id, modification_height, e);
-        DatabaseError::ProcessingError
+        DatabaseError::classified(&e, DatabaseError::ProcessingError)
     })?;
 
     // Log ancestor folders for old path (for deletes/moves)
@@ -927,7 +939,7 @@ pub fn get_inode_by_id(
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
     .optional()
-    .map_err(|_| DatabaseError::RecallError)
+    .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))
 }
 
 /// Look up a user's blob_access wrap for a specific blob (via their pubkey).
@@ -947,7 +959,7 @@ pub fn get_file_access(
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()
-        .map_err(|_| DatabaseError::RecallError)?
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?
         .map(|blob| <[u8; 32]>::try_from(blob).map_err(|_| DatabaseError::RecallError))
         .transpose()?;
     let pubkey = match pubkey {
@@ -971,7 +983,7 @@ pub fn user_data_size(conn: &rusqlite::Connection, user_id: i32) -> Result<u64, 
             rusqlite::params![user_id],
             |row| row.get(0),
         )
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     Ok(total_size.unwrap_or(0) as u64)
 }

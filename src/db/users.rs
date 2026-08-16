@@ -8,7 +8,7 @@ pub fn get_users(
         Ok(db_lock) => {
             let mut stmt = db_lock
                 .prepare("SELECT * FROM users")
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
             let results = stmt.query_map([], |row| {
                 Ok(User {
                     user_id: row.get(0)?,
@@ -27,10 +27,10 @@ pub fn get_users(
             match results {
                 Ok(users) => Ok(users
                     .collect::<Result<_, _>>()
-                    .map_err(|_| DatabaseError::ProcessingError)?),
+                    .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?),
                 Err(e) => {
                     tracing::error!("Error querying users: {:?}", e);
-                    Err(DatabaseError::RecordError)
+                    Err(DatabaseError::classified(&e, DatabaseError::RecordError))
                 }
             }
         }
@@ -49,24 +49,47 @@ pub fn get_user_by_username(
         Ok(db_lock) => {
             let mut stmt = db_lock
                 .prepare("SELECT * FROM users WHERE username = ?")
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             let mut rows = stmt
                 .query([&username])
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
-            if let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
+            if let Some(row) = rows
+                .next()
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?
+            {
                 let user = User {
-                    user_id: row.get(0).map_err(|_| DatabaseError::RecallError)?,
-                    username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
-                    pubkey: row.get(2).map_err(|_| DatabaseError::RecallError)?,
-                    x25519_pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
-                    encrypted_privkey: row.get(4).map_err(|_| DatabaseError::RecallError)?,
-                    key_salt: row.get(5).map_err(|_| DatabaseError::RecallError)?,
-                    first_name: row.get(6).map_err(|_| DatabaseError::RecallError)?,
-                    last_name: row.get(7).map_err(|_| DatabaseError::RecallError)?,
-                    avatar: row.get(8).map_err(|_| DatabaseError::RecallError)?,
-                    onboarding_flags: row.get(9).map_err(|_| DatabaseError::RecallError)?,
+                    user_id: row
+                        .get(0)
+                        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+                    username: row
+                        .get(1)
+                        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+                    pubkey: row
+                        .get(2)
+                        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+                    x25519_pubkey: row
+                        .get(3)
+                        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+                    encrypted_privkey: row
+                        .get(4)
+                        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+                    key_salt: row
+                        .get(5)
+                        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+                    first_name: row
+                        .get(6)
+                        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+                    last_name: row
+                        .get(7)
+                        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+                    avatar: row
+                        .get(8)
+                        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+                    onboarding_flags: row
+                        .get(9)
+                        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
                 };
                 Ok(Some(user))
             } else {
@@ -83,24 +106,47 @@ pub fn get_user_by_userid_conn(
 ) -> Result<Option<User>, DatabaseError> {
     let mut stmt = conn
         .prepare("SELECT * FROM users WHERE user_id = ?")
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     let mut rows = stmt
         .query([&userid])
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
-    if let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
+    if let Some(row) = rows
+        .next()
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?
+    {
         let user = User {
-            user_id: row.get(0).map_err(|_| DatabaseError::RecallError)?,
-            username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
-            pubkey: row.get(2).map_err(|_| DatabaseError::RecallError)?,
-            x25519_pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
-            encrypted_privkey: row.get(4).map_err(|_| DatabaseError::RecallError)?,
-            key_salt: row.get(5).map_err(|_| DatabaseError::RecallError)?,
-            first_name: row.get(6).map_err(|_| DatabaseError::RecallError)?,
-            last_name: row.get(7).map_err(|_| DatabaseError::RecallError)?,
-            avatar: row.get(8).map_err(|_| DatabaseError::RecallError)?,
-            onboarding_flags: row.get(9).map_err(|_| DatabaseError::RecallError)?,
+            user_id: row
+                .get(0)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+            username: row
+                .get(1)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+            pubkey: row
+                .get(2)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+            x25519_pubkey: row
+                .get(3)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+            encrypted_privkey: row
+                .get(4)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+            key_salt: row
+                .get(5)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+            first_name: row
+                .get(6)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+            last_name: row
+                .get(7)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+            avatar: row
+                .get(8)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
+            onboarding_flags: row
+                .get(9)
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?,
         };
         Ok(Some(user))
     } else {
@@ -127,19 +173,19 @@ pub fn insert_user_tx(tx: &rusqlite::Transaction, user: User) -> Result<i32, Dat
             [],
             |row| row.get::<_, i32>(0),
         )
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     tx.execute(
         "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt) VALUES (?, ?, ?, ?, ?, ?)",
         params![next_id, user.username, user.pubkey, user.x25519_pubkey, user.encrypted_privkey, user.key_salt]
-    ).map_err(|_| DatabaseError::InsertError)?;
+    ).map_err(|e| DatabaseError::classified(&e, DatabaseError::InsertError))?;
 
     // Update the sequence for next user
     tx.execute(
         "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'users'",
         [],
     )
-    .map_err(|_| DatabaseError::InsertError)?;
+    .map_err(|e| DatabaseError::classified(&e, DatabaseError::InsertError))?;
 
     Ok(next_id)
 }
@@ -179,7 +225,7 @@ pub fn update_user_profile_tx(
             user_id
         ],
     )
-    .map_err(|_| DatabaseError::InsertError)?;
+    .map_err(|e| DatabaseError::classified(&e, DatabaseError::InsertError))?;
 
     Ok(())
 }
@@ -194,7 +240,7 @@ pub fn update_user_onboarding_tx(
         "UPDATE users SET onboarding_flags = (onboarding_flags | ?) & ~? WHERE user_id = ?",
         params![payload.set_flags, payload.clear_flags, payload.user_id],
     )
-    .map_err(|_| DatabaseError::InsertError)?;
+    .map_err(|e| DatabaseError::classified(&e, DatabaseError::InsertError))?;
     Ok(())
 }
 
@@ -208,16 +254,18 @@ pub fn insert_user(
         Ok(mut db_lock) => {
             let tx = db_lock
                 .transaction()
-                .map_err(|_| DatabaseError::LockError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::LockError))?;
 
             let user_id = insert_user_tx(&tx, user)?;
 
             // Commit or rollback based on execute flag
             if execute {
-                crate::db::shared::commit_timed(tx).map_err(|_| DatabaseError::InsertError)?;
+                crate::db::shared::commit_timed(tx)
+                    .map_err(|e| DatabaseError::classified(&e, DatabaseError::InsertError))?;
                 tracing::info!("Successfully inserted user {}", user_id);
             } else {
-                tx.rollback().map_err(|_| DatabaseError::LockError)?;
+                tx.rollback()
+                    .map_err(|e| DatabaseError::classified(&e, DatabaseError::LockError))?;
                 tracing::debug!(
                     "User {} insertion validated successfully (rolled back)",
                     user_id

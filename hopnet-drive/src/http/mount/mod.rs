@@ -69,7 +69,15 @@ fn tx_error_status(e: &TxSubmitError) -> StatusCode {
     match e {
         // Outcome UNKNOWN — the tx may still commit; never claim success.
         TxSubmitError::Timeout => StatusCode::GATEWAY_TIMEOUT,
-        TxSubmitError::Rejected(_) => StatusCode::CONFLICT,
+        TxSubmitError::Rejected(reason) => {
+            // 409 here is indistinguishable at the client from the
+            // destination-occupied verdicts (ensure_vacant / ConflictError),
+            // and hopnet-mount turns all of them into EEXIST. Log the reason
+            // so a transient storage rejection can be told apart after the
+            // fact.
+            tracing::warn!("consensus rejected transaction, answering 409: {reason}");
+            StatusCode::CONFLICT
+        }
         TxSubmitError::Signing => StatusCode::INTERNAL_SERVER_ERROR,
         TxSubmitError::Submit => StatusCode::SERVICE_UNAVAILABLE,
         // Admission closed at a regenesis boundary (RFC-019 S5) — the
@@ -501,7 +509,12 @@ fn ensure_vacant(
         &session.siv_key,
         &session.siv_nonce,
     ) {
-        Ok(_) => Err(StatusCode::CONFLICT),
+        Ok(_) => {
+            // Genuine destination-occupied 409 — distinct from the
+            // consensus-rejection 409 in tx_error_status.
+            tracing::debug!("rename destination is occupied, answering 409");
+            Err(StatusCode::CONFLICT)
+        }
         Err(DatabaseError::NotFound) => Ok(()),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -596,7 +609,11 @@ pub async fn patch_modify(
         )
         .map_err(|e| match e {
             DatabaseError::NotFound => StatusCode::NOT_FOUND,
-            DatabaseError::ConflictError => StatusCode::CONFLICT,
+            DatabaseError::ConflictError => {
+                // Third 409 source on this route; see tx_error_status.
+                tracing::debug!("rename preflight found the path occupied, answering 409");
+                StatusCode::CONFLICT
+            }
             DatabaseError::InvalidPayload => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         })?;

@@ -41,7 +41,7 @@ pub fn read_regenesis_state(conn: &rusqlite::Connection) -> Result<RegenesisStat
             },
         )
         .optional()
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
     let Some((phase, target, hash, seal)) = row else {
         return Ok(RegenesisState::default());
     };
@@ -74,7 +74,7 @@ pub fn set_moratorium_tx(
              VALUES (1, 1, ?, NULL, NULL)",
             rusqlite::params![target_version_code],
         )
-        .map_err(|_| DatabaseError::ProcessingError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
     Ok(())
 }
 
@@ -95,7 +95,7 @@ pub fn set_sealed_tx(
                 hopnet_common::height::height_to_db(seal_height)
             ],
         )
-        .map_err(|_| DatabaseError::ProcessingError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
     if n == 0 {
         return Err(DatabaseError::ProcessingError);
     }
@@ -107,7 +107,7 @@ pub fn set_sealed_tx(
 pub fn clear_to_normal_tx(db_tx: &rusqlite::Transaction) -> Result<(), DatabaseError> {
     let n = db_tx
         .execute("DELETE FROM regenesis_state WHERE internal_id = 1", [])
-        .map_err(|_| DatabaseError::ProcessingError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))?;
     if n == 0 {
         return Err(DatabaseError::ProcessingError);
     }

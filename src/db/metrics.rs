@@ -10,7 +10,7 @@ pub fn get_metric(
             // Prepare the query
             let mut stmt = db_lock
                 .prepare("SELECT * FROM metrics")
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
             // Execute the query and map each row to a Metric
             let results = stmt.query_map([], |row| {
                 let from_node: i32 = row.get(0)?;
@@ -45,11 +45,11 @@ pub fn get_metric(
             match results {
                 Ok(metrics) => metrics.collect::<Result<Vec<_>, _>>().map_err(|e| {
                     tracing::error!("Error parsing metric row: {:?}", e);
-                    DatabaseError::ProcessingError
+                    DatabaseError::classified(&e, DatabaseError::ProcessingError)
                 }),
                 Err(e) => {
                     tracing::error!("Error querying metrics: {:?}", e);
-                    Err(DatabaseError::RecordError)
+                    Err(DatabaseError::classified(&e, DatabaseError::RecordError))
                 }
             }
         }
@@ -92,7 +92,7 @@ pub fn insert_metric(
                 }
                 Err(e) => {
                     tracing::error!("Error inserting metric: {:?}", e);
-                    Err(DatabaseError::InsertError)
+                    Err(DatabaseError::classified(&e, DatabaseError::InsertError))
                 }
             }
         }
@@ -125,7 +125,7 @@ pub fn insert_metrics_batch(
             ]
         ).map_err(|e| {
             tracing::error!("Error inserting metric from {} to {}: {:?}", metric.from_node, metric.to_node, e);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     }
 
@@ -147,7 +147,7 @@ pub fn get_nodes_to_measure(
                 WHERE node_id != ?
                 ORDER BY node_id",
                 )
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             let nodes = stmt
                 .query_map([exclude_node_id], |row| {
@@ -158,9 +158,9 @@ pub fn get_nodes_to_measure(
                         pubkey: row.get(3)?,
                     })
                 })
-                .map_err(|_| DatabaseError::RecallError)?
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?
                 .collect::<Result<Vec<crate::types::Node>, _>>()
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             tracing::debug!(
                 "Found {} network nodes to measure (excluding node {})",
@@ -335,7 +335,7 @@ pub fn get_all_node_metrics_with_conn(
 
             let mut stmt = db_lock.prepare(query).map_err(|e| {
                 tracing::error!("Failed to prepare metrics query: {:?}", e);
-                DatabaseError::RecallError
+                DatabaseError::classified(&e, DatabaseError::RecallError)
             })?;
 
             let metrics = stmt
@@ -355,12 +355,12 @@ pub fn get_all_node_metrics_with_conn(
                 })
                 .map_err(|e| {
                     tracing::error!("Failed to execute metrics query: {:?}", e);
-                    DatabaseError::RecallError
+                    DatabaseError::classified(&e, DatabaseError::RecallError)
                 })?
                 .collect::<Result<Vec<NodeMetrics>, _>>()
                 .map_err(|e| {
                     tracing::error!("Failed to parse metrics results: {:?}", e);
-                    DatabaseError::ProcessingError
+                    DatabaseError::classified(&e, DatabaseError::ProcessingError)
                 })?;
 
             tracing::debug!(
@@ -414,7 +414,7 @@ pub fn get_availability_history_with_conn(
         )
         .map_err(|e| {
             tracing::error!("availability anchor query failed: {e:?}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
     let Some(anchor_ts) = anchor else {
         return Ok(AvailabilityGrid {
@@ -442,7 +442,7 @@ pub fn get_availability_history_with_conn(
         )
         .map_err(|e| {
             tracing::error!("availability history prepare failed: {e:?}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
     let sparse: Vec<(i32, i64, bool)> = stmt
         .query_map(
@@ -461,12 +461,12 @@ pub fn get_availability_history_with_conn(
         )
         .map_err(|e| {
             tracing::error!("availability history query failed: {e:?}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?
         .collect::<Result<_, _>>()
         .map_err(|e| {
             tracing::error!("availability history rows failed: {e:?}");
-            DatabaseError::ProcessingError
+            DatabaseError::classified(&e, DatabaseError::ProcessingError)
         })?;
 
     let mut per_node: std::collections::HashMap<i32, Vec<(i64, bool)>> = Default::default();

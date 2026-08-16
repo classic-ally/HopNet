@@ -8,6 +8,7 @@ mod byzantine;
 mod malachite_integration;
 mod regenesis;
 mod signatures;
+mod transient_restage;
 mod upgrade;
 
 #[derive(Clone)]

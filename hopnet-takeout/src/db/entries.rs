@@ -132,7 +132,7 @@ pub fn create_entries_table(
     ))
     .map_err(|e| {
         tracing::error!("Failed to create table {}: {:?}", table, e);
-        DatabaseError::InsertError
+        DatabaseError::classified(&e, DatabaseError::InsertError)
     })?;
     Ok(())
 }
@@ -166,7 +166,7 @@ pub fn insert_entry(
     )
     .map_err(|e| {
         tracing::error!("insert_entry {} failed: {:?}", table, e);
-        DatabaseError::InsertError
+        DatabaseError::classified(&e, DatabaseError::InsertError)
     })?;
     Ok(())
 }
@@ -262,15 +262,15 @@ fn collect_rows(
 ) -> Result<Vec<EntryRow>, DatabaseError> {
     let mut stmt = conn.prepare(query).map_err(|e| {
         tracing::error!("Failed to prepare entries query on {}: {:?}", table, e);
-        DatabaseError::RecallError
+        DatabaseError::classified(&e, DatabaseError::RecallError)
     })?;
     let rows = stmt.query_map([], row_to_entry).map_err(|e| {
         tracing::error!("Failed to execute entries query on {}: {:?}", table, e);
-        DatabaseError::RecallError
+        DatabaseError::classified(&e, DatabaseError::RecallError)
     })?;
     let mut out = Vec::new();
     for r in rows {
-        out.push(r.map_err(|_| DatabaseError::RecallError)?);
+        out.push(r.map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?);
     }
     Ok(out)
 }
@@ -305,7 +305,7 @@ pub fn update_entry_status(
     }
     .map_err(|e| {
         tracing::error!("Failed to update entry status: {:?}", e);
-        DatabaseError::ProcessingError
+        DatabaseError::classified(&e, DatabaseError::ProcessingError)
     })?;
 
     tracing::debug!("Updated entry {}/{} status to {}", projection, path, status);

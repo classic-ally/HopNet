@@ -28,13 +28,15 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use malachitebft_core_consensus::Params;
-use malachitebft_core_types::{LinearTimeouts, Timeout, Validity, ValuePayload};
+use malachitebft_core_types::{LinearTimeouts, Timeout, ValuePayload};
 
 use crate::codec::{WireCommitCertificate, WireConsensusMsg, WireVote, WireVoteType, WireWalEntry};
 use crate::config::{MalachiteThresholds, QuorumProfile};
 use crate::context::{Address, Height, HopNetValidatorSet, Validator};
 use crate::host::{HostCore, HostError, HostOutput};
-use crate::traits::{Application, ApplyError, Gossip, Storage, Timers, ValidationOrigin};
+use crate::traits::{
+    Application, ApplyError, Gossip, Storage, Timers, ValidationOrigin, ValidationVerdict,
+};
 use crate::types::{Blake3Hash, Block, BlockData, PrivKey, Transactions};
 
 // ---------------------------------------------------------------------------
@@ -230,16 +232,16 @@ impl Application<MemStorage> for MemApp {
         _block: &Block,
         _tx: &mut MemTx,
         _origin: ValidationOrigin,
-    ) -> Validity {
+    ) -> ValidationVerdict {
         if *self.reject_height.borrow() == Some(height) {
-            return Validity::Invalid;
+            return ValidationVerdict::Invalid;
         }
         // Sealed-epoch refusal (RFC-019 seal contract): nothing past the
         // terminal height is votable.
         if self.terminal.borrow().is_some_and(|t| height.0 > t) {
-            return Validity::Invalid;
+            return ValidationVerdict::Invalid;
         }
-        Validity::Valid
+        ValidationVerdict::Valid
     }
     fn apply_block(
         &mut self,

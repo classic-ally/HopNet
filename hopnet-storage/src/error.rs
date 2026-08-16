@@ -19,6 +19,10 @@ pub enum StorageError {
     /// query, or signing problems surface as opaque strings — the substrate
     /// never sees the host's error taxonomy.
     Host(String),
+    /// Transient database contention (SQLITE_BUSY / SQLITE_LOCKED). Retryable
+    /// and node-local — consumers must not turn this into a verdict on the
+    /// data or the operation.
+    Transient(rusqlite::ErrorCode),
 }
 
 impl std::fmt::Display for StorageError {
@@ -30,6 +34,9 @@ impl std::fmt::Display for StorageError {
             StorageError::Read(e) => write!(f, "source read error: {}", e),
             StorageError::Rs => write!(f, "reed-solomon coding error"),
             StorageError::Host(msg) => write!(f, "host seam error: {}", msg),
+            StorageError::Transient(code) => {
+                write!(f, "transient database contention: {:?}", code)
+            }
         }
     }
 }

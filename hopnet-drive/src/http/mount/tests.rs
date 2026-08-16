@@ -156,6 +156,27 @@ impl TxGateway for TimeoutTx {
     }
 }
 
+/// Every submission fails the way consensus now reports transient storage
+/// contention that outlived its restage budget: `TxSubmitError::Submit`
+/// (503), NEVER `Rejected` (409). A busy-shaped `Rejected` is
+/// unrepresentable post-classification — the preflight restages transient
+/// failures and only `PendingPool::fail` (→ `Submit`) reaches the client —
+/// so this fake guards the HTTP mapping table rather than the consensus
+/// routing (which has its own tests in `src/consensus/queue.rs` and
+/// `src/consensus/tests/transient_restage.rs`).
+struct BusyRejectTx;
+impl TxGateway for BusyRejectTx {
+    fn submit_batch(&self, txs: Vec<TxSpec>) -> BoxFuture<'_, Vec<Result<(), TxSubmitError>>> {
+        Box::pin(async move { txs.iter().map(|_| Err(TxSubmitError::Submit)).collect() })
+    }
+    fn submit_batch_decided(
+        &self,
+        txs: Vec<TxSpec>,
+    ) -> BoxFuture<'_, Vec<Result<u64, TxSubmitError>>> {
+        Box::pin(async move { txs.iter().map(|_| Err(TxSubmitError::Submit)).collect() })
+    }
+}
+
 struct AllowWrites;
 impl WriteAdmission for AllowWrites {
     fn check_write(&self, _user_id: i32) -> BoxFuture<'_, Result<(), WriteCheckError>> {
@@ -690,6 +711,69 @@ async fn modify_renames_and_moves() {
     assert_eq!(found.unwrap().id, Some(file_id));
 }
 
+// Impact: 409 is the destination-occupied verdict, and hopnet-mount turns
+// it into EEXIST (vfs.rs map_create_err -> fuse.rs). A transient SQLITE_BUSY
+// on the proposer's preflight used to reach this route as
+// TxSubmitError::Rejected, so a momentary lock collision was reported to the
+// kernel as "the destination already exists". rsync believed that and
+// dropped the file: files were lost this way during a live migration, to a
+// destination that provably did not exist. Consensus now restages transient
+// failures and reports an exhausted budget as Submit; this guards the
+// route's mapping of that terminal state.
+// Should: answer a transient-terminal submission failure with a retryable
+// 5xx on a rename whose destination is vacant.
+// Should not: report a storage condition as a namespace conflict.
+#[tokio::test]
+async fn transient_rejection_is_not_reported_as_a_name_conflict() {
+    let mut env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let content = b"rsync temp";
+    let (_, file) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", content.len()),
+            Some(".final.txt.ZqfPGx"),
+            content.as_slice(),
+        )],
+    )
+    .await;
+    let file_id = file.unwrap().item.unwrap().id.unwrap();
+
+    // The destination is vacant — nothing has ever been created at this
+    // name, which is exactly the rsync temp->final rename.
+    let (status, _) = get_json::<MountItem>(&app, "/lookup?name=final.txt").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "precondition: the rename destination is vacant"
+    );
+
+    // Every submission now fails as transient-terminal (Submit -> 503).
+    env.state.txs = Arc::new(BusyRejectTx);
+    let app = env.app();
+
+    let (status, _) = send_json::<MountMutationResponse>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": file_id, "new_name": "final.txt" }),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        StatusCode::CONFLICT,
+        "a transient storage rejection must not be reported as a name conflict: \
+         the mount maps 409 to EEXIST and rsync drops the file"
+    );
+    assert!(
+        status.is_server_error(),
+        "expected a retryable server-side status, got {status}"
+    );
+}
+
 // Should: refuse deleting a non-empty folder without recursive, delete it
 // with recursive, and report the deletion in /changes.
 #[tokio::test]
@@ -753,6 +837,96 @@ async fn delete_respects_recursive_and_feeds_changes() {
     assert!(
         changes.unwrap().deleted_ids.contains(&folder_id),
         "deletion must appear in the delta feed"
+    );
+}
+
+// Impact: the rmdir twin of the rename data loss — delete_item's only
+// genuine 409 means "folder not empty", and hopnet-mount maps Conflict to
+// ENOTEMPTY (vfs.rs remove). A transient-terminal failure answered 409
+// would tell the kernel an EMPTY directory is non-empty, which `rm -rf`
+// and `rsync --delete` tolerate silently, leaving stale trees behind.
+// Should: answer a transient-terminal submission failure on rmdir of an
+// empty folder with a retryable 5xx.
+// Should not: report a storage condition as a non-empty directory.
+#[tokio::test]
+async fn transient_rejection_on_rmdir_is_not_reported_as_non_empty() {
+    let mut env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let (_, folder) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[("folder_name", None, b"Empty")],
+    )
+    .await;
+    let folder_id = folder.unwrap().item.unwrap().id.unwrap();
+
+    // Every submission now fails as transient-terminal (Submit -> 503).
+    env.state.txs = Arc::new(BusyRejectTx);
+    let app = env.app();
+
+    let (status, _) = send_json::<MountMutationResponse>(
+        &app,
+        "DELETE",
+        "/delete",
+        serde_json::json!({ "id": folder_id, "recursive": false }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::CONFLICT,
+        "a transient storage failure must not be reported as a non-empty directory"
+    );
+    assert!(
+        status.is_server_error(),
+        "expected a retryable server-side status, got {status}"
+    );
+}
+
+// Impact: the positive twin that keeps the fix honest — the transient
+// classification must not be implementable by weakening the 409 mapping,
+// because genuine occupancy is exactly what write-temp-then-rename clients
+// rely on for atomic-save semantics.
+// Should: still answer 409 for a rename onto a genuinely occupied name.
+#[tokio::test]
+async fn genuine_rename_conflict_still_answers_409() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let content = b"occupant";
+    send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", content.len()),
+            Some("taken.txt"),
+            content.as_slice(),
+        )],
+    )
+    .await;
+    let (_, file) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", content.len()),
+            Some("mover.txt"),
+            content.as_slice(),
+        )],
+    )
+    .await;
+    let mover_id = file.unwrap().item.unwrap().id.unwrap();
+
+    let (status, _) = send_json::<MountMutationResponse>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": mover_id, "new_name": "taken.txt" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "genuine occupancy must keep its 409 -> EEXIST contract"
     );
 }
 

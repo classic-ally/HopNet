@@ -420,6 +420,37 @@ impl<C: DerefMut<Target = Connection> + 'static> Storage for SqliteStorage<C> {
         Ok(r)
     }
 
+    fn with_rollback_immediate<R>(
+        &mut self,
+        busy_timeout_ms: u32,
+        f: impl FnOnce(&mut Self::Tx<'_>) -> R,
+    ) -> Result<R, StoreError> {
+        // Bound the wait ourselves: this runs on the single-threaded
+        // consensus shell, where the connection's default busy_timeout
+        // (5s) would stall vote processing for far too long.
+        let prior: i64 = self
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+        self.conn
+            .execute_batch(&format!("PRAGMA busy_timeout = {busy_timeout_ms}"))?;
+        let out = match self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+        {
+            Ok(mut tx) => {
+                let r = f(&mut tx);
+                // Dropped without commit — rolls back.
+                drop(tx);
+                Ok(r)
+            }
+            Err(e) => Err(StoreError::from(e)),
+        };
+        let _ = self
+            .conn
+            .execute_batch(&format!("PRAGMA busy_timeout = {prior}"));
+        out
+    }
+
     fn store_decided_tx(
         tx: &mut Self::Tx<'_>,
         block: &Block,
@@ -523,6 +554,114 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0.block_hash, block.block_hash);
         assert_eq!(pairs[0].1.value_id, block.block_hash);
+    }
+
+    /// File-backed DB so a second raw connection can contend for the write
+    /// lock (`:memory:` databases are per-connection). WAL + a busy_timeout
+    /// mirroring production (src/db/shared.rs in the host).
+    fn contended_pair(tag: &str) -> (std::path::PathBuf, Connection) {
+        let path = std::env::temp_dir().join(format!(
+            "hopnet-consensus-busy-{tag}-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
+            .unwrap();
+        install_schema(&conn).unwrap();
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS victim_probe (id INTEGER)")
+            .unwrap();
+        (path, conn)
+    }
+
+    fn hold_write_lock(
+        path: &std::path::Path,
+        hold: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let side = Connection::open(path).unwrap();
+        side.execute_batch("BEGIN IMMEDIATE; INSERT INTO victim_probe (id) VALUES (4242);")
+            .unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            side.execute_batch("COMMIT").unwrap();
+        })
+    }
+
+    // Impact: validate_block dry-runs write inside the host's rollback
+    // transaction; a DEFERRED transaction that read first cannot promote to
+    // writer while another connection holds the lock, and SQLite refuses
+    // WITHOUT consulting busy_timeout. This is the mechanism that turned
+    // node-local lock contention into Invalid votes and false SyncInvalid
+    // determinism alarms.
+    // Should: fail the read-then-write under a DEFERRED rollback transaction
+    // while a competing writer holds the lock.
+    // Should: succeed via with_rollback_immediate under the same contention,
+    // because IMMEDIATE keeps the busy handler in play and the snapshot
+    // cannot go stale mid-transaction.
+    #[test]
+    fn immediate_rollback_transaction_survives_contention_deferred_does_not() {
+        let (path, conn) = contended_pair("immediate");
+        let mut storage = SqliteStorage::new(conn, |tx| tx.commit()).unwrap();
+
+        let contender = hold_write_lock(&path, std::time::Duration::from_millis(150));
+        let deferred = storage
+            .with_rollback(|tx| {
+                // Read first (pins the snapshot), then attempt the write.
+                let _: i64 = tx
+                    .query_row("SELECT COUNT(*) FROM victim_probe", [], |r| r.get(0))
+                    .unwrap();
+                tx.execute("INSERT INTO victim_probe (id) VALUES (1)", [])
+            })
+            .unwrap();
+        assert!(
+            deferred.is_err(),
+            "deferred read-then-write should hit the busy path under contention"
+        );
+
+        let immediate = storage
+            .with_rollback_immediate(300, |tx| {
+                let _: i64 = tx
+                    .query_row("SELECT COUNT(*) FROM victim_probe", [], |r| r.get(0))
+                    .unwrap();
+                tx.execute("INSERT INTO victim_probe (id) VALUES (1)", [])
+            })
+            .unwrap();
+        assert!(
+            immediate.is_ok(),
+            "IMMEDIATE retry must produce a verdict once the lock clears: {immediate:?}"
+        );
+        contender.join().unwrap();
+
+        // The probe row rolled back — with_rollback_immediate never commits.
+        let check = Connection::open(&path).unwrap();
+        let n: i64 = check
+            .query_row("SELECT COUNT(*) FROM victim_probe WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0, "dry-run writes must roll back");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Should: restore the connection's prior busy_timeout after the bounded
+    // IMMEDIATE attempt, so the shared consensus connection keeps its
+    // production configuration.
+    #[test]
+    fn immediate_rollback_restores_busy_timeout() {
+        let (path, conn) = contended_pair("timeout-restore");
+        let mut storage = SqliteStorage::new(conn, |tx| tx.commit()).unwrap();
+        storage
+            .with_rollback_immediate(300, |tx| {
+                tx.execute("INSERT INTO victim_probe (id) VALUES (2)", [])
+                    .unwrap();
+            })
+            .unwrap();
+        let restored: i64 = storage
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(restored, 5000);
+        let _ = std::fs::remove_file(&path);
     }
 
     // Should: keep the fresh-mesh path byte-for-byte — a height-0 genesis

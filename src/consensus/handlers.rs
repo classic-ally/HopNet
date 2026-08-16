@@ -362,7 +362,7 @@ impl TransactionHandler for InsertGenesisHandler {
             .query_row("SELECT COUNT(*) FROM sequences", [], |row| row.get(0))
             .map_err(|e| {
                 tracing::error!("InsertGenesisHandler: Failed to query sequences: {:?}", e);
-                DatabaseError::RecallError
+                DatabaseError::classified(&e, DatabaseError::RecallError)
             })?;
         tracing::debug!(
             "InsertGenesisHandler: Found {} existing sequences",

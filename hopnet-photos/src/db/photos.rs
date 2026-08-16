@@ -71,7 +71,7 @@ pub fn insert_photo_entry(
                 "photo_add: insert photos row {} failed: {e}",
                 entry.photo_id
             );
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
 
     // photo_resources — one row per resource.
@@ -88,7 +88,7 @@ pub fn insert_photo_entry(
                     entry.photo_id,
                     resource.resource_type,
                 );
-                DatabaseError::InsertError
+                DatabaseError::classified(&e, DatabaseError::InsertError)
             })?;
     }
 
@@ -136,7 +136,7 @@ pub fn soft_delete_photo(
         )
         .map_err(|e| {
             tracing::error!("photo_delete: update photos row {} failed: {e}", photo_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     if rows == 0 {
         // Already tombstoned or not found — idempotent, not an error.
@@ -154,7 +154,7 @@ pub fn soft_delete_photo(
                 "photo_delete: clear album_entries for {} failed: {e}",
                 photo_id
             );
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     db_tx
         .execute(
@@ -163,7 +163,7 @@ pub fn soft_delete_photo(
         )
         .map_err(|e| {
             tracing::error!("photo_delete: clear favorites for {} failed: {e}", photo_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
 
     // Log operation (type = 2 = delete).
@@ -255,7 +255,7 @@ pub fn hard_delete_expired_photo(
             rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
             _ => {
                 tracing::error!("photo_cleanup: query photos row {} failed: {e}", photo_id,);
-                DatabaseError::RecallError
+                DatabaseError::classified(&e, DatabaseError::RecallError)
             }
         })?;
 
@@ -279,7 +279,7 @@ pub fn hard_delete_expired_photo(
         )
         .map_err(|e| {
             tracing::error!("photo_cleanup: datetime check for {} failed: {e}", photo_id,);
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
 
     if !expired {
@@ -299,7 +299,7 @@ pub fn hard_delete_expired_photo(
                 "photo_cleanup: delete photo_operations for {} failed: {e}",
                 photo_id
             );
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     db_tx
         .execute(
@@ -311,7 +311,7 @@ pub fn hard_delete_expired_photo(
                 "photo_cleanup: delete photo_resources for {} failed: {e}",
                 photo_id
             );
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     db_tx
         .execute(
@@ -323,7 +323,7 @@ pub fn hard_delete_expired_photo(
                 "photo_cleanup: delete photo_metadata_access for {} failed: {e}",
                 photo_id
             );
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     db_tx
         .execute(
@@ -335,7 +335,7 @@ pub fn hard_delete_expired_photo(
                 "photo_cleanup: delete photo_favorites for {} failed: {e}",
                 photo_id
             );
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     db_tx
         .execute(
@@ -347,7 +347,7 @@ pub fn hard_delete_expired_photo(
                 "photo_cleanup: delete photo_album_entries for {} failed: {e}",
                 photo_id
             );
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     db_tx
         .execute(
@@ -356,7 +356,7 @@ pub fn hard_delete_expired_photo(
         )
         .map_err(|e| {
             tracing::error!("photo_cleanup: delete photos row {} failed: {e}", photo_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
 
     Ok(())
@@ -399,7 +399,7 @@ pub fn upsert_ingress_responsibility(
             user_id,
             device_id,
         );
-        DatabaseError::InsertError
+        DatabaseError::classified(&e, DatabaseError::InsertError)
     })?;
     Ok(())
 }
@@ -424,7 +424,7 @@ pub fn delete_ingress_responsibility_for_library(
                 user_id,
                 library_id,
             );
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -449,7 +449,7 @@ pub fn device_belongs_to_user(
                 device_id,
                 user_id
             );
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })
 }
 
@@ -486,14 +486,14 @@ pub fn uncovered_wrap_holders(
         .prepare("SELECT user_id FROM photo_metadata_access WHERE photo_id = ?1")
         .map_err(|e| {
             tracing::error!("uncovered_wrap_holders: prepare for {photo_id} failed: {e}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
     let holders: Vec<i32> = stmt
         .query_map(params![photo_id], |r| r.get(0))
         .and_then(|rows| rows.collect())
         .map_err(|e| {
             tracing::error!("uncovered_wrap_holders: read holders for {photo_id} failed: {e}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
 
     let entitled: Vec<i32> = match library_id {
@@ -541,7 +541,7 @@ fn upsert_metadata_access_row(
             photo_id,
             entry.user_id,
         );
-        DatabaseError::InsertError
+        DatabaseError::classified(&e, DatabaseError::InsertError)
     })?;
     Ok(())
 }
@@ -581,7 +581,7 @@ pub fn insert_operation_row(
         )
         .map_err(|e| {
             tracing::error!("insert photo_operations row {} failed: {e}", operation_id,);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -602,7 +602,7 @@ pub fn upsert_photo_changes(
         )
         .map_err(|e| {
             tracing::error!("upsert photo_changes for {} failed: {e}", photo_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -627,7 +627,7 @@ pub fn lookup_photo_authz(
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => {
             tracing::error!("lookup_photo_authz {} failed: {e}", photo_id);
-            Err(DatabaseError::RecallError)
+            Err(DatabaseError::classified(&e, DatabaseError::RecallError))
         }
     }
 }
@@ -675,7 +675,7 @@ pub fn lookup_resource_block_authz(
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(ResourceBlockLookup::NotFound),
         Err(e) => {
             tracing::error!("lookup_resource_block {photo_id}/{resource_type} failed: {e}");
-            Err(DatabaseError::RecallError)
+            Err(DatabaseError::classified(&e, DatabaseError::RecallError))
         }
     }
 }
@@ -701,7 +701,7 @@ pub fn get_blob_access_for_user(
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()
-        .map_err(|_| DatabaseError::RecallError)?
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?
         .map(|blob| <[u8; 32]>::try_from(blob).map_err(|_| DatabaseError::RecallError))
         .transpose()?;
     let pubkey = match pubkey {
@@ -768,7 +768,7 @@ pub fn edit_photo_content(
                     "photo_edit_content: lookup prior for {} failed: {e}",
                     entry.photo_id,
                 );
-                Err(DatabaseError::RecallError)
+                Err(DatabaseError::classified(&e, DatabaseError::RecallError))
             }
         })?;
 
@@ -787,7 +787,7 @@ pub fn edit_photo_content(
                     entry.photo_id,
                     resource.resource_type,
                 );
-                DatabaseError::InsertError
+                DatabaseError::classified(&e, DatabaseError::InsertError)
             })?;
     }
 
@@ -807,7 +807,7 @@ pub fn edit_photo_content(
                     entry.photo_id,
                     resource_type,
                 );
-                DatabaseError::InsertError
+                DatabaseError::classified(&e, DatabaseError::InsertError)
             })?;
     }
 
@@ -825,7 +825,7 @@ pub fn edit_photo_content(
                     "photo_edit_content: update metadata {} failed: {e}",
                     entry.photo_id
                 );
-                DatabaseError::InsertError
+                DatabaseError::classified(&e, DatabaseError::InsertError)
             })?;
         for access in &entry.metadata_access {
             upsert_metadata_access_row(db_tx, &entry.photo_id, access)?;
@@ -867,7 +867,7 @@ pub fn edit_photo_metadata(
             rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
             _ => {
                 tracing::error!("edit_metadata lookup {} failed: {e}", entry.photo_id);
-                DatabaseError::RecallError
+                DatabaseError::classified(&e, DatabaseError::RecallError)
             }
         })?;
 
@@ -882,7 +882,7 @@ pub fn edit_photo_metadata(
         )
         .map_err(|e| {
             tracing::error!("edit_metadata update {} failed: {e}", entry.photo_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
 
     // Same transaction as the ciphertext — see edit_photo_content.
@@ -930,7 +930,7 @@ pub fn undo_content_edit(
                 rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
                 _ => {
                     tracing::error!("undo lookup op {} failed: {e}", target_operation_id);
-                    DatabaseError::RecallError
+                    DatabaseError::classified(&e, DatabaseError::RecallError)
                 }
             })?;
 
@@ -952,7 +952,7 @@ pub fn undo_content_edit(
         )
         .map_err(|e| {
             tracing::error!("undo blob-exists check {} failed: {e}", prior_id);
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
     if !blob_exists {
         tracing::warn!(
@@ -977,7 +977,7 @@ pub fn undo_content_edit(
                 photo_id,
                 resource_type
             );
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
 
     upsert_photo_changes(db_tx, photo_id)?;
@@ -1012,7 +1012,7 @@ pub fn insert_favorite(
         )
         .map_err(|e| {
             tracing::error!("insert_favorite ({}, {}) failed: {e}", photo_id, user_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -1030,7 +1030,7 @@ pub fn delete_favorite(
         )
         .map_err(|e| {
             tracing::error!("delete_favorite ({}, {}) failed: {e}", photo_id, user_id);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -1116,7 +1116,7 @@ pub fn query_changes(
         )
         .map_err(|e| {
             tracing::error!("query_changes prepare: {e}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
 
     let mut rows = stmt
@@ -1126,12 +1126,12 @@ pub fn query_changes(
         )
         .map_err(|e| {
             tracing::error!("query_changes: {e}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
             tracing::error!("query_changes collect: {e}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
 
     // Never split a consensus height: every mutation in one decided block
@@ -1166,7 +1166,7 @@ pub fn query_changes(
             )
             .map_err(|e| {
                 tracing::error!("query_changes boundary prepare: {e}");
-                DatabaseError::RecallError
+                DatabaseError::classified(&e, DatabaseError::RecallError)
             })?;
         let boundary_rows = boundary_stmt
             .query_map(
@@ -1175,12 +1175,12 @@ pub fn query_changes(
             )
             .map_err(|e| {
                 tracing::error!("query_changes boundary: {e}");
-                DatabaseError::RecallError
+                DatabaseError::classified(&e, DatabaseError::RecallError)
             })?;
         for row in boundary_rows {
             rows.push(row.map_err(|e| {
                 tracing::error!("query_changes boundary row: {e}");
-                DatabaseError::RecallError
+                DatabaseError::classified(&e, DatabaseError::RecallError)
             })?);
         }
     }
@@ -1206,7 +1206,7 @@ pub fn query_resources(
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| {
             tracing::error!("query_resources prepare: {e}");
-            DatabaseError::RecallError
+            DatabaseError::classified(&e, DatabaseError::RecallError)
         })?;
         let params: Vec<&dyn rusqlite::types::ToSql> = chunk
             .iter()
@@ -1222,12 +1222,12 @@ pub fn query_resources(
             })
             .map_err(|e| {
                 tracing::error!("query_resources: {e}");
-                DatabaseError::RecallError
+                DatabaseError::classified(&e, DatabaseError::RecallError)
             })?;
         for row in rows {
             let (pid, rt, bid) = row.map_err(|e| {
                 tracing::error!("query_resources row: {e}");
-                DatabaseError::RecallError
+                DatabaseError::classified(&e, DatabaseError::RecallError)
             })?;
             map.entry(pid).or_default().push((rt, bid));
         }

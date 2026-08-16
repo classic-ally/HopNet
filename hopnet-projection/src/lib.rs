@@ -87,6 +87,25 @@ pub enum DatabaseError {
     ConflictError,      // Resource already exists at the specified location/identifier
     AuthorizationError, // User or node not authorized for the operation
     ValidationError, // Data validation failed (e.g., cryptographic verification, consistency checks)
+    /// Transient, node-local storage contention (SQLITE_BUSY / SQLITE_LOCKED).
+    /// Not a verdict on the operation: consumers must retry or restage, never
+    /// treat it as a permanent semantic failure (it is non-deterministic and
+    /// would otherwise leak into consensus verdicts and client-visible 409s).
+    Transient(rusqlite::ErrorCode),
+}
+
+impl DatabaseError {
+    /// Classify a rusqlite failure at the seam where it is still typed:
+    /// retryable lock contention becomes [`DatabaseError::Transient`];
+    /// anything else keeps the caller's chosen verdict.
+    pub fn classified(e: &rusqlite::Error, fallback: DatabaseError) -> DatabaseError {
+        match e.sqlite_error_code() {
+            Some(
+                code @ (rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked),
+            ) => DatabaseError::Transient(code),
+            _ => fallback,
+        }
+    }
 }
 
 pub type HandlerResult = Result<(), DatabaseError>;
@@ -459,4 +478,60 @@ pub fn current_height(conn: &rusqlite::Connection) -> Result<u64, DatabaseError>
     hopnet_consensus::store::last_decided_height(conn)
         .map(|h| h.map_or(0, |h| h.0))
         .map_err(|_| DatabaseError::RecallError)
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    fn sqlite_failure(extended_code: std::ffi::c_int) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(extended_code),
+            Some("database is locked".into()),
+        )
+    }
+
+    // Impact: this classification is what keeps node-local lock contention out
+    // of consensus verdicts and client-visible 409s; misclassifying either way
+    // reintroduces the EEXIST data-loss path or masks real failures.
+    // Should: classify SQLITE_BUSY as transient, preserving the error code.
+    // Should: classify the snapshot-promotion flavour of busy as transient.
+    // Should: classify SQLITE_LOCKED as transient.
+    #[test]
+    fn lock_contention_is_transient() {
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+            rusqlite::ffi::SQLITE_LOCKED,
+        ] {
+            let got = DatabaseError::classified(&sqlite_failure(code), DatabaseError::InsertError);
+            assert!(
+                matches!(got, DatabaseError::Transient(_)),
+                "extended code {code} should classify as Transient, got {got:?}"
+            );
+        }
+    }
+
+    // Should: keep the caller's verdict for non-contention sqlite failures.
+    // Should not: classify a constraint violation as transient.
+    #[test]
+    fn semantic_failures_keep_the_callers_verdict() {
+        let constraint = sqlite_failure(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE);
+        assert_eq!(
+            DatabaseError::classified(&constraint, DatabaseError::ConflictError),
+            DatabaseError::ConflictError
+        );
+    }
+
+    // Should: keep the caller's verdict for rusqlite errors with no sqlite code.
+    #[test]
+    fn non_sqlite_errors_keep_the_callers_verdict() {
+        assert_eq!(
+            DatabaseError::classified(
+                &rusqlite::Error::QueryReturnedNoRows,
+                DatabaseError::RecordError
+            ),
+            DatabaseError::RecordError
+        );
+    }
 }

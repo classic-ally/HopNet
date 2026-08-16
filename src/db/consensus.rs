@@ -58,7 +58,7 @@ pub fn insert_tx_nonces_tx(
             nonces.len(),
             e
         );
-        DatabaseError::InsertError
+        DatabaseError::classified(&e, DatabaseError::InsertError)
     })?;
     Ok(())
 }
@@ -81,12 +81,19 @@ pub fn check_committed_nonces(
     );
     let params: Vec<&dyn rusqlite::ToSql> =
         nonces.iter().map(|n| n as &dyn rusqlite::ToSql).collect();
-    let mut stmt = conn.prepare(&sql).map_err(|_| DatabaseError::RecallError)?;
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
     let mut rows = stmt
         .query(params.as_slice())
-        .map_err(|_| DatabaseError::RecallError)?;
-    while let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
-        let nonce_str: String = row.get(0).map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?
+    {
+        let nonce_str: String = row
+            .get(0)
+            .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
         committed.insert(nonce_str);
     }
     Ok(committed)
@@ -103,7 +110,7 @@ pub fn cleanup_old_nonces(
             "DELETE FROM committed_tx_nonces WHERE nonce < ?",
             params![cutoff],
         )
-        .map_err(|_| DatabaseError::InsertError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::InsertError))?;
     Ok(deleted)
 }
 
@@ -116,11 +123,11 @@ pub fn get_node_pubkey(
         Ok(db_lock) => {
             let mut stmt = db_lock
                 .prepare("SELECT pubkey FROM nodes WHERE node_id = ?")
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             let node_pubkey: PubKey = stmt
                 .query_row([node_id], |row| row.get(0))
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             Ok(node_pubkey)
         }
@@ -133,7 +140,7 @@ pub fn get_all_node_pubkeys(
 ) -> Result<std::collections::HashMap<i32, PubKey>, DatabaseError> {
     let mut stmt = db_lock
         .prepare("SELECT node_id, pubkey FROM nodes")
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     let rows = stmt
         .query_map([], |row| {
@@ -141,11 +148,12 @@ pub fn get_all_node_pubkeys(
             let pubkey: PubKey = row.get(1)?;
             Ok((node_id, pubkey))
         })
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     let mut map = std::collections::HashMap::new();
     for row in rows {
-        let (node_id, pubkey) = row.map_err(|_| DatabaseError::RecallError)?;
+        let (node_id, pubkey) =
+            row.map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
         map.insert(node_id, pubkey);
     }
 
@@ -157,7 +165,7 @@ pub fn get_all_user_pubkeys(
 ) -> Result<std::collections::HashMap<i32, PubKey>, DatabaseError> {
     let mut stmt = db_lock
         .prepare("SELECT user_id, pubkey FROM users")
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     let rows = stmt
         .query_map([], |row| {
@@ -165,11 +173,12 @@ pub fn get_all_user_pubkeys(
             let pubkey: PubKey = row.get(1)?;
             Ok((user_id, pubkey))
         })
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
     let mut map = std::collections::HashMap::new();
     for row in rows {
-        let (user_id, pubkey) = row.map_err(|_| DatabaseError::RecallError)?;
+        let (user_id, pubkey) =
+            row.map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
         map.insert(user_id, pubkey);
     }
 
@@ -191,7 +200,7 @@ pub fn get_startup_state(
             // First, get node_id and privkey from this_node table
             let mut stmt = db_lock
                 .prepare("SELECT node_id, privkey FROM this_node")
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             let (node_id, node_privkey) = stmt
                 .query_row([], |row| {
@@ -199,16 +208,16 @@ pub fn get_startup_state(
                     let node_privkey: PrivKey = row.get(1)?;
                     Ok((node_id, node_privkey))
                 })
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             // Now get user_id from nodes table
             let mut stmt = db_lock
                 .prepare("SELECT owner FROM nodes WHERE node_id = ?")
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             let user_id: i32 = stmt
                 .query_row([node_id], |row| row.get(0))
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
             Ok(StartupState {
                 node_id,

@@ -367,7 +367,7 @@ fn commit_seals_and_closes_the_window() {
 #[test]
 fn commit_block_vote_iff_match_and_shape() {
     use super::byzantine::validate_at_height_1;
-    use hopnet_consensus::Validity;
+    use hopnet_consensus::traits::ValidationVerdict;
 
     let network = MockNetwork::setup_with_validators(1);
     let node = &network.nodes[0];
@@ -404,21 +404,21 @@ fn commit_block_vote_iff_match_and_shape() {
     // Honest commit at the actual block height, alone: votable.
     assert_eq!(
         validate_at_height_1(&node.app_state, vec![commit_tx(honest, 1)]),
-        Validity::Valid,
+        ValidationVerdict::Valid,
         "honest seal must be votable"
     );
 
     // Wrong hash: vote-iff-match refuses.
     assert_eq!(
         validate_at_height_1(&node.app_state, vec![commit_tx([0xAB; 32], 1)]),
-        Validity::Invalid,
+        ValidationVerdict::Invalid,
         "hash mismatch must refuse the vote"
     );
 
     // seal_height not bound to the block height: refused.
     assert_eq!(
         validate_at_height_1(&node.app_state, vec![commit_tx(honest, 7)]),
-        Validity::Invalid,
+        ValidationVerdict::Invalid,
         "unbound seal_height must be refused"
     );
 
@@ -432,7 +432,7 @@ fn commit_block_vote_iff_match_and_shape() {
     .unwrap();
     assert_eq!(
         validate_at_height_1(&node.app_state, vec![commit_tx(honest, 1), bystander]),
-        Validity::Invalid,
+        ValidationVerdict::Invalid,
         "commit sharing a block must be refused"
     );
 
@@ -453,7 +453,7 @@ fn commit_block_vote_iff_match_and_shape() {
     .unwrap();
     assert_eq!(
         validate_at_height_1(&node.app_state, vec![ordinary]),
-        Validity::Invalid,
+        ValidationVerdict::Invalid,
         "no block may decide past the seal"
     );
 }

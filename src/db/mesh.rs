@@ -20,7 +20,7 @@ pub fn insert_mesh_key_tx(
         )
         .map_err(|e| {
             tracing::error!("Failed to insert mesh_key: {:?}", e);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -40,7 +40,7 @@ pub fn insert_mesh_grant_tx(
         )
         .map_err(|e| {
             tracing::error!("Failed to insert mesh_key_access grant: {:?}", e);
-            DatabaseError::InsertError
+            DatabaseError::classified(&e, DatabaseError::InsertError)
         })?;
     Ok(())
 }
@@ -53,7 +53,7 @@ pub fn get_mesh_pubkey(conn: &rusqlite::Connection) -> Result<Option<[u8; 32]>, 
             |r| r.get(0),
         )
         .optional()
-        .map_err(|_| DatabaseError::RecallError)?;
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
     match blob {
         None => Ok(None),
         Some(v) => v
@@ -91,5 +91,5 @@ pub fn get_mesh_grant(
         },
     )
     .optional()
-    .map_err(|_| DatabaseError::RecallError)
+    .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))
 }
