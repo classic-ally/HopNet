@@ -237,7 +237,10 @@ Each tracked, not forgotten:
 - **Client binary rollout** — how a stale client gets new bytes
   (nix auto-upgrade inheritance for the mount, home-manager, app
   updates). RFC-021 defers non-node deployment classes behind the
-  `UpgradeProvider` seam; a client channel would be its own RFC.
+  `UpgradeProvider` seam; a client channel is its own RFC. The
+  coupling contract that RFC should build against is sketched below
+  (Deferred: rollout coupling) — S4 ships the machine-consumable
+  signal it hooks.
 - **v2 visibility** — the replicated `client_version` column,
   deferred above behind snapshot format tolerance (its named,
   minimal dependency).
@@ -248,6 +251,57 @@ Each tracked, not forgotten:
   select endpoints ("if node ≥ X use the new route"); if a client
   needs an endpoint, it raises its `min_node`. This keeps the
   header from mutating into ad-hoc capability sniffing.
+
+## Deferred: rollout coupling (informative)
+
+How the mount's future auto-upgrade should consume this RFC's
+signals — recorded so the client-channel RFC inherits the contract
+instead of re-deriving it. The shape is RFC-021's
+filesystem-plus-exit-code coupling, minus the epoch gate, plus one
+client-specific obligation: the wrapper is version-AWARE, not
+newest-wins.
+
+- **The wrapper targets compatibility, not recency.** Its job is to
+  provide a mount binary compatible with the node the user points it
+  at: the newest release whose own `min_node` the target node
+  satisfies AND whose version satisfies the node's `min_client` —
+  the skew window, evaluated wrapper-side. Blind newest can
+  overshoot a lagging node.
+- **The node's half of the window is one unauthenticated probe.**
+  A versioned health probe answers `node_version`; a header-less
+  probe's 426 body hands over `min_client` + `node_version` together
+  — a complete policy readout, no token required.
+- **The candidate's half comes from building it.** A candidate
+  release's own `min_node` is compiled into that release, so the
+  wrapper builds the candidate (which staging requires anyway) and
+  asks the staged binary to print its requirement — the honest-bytes
+  route: the answer IS the bytes, and cannot drift the way a
+  feed-published number could. An incompatible newest means checking
+  the next-older tag.
+- **426 from the daemon is the backstop, not the trigger.** Staging
+  stays proactive on the release-feed timer (build → verify the
+  staged `--version` answers the tag, the honest-bytes rule → atomic
+  profile-symlink flip). A daemon 426 adds urgency, and its
+  `min_client` doubles as a floor hint the wrapper may act on
+  immediately rather than waiting for the next tick.
+- **Escalation is safe by construction.** Lazy activation exists to
+  protect open handles — but under a mid-operation 426 the surface
+  is already refusing everything, and durable staging + startup
+  orphan-upload recovery (RFC-018 S7) mean a restart loses no dirty
+  bytes. Immediate restart beats limping.
+- **Zero IPC.** ExecStart goes through a profile symlink (seeded
+  newest-compatible by home-manager, mirroring
+  `nix/hopnet-module.nix`); the wrapper is a subcommand on a systemd
+  user timer whose ONLY output is the symlink flip; the daemon's
+  ONLY output is exit 75 (`RestartForceExitStatus=75`), and only
+  when the profile points at a version other than its own — a 426
+  with nothing flipped holds and re-probes rather than exiting into
+  the same binary. systemd is the sole coordinator.
+- **A too-old NODE is not the wrapper's to force.** When the window
+  is empty in the other direction (`min_node` unsatisfiable by the
+  target node), the wrapper holds the newest COMPATIBLE binary
+  rather than flipping past the node, and the daemon's named error
+  points at the node.
 
 ## Implementation Slices
 
