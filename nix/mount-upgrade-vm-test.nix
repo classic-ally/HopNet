@@ -1,4 +1,4 @@
-# RFC-023 end-to-end: one NixOS machine runs a single-seat hopnet node
+# RFC-024 end-to-end: one NixOS machine runs a single-seat hopnet node
 # (quorum(1), local iroh relay), a user-session hopnet-mount under
 # alice, and a file-served release feed the test mutates between
 # phases. Proves stage → flip → exit 75 → the daemon serves from the
@@ -76,8 +76,15 @@ in
       upgrade.releaseUrl = "http://localhost/node-releases.json";
     };
     # Release build: the min-client seam (and every other test seam)
-    # is gated on HOPNET_TEST_MODE.
-    systemd.services.hopnet.environment.HOPNET_TEST_MODE = "1";
+    # is gated on HOPNET_TEST_MODE. The dev-shape listener contract
+    # (RFC-022 pinned-https): TLS off, plaintext pinned to the classic
+    # port — the mount is a loopback-IPC consumer either way, and the
+    # test's URLs stay static.
+    systemd.services.hopnet.environment = {
+      HOPNET_TEST_MODE = "1";
+      HOPNET_DISABLE_TLS = "1";
+      HOPNET_HTTP_PORT = "34632";
+    };
 
     systemd.services.iroh-relay = {
       wantedBy = [ "multi-user.target" ];
