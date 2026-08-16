@@ -44,6 +44,15 @@ pub struct ArchiveEntry {
     pub is_directory: bool,
 }
 
+/// Counts reported by `create_archive`. `files_archived` lets the caller
+/// assert the archive holds everything the manifest promises before the
+/// takeout is announced as ready.
+#[derive(Debug, Clone, Copy)]
+pub struct ArchiveStats {
+    pub files_archived: u64,
+    pub total_bytes: u64,
+}
+
 /// Create a tar.gz archive from a list of file entries.
 ///
 /// `manifest_bytes` is written as the first tar entry at `manifest.json`.
@@ -54,7 +63,7 @@ pub fn create_archive(
     entries: Vec<ArchiveEntry>,
     archive_path: &str,
     delete_source_files: bool,
-) -> Result<u64, std::io::Error> {
+) -> Result<ArchiveStats, std::io::Error> {
     tracing::info!(
         "Creating archive {} with manifest ({} bytes) and {} entries",
         archive_path,
@@ -101,48 +110,27 @@ pub fn create_archive(
         }
     });
 
-    // Process each entry
+    // Process each entry. Every entry was marked Success by materialization,
+    // so a missing source or append failure is an invariant violation —
+    // skipping would silently truncate a user-facing backup archive.
     for entry in sorted_entries {
-        // Check if source exists
         if !Path::new(&entry.staging_path).exists() {
-            tracing::warn!("Source path not found: {}, skipping", entry.staging_path);
-            continue;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("staged entry missing: {}", entry.staging_path),
+            ));
         }
 
         let prefixed_archive_path = &entry.archive_path;
 
         if entry.is_directory {
-            // Add directory to archive
-            if let Err(e) = tar_builder.append_dir(prefixed_archive_path, &entry.staging_path) {
-                tracing::error!(
-                    "Failed to add directory {} to archive: {:?}",
-                    entry.staging_path,
-                    e
-                );
-                continue;
-            }
+            tar_builder.append_dir(prefixed_archive_path, &entry.staging_path)?;
             tracing::debug!("Added directory: {}", prefixed_archive_path);
         } else {
             // Get file size before adding to archive
-            let file_size = match std::fs::metadata(&entry.staging_path) {
-                Ok(metadata) => metadata.len(),
-                Err(e) => {
-                    tracing::error!("Failed to get metadata for {}: {:?}", entry.staging_path, e);
-                    continue;
-                }
-            };
+            let file_size = std::fs::metadata(&entry.staging_path)?.len();
 
-            // Add file to tar.gz
-            if let Err(e) =
-                tar_builder.append_path_with_name(&entry.staging_path, prefixed_archive_path)
-            {
-                tracing::error!(
-                    "Failed to add file {} to archive: {:?}",
-                    entry.staging_path,
-                    e
-                );
-                continue;
-            }
+            tar_builder.append_path_with_name(&entry.staging_path, prefixed_archive_path)?;
 
             files_archived += 1;
             total_size += file_size;
@@ -154,19 +142,17 @@ pub fn create_archive(
             );
         }
 
-        // Delete source file/directory if requested
-        if delete_source_files {
-            let delete_result = if entry.is_directory {
-                std::fs::remove_dir_all(&entry.staging_path)
-            } else {
-                // Delete the file
-                std::fs::remove_file(&entry.staging_path).map(|_| {
-                    // Try to clean up empty parent directories
-                    if let Some(parent) = Path::new(&entry.staging_path).parent() {
-                        cleanup_empty_directories(parent);
-                    }
-                })
-            };
+        // Delete source files as they are archived to keep peak disk usage at
+        // ~1x the drive size. Files only: directories sort first, so deleting
+        // one here would destroy descendants that have not been archived yet.
+        // Their (by then empty) tree is removed wholesale by the caller.
+        if delete_source_files && !entry.is_directory {
+            let delete_result = std::fs::remove_file(&entry.staging_path).map(|_| {
+                // Try to clean up empty parent directories
+                if let Some(parent) = Path::new(&entry.staging_path).parent() {
+                    cleanup_empty_directories(parent);
+                }
+            });
 
             if let Err(e) = delete_result {
                 tracing::warn!("Failed to delete source {}: {:?}", entry.staging_path, e);
@@ -190,7 +176,10 @@ pub fn create_archive(
         files_archived,
         total_size
     );
-    Ok(total_size)
+    Ok(ArchiveStats {
+        files_archived,
+        total_bytes: total_size,
+    })
 }
 
 /// Open a staging tar.gz, pull the first entry expecting `manifest.json`,
@@ -469,5 +458,116 @@ mod tests {
             paths.contains(&"drive/Documents/High School/essay.txt".to_string()),
             "nested file missing from archive; got {paths:?}"
         );
+    }
+
+    /// Impact: entries reaching the archiver were marked Success by
+    /// materialization, so a missing staged source is an invariant
+    /// violation — the old skip-and-warn path is how a truncated archive
+    /// could still announce itself Ready.
+    /// Should: fail archive creation when a staged entry is missing.
+    /// Should not: skip the entry and produce a smaller archive.
+    #[test]
+    fn missing_staged_source_fails_archive_creation() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let entries = vec![ArchiveEntry {
+            staging_path: temp_dir
+                .path()
+                .join("staging/drive/gone.txt")
+                .to_string_lossy()
+                .into(),
+            archive_path: "drive/gone.txt".to_string(),
+            is_directory: false,
+        }];
+
+        let archive_path = temp_dir.path().join("out.tar.gz");
+        let result = create_archive(
+            br#"{"version":2}"#,
+            entries,
+            archive_path.to_str().unwrap(),
+            true,
+        );
+
+        let err = result.expect_err("missing staged source must fail creation");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Impact: the manifest is the completeness contract for restore — an
+    /// archive holding fewer entries than promised is undetectable on the
+    /// import side once download succeeds.
+    /// Should: report every archived file in the returned stats.
+    /// Should: contain exactly the manifest plus every folder and file entry,
+    /// two levels deep, when sources are deleted as they are archived.
+    #[test]
+    fn nested_tree_archives_completely_with_source_deletion() {
+        let temp_dir = TempDir::new().unwrap();
+        let staging = temp_dir.path().join("staging");
+        let nested = staging.join("drive/photos/2026");
+        fs::create_dir_all(&nested).unwrap();
+
+        let top_file = staging.join("drive/readme.txt");
+        File::create(&top_file).unwrap().write_all(b"top").unwrap();
+        let nested_file = nested.join("trip.jpg");
+        File::create(&nested_file)
+            .unwrap()
+            .write_all(b"jpeg bytes")
+            .unwrap();
+
+        let entries = vec![
+            ArchiveEntry {
+                staging_path: staging.join("drive/photos").to_string_lossy().into(),
+                archive_path: "drive/photos".to_string(),
+                is_directory: true,
+            },
+            ArchiveEntry {
+                staging_path: nested.to_string_lossy().into(),
+                archive_path: "drive/photos/2026".to_string(),
+                is_directory: true,
+            },
+            ArchiveEntry {
+                staging_path: top_file.to_string_lossy().into(),
+                archive_path: "drive/readme.txt".to_string(),
+                is_directory: false,
+            },
+            ArchiveEntry {
+                staging_path: nested_file.to_string_lossy().into(),
+                archive_path: "drive/photos/2026/trip.jpg".to_string(),
+                is_directory: false,
+            },
+        ];
+
+        let archive_path = temp_dir.path().join("out.tar.gz");
+        let stats = create_archive(
+            br#"{"version":2}"#,
+            entries,
+            archive_path.to_str().unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(stats.files_archived, 2);
+
+        let gz = GzDecoder::new(File::open(&archive_path).unwrap());
+        let mut ar = Archive::new(gz);
+        let mut paths: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "drive/photos",
+                "drive/photos/2026",
+                "drive/photos/2026/trip.jpg",
+                "drive/readme.txt",
+                "manifest.json",
+            ]
+        );
+
+        // Staged files are deleted as they are archived; the (now empty)
+        // directory tree is left for the caller's wholesale cleanup.
+        assert!(!top_file.exists());
+        assert!(!nested_file.exists());
     }
 }
