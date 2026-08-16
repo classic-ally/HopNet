@@ -91,6 +91,13 @@ object WatchLoop {
                     true
                 } catch (e: InterruptedException) {
                     return
+                } catch (e: UpgradeRequiredException) {
+                    // Park, don't spin: the node already said this build is
+                    // too old, so re-probe only at max backoff. Loudness and
+                    // the sticky flag live in UpgradeState (raised by the
+                    // transport); the next successful connect clears them.
+                    backoffMs = BACKOFF_MAX_MS
+                    false
                 } catch (e: Exception) {
                     Log.d(TAG, "watch connect/stream failed: $e")
                     false

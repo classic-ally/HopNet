@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.CancellationSignal
 import app.hopnet.drive.data.Pairing
 import app.hopnet.drive.data.PairingStore
+import app.hopnet.drive.data.UpgradeState
 import java.io.File
 import java.io.IOException
 import kotlinx.serialization.json.Json
@@ -17,15 +18,28 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 
 /** Non-2xx from the node; SAF-facing callers map codes to UX. */
-class NodeHttpException(val code: Int, detail: String) : IOException("HTTP $code: $detail")
+open class NodeHttpException(val code: Int, detail: String) : IOException("HTTP $code: $detail")
+
+/**
+ * Typed RFC-023 rejection: the node's version gate refused this build.
+ * Subclasses [NodeHttpException] so existing catch sites keep working.
+ */
+class UpgradeRequiredException(
+    val surface: String,
+    val minClient: Int,
+    val nodeVersion: Int,
+) : NodeHttpException(426, "node requires client >= ${formatVersionCode(minClient)}")
 
 /**
  * Synchronous client for the node's device-token surfaces. Reads ride the
  * DocumentProvider surface; mutations ride the mount surface because its
  * responses are strict-wait (decided + applied) and carry the resulting
  * item — no convergence polling.
+ *
+ * [appContext] is null for direct-constructed clients (JVM tests); then
+ * upgrade episodes are state-only, with no notification.
  */
-class ApiClient(private val pairing: Pairing) {
+class ApiClient(private val pairing: Pairing, private val appContext: Context? = null) {
 
     private val http: OkHttpClient = buildPinnedClient(pairing)
     private val json = Json { ignoreUnknownKeys = true }
@@ -66,13 +80,35 @@ class ApiClient(private val pairing: Pairing) {
                 Thread.sleep(retryAfterMs)
                 continue
             }
-            if (!response.isSuccessful) {
-                val detail = response.body?.string().orEmpty().take(200)
-                response.close()
-                throw NodeHttpException(response.code, detail)
-            }
+            if (!response.isSuccessful) raiseFor(response)
+            UpgradeState.clear(appContext)
             return response
         }
+    }
+
+    /**
+     * Map a non-2xx response to its exception. A 426 with a parseable
+     * RFC-023 body raises the sticky upgrade episode and throws the typed
+     * exception; an unparseable body degrades to the generic error so a
+     * half-written body can never poison the banner with zero versions.
+     */
+    private fun raiseFor(response: Response): Nothing {
+        val body = response.body?.string().orEmpty()
+        response.close()
+        if (response.code == 426) {
+            val payload = runCatching {
+                json.decodeFromString<UpgradeRequiredResponse>(body)
+            }.getOrNull()
+            if (payload != null) {
+                UpgradeState.raise(appContext, payload)
+                throw UpgradeRequiredException(
+                    payload.surface,
+                    payload.minClient,
+                    payload.nodeVersion
+                )
+            }
+        }
+        throw NodeHttpException(response.code, body.take(200))
     }
 
     private inline fun <reified T> getJson(url: String, signal: CancellationSignal?): T {
@@ -130,11 +166,8 @@ class ApiClient(private val pairing: Pairing) {
             .url(url("/api/integrations/mount/watch"))
             .build()
         val response = watchHttp.newCall(request).execute()
-        if (!response.isSuccessful) {
-            val code = response.code
-            response.close()
-            throw NodeHttpException(code, "watch stream refused")
-        }
+        if (!response.isSuccessful) raiseFor(response)
+        UpgradeState.clear(appContext)
         return response
     }
 
@@ -262,7 +295,7 @@ class ApiClient(private val pairing: Pairing) {
             if (cached != null && cachedFor == pairing) return cached
             synchronized(this) {
                 if (cachedClient == null || cachedFor != pairing) {
-                    cachedClient = ApiClient(pairing)
+                    cachedClient = ApiClient(pairing, context.applicationContext)
                     cachedFor = pairing
                 }
                 return cachedClient!!
