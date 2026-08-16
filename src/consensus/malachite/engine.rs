@@ -936,35 +936,31 @@ async fn handle_need_value(
     match built {
         Ok(built) => {
             // Resolve preflight verdicts for the queue-backed entries.
-            // Solo-block deferrals restage (valid txs that may not share a
-            // block with a membership transition); deferred indices beyond
-            // entries.len() (the appended system candidate) have no pool
-            // entry and are naturally dropped.
-            let mut rejected_by_idx: std::collections::HashMap<usize, String> =
-                built.rejected.into_iter().collect();
-            let deferred_idx: std::collections::HashSet<usize> =
-                built.deferred.into_iter().collect();
-            let mut inflight = Vec::new();
-            let mut restage = Vec::new();
-            for (i, entry) in entries.into_iter().enumerate() {
-                if deferred_idx.contains(&i) {
-                    restage.push(entry);
-                    continue;
-                }
-                match rejected_by_idx.remove(&i) {
-                    Some(reason) if reason == "already committed" => {
-                        // Nonce is in local committed_tx_nonces — applied
-                        // here at some height below the one we're proposing.
-                        pool.resolve_committed(entry, height.0.saturating_sub(1));
-                    }
-                    Some(reason) => pool.reject(entry, reason),
-                    None => inflight.push(entry),
-                }
+            // Solo-block deferrals and transient storage failures restage
+            // (the latter bounded — see resolve_preflight_verdicts);
+            // deferred indices beyond entries.len() (the appended system
+            // candidate) have no pool entry and are naturally dropped.
+            let resolved = crate::consensus::queue::resolve_preflight_verdicts(
+                entries,
+                built.rejected,
+                built.deferred,
+                crate::consensus::queue::MAX_TRANSIENT_RESTAGES,
+            );
+            for entry in resolved.committed {
+                // Nonce is in local committed_tx_nonces — applied here at
+                // some height below the one we're proposing.
+                pool.resolve_committed(entry, height.0.saturating_sub(1));
             }
-            if !restage.is_empty() {
-                pool.restage(restage);
+            for (entry, reason) in resolved.reject {
+                pool.reject(entry, reason);
             }
-            pool.mark_inflight(inflight, height.0);
+            for (entry, reason) in resolved.fail {
+                pool.fail(entry, reason);
+            }
+            if !resolved.restage.is_empty() {
+                pool.restage(resolved.restage);
+            }
+            pool.mark_inflight(resolved.inflight, height.0);
 
             if input_tx
                 .send(HostInput::Propose {

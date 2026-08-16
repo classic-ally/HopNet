@@ -9,7 +9,7 @@ use hopnet_consensus::codec::WireCommitCertificate;
 use hopnet_consensus::config::{MalachiteThresholds, QuorumProfile};
 use hopnet_consensus::context::{Address, Height, HopNetContext, Validator};
 use hopnet_consensus::store::SqliteStorage;
-use hopnet_consensus::traits::{Application, ApplyError, ValidationOrigin};
+use hopnet_consensus::traits::{Application, ApplyError, ValidationOrigin, ValidationVerdict};
 use hopnet_consensus::types::{Blake3Hash, Block, BlockData, PrivKey, PubKey, Transactions};
 use hopnet_consensus::HopNetValidatorSet;
 
@@ -82,8 +82,8 @@ impl Application<SqliteStorage> for SqlApp {
         _block: &Block,
         _tx: &mut rusqlite::Transaction<'_>,
         _origin: ValidationOrigin,
-    ) -> Validity {
-        Validity::Valid
+    ) -> ValidationVerdict {
+        ValidationVerdict::Valid
     }
 
     fn apply_block(

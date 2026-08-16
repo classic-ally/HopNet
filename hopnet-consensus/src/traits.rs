@@ -4,7 +4,7 @@
 //! dispatch core never awaits; asynchrony (spawning value builds, network
 //! sends) lives in the shell around it.
 
-use malachitebft_core_types::{Timeout, Validity};
+use malachitebft_core_types::Timeout;
 
 use crate::codec::{WireCommitCertificate, WireConsensusMsg, WireWalEntry};
 use crate::context::{Height, HopNetValidatorSet};
@@ -51,6 +51,21 @@ pub trait Storage {
         f: impl FnOnce(&mut Self::Tx<'_>) -> R,
     ) -> Result<R, Self::Error>;
 
+    /// Like [`Storage::with_rollback`], but the transaction takes the write
+    /// lock up front (IMMEDIATE) under a caller-bounded busy timeout — the
+    /// retry path for [`ValidationVerdict::Undetermined`]: an IMMEDIATE
+    /// transaction cannot lose its snapshot mid-run, so a verdict is
+    /// guaranteed if the lock is acquired within the bound. Default falls
+    /// back to `with_rollback` for storages without contention semantics.
+    fn with_rollback_immediate<R>(
+        &mut self,
+        busy_timeout_ms: u32,
+        f: impl FnOnce(&mut Self::Tx<'_>) -> R,
+    ) -> Result<R, Self::Error> {
+        let _ = busy_timeout_ms;
+        self.with_rollback(f)
+    }
+
     // Consensus-side writes inside the decide transaction.
     fn store_decided_tx(
         tx: &mut Self::Tx<'_>,
@@ -82,6 +97,19 @@ pub enum ValidationOrigin {
     Sync,
 }
 
+/// The application's Rule-8 dry-run verdict. `Undetermined` is a host-internal
+/// state — a node-local storage condition prevented reaching a verdict at all.
+/// The host retries it on an IMMEDIATE transaction; it is NEVER fed to the
+/// engine as a vote, because a non-deterministic local condition must not be
+/// expressible as a judgement on block validity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationVerdict {
+    Valid,
+    Invalid,
+    /// Could not determine validity (transient storage contention).
+    Undetermined(String),
+}
+
 /// The application seam (ABCI in spirit). Deterministic: same inputs must
 /// produce the same verdicts and state on every node — that's what agreement
 /// on blocks means. No network, no clocks, no randomness.
@@ -92,14 +120,16 @@ pub enum ValidationOrigin {
 /// dispatch core never blocks.
 pub trait Application<S: Storage> {
     /// Rule-8 dry-run: signatures, nonce/staleness, execute=false dispatch.
-    /// Runs inside a rollback transaction the host opens.
+    /// Runs inside a rollback transaction the host opens. Returns a
+    /// tri-state verdict — `Undetermined` (transient storage contention)
+    /// makes the host retry on an IMMEDIATE transaction rather than vote.
     fn validate_block(
         &mut self,
         height: Height,
         block: &Block,
         tx: &mut S::Tx<'_>,
         origin: ValidationOrigin,
-    ) -> Validity;
+    ) -> ValidationVerdict;
 
     /// Apply a decided block (execute=true dispatch + nonce insertion) inside
     /// the host's decide transaction.

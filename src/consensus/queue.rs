@@ -66,6 +66,95 @@ pub struct QueuedTransaction {
     notifier: oneshot::Sender<ConsensusResult>,
     /// Node IDs of leaders that have explicitly rejected this transaction.
     rejecting_leaders: HashSet<i32>,
+    /// Preflight restages consumed by transient storage contention. Bounded
+    /// by [`MAX_TRANSIENT_RESTAGES`]: an immortal entry would block the
+    /// regenesis drain invariant and age past MAX_TRANSACTION_AGE into a
+    /// spurious permanent rejection.
+    transient_attempts: u32,
+}
+
+/// Preflight verdict for a candidate dropped from a proposal — typed so the
+/// engine routes each class correctly (resolve / reject / restage) instead
+/// of string-matching reasons.
+#[derive(Debug)]
+pub enum RejectReason {
+    /// Nonce already in committed_tx_nonces — success for the submitter.
+    AlreadyCommitted,
+    /// Semantically invalid — permanent; the submitter sees Rejected (409).
+    Permanent(String),
+    /// Node-local transient storage contention — not a verdict on the
+    /// transaction; restage it for a later height.
+    Transient(String),
+}
+
+/// Restage budget for transient preflight failures before the submitter is
+/// told to back off (ConsensusResult::Failed -> 503, never a 409).
+pub(crate) const MAX_TRANSIENT_RESTAGES: u32 = 5;
+
+/// Buckets produced by [`resolve_preflight_verdicts`]; the caller applies
+/// them to the pool (kept separate so the routing is unit-testable).
+pub(crate) struct ResolvedVerdicts {
+    pub inflight: Vec<QueuedTransaction>,
+    pub restage: Vec<QueuedTransaction>,
+    pub reject: Vec<(QueuedTransaction, String)>,
+    pub fail: Vec<(QueuedTransaction, String)>,
+    pub committed: Vec<QueuedTransaction>,
+}
+
+/// Route build_value's preflight verdicts to pool outcomes: deferred and
+/// transiently-failed entries restage (the latter bounded), permanent
+/// rejections notify the submitter, already-committed entries resolve as
+/// success, and everything else is inflight in the proposed block.
+pub(crate) fn resolve_preflight_verdicts(
+    entries: Vec<QueuedTransaction>,
+    rejected: Vec<(usize, RejectReason)>,
+    deferred: Vec<usize>,
+    max_transient_restages: u32,
+) -> ResolvedVerdicts {
+    let mut rejected_by_idx: std::collections::HashMap<usize, RejectReason> =
+        rejected.into_iter().collect();
+    let deferred_idx: HashSet<usize> = deferred.into_iter().collect();
+    let mut out = ResolvedVerdicts {
+        inflight: Vec::new(),
+        restage: Vec::new(),
+        reject: Vec::new(),
+        fail: Vec::new(),
+        committed: Vec::new(),
+    };
+    for (i, mut entry) in entries.into_iter().enumerate() {
+        if deferred_idx.contains(&i) {
+            out.restage.push(entry);
+            continue;
+        }
+        match rejected_by_idx.remove(&i) {
+            Some(RejectReason::AlreadyCommitted) => out.committed.push(entry),
+            Some(RejectReason::Permanent(reason)) => out.reject.push((entry, reason)),
+            Some(RejectReason::Transient(reason)) => {
+                entry.transient_attempts += 1;
+                if entry.transient_attempts > max_transient_restages {
+                    tracing::warn!(
+                        attempts = entry.transient_attempts,
+                        "transient preflight failure exhausted its restage budget: {reason}"
+                    );
+                    out.fail.push((
+                        entry,
+                        format!(
+                            "transient storage contention persisted after \
+                             {max_transient_restages} restage attempts: {reason}"
+                        ),
+                    ));
+                } else {
+                    tracing::warn!(
+                        attempt = entry.transient_attempts,
+                        "restaging transaction after transient preflight failure: {reason}"
+                    );
+                    out.restage.push(entry);
+                }
+            }
+            None => out.inflight.push(entry),
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -160,6 +249,13 @@ impl PendingPool {
     /// submitter immediately.
     pub fn reject(&self, entry: QueuedTransaction, reason: String) {
         let _ = entry.notifier.send(ConsensusResult::Rejected(reason));
+    }
+
+    /// Resolve an entry whose outcome could not be determined (transient
+    /// restage budget exhausted) — Failed, NOT Rejected: the submitter sees
+    /// a retryable 503, never a semantic 409.
+    pub fn fail(&self, entry: QueuedTransaction, reason: String) {
+        let _ = entry.notifier.send(ConsensusResult::Failed(reason));
     }
 
     /// Resolve an entry whose nonce is already committed (duplicate submit or
@@ -382,6 +478,7 @@ impl ConsensusQueue {
                 tx: transaction,
                 notifier: result_tx,
                 rejecting_leaders: HashSet::new(),
+                transient_attempts: 0,
             });
             receivers.push(result_rx);
         }
@@ -431,6 +528,7 @@ impl ConsensusQueue {
             tx: transaction,
             notifier: result_tx,
             rejecting_leaders: HashSet::new(),
+            transient_attempts: 0,
         };
 
         self.sender
@@ -450,6 +548,7 @@ impl ConsensusQueue {
             tx: transaction,
             notifier: result_tx,
             rejecting_leaders: HashSet::new(),
+            transient_attempts: 0,
         };
 
         self.sender
@@ -876,6 +975,7 @@ fn process_forward_results(
                         tx: queued.tx,
                         notifier: queued.notifier,
                         rejecting_leaders,
+                        transient_attempts: queued.transient_attempts,
                     });
                 }
             }
@@ -889,6 +989,7 @@ fn process_forward_results(
                     tx: queued.tx,
                     notifier: queued.notifier,
                     rejecting_leaders: queued.rejecting_leaders,
+                    transient_attempts: queued.transient_attempts,
                 });
             }
         }
@@ -916,5 +1017,145 @@ fn max_byzantine_faults(validator_count: usize) -> usize {
         (validator_count / 2).saturating_sub(1)
     } else {
         (validator_count - 1) / 3
+    }
+}
+
+#[cfg(test)]
+mod preflight_resolution_tests {
+    use super::*;
+
+    fn entry() -> (QueuedTransaction, oneshot::Receiver<ConsensusResult>) {
+        entry_with_attempts(0)
+    }
+
+    fn entry_with_attempts(
+        attempts: u32,
+    ) -> (QueuedTransaction, oneshot::Receiver<ConsensusResult>) {
+        let (result_tx, result_rx) = oneshot::channel();
+        let tx = Transaction {
+            rpc: crate::consensus::types::RpcCall {
+                function: "test.noop".into(),
+                payload: Vec::new(),
+            },
+            submitter: crate::consensus::types::SignedIdentity {
+                id: 1,
+                signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
+            },
+            user: None,
+            nonce: hopnet_common::CustomUUID::new(None),
+        };
+        (
+            QueuedTransaction {
+                tx,
+                notifier: result_tx,
+                rejecting_leaders: HashSet::new(),
+                transient_attempts: attempts,
+            },
+            result_rx,
+        )
+    }
+
+    // Impact: this routing is what keeps a transient SQLITE_BUSY during the
+    // proposer's preflight from reaching an rsync client as 409 -> EEXIST
+    // (observed data loss: silently dropped files during a live migration).
+    // Should: restage a transiently-failed transaction instead of rejecting it.
+    // Should: count the restage against the entry's transient budget.
+    // Should not: notify the submitter while restages remain available.
+    #[test]
+    fn transient_preflight_failure_restages() {
+        let (e, mut rx) = entry();
+        let resolved = resolve_preflight_verdicts(
+            vec![e],
+            vec![(0, RejectReason::Transient("DatabaseBusy".into()))],
+            vec![],
+            MAX_TRANSIENT_RESTAGES,
+        );
+        assert_eq!(resolved.restage.len(), 1);
+        assert_eq!(resolved.restage[0].transient_attempts, 1);
+        assert!(resolved.reject.is_empty() && resolved.fail.is_empty());
+        assert!(rx.try_recv().is_err(), "submitter must still be waiting");
+    }
+
+    // Impact: an immortal restaged entry would block the regenesis drain
+    // invariant and age into a spurious staleness rejection ~50min later.
+    // Should: fail (not reject) an entry whose restage budget is exhausted,
+    // so the submitter sees a retryable 503, never a semantic 409.
+    #[test]
+    fn exhausted_transient_budget_fails_instead_of_rejecting() {
+        let (e, mut rx) = entry_with_attempts(MAX_TRANSIENT_RESTAGES);
+        let resolved = resolve_preflight_verdicts(
+            vec![e],
+            vec![(0, RejectReason::Transient("DatabaseBusy".into()))],
+            vec![],
+            MAX_TRANSIENT_RESTAGES,
+        );
+        assert!(resolved.restage.is_empty());
+        assert_eq!(resolved.fail.len(), 1);
+        let (entry, reason) = resolved.fail.into_iter().next().unwrap();
+        assert!(reason.contains("transient storage contention"));
+        drop(entry);
+        assert!(rx.try_recv().is_err(), "resolution is the caller's job");
+    }
+
+    // Should: reject a permanently-failed transaction with its reason.
+    // Should: resolve an already-committed nonce as committed, not rejected.
+    // Should: route untouched entries to inflight.
+    #[test]
+    fn permanent_committed_and_clean_entries_route_correctly() {
+        let (a, _rx_a) = entry();
+        let (b, _rx_b) = entry();
+        let (c, _rx_c) = entry();
+        let resolved = resolve_preflight_verdicts(
+            vec![a, b, c],
+            vec![
+                (0, RejectReason::Permanent("membership guard: nope".into())),
+                (1, RejectReason::AlreadyCommitted),
+            ],
+            vec![],
+            MAX_TRANSIENT_RESTAGES,
+        );
+        assert_eq!(resolved.reject.len(), 1);
+        assert_eq!(resolved.reject[0].1, "membership guard: nope");
+        assert_eq!(resolved.committed.len(), 1);
+        assert_eq!(resolved.inflight.len(), 1);
+        assert!(resolved.restage.is_empty() && resolved.fail.is_empty());
+    }
+
+    // Should: restage solo-block deferrals without consuming transient budget.
+    #[test]
+    fn deferred_entries_restage_without_budget_charge() {
+        let (e, _rx) = entry();
+        let resolved = resolve_preflight_verdicts(vec![e], vec![], vec![0], MAX_TRANSIENT_RESTAGES);
+        assert_eq!(resolved.restage.len(), 1);
+        assert_eq!(resolved.restage[0].transient_attempts, 0);
+    }
+
+    // Should: report Failed (503 path) to the submitter when the pool fails an
+    // entry, and Rejected (409 path) when it rejects one.
+    #[tokio::test]
+    async fn pool_fail_and_reject_send_distinct_results() {
+        let pool = PendingPool::default();
+        let (e1, rx1) = entry();
+        let (e2, rx2) = entry();
+        pool.fail(e1, "contention".into());
+        pool.reject(e2, "occupied".into());
+        assert!(matches!(rx1.await, Ok(ConsensusResult::Failed(_))));
+        assert!(matches!(rx2.await, Ok(ConsensusResult::Rejected(_))));
+    }
+
+    // Impact: restaged entries must retry at the very next height — appended
+    // entries would starve behind a deep queue and time out at the client.
+    // Should: prepend restaged entries ahead of already-queued work.
+    #[test]
+    fn restage_prepends_to_the_front_of_the_queue() {
+        let pool = PendingPool::default();
+        let (queued_first, _r1) = entry();
+        let (restaged, _r2) = entry();
+        let marker = restaged.tx.nonce.to_string();
+        pool.push(queued_first);
+        pool.restage(vec![restaged]);
+        let taken = pool.take_for_proposal(2);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].tx.nonce.to_string(), marker);
     }
 }

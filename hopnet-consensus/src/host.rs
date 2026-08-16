@@ -31,7 +31,7 @@ use crate::codec::{self, WireCommitCertificate, WireConsensusMsg, WireWalEntry};
 use crate::config::MalachiteThresholds;
 use crate::context::{Address, ConsensusVote, Height, HopNetContext, HopNetValidatorSet};
 use crate::signing;
-use crate::traits::{Application, Gossip, Storage, Timers, ValidationOrigin};
+use crate::traits::{Application, Gossip, Storage, Timers, ValidationOrigin, ValidationVerdict};
 use crate::types::{Blake3Hash, Block, PrivKey};
 use crate::verify;
 
@@ -145,6 +145,12 @@ pub struct HostCore<A, S, G, T> {
 /// caps memory against a flooding peer (blocks can be large).
 const PROPOSAL_STASH_AHEAD: u64 = 4;
 const PROPOSAL_STASH_MAX: usize = 16;
+
+/// busy_timeout for the IMMEDIATE validation retry. Deliberately far below
+/// the connection default (5s): this runs on the single-threaded consensus
+/// shell, where the wait stalls vote processing — the bound is a number we
+/// chose, not one we inherited.
+const UNDETERMINED_RETRY_BUSY_TIMEOUT_MS: u32 = 300;
 
 impl<A, S, G, T> HostCore<A, S, G, T>
 where
@@ -376,9 +382,39 @@ where
         // Disjoint borrows so app and storage can be used together.
         let validity = {
             let Self { app, storage, .. } = self;
-            storage
+            let mut verdict = storage
                 .with_rollback(|tx| app.validate_block(height, &block, tx, ValidationOrigin::Live))
-                .map_err(HostError::Storage)?
+                .map_err(HostError::Storage)?;
+            if let ValidationVerdict::Undetermined(reason) = &verdict {
+                // Transient node-local contention is not a verdict. Retry on
+                // an IMMEDIATE transaction: it cannot lose its snapshot
+                // mid-run, so a verdict is guaranteed if the (bounded) lock
+                // wait succeeds.
+                tracing::warn!(
+                    %height,
+                    "validation undetermined ({reason}); retrying on an IMMEDIATE transaction"
+                );
+                verdict = storage
+                    .with_rollback_immediate(UNDETERMINED_RETRY_BUSY_TIMEOUT_MS, |tx| {
+                        app.validate_block(height, &block, tx, ValidationOrigin::Live)
+                    })
+                    .map_err(HostError::Storage)?;
+            }
+            match verdict {
+                ValidationVerdict::Valid => Validity::Valid,
+                ValidationVerdict::Invalid => Validity::Invalid,
+                ValidationVerdict::Undetermined(reason) => {
+                    // Terminal backstop — storage contention outlived the
+                    // IMMEDIATE retry. A nil vote here is absorbed by
+                    // sync-and-apply; rare by construction now.
+                    tracing::error!(
+                        %height,
+                        "validation still undetermined after IMMEDIATE retry \
+                         (storage contention): {reason}"
+                    );
+                    Validity::Invalid
+                }
+            }
         };
         let pv = w.into_proposed_value(validity).map_err(HostError::Codec)?;
         self.remember_block(pv.height, pv.value.clone());
@@ -854,38 +890,70 @@ where
                 Ok(block)
                     if block.verify().is_ok() && block.block_hash == value.certificate.value_id =>
                 {
-                    let validity = {
+                    let verdict = {
                         let app = &mut *ctx.app;
-                        ctx.storage
+                        let mut v = ctx
+                            .storage
                             .with_rollback(|tx| {
                                 app.validate_block(height, &block, tx, ValidationOrigin::Sync)
                             })
-                            .map_err(HostError::Storage)?
+                            .map_err(HostError::Storage)?;
+                        if matches!(v, ValidationVerdict::Undetermined(_)) {
+                            // Same retry seam as the live path: contention is
+                            // not a verdict, and on the sync path a false
+                            // Invalid raises a determinism alarm.
+                            v = ctx
+                                .storage
+                                .with_rollback_immediate(UNDETERMINED_RETRY_BUSY_TIMEOUT_MS, |tx| {
+                                    app.validate_block(height, &block, tx, ValidationOrigin::Sync)
+                                })
+                                .map_err(HostError::Storage)?;
+                        }
+                        v
                     };
-                    if validity == Validity::Invalid {
-                        // A quorum committed a value our app rejects: an app
-                        // determinism violation, not a peer fault. Surface it —
-                        // the engine will log and hold at this height. Log the
-                        // block's tx functions: identifying WHICH handler
-                        // diverged is the whole diagnosis (observed once
-                        // 2026-07-06 at h=10 under a catch-up during load;
-                        // did not wedge — live decided the height).
-                        let functions: Vec<&str> = block
-                            .data
-                            .transactions
-                            .iter()
-                            .map(|t| t.rpc.function.as_str())
-                            .collect();
-                        tracing::error!(
-                            %height,
-                            ?functions,
-                            "sync value failed local validation despite a valid commit certificate"
-                        );
-                        ctx.outputs.push(HostOutput::SyncInvalid {
-                            peer: value.peer,
-                            height,
-                        });
-                    }
+                    let validity = match verdict {
+                        ValidationVerdict::Valid => Validity::Valid,
+                        ValidationVerdict::Invalid => {
+                            // A quorum committed a value our app rejects: an app
+                            // determinism violation, not a peer fault. Surface it —
+                            // the engine will log and hold at this height. Log the
+                            // block's tx functions: identifying WHICH handler
+                            // diverged is the whole diagnosis (observed once
+                            // 2026-07-06 at h=10 under a catch-up during load;
+                            // did not wedge — live decided the height).
+                            let functions: Vec<&str> = block
+                                .data
+                                .transactions
+                                .iter()
+                                .map(|t| t.rpc.function.as_str())
+                                .collect();
+                            tracing::error!(
+                                %height,
+                                ?functions,
+                                "sync value failed local validation despite a valid commit certificate"
+                            );
+                            ctx.outputs.push(HostOutput::SyncInvalid {
+                                peer: value.peer,
+                                height,
+                            });
+                            Validity::Invalid
+                        }
+                        ValidationVerdict::Undetermined(reason) => {
+                            // Storage contention outlived the IMMEDIATE retry.
+                            // Explicitly NOT the determinism alarm above — the
+                            // engine holds at this height and sync re-attempts.
+                            tracing::error!(
+                                %height,
+                                "sync validation undetermined after IMMEDIATE retry \
+                                 (storage contention, not a determinism violation): {reason}"
+                            );
+                            ctx.outputs.push(HostOutput::SyncInvalid {
+                                peer: value.peer,
+                                height,
+                            });
+                            Validity::Invalid
+                        }
+                    };
                     ctx.blocks.insert((height, block.block_hash), block.clone());
                     let pv = ProposedValue {
                         height,
