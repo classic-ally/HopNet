@@ -1046,7 +1046,9 @@ mod busy_repro_tests {
         // Another connection holds the write lock, as consensus apply or a
         // concurrent mount request would.
         writer
-            .execute_batch("BEGIN IMMEDIATE; INSERT INTO users (user_id, username) VALUES (1, 'bob');")
+            .execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO users (user_id, username) VALUES (1, 'bob');",
+            )
             .expect("writer takes the write lock");
 
         // The handler's transaction: DEFERRED, so the SELECT inside
