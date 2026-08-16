@@ -513,6 +513,11 @@ Cross-platform desktop application providing file management and network adminis
       guard: orchestrator test `mount-cross-node-consistency` mounts via
       FUSE inside a node container and proves kernel IO converges across
       the mesh (2026-08-01). Remaining: S10 desktop polish/packaging)
+- [ ] Client API compatibility — CalVer identity + skew enforcement
+      ([RFC-022](specs/client-compat.md), spec 2026-08-16: per-surface
+      `min_client` in the RFC-016 manifest, per-request version header
+      with mandatory 426 on DeviceToken surfaces, client-side
+      `min_node` health probe; implementation S1–S4 not started)
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
       Network Resilience pane reports margins to the model-checked invariants rather than

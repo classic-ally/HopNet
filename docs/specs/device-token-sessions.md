@@ -1,5 +1,8 @@
 # RFC-012: Device Token Session Bootstrap
 
+**Amended by**: RFC-022 (client compatibility — device-token requests
+carry the client version; per-surface health probes, 2026-08-16)
+
 ## Abstract
 
 This RFC specifies a mechanism for device tokens to carry wrapped user key material, enabling OS integration endpoints (FileProvider, DocumentProvider) to establish authenticated sessions without requiring a prior user login. By encrypting the user's key material with a key derived from the device secret at registration time, and storing the resulting ciphertext alongside the device token in the consensus-replicated `device_tokens` table, we couple the session lifecycle to the device token lifecycle. This eliminates the current dependency on ephemeral in-memory sessions for OS integration surfaces, and replaces the FileProvider's ad-hoc API key authentication with the existing device token infrastructure.

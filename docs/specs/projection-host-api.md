@@ -3,7 +3,8 @@
 **Status**: Implemented (stages 1–6 complete, 2026-07-08)
 **Depends on**: RFC-014 (storage substrate), RFC-015 (projection modularity)
 **Amended by**: RFC-019 (snapshot seam — `snapshot_section` /
-`node_local_tables`, 2026-08-01)
+`node_local_tables`, 2026-08-01); RFC-022 (client compatibility —
+`min_client()` + `Mount.min_client`, 2026-08-16)
 
 ## Motivation
 
