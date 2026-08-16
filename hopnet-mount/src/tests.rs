@@ -555,6 +555,44 @@ async fn empty_file_reads_eof_without_fetch() {
     assert!(read_blob_calls(&handle).is_empty());
 }
 
+/// Descriptors this process holds into `root`, via /proc/self/fd.
+/// Path-filtered so concurrently-running tests' fds don't pollute the
+/// count (the shared libtest process rules out setrlimit here).
+#[cfg(target_os = "linux")]
+fn cache_fd_census(root: &std::path::Path) -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .expect("read /proc/self/fd")
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| target.starts_with(root))
+        .count()
+}
+
+// Impact: regression guard for the production wedge — the daemon held one
+// cache fd per distinct blob for its whole lifetime, sat down on the 1024
+// soft RLIMIT_NOFILE after ~1000 distinct files, and every later read
+// returned EIO with nothing logged.
+// Should: keep the number of open cache-file descriptors bounded
+// regardless of how many distinct blobs have been read.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn distinct_blob_reads_do_not_accumulate_fds() {
+    let (core, handle, dir) = setup_cached(64, EvictionPolicy::MaxBytes { bytes: 1 << 20 });
+    for i in 0..20u8 {
+        let name = format!("file-{i}.bin");
+        let content = vec![i; 64];
+        handle.add_file_with_content(ItemId::Root, &name, &content);
+        let node = core.lookup(ROOT_INO, &name).await.unwrap();
+        let fh = core.open(node.ino).await.unwrap();
+        assert_eq!(core.read(fh, 0, 64).await.unwrap(), content);
+    }
+    let census = cache_fd_census(&dir.path().join("content"));
+    assert!(
+        census <= 8,
+        "{census} cache fds held after 20 distinct blob reads — \
+         descriptors must not scale with distinct blobs"
+    );
+}
+
 // Should: coalesce concurrent reads of one segment into exactly one
 // transport fetch, with every reader getting the bytes.
 // Impact: without single-flight, a kernel readahead burst multiplies a
