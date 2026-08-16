@@ -343,6 +343,11 @@ Each PR-sized, landing green:
       S4 keeps the 426 handler UX, `min_node`, and the remaining
       clients. Registry + gate tests in `src/client_compat.rs`;
       end-to-end 426 shape asserted in the mount stack suite.
+      *(RFC-023 S3 addition, 2026-08-16: `HOPNET_MIN_CLIENT_OVERRIDE`,
+      a test-mode-only seam inside the gate — raises the effective
+      minimum (never lowers: `max()` over the compiled value) and is
+      advertised in the 426 body, so the mount-upgrade VM test can
+      force the upgrade-required state against a single build.)*
 - [x] S4 — clients + end-to-end (2026-08-16): mount gains the typed
       `TransportError::UpgradeRequired` (426 bodies parsed at every
       transport site), `MIN_NODE`/`check_node_version` at the

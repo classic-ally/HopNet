@@ -42,7 +42,7 @@ pub fn running_version_code() -> u32 {
 /// node CLAIM a different version (awaiting-upgrade parking, upgrade-
 /// target regenesis) without building a second image; production
 /// release binaries ignore them entirely.
-fn test_mode() -> bool {
+pub(crate) fn test_mode() -> bool {
     cfg!(debug_assertions) || std::env::var("HOPNET_TEST_MODE").is_ok()
 }
 

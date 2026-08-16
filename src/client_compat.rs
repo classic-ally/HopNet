@@ -25,6 +25,34 @@ pub struct SurfaceCompat {
     pub min_client: u32,
 }
 
+/// Test-mode-only RAISE of a surface's minimum (RFC-023 S3's VM seam):
+/// `HOPNET_MIN_CLIENT_OVERRIDE` holding a CalVer token raises the
+/// compiled minimum via max() — it can never lower one, so a stray
+/// variable cannot disable skew enforcement. Malformed tokens are
+/// ignored with a warning (HOPNET_UPGRADE_VERSION_OVERRIDE's pattern).
+/// Read per request on purpose: the compiled minimum is frozen into
+/// each gate layer at router build, and the S3 scenario flips this
+/// mid-run via a systemd drop-in + restart — one per-request read here
+/// covers every SurfaceCompat site at once.
+fn effective_min(compiled: u32) -> u32 {
+    if !crate::version::test_mode() {
+        return compiled;
+    }
+    let Ok(v) = std::env::var("HOPNET_MIN_CLIENT_OVERRIDE") else {
+        return compiled;
+    };
+    match crate::version::parse_code(&v) {
+        Some(code) => compiled.max(code),
+        None => {
+            tracing::warn!(
+                override_value = %v,
+                "ignoring malformed HOPNET_MIN_CLIENT_OVERRIDE"
+            );
+            compiled
+        }
+    }
+}
+
 /// The version gate. Missing, malformed, and too-old identities are all
 /// rejected the same way: device tokens exist for separate-lifecycle
 /// binaries, so an unversioned request on this auth class is exactly the
@@ -34,18 +62,21 @@ pub async fn client_version_gate(
     req: Request,
     next: Next,
 ) -> Response {
+    // The enforced and advertised minimums come from the same read —
+    // the wrapper's policy readout must see the number the gate applies.
+    let min_client = effective_min(cfg.min_client);
     let claimed = req
         .headers()
         .get(CLIENT_VERSION_HEADER)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u32>().ok());
     match claimed {
-        Some(code) if code >= cfg.min_client => next.run(req).await,
+        Some(code) if code >= min_client => next.run(req).await,
         _ => (
             StatusCode::UPGRADE_REQUIRED,
             Json(UpgradeRequiredResponse {
                 surface: cfg.surface.to_string(),
-                min_client: cfg.min_client,
+                min_client,
                 node_version: crate::version::effective_running_code(),
             }),
         )
@@ -139,6 +170,8 @@ mod tests {
     // all three reject as 426, never as an auth error.
     #[tokio::test]
     async fn gate_passes_current_and_rejects_stale_or_absent() {
+        // Locked: the min-client override test mutates process env.
+        let _guard = crate::test_env::lock_env();
         let app = gated("/test", 20260802);
         assert_eq!(status_for(&app, Some("20260802")).await, StatusCode::OK);
         assert_eq!(status_for(&app, Some("20270101")).await, StatusCode::OK);
@@ -158,6 +191,8 @@ mod tests {
     // to remedy.
     #[tokio::test]
     async fn rejection_body_names_surface_minimum_and_node() {
+        // Locked: the min-client override test mutates process env.
+        let _guard = crate::test_env::lock_env();
         let app = gated("/integrations/mount", 20260802);
         let resp = app
             .clone()
@@ -177,6 +212,55 @@ mod tests {
         assert_eq!(body.surface, "/integrations/mount");
         assert_eq!(body.min_client, 20260802);
         assert_eq!(body.node_version, crate::version::effective_running_code());
+    }
+
+    // Impact: the S3 VM test raises a surface's minimum mid-run through
+    // this seam; if it could LOWER one, a stray variable would silently
+    // disable skew enforcement wherever test mode is on.
+    // Should: raise the effective minimum when the override exceeds the
+    // compiled value, and advertise the RAISED value in the 426 body —
+    // the wrapper's policy readout must see the number the gate applies.
+    // Should not: lower the minimum below the compiled value, act on a
+    // malformed token, or outlive the variable's removal.
+    #[tokio::test]
+    async fn min_client_override_raises_and_never_lowers() {
+        let guard = crate::test_env::lock_env();
+        let app = gated("/integrations/mount", 20260802);
+
+        crate::test_env::set(&guard, "HOPNET_MIN_CLIENT_OVERRIDE", "2026.12.99");
+        assert_eq!(
+            status_for(&app, Some("20260802")).await,
+            StatusCode::UPGRADE_REQUIRED
+        );
+        assert_eq!(status_for(&app, Some("20261299")).await, StatusCode::OK);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: UpgradeRequiredResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.min_client, 20261299);
+
+        crate::test_env::set(&guard, "HOPNET_MIN_CLIENT_OVERRIDE", "2020.1.1");
+        assert_eq!(status_for(&app, Some("20260802")).await, StatusCode::OK);
+        assert_eq!(
+            status_for(&app, Some("20200101")).await,
+            StatusCode::UPGRADE_REQUIRED
+        );
+
+        crate::test_env::set(&guard, "HOPNET_MIN_CLIENT_OVERRIDE", "not-calver");
+        assert_eq!(status_for(&app, Some("20260802")).await, StatusCode::OK);
+
+        crate::test_env::remove(&guard, "HOPNET_MIN_CLIENT_OVERRIDE");
+        assert_eq!(status_for(&app, Some("20260802")).await, StatusCode::OK);
     }
 
     // Impact: the probe list is what makes "every DeviceToken surface
