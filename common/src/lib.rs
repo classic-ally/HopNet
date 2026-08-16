@@ -12,6 +12,7 @@ pub mod setup;
 pub mod shares;
 pub mod snapshot;
 pub mod users;
+pub mod version;
 pub mod views;
 
 // Database implementations (only when database feature is enabled)
