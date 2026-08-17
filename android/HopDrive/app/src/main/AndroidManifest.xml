@@ -3,6 +3,9 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Upgrade-required notification (RFC-023); denial is non-fatal, the
+         in-app banner remains the guaranteed signal. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- QR pairing is optional; the manual-entry form covers camera-less devices -->
     <uses-feature

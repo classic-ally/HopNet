@@ -52,10 +52,13 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.compose.runtime.LaunchedEffect
 import app.hopnet.drive.data.ApiCallLog
 import app.hopnet.drive.data.LogRepository
 import app.hopnet.drive.data.Pairing
 import app.hopnet.drive.data.PairingStore
+import app.hopnet.drive.data.UpgradeState
+import app.hopnet.drive.net.formatVersionCode
 import app.hopnet.drive.ui.PairingTab
 import app.hopnet.drive.ui.QrScannerScreen
 import app.hopnet.drive.ui.parsePairingPayload
@@ -83,6 +86,22 @@ fun DocumentStoreViewer() {
     val cameraPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted -> if (granted) scanning = true }
+    val notificationPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* denial is non-fatal: the in-app banner remains the signal */ }
+
+    // Ask once a pairing exists — that's the moment the request has context
+    // ("we'll tell you when the node requires an upgrade"), not cold start.
+    LaunchedEffect(Unit) {
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            PairingStore.load(context) != null &&
+            ContextCompat.checkSelfPermission(
+                context, Manifest.permission.POST_NOTIFICATIONS
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     if (scanning) {
         QrScannerScreen(
@@ -142,6 +161,8 @@ fun DocumentStoreViewer() {
                 }
             }
 
+            UpgradeBanner()
+
             when (selectedTab) {
                 0 -> PairingTab(onScanQr = {
                     val granted = ContextCompat.checkSelfPermission(
@@ -155,6 +176,48 @@ fun DocumentStoreViewer() {
                 })
                 1 -> ApiLogsTab()
             }
+        }
+    }
+}
+
+/**
+ * Sticky RFC-023 banner: visible on both tabs while the paired node rejects
+ * this build's version; disappears on its own once a request succeeds
+ * again (node rollback or app upgrade).
+ */
+@Composable
+fun UpgradeBanner() {
+    var info by remember { mutableStateOf(UpgradeState.current) }
+
+    DisposableEffect(Unit) {
+        val listener = { info = UpgradeState.current }
+        UpgradeState.addListener(listener)
+        onDispose { UpgradeState.removeListener(listener) }
+    }
+
+    val current = info ?: return
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer
+        )
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(
+                text = "Upgrade required",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onErrorContainer
+            )
+            Text(
+                text = "Node ${formatVersionCode(current.nodeVersion)} requires app " +
+                    "${formatVersionCode(current.minClient)} or newer " +
+                    "(installed: ${BuildConfig.HOPNET_CLIENT_VERSION_NAME}).",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onErrorContainer
+            )
         }
     }
 }
