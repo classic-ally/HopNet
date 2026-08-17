@@ -66,6 +66,14 @@ pub trait Storage {
         self.with_rollback(f)
     }
 
+    /// Whether `e` is transient node-local contention — safe for the host to
+    /// absorb as [`ValidationVerdict::Undetermined`] on validation dry-run
+    /// paths — rather than a durability failure. Default: never; storages
+    /// without contention semantics keep every error fatal.
+    fn error_is_transient(_e: &Self::Error) -> bool {
+        false
+    }
+
     // Consensus-side writes inside the decide transaction.
     fn store_decided_tx(
         tx: &mut Self::Tx<'_>,

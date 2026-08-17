@@ -137,6 +137,7 @@ async fn start_engine_with_candidates(
         decided,
         round,
         mut events,
+        running,
     } = handle;
 
     let sync_inflight = Arc::new(AtomicBool::new(false));
@@ -151,6 +152,7 @@ async fn start_engine_with_candidates(
         decided: decided.clone(),
         round,
         sync_inflight: sync_inflight.clone(),
+        running,
     });
 
     // Driver: the app-side loop the Stage-5 cutover formalized.
@@ -869,6 +871,7 @@ async fn start_engine_production_with_chain(
         decided,
         round,
         events,
+        running,
     } = handle;
     let sync_inflight = Arc::new(AtomicBool::new(false));
     let _ = app_state.malachite.set(EngineHandle {
@@ -876,6 +879,7 @@ async fn start_engine_production_with_chain(
         decided: decided.clone(),
         round,
         sync_inflight: sync_inflight.clone(),
+        running,
     });
 
     // Settler (spawn_engine parity): resolve pool notifiers on decide —
