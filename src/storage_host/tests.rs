@@ -445,3 +445,31 @@ fn golden_inode_wire_survives_owner_narrowing() {
         "1001890a5dac96774bb9aa9f8b24f0c9a30000022f670100"
     );
 }
+
+// Impact: the drain enqueues onto an unbounded channel, so the bound here is
+// the only thing between an operator typo and handing a whole backlog to four
+// distribution workers and the placement batcher at once. A negative value
+// would also reach SQLite's LIMIT as a foot-gun.
+// Should: accept a positive limit unchanged.
+// Should: clamp a limit above the per-pass cap rather than erroring, since
+//   the drain is designed to be repeated.
+// Should not: accept zero or negative limits.
+#[test]
+fn drain_limit_is_bounded_and_rejects_non_positive() {
+    use crate::storage_host::routes::{MAX_DRAIN_LIMIT, resolve_drain_limit};
+
+    assert_eq!(resolve_drain_limit(1), Ok(1));
+    assert_eq!(resolve_drain_limit(500), Ok(500));
+    assert_eq!(resolve_drain_limit(MAX_DRAIN_LIMIT), Ok(MAX_DRAIN_LIMIT));
+
+    assert_eq!(
+        resolve_drain_limit(MAX_DRAIN_LIMIT + 1),
+        Ok(MAX_DRAIN_LIMIT),
+        "over-cap clamps, it does not error"
+    );
+    assert_eq!(resolve_drain_limit(i32::MAX), Ok(MAX_DRAIN_LIMIT));
+
+    assert!(resolve_drain_limit(0).is_err());
+    assert!(resolve_drain_limit(-1).is_err());
+    assert!(resolve_drain_limit(i32::MIN).is_err());
+}
