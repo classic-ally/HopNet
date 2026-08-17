@@ -814,6 +814,7 @@ mod tests {
             serde_json::to_vec(&HealthResponse {
                 status: HealthStatus::Ready,
                 node_version,
+                consensus_height: None,
             })
             .unwrap()
         };

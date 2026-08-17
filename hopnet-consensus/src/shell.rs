@@ -19,6 +19,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use malachitebft_core_types::{LinearTimeouts, Round, Timeout};
 use tokio::sync::{mpsc, watch};
@@ -153,6 +155,12 @@ pub struct ConsensusHandle {
     pub round: watch::Receiver<Option<RoundInfo>>,
     /// Event stream (single consumer — move into your driver task).
     pub events: mpsc::UnboundedReceiver<HostEvent>,
+    /// True while the shell thread's run loop is alive; cleared on EVERY exit
+    /// (clean shutdown, start failure, unwind). Fatal host errors abort the
+    /// process instead of clearing it. A node whose flag is false must not
+    /// report itself healthy — it serves HTTP but does not participate in
+    /// consensus.
+    pub running: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -182,10 +190,22 @@ where
     let (event_tx, event_rx) = mpsc::unbounded_channel::<HostEvent>();
     let (decided_tx, decided_rx) = watch::channel(0u64);
     let (round_tx, round_rx) = watch::channel(None::<RoundInfo>);
+    let running = Arc::new(AtomicBool::new(true));
+    let running_in_thread = running.clone();
 
     std::thread::Builder::new()
         .name("hopnet-consensus".into())
         .spawn(move || {
+            /// Clears the liveness flag on every exit path — clean shutdown,
+            /// start failure, and unwind (drops before catch_unwind returns;
+            /// harmless ahead of an abort()).
+            struct RunningGuard(Arc<AtomicBool>);
+            impl Drop for RunningGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            let _running = RunningGuard(running_in_thread);
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
                 .build()
@@ -216,6 +236,29 @@ where
         decided: decided_rx,
         round: round_rx,
         events: event_rx,
+        running,
+    }
+}
+
+/// What the shell loop does with one step result. Extracted pure so the
+/// fatal mapping is unit-testable; `abort()` itself stays at the call site
+/// (untestable in-process by construction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepDisposition {
+    Continue,
+    CleanShutdown,
+    /// Storage/host-invariant failure. The process must die loudly so
+    /// supervision restarts it — a shell-less node is a zombie (HTTP up,
+    /// chain dead). Transient contention is classified at the validation
+    /// sites (`StoreError::is_transient`) and never reaches here.
+    Fatal,
+}
+
+fn disposition(step: &Result<bool, String>) -> StepDisposition {
+    match step {
+        Ok(true) => StepDisposition::Continue,
+        Ok(false) => StepDisposition::CleanShutdown,
+        Err(_) => StepDisposition::Fatal,
     }
 }
 
@@ -333,15 +376,23 @@ async fn run_shell<A, S, F>(
             },
         };
 
-        match step {
-            Ok(true) => {}
-            Ok(false) => break,
-            Err(e) => {
+        match disposition(&step) {
+            StepDisposition::Continue => {}
+            StepDisposition::CleanShutdown => break,
+            StepDisposition::Fatal => {
                 // Only storage/host-invariant failures reach here (engine and
-                // codec errors are handled leniently inside the core). A
-                // durability failure is fatal for consensus participation.
-                tracing::error!("consensus host fatal error, shell stopping: {e}");
-                break;
+                // codec errors are handled leniently inside the core, and
+                // transient contention is classified into verdicts at the
+                // validation sites). A durability failure is fatal for
+                // consensus participation — abort so supervision restarts the
+                // process, instead of the 2026-08-17 zombie: a `break` here
+                // exited the loop cleanly, the panic guard never fired, and
+                // the node served HTTP for 42 minutes with a dead chain.
+                tracing::error!(
+                    "consensus host fatal error — aborting process: {}",
+                    step.unwrap_err()
+                );
+                std::process::abort();
             }
         }
 
@@ -400,5 +451,27 @@ fn drain<A, S>(
     }
     for (timeout, gen) in timers.take_pending() {
         dq.insert((timeout, gen), timeouts.duration_for(timeout));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Impact: the 2026-08-17 zombie — a fatal step result mapped to a loop
+    // break, so run_shell returned cleanly, the panic guard never fired, and
+    // the wedged node kept answering /health Ready. The seam pins that a
+    // host error is Fatal (process abort at the call site), never a break.
+    // Should: map a step error to Fatal, a false step to CleanShutdown, and
+    // a true step to Continue.
+    // Should not: give an error result any disposition other than Fatal.
+    #[test]
+    fn step_error_is_fatal_not_a_clean_stop() {
+        assert_eq!(disposition(&Ok(true)), StepDisposition::Continue);
+        assert_eq!(disposition(&Ok(false)), StepDisposition::CleanShutdown);
+        assert_eq!(
+            disposition(&Err("Storage(Db(SqliteFailure(..)))".into())),
+            StepDisposition::Fatal
+        );
     }
 }

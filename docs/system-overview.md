@@ -29,6 +29,16 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       rejecting it (the 409→EEXIST rsync data-loss path), and block validation returns
       Undetermined + retries on a bounded IMMEDIATE transaction instead of voting
       Invalid (ends the false SyncInvalid determinism alarms)
+- [x] Shell-wedge fix (2026-08-17): the third instance of the transient-error defect
+      class — a BUSY *acquiring* the validation retry transaction became a fatal
+      `HostError` and stopped the consensus shell without tripping the abort guard
+      (zombie: HTTP up, `/health` Ready, chain dead; two of three nodes within 45 min
+      under rsync load). `StoreError::is_transient` + a `Storage::error_is_transient`
+      seam classify all four validation sites into the existing Undetermined backstops;
+      the shell's fatal arm now aborts the process so supervision restarts it; the
+      shell exposes a liveness flag that `/health` folds into Ready/NotReady alongside
+      a new `consensus_height` payload field; the feature-gated shell test suite now
+      runs in CI with an end-to-end contention-wedge guard
 - [x] Deterministic simulation + seeded fault fuzzing (200-seed safety corpus, wake-rule tests)
 - [x] Validator set management with height-based activation
 - [x] Performance metrics integration for node reliability (latency + throughput measurement complete)
@@ -830,6 +840,10 @@ PhotoKit→HopNet on-ramp daemon (personal + iCloud Shared Photo Library). Bytes
      The latter needs the on-demand engine's own wake rules — `round.height > decided`
      together with `PendingPool::staged_len()` — since a quiescent mesh legitimately does
      not advance height and a rate metric alone cannot tell it from a wedged one.
+     Partially closed 2026-08-17: `/health` now reports NotReady when the consensus
+     shell is not running (the shell-wedge zombie shape) and carries the node's
+     `consensus_height`, so cross-host height comparison no longer needs shell access;
+     the mesh-stall predicate above (wedged-vs-quiescent) remains open.
 
 ### Phase 2: Performance & Reliability
 - Advanced node reliability scoring with predictive capabilities

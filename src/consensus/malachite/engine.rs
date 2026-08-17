@@ -269,6 +269,7 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         decided,
         round,
         events,
+        running,
     } = handle;
 
     // --- Settler: resolve queue notifiers as heights decide ---------------
@@ -354,6 +355,7 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         decided,
         round,
         sync_inflight,
+        running,
     };
     app_state
         .malachite

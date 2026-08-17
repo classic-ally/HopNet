@@ -37,11 +37,14 @@ jobs:
       - name: cargo test (unit only — skips orchestrator)
         run: nix develop --command cargo test --workspace --lib --bins
 
-      - name: cargo test (consensus integration binaries — sim corpus, seam, regenesis)
+      - name: cargo test (consensus integration binaries — sim corpus, seam, regenesis, shell)
         # --lib --bins above skips hopnet-consensus/tests/* entirely; the
         # seeded fuzz corpus and the RFC-019 drain/seal scenarios live
         # there and must gate merges. ~15 min, dominated by the corpus.
-        run: nix develop --command cargo test -p hopnet-consensus --tests
+        # --features shell builds the feature-gated tests/shell.rs target
+        # (tokio shell smoke + the 2026-08-17 contention-wedge guard), which
+        # otherwise never runs in CI.
+        run: nix develop --command cargo test -p hopnet-consensus --tests --features shell
       # The mount stack suite boots the real node binary over localhost HTTP
       # (no /dev/fuse needed — the two kernel smokes stay #[ignore]d).
       - name: hopnet-mount stack suite

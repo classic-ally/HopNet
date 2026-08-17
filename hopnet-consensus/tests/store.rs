@@ -408,6 +408,175 @@ fn two_node_crash_midheight_replays_wal_without_equivocation() {
     let _ = std::fs::remove_file(&path1);
 }
 
+// ---------------------------------------------------------------------------
+// Transient contention during validation (the 2026-08-17 shell wedge)
+
+type ContendedCore = HostCore<common::ContendedApp, SqliteStorage, MemGossip, MemTimers>;
+
+fn build_contended_core(
+    node_id: i32,
+    n: i32,
+    storage: SqliteStorage,
+    gossip: MemGossip,
+) -> ContendedCore {
+    let valset = common::valset(n);
+    HostCore::new(
+        common::chain_id(),
+        common::key(node_id),
+        Address(node_id),
+        QuorumProfile::Majority,
+        common::params(node_id, QuorumProfile::Majority),
+        Height::INITIAL,
+        valset.clone(),
+        common::ContendedApp::new(valset),
+        storage,
+        gossip,
+        MemTimers::default(),
+    )
+}
+
+/// Commit certificate for `block` at (height, round), signed by every node id.
+fn signed_cert(
+    block: &hopnet_consensus::types::Block,
+    height: u64,
+    round: u32,
+    signers: &[i32],
+) -> hopnet_consensus::codec::WireCommitCertificate {
+    use malachitebft_core_types::{CommitCertificate, CommitSignature, Context, NilOrVal};
+    let ctx = hopnet_consensus::context::HopNetContext;
+    let sigs = signers
+        .iter()
+        .map(|&id| {
+            let vote = ctx.new_precommit(
+                Height(height),
+                Round::new(round),
+                NilOrVal::Val(block.block_hash),
+                Address(id),
+            );
+            CommitSignature {
+                address: Address(id),
+                signature: hopnet_consensus::signing::sign_vote(
+                    &common::chain_id(),
+                    &common::key(id),
+                    &vote,
+                ),
+            }
+        })
+        .collect();
+    let cert: CommitCertificate<hopnet_consensus::context::HopNetContext> = CommitCertificate {
+        height: Height(height),
+        round: Round::new(round),
+        value_id: block.block_hash,
+        commit_signatures: sigs,
+    };
+    hopnet_consensus::codec::WireCommitCertificate::from(&cert)
+}
+
+// Impact: the production wedge of 2026-08-17 — a write-lock hold outlasting
+// the IMMEDIATE retry's 300 ms bound turned into HostError::Storage, which
+// the shell treats as fatal: two of three nodes left consensus permanently
+// while reporting healthy. This is the regression guard for that exact path.
+// Should: absorb a transient BUSY acquiring the IMMEDIATE retry transaction
+// during live proposal validation and vote nil instead of erroring.
+// Should not: lift lock contention on a validation dry-run into a host error.
+#[test]
+fn live_proposal_validation_survives_retry_acquisition_busy() {
+    let (path, storage) = common::contended_db("live-retry-busy");
+    let gossip = MemGossip::default();
+    let mut core = build_contended_core(0, 2, storage, gossip.clone());
+    core.start_height(Height::INITIAL, false).unwrap();
+    let _ = core.take_outputs();
+    let _ = gossip.take_outbox();
+
+    // Height 1 proposer is node 1; hand-build its wire proposal (unsigned by
+    // design — the receiver attaches its own verdict).
+    let block = build_block(Height(1), Round::new(0), 1, None);
+    let wire = WireConsensusMsg::ProposedValue(hopnet_consensus::codec::WireProposedValue {
+        height: 1,
+        round: 0,
+        valid_round: -1,
+        proposer: 1,
+        block,
+    });
+
+    // Hold the write lock well past UNDETERMINED_RETRY_BUSY_TIMEOUT_MS (300):
+    // the DEFERRED dry-run fails fast (read-then-write cannot promote), the
+    // app classifies it Undetermined, and the IMMEDIATE retry cannot BEGIN
+    // within its bound.
+    let contender = common::hold_write_lock(&path, std::time::Duration::from_millis(700));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    core.on_wire(wire)
+        .expect("transient BUSY during the IMMEDIATE retry must not become a host error");
+    contender.join().unwrap();
+
+    // The terminal backstop voted instead of dying: a nil prevote at height 1.
+    let votes: Vec<_> = gossip
+        .take_outbox()
+        .into_iter()
+        .filter_map(|m| match m {
+            WireConsensusMsg::Vote(v) | WireConsensusMsg::LivenessVote(v) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        votes.iter().any(|v| v.height == 1 && v.value.is_none()),
+        "expected a nil vote at height 1, got {votes:?}"
+    );
+    // Still at height 1 (nothing decided) and still usable.
+    assert_eq!(core.height(), Height(1));
+    let _ = core.take_outputs();
+    let _ = std::fs::remove_file(&path);
+}
+
+// Impact: the sync twin of the live wedge — both production deaths came via
+// the live path, but the sync sites share the defect and had no coverage.
+// A transient failure here must route to the residual-Undetermined arm
+// (SyncInvalid + retry), NOT the determinism alarm, and NOT a host error.
+// Should: absorb a transient BUSY acquiring the IMMEDIATE retry transaction
+// during sync validation, emit SyncInvalid, and keep the host usable.
+// Should: decide the height from a later uncontended sync value.
+#[test]
+fn sync_value_validation_survives_retry_acquisition_busy() {
+    let (path, storage) = common::contended_db("sync-retry-busy");
+    let gossip = MemGossip::default();
+    let mut core = build_contended_core(0, 2, storage, gossip.clone());
+    core.start_height(Height::INITIAL, false).unwrap();
+    let _ = core.take_outputs();
+
+    let block = build_block(Height(1), Round::new(0), 1, None);
+    let cert = signed_cert(&block, 1, 0, &[0, 1]);
+
+    let contender = common::hold_write_lock(&path, std::time::Duration::from_millis(700));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    core.on_sync_value(hopnet_consensus::host::peer_id_for_node(1), block, &cert)
+        .expect("transient BUSY during sync validation must not become a host error");
+    contender.join().unwrap();
+
+    let outs = core.take_outputs();
+    assert!(
+        outs.iter()
+            .any(|o| matches!(o, HostOutput::SyncInvalid { height, .. } if height.0 == 1)),
+        "expected SyncInvalid at height 1, got {outs:?}"
+    );
+
+    // Recovery: a DIFFERENT decided value for height 1 (re-feeding the same
+    // block would flip its recorded verdict and trip the engine's
+    // changed-its-mind invariant) syncs cleanly once contention is gone.
+    let block2 = build_block(Height(1), Round::new(1), 0, None);
+    let cert2 = signed_cert(&block2, 1, 1, &[0, 1]);
+    core.on_sync_value(hopnet_consensus::host::peer_id_for_node(1), block2, &cert2)
+        .expect("uncontended sync value must ingest");
+    let outs = core.take_outputs();
+    assert!(
+        outs.iter()
+            .any(|o| matches!(o, HostOutput::Decided { height } if height.0 == 1)),
+        "expected the height to decide from the clean sync value, got {outs:?}"
+    );
+    assert_eq!(decided_heights(&path).first().map(|(h, _)| *h), Some(1));
+    let _ = std::fs::remove_file(&path);
+}
+
 // Should: hopnet_consensus_policy roundtrip — defaults when empty, per-key
 // resolution on partial seeds, INSERT OR REPLACE overwrite semantics.
 // Impact: genesis-seeded policy is how orchestrator membership tests run

@@ -337,7 +337,15 @@ Each PR-sized, landing green:
       body (`UpgradeRequiredResponse`) and header constant live in
       `hopnet_common::compat` and are typeshared. Health payloads
       carry `node_version` (`#[serde(default)]` — 0 = pre-RFC-023
-      node); documentprovider + photos-client probes added. Pulled
+      node); documentprovider + photos-client probes added.
+      *(2026-08-17, shell-wedge fix: health payloads additionally
+      carry `consensus_height` (`Option`, `#[serde(default)]` —
+      `None` = older node or engine never started), and `status`
+      is Ready only when the node is set up AND its consensus
+      shell is running — a wedged/never-started engine answers
+      `not_ready`. No new `HealthStatus` variant: old clients have
+      no unknown-variant fallback and `not_ready` degrades
+      correctly everywhere.)* Pulled
       forward from S4 by necessity: the mount transport sends the
       header as a reqwest default (stack tests break otherwise) —
       S4 keeps the 426 handler UX, `min_node`, and the remaining
