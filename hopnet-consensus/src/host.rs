@@ -382,9 +382,19 @@ where
         // Disjoint borrows so app and storage can be used together.
         let validity = {
             let Self { app, storage, .. } = self;
-            let mut verdict = storage
+            // Transient contention while opening the dry-run transaction is
+            // the same condition as contention inside it — Undetermined, not
+            // HostError (which the shell treats as fatal; the 2026-08-17
+            // wedge was exactly this lift on the retry below).
+            let mut verdict = match storage
                 .with_rollback(|tx| app.validate_block(height, &block, tx, ValidationOrigin::Live))
-                .map_err(HostError::Storage)?;
+            {
+                Ok(v) => v,
+                Err(e) if S::error_is_transient(&e) => {
+                    ValidationVerdict::Undetermined(format!("rollback tx acquisition: {e:?}"))
+                }
+                Err(e) => return Err(HostError::Storage(e)),
+            };
             if let ValidationVerdict::Undetermined(reason) = &verdict {
                 // Transient node-local contention is not a verdict. Retry on
                 // an IMMEDIATE transaction: it cannot lose its snapshot
@@ -394,11 +404,16 @@ where
                     %height,
                     "validation undetermined ({reason}); retrying on an IMMEDIATE transaction"
                 );
-                verdict = storage
+                verdict = match storage
                     .with_rollback_immediate(UNDETERMINED_RETRY_BUSY_TIMEOUT_MS, |tx| {
                         app.validate_block(height, &block, tx, ValidationOrigin::Live)
-                    })
-                    .map_err(HostError::Storage)?;
+                    }) {
+                    Ok(v) => v,
+                    Err(e) if S::error_is_transient(&e) => ValidationVerdict::Undetermined(
+                        format!("IMMEDIATE retry acquisition: {e:?}"),
+                    ),
+                    Err(e) => return Err(HostError::Storage(e)),
+                };
             }
             match verdict {
                 ValidationVerdict::Valid => Validity::Valid,
@@ -892,22 +907,35 @@ where
                 {
                     let verdict = {
                         let app = &mut *ctx.app;
-                        let mut v = ctx
-                            .storage
-                            .with_rollback(|tx| {
-                                app.validate_block(height, &block, tx, ValidationOrigin::Sync)
-                            })
-                            .map_err(HostError::Storage)?;
+                        // As on the live path: transient contention acquiring
+                        // either dry-run transaction is Undetermined, never a
+                        // (shell-fatal) HostError.
+                        let mut v = match ctx.storage.with_rollback(|tx| {
+                            app.validate_block(height, &block, tx, ValidationOrigin::Sync)
+                        }) {
+                            Ok(v) => v,
+                            Err(e) if S::error_is_transient(&e) => ValidationVerdict::Undetermined(
+                                format!("rollback tx acquisition: {e:?}"),
+                            ),
+                            Err(e) => return Err(HostError::Storage(e)),
+                        };
                         if matches!(v, ValidationVerdict::Undetermined(_)) {
                             // Same retry seam as the live path: contention is
                             // not a verdict, and on the sync path a false
                             // Invalid raises a determinism alarm.
-                            v = ctx
+                            v = match ctx
                                 .storage
                                 .with_rollback_immediate(UNDETERMINED_RETRY_BUSY_TIMEOUT_MS, |tx| {
                                     app.validate_block(height, &block, tx, ValidationOrigin::Sync)
-                                })
-                                .map_err(HostError::Storage)?;
+                                }) {
+                                Ok(v) => v,
+                                Err(e) if S::error_is_transient(&e) => {
+                                    ValidationVerdict::Undetermined(format!(
+                                        "IMMEDIATE retry acquisition: {e:?}"
+                                    ))
+                                }
+                                Err(e) => return Err(HostError::Storage(e)),
+                            };
                         }
                         v
                     };

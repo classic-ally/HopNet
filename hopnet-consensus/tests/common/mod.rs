@@ -107,6 +107,99 @@ impl Application<SqliteStorage> for SqlApp {
     fn on_decided(&mut self, _height: Height, _block: &Block, _cert: &WireCommitCertificate) {}
 }
 
+/// Open storage over a file-backed DB that a second raw connection can
+/// contend for the write lock (`:memory:` databases are per-connection).
+/// WAL + busy_timeout mirror production — the 5000 ms busy_timeout is
+/// load-bearing: it keeps WAL appends and decides (genuinely fatal paths,
+/// which post-fix abort the process) waiting out a test's write-lock hold
+/// instead of failing. Only the validation dry-run paths bound their own
+/// wait below it.
+pub fn contended_db(name: &str) -> (PathBuf, SqliteStorage) {
+    let path = temp_db(name);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;
+         CREATE TABLE IF NOT EXISTS victim_probe (id INTEGER);",
+    )
+    .unwrap();
+    (path, storage_from_conn(conn))
+}
+
+/// Hold the database's write lock from a second connection for `hold`, then
+/// commit. Mirrors the helper in store.rs's unit tests (module-private
+/// there).
+pub fn hold_write_lock(
+    path: &std::path::Path,
+    hold: std::time::Duration,
+) -> std::thread::JoinHandle<()> {
+    let side = rusqlite::Connection::open(path).unwrap();
+    side.execute_batch("BEGIN IMMEDIATE; INSERT INTO victim_probe (id) VALUES (4242);")
+        .unwrap();
+    std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        side.execute_batch("COMMIT").unwrap();
+    })
+}
+
+/// SqlApp variant whose validate_block read-then-writes inside the dry-run
+/// transaction and classifies lock contention as Undetermined — a miniature
+/// of HopNetApplication's classified handler dry-run. Behaves exactly like
+/// SqlApp (Valid) when uncontended, so it can back every node of a mesh.
+pub struct ContendedApp {
+    pub inner: SqlApp,
+}
+
+impl ContendedApp {
+    pub fn new(valset: HopNetValidatorSet) -> Self {
+        Self {
+            inner: SqlApp { valset },
+        }
+    }
+}
+
+impl Application<SqliteStorage> for ContendedApp {
+    fn validate_block(
+        &mut self,
+        _height: Height,
+        _block: &Block,
+        tx: &mut rusqlite::Transaction<'_>,
+        _origin: ValidationOrigin,
+    ) -> ValidationVerdict {
+        let r = tx
+            .query_row("SELECT COUNT(*) FROM victim_probe", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .and_then(|_| tx.execute("INSERT INTO victim_probe (id) VALUES (1)", []));
+        match r {
+            Ok(_) => ValidationVerdict::Valid,
+            Err(e)
+                if matches!(
+                    e.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) =>
+            {
+                ValidationVerdict::Undetermined(format!("test contention: {e}"))
+            }
+            Err(_) => ValidationVerdict::Invalid,
+        }
+    }
+
+    fn apply_block(
+        &mut self,
+        height: Height,
+        block: &Block,
+        tx: &mut rusqlite::Transaction<'_>,
+    ) -> Result<(), ApplyError> {
+        self.inner.apply_block(height, block, tx)
+    }
+
+    fn validator_set(&mut self, height: Height) -> HopNetValidatorSet {
+        self.inner.validator_set(height)
+    }
+
+    fn on_decided(&mut self, _height: Height, _block: &Block, _cert: &WireCommitCertificate) {}
+}
+
 /// Deterministic one-transaction block for a (height, round, proposer).
 pub fn build_block(
     height: Height,
