@@ -73,19 +73,32 @@ pub async fn get_mount_statfs(
 }
 
 /// Health check endpoint for FileProvider extension
-/// Returns ready if database setup is completed, not_ready otherwise
+/// Ready = database setup completed AND the consensus shell is running.
 pub async fn get_health(State(app_state): State<AppState>) -> impl axum::response::IntoResponse {
     // Check if database setup is completed using the same pattern as /setup
-    let status = match db::setup::get_initial_setup(app_state.db_pool.get()) {
-        Ok(StatusCode::OK) => HealthStatus::Ready,
-        // Not initialized, or database error: FileProvider cannot operate
-        Ok(_) | Err(_) => HealthStatus::NotReady,
+    let setup_ok = matches!(
+        db::setup::get_initial_setup(app_state.db_pool.get()),
+        Ok(StatusCode::OK)
+    );
+    // Consensus liveness: a node whose shell has stopped is a zombie (HTTP
+    // up, chain dead — the 2026-08-17 wedge ran 42 minutes undetected
+    // because nothing on the node's own surface revealed it). A set-up node
+    // with NO engine handle is the restart-path spawn failure in main.rs —
+    // the same shape, the same answer.
+    let engine = app_state.malachite.get();
+    let consensus_alive =
+        engine.is_some_and(|e| e.running.load(std::sync::atomic::Ordering::SeqCst));
+    let status = if setup_ok && consensus_alive {
+        HealthStatus::Ready
+    } else {
+        HealthStatus::NotReady
     };
     Json(HealthResponse {
         status,
         // RFC-023 S3: the probe carries the node's identity — what the
         // client's min_node check reads.
         node_version: crate::version::effective_running_code(),
+        consensus_height: engine.map(|e| *e.decided.borrow()),
     })
 }
 

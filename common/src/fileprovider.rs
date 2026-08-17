@@ -22,6 +22,12 @@ pub struct HealthResponse {
     /// sent the field.
     #[serde(default)]
     pub node_version: u32,
+    /// Last decided consensus height, when the engine handle exists.
+    /// `None` = an older node that never sent the field, or a node whose
+    /// consensus engine never started (the latter also reports NotReady).
+    #[serde(default)]
+    #[typeshare(serialized_as = "Option<U64Height>")]
+    pub consensus_height: Option<u64>,
 }
 
 /// FileProvider item metadata
