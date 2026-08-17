@@ -337,7 +337,15 @@ Each PR-sized, landing green:
       body (`UpgradeRequiredResponse`) and header constant live in
       `hopnet_common::compat` and are typeshared. Health payloads
       carry `node_version` (`#[serde(default)]` — 0 = pre-RFC-023
-      node); documentprovider + photos-client probes added. Pulled
+      node); documentprovider + photos-client probes added.
+      *(2026-08-17, shell-wedge fix: health payloads additionally
+      carry `consensus_height` (`Option`, `#[serde(default)]` —
+      `None` = older node or engine never started), and `status`
+      is Ready only when the node is set up AND its consensus
+      shell is running — a wedged/never-started engine answers
+      `not_ready`. No new `HealthStatus` variant: old clients have
+      no unknown-variant fallback and `not_ready` degrades
+      correctly everywhere.)* Pulled
       forward from S4 by necessity: the mount transport sends the
       header as a reqwest default (stack tests break otherwise) —
       S4 keeps the 426 handler UX, `min_node`, and the remaining
@@ -360,13 +368,28 @@ Each PR-sized, landing green:
       header and an `.upgradeRequired` ApiError case; the photo
       ingress publisher takes its identity from hopnet-common's own
       compiled token (excluded-workspace crates path-dep it from the
-      same checkout) and classifies 426 as park; the Android
-      documentprovider is a NO-OP (pure local mock, no HTTP); the
+      same checkout) and classifies 426 as park; the
       orchestrator was itself a header-less client broken by S3 —
       its device-token calls now ride a shared `device_client()`.
       Orchestrator test `client-version-skew` covers header-less /
       stale / current probes plus the client-side min_node refusal
       via a node claiming 2020.1.1.
+      *(Android parity addendum, 2026-08-17: the original S4 note
+      called the Android documentprovider "a NO-OP (pure local mock,
+      no HTTP)" — by then HopDrive was already a live pinned-HTTPS
+      client, so S3 had silently broken it. Completed the Android
+      leg: identity is a Gradle-derived `BuildConfig` code parsed
+      from the workspace Cargo.toml at configure time and attached
+      in the pinned-client interceptor (every request incl. the SSE
+      watch stream); 426 bodies parse into a typed
+      `UpgradeRequiredException` feeding a sticky `UpgradeState`
+      (loud once per episode: banner in the app + one system
+      notification, cleared by the next successful request); the
+      watch loop parks at max backoff. E2E: `scripts/android/e2e.sh`
+      boots a current node and a `HOPNET_MIN_CLIENT_OVERRIDE`-raised
+      node and runs the instrumented `UpgradeRequiredTest` against
+      both over pinned TLS from the emulator. `min_node` preflight
+      parity is explicitly deferred — see hop-drive-android.md.)*
 
 ## Open Questions
 

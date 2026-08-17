@@ -29,6 +29,16 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       rejecting it (the 409→EEXIST rsync data-loss path), and block validation returns
       Undetermined + retries on a bounded IMMEDIATE transaction instead of voting
       Invalid (ends the false SyncInvalid determinism alarms)
+- [x] Shell-wedge fix (2026-08-17): the third instance of the transient-error defect
+      class — a BUSY *acquiring* the validation retry transaction became a fatal
+      `HostError` and stopped the consensus shell without tripping the abort guard
+      (zombie: HTTP up, `/health` Ready, chain dead; two of three nodes within 45 min
+      under rsync load). `StoreError::is_transient` + a `Storage::error_is_transient`
+      seam classify all four validation sites into the existing Undetermined backstops;
+      the shell's fatal arm now aborts the process so supervision restarts it; the
+      shell exposes a liveness flag that `/health` folds into Ready/NotReady alongside
+      a new `consensus_height` payload field; the feature-gated shell test suite now
+      runs in CI with an end-to-end contention-wedge guard
 - [x] Deterministic simulation + seeded fault fuzzing (200-seed safety corpus, wake-rule tests)
 - [x] Validator set management with height-based activation
 - [x] Performance metrics integration for node reliability (latency + throughput measurement complete)
@@ -147,25 +157,33 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     ([RFC-020](specs/module-versioning.md), Draft 2026-08-16): schema
     evolution via per-module append-only migration chains — replay is
     the only installer, epoch boundaries fast-forward, and a one-time
-    cutover exits the `initialize` regime. Ships as one PR (S1–S6
-    staged), merged only when the cutover slice is ready. S1–S4
+    cutover exits the `initialize` regime. Ships as one PR (S1–S7
+    staged), merged only when the cutover slice is ready. S1–S6
     complete on the working branch: `hopnet-common::chain` runner, the
-    identity/telemetry section split (pulled forward from S6), frozen
+    identity/telemetry section split (pulled forward), frozen
     per-module baselines, replay as the ONLY installer (`initialize`
     deleted; `migrations/schema.sql` is the generated readable
     rendering), the `schema_ordinals` stamp born as the chain's first
     real step, boot fast-forward + fingerprint validation with the
     legacy adopt-at-baseline path the cutover reuses, the release-tag
-    tripwires (`scripts/check-chains.sh` in check-linux.yml), and the
+    tripwires (`scripts/check-chains.sh` in check-linux.yml), the
     S4 copy+prune+fast-forward epoch build (sealing node crosses by
-    copying its own certified file; pruned history VACUUMed away), and
+    copying its own certified file; pruned history VACUUMed away),
     the S5 join rework (ordinal-aware import, the scratch-database
     splice verified at the artifact's own shape, the self-retiring
     host@3 cutover mapping, fresh joins never restarting;
-    build_next_import and the last carry machinery deleted);
-    and the S6 vote-time dissent marker (diverged-but-outvoted
+    build_next_import and the last carry machinery deleted), and
+    the S6 vote-time dissent marker (diverged-but-outvoted
     replicas park at the boundary and rebuild from peers); S7 cutover
-    pending.
+    (rehearsal + release) in progress.
+  - **RFC-025 drafted**
+    ([RFC-025](specs/rpc-version-enforcement.md), Draft 2026-08-17):
+    RPC version enforcement — locked scopes refuse mixed-version
+    peers at the ALPN (mesh magic + exact CalVer), compat scopes
+    (status, regenesis, ping) serve a two-generation window so
+    stragglers stage across boundaries; typed refusals replace
+    silent bincode misdecode. Implementation not started; one PR
+    (S1–S6), the following release is the enforcement cutover.
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`
@@ -569,6 +587,36 @@ Cross-platform desktop application providing file management and network adminis
       exit 75 into the new binary and pinning the held-state
       no-restart-loop, via the test-mode `HOPNET_MIN_CLIENT_OVERRIDE`
       gate seam)
+- [~] macOS app as a first-class node
+      ([RFC-026](specs/macos-app-node.md), Draft 2026-08-17):
+      certified-artifact staging + launchd supervision for the signed
+      app bundle — discharges RFC-021's deferred deployment class. S1
+      shipped 2026-08-17 (version identity through the bundle: the
+      workspace CalVer reaches `tauri.conf.json` via the Tauri
+      crate-version fallback, both Info.plists via
+      `scripts/macos/version.sh` check/write, and the zip name; the
+      release workflow gates tag == version). S2 shipped 2026-08-17:
+      `darwinModules.hopnet-desktop` (launchd user agent through the
+      RFC-021 profile indirection, newest-wins seed wrapper, exit-75
+      restarts via `SuccessfulExit = false`) plus three product fixes —
+      tray-only `HOPNET_AUTOSTART` launches, a data-dir instance flock
+      (loser exits 0, so a supervised agent never restart-loops against
+      a Finder-launched copy), and a startup SMAppService healer that
+      re-registers the ingress agent after a bundle move. Discovered en
+      route: releases v2026.8.1–v2026.8.4 all carry zero assets (the
+      u64-heights Swift breakage failed every CalVer release build), so
+      the `hopnet-desktop` pin bump waits on the next release. S3
+      implemented 2026-08-17 (e2e crossing pending): the `macos-app`
+      provider stages the CI-certified artifact (asset-attached
+      availability, sha256 sidecar + codesign + staple + honest-bytes
+      verification, provenance last) and activates via the RFC-021
+      profile flip; `ActivationEnv` generalizes the tick/boot/seal/view
+      seams over both wrapper classes; activation unattended by default
+      (tray-only relaunch). S3 e2e crossed 2026-08-17 on the macbook
+      (isolated fake feed + one-node scratch mesh): one tick staged the
+      certified 2026.8.99 artifact, regenesis_start → seal → unattended
+      flip → exit 75 → epoch 2 decided on the new bundle, 3.4 s seal-to-
+      cross; crash-loop probe clean. Remaining: S4 pin-bump automation.
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
       Network Resilience pane reports margins to the model-checked invariants rather than
@@ -596,7 +644,7 @@ End-to-end encryption and comprehensive authentication system.
 - [x] Per-file encryption keys with user access control
 - [x] Consensus operation authentication and validation
 - [x] TLS-only network surface with per-node self-signed cert and SPKI pairing ([RFC-022](specs/pinned-https.md)); plaintext HTTP is loopback-only
-- [x] Android Hop Drive client — live SAF provider over pinned HTTPS ([spec](specs/hop-drive-android.md))
+- [x] Android Hop Drive client — live SAF provider over pinned HTTPS with RFC-023 client compat (identity header, typed 426, upgrade banner/notification) and an automated e2e harness (`nix develop .#android` + `scripts/android/e2e.sh`) ([spec](specs/hop-drive-android.md))
 - [ ] Advanced permission models (read-only, time-limited access)
 - [ ] Key rotation and recovery mechanisms
 - [ ] Audit logging and security monitoring
@@ -846,6 +894,10 @@ PhotoKit→HopNet on-ramp daemon (personal + iCloud Shared Photo Library). Bytes
      The latter needs the on-demand engine's own wake rules — `round.height > decided`
      together with `PendingPool::staged_len()` — since a quiescent mesh legitimately does
      not advance height and a rate metric alone cannot tell it from a wedged one.
+     Partially closed 2026-08-17: `/health` now reports NotReady when the consensus
+     shell is not running (the shell-wedge zombie shape) and carries the node's
+     `consensus_height`, so cross-host height comparison no longer needs shell access;
+     the mesh-stall predicate above (wedged-vs-quiescent) remains open.
 
 ### Phase 2: Performance & Reliability
 - Advanced node reliability scoring with predictive capabilities

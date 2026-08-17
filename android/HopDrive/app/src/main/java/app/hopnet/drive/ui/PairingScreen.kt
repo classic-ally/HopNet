@@ -28,11 +28,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import app.hopnet.drive.BuildConfig
 import app.hopnet.drive.data.Pairing
 import app.hopnet.drive.data.PairingStore
 import app.hopnet.drive.net.ApiClient
 import app.hopnet.drive.net.NodeHttpException
 import app.hopnet.drive.net.QrPayload
+import app.hopnet.drive.net.UpgradeRequiredException
+import app.hopnet.drive.net.formatVersionCode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -283,9 +286,14 @@ private fun runConnectionTest(context: android.content.Context): String {
     return try {
         val items = client.enumerate(null)
         "OK — root has ${items.size} item(s)"
+    } catch (e: UpgradeRequiredException) {
+        "Upgrade required — node ${formatVersionCode(e.nodeVersion)} accepts app " +
+            "${formatVersionCode(e.minClient)} or newer; this app is " +
+            BuildConfig.HOPNET_CLIENT_VERSION_NAME
     } catch (e: NodeHttpException) {
         when (e.code) {
             401 -> "Rejected: the device token is invalid or revoked — re-pair"
+            426 -> "Upgrade required — update the app"
             428 -> "Node is locked — sign in on the node's web UI once"
             else -> "Node error: HTTP ${e.code}"
         }

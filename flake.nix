@@ -339,8 +339,8 @@
           # a new release.
           hopnet-desktop =
             let
-              version = "0.1.0-rc.2";
-              sha256 = "cfc0fe2e8262c02ccc8d392d650d1a124a4be78433a6e77ea0f48c9f53b41321";
+              version = "2026.8.5";
+              sha256 = "89778428691d9ca60b8a78bc2d30cdf81a3c0f5fec8913052625ead472a3ba7c";
             in
             pkgs.stdenvNoCC.mkDerivation {
               pname = "hopnet-desktop";
@@ -404,6 +404,14 @@
         default = hopnet-mount;
       };
 
+      # HopNet.app as a supervised launchd node (RFC-026 S2): the same
+      # profile indirection in launchd vocabulary, seeded from the
+      # signed-artifact package.
+      darwinModules = rec {
+        hopnet-desktop = import ./nix/hopnet-desktop-module.nix { inherit self; };
+        default = hopnet-desktop;
+      };
+
       # RFC-021 / RFC-024 end-to-end VM tests. Heavy (each builds a
       # second hopnet or hopnet-mount generation and boots VMs) — run
       # on demand:
@@ -458,6 +466,47 @@
           # Pair it with HOPNET_EPHEMERAL_ROOT to place the disposable tree
           # somewhere other than $TMPDIR (see src/paths.rs).
         };
+      } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+        # Android SDK + emulator for android/HopDrive; drives
+        # scripts/android/e2e.sh. Separate nixpkgs import: the shared pkgs
+        # carries no config, and the SDK needs the license flag + unfree.
+        android =
+          let
+            androidPkgs = import nixpkgs {
+              inherit (pkgs.stdenv.hostPlatform) system;
+              config = {
+                allowUnfree = true;
+                android_sdk.accept_license = true;
+              };
+            };
+            androidComposition = androidPkgs.androidenv.composeAndroidPackages {
+              buildToolsVersions = [ "36.0.0" ];
+              platformVersions = [ "36" ];
+              includeEmulator = true;
+              includeSystemImages = true;
+              systemImageTypes = [ "google_apis" ];
+              abiVersions = [ "x86_64" ];
+            };
+            sdk = "${androidComposition.androidsdk}/libexec/android-sdk";
+          in
+          pkgs.mkShell {
+            buildInputs = [
+              androidComposition.androidsdk
+              androidPkgs.jdk17
+              # e2e driver builds and boots real nodes from this shell too
+              (pkgs.rust-bin.stable.latest.default)
+              pkgs.pkg-config
+              pkgs.openssl.dev
+              pkgs.jq
+              pkgs.curl
+            ];
+            ANDROID_HOME = sdk;
+            ANDROID_SDK_ROOT = sdk;
+            JAVA_HOME = "${androidPkgs.jdk17}";
+            # NixOS quirk (docs/specs/hop-drive-android.md): AGP must be
+            # pointed at the SDK's own aapt2, the store being read-only.
+            HOPNET_AAPT2 = "${sdk}/build-tools/36.0.0/aapt2";
+          };
       });
     };
 }

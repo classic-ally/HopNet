@@ -36,4 +36,8 @@ pub struct EngineHandle {
     /// above ours proves peers decided past us; waiting for timeout-driven
     /// republish costs seconds).
     pub sync_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// True while the consensus shell thread runs (cleared on any shell
+    /// exit). False = the zombie shape of the 2026-08-17 wedge — HTTP up,
+    /// chain dead — and /health must not report Ready.
+    pub running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }

@@ -359,6 +359,7 @@ class HopDriveProvider : DocumentsProvider() {
         } catch (e: NodeHttpException) {
             when (e.code) {
                 401 -> "Pairing rejected — re-pair in the Hop Drive app"
+                426 -> "Update the Hop Drive app — this node requires a newer version"
                 428 -> "Node is locked — sign in on the node once"
                 else -> "Node error (HTTP ${e.code})"
             }

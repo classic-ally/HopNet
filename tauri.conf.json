@@ -1,6 +1,5 @@
 {
   "productName": "HopNet",
-  "version": "0.1.0",
   "identifier": "com.hopnet.desktop",
   "build": {
     "frontendDist": "frontend/dist",

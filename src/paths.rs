@@ -180,6 +180,33 @@ fn claim(dir: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Name of the flock'd file that marks the live node owning a durable data dir.
+const INSTANCE_LOCK_FILE: &str = ".instance-lock";
+
+/// Held for the process lifetime; the kernel releases it however the process
+/// dies, so a crash never wedges the next start.
+pub struct InstanceLock {
+    _file: std::fs::File,
+}
+
+/// Claim exclusive ownership of `data_dir` for this node process.
+///
+/// Two nodes pointed at one durable data dir fail QUIETLY today: they share
+/// the WAL database and the second silently loses the network bind. The
+/// flock makes the collision explicit. `Ok(None)` means another live process
+/// holds the dir — the caller decides how to exit (a supervised agent must
+/// exit 0 so launchd's `SuccessfulExit = false` does not restart-loop it
+/// against a Finder-launched copy).
+pub fn try_claim_instance(data_dir: &Path) -> std::io::Result<Option<InstanceLock>> {
+    use fs4::fs_std::FileExt;
+    std::fs::create_dir_all(data_dir)?;
+    let file = std::fs::File::create(data_dir.join(INSTANCE_LOCK_FILE))?;
+    if !file.try_lock_exclusive()? {
+        return Ok(None);
+    }
+    Ok(Some(InstanceLock { _file: file }))
+}
+
 /// Delete sibling trees in `parent` whose owning process is gone.
 ///
 /// Liveness is the flock, not the pid: pids are recycled, and a recycled one
@@ -254,6 +281,28 @@ pub fn init_ephemeral() -> std::io::Result<EphemeralGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Impact: two nodes on one durable data dir fail quietly — shared WAL
+    //         database, silently split network surface — so the lock is what
+    //         stands between a supervised agent and a Finder-launched copy.
+    // Should: grant the instance lock to the first claimant.
+    // Should: refuse a second claim on the same data dir while the first
+    //         lock is alive.
+    // Should: allow re-claiming once the first lock is dropped.
+    #[test]
+    fn instance_lock_is_exclusive_per_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = try_claim_instance(dir.path()).unwrap();
+        assert!(first.is_some());
+
+        let second = try_claim_instance(dir.path()).unwrap();
+        assert!(second.is_none());
+
+        drop(first);
+        let third = try_claim_instance(dir.path()).unwrap();
+        assert!(third.is_some());
+    }
 
     // Impact: the hash is the isolation boundary between checkouts — equal
     //         hashes for distinct paths would silently merge two worktrees'

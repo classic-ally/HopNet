@@ -18,6 +18,20 @@ jobs:
         with:
           fetch-depth: 0  # need tags for `git describe`
 
+      - name: Verify tag matches workspace version
+        # RFC-026 S1: a release's bytes must answer exactly the tagged
+        # version — the honest-bytes rule starts at the tag. Prerelease-
+        # suffixed tags fail here by design: the workspace CalVer is the
+        # only identity a build can answer, so cutting an rc means the
+        # workspace version IS the rc value.
+        run: |
+          WORKSPACE_VERSION=$(grep -m1 '^version = "' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
+          if [ "${GITHUB_REF_NAME}" != "v${WORKSPACE_VERSION}" ]; then
+            echo "Tag '${GITHUB_REF_NAME}' does not match workspace version 'v${WORKSPACE_VERSION}'"
+            exit 1
+          fi
+          echo "Tag ${GITHUB_REF_NAME} matches workspace version"
+
       - name: Verify Xcode CLT
         run: |
           xcode-select -p

@@ -659,6 +659,47 @@ pub fn get_distributable_blob(
     }
 }
 
+/// Blob ids stuck at `placement_height IS NULL` — distribution either never
+/// ran or failed, and nothing retries them: the distribution worker drops a
+/// failed blob (no requeue), and tier-1 repair bails on unplaced blobs by
+/// design (`repair_one` diffs placement against a prior height it does not
+/// have). This is the selection half of the operator drain that recovers
+/// them; `notify_blob_committed` is the other half.
+///
+/// Ordered by `id`, which is a UUIDv7 — its leading 48 bits are a
+/// millisecond timestamp, so lexicographic order IS creation order. Oldest
+/// stranded blobs drain first.
+///
+/// `count_unplaced_blobs` is the unbounded companion: the caller reports
+/// how many remain beyond `limit` so an operator knows how many more passes
+/// are needed.
+pub fn get_unplaced_blob_ids(
+    conn: &rusqlite::Connection,
+    limit: i32,
+) -> Result<Vec<BlobId>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM data_blocks
+         WHERE placement_height IS NULL
+         ORDER BY id ASC
+         LIMIT ?",
+    )?;
+    // Bound to a local: the MappedRows temporary borrows `stmt`, so
+    // returning the collect() directly outlives the statement.
+    let ids: Result<Vec<BlobId>, _> = stmt.query_map(params![limit], |row| row.get(0))?.collect();
+    ids
+}
+
+/// Total blobs stuck unplaced, ignoring any drain limit. Paired with
+/// [`get_unplaced_blob_ids`] so a drain response can report the remaining
+/// backlog rather than just what it enqueued this pass.
+pub fn count_unplaced_blobs(conn: &rusqlite::Connection) -> Result<i64, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM data_blocks WHERE placement_height IS NULL",
+        [],
+        |row| row.get(0),
+    )
+}
+
 /// A rebalance candidate: one placed blob with its full fragment layout.
 #[derive(Debug, Clone)]
 pub struct DataBlockRebalanceInfo {
@@ -984,5 +1025,143 @@ mod tests {
         assert!(get_blob_access(&tx, &blob_id, &[7u8; 32])
             .unwrap()
             .is_none());
+    }
+
+    /// Insert a bare data_blocks row with the given placement height.
+    fn seed_block(conn: &rusqlite::Connection, id: &str, placement: Option<i64>) {
+        seed_block_with_fragments(conn, id, placement, 30);
+    }
+
+    /// As `seed_block`, but pinning `fragment_count` — the distributable
+    /// query compares it against the locally-stored fragment rows.
+    fn seed_block_with_fragments(
+        conn: &rusqlite::Connection,
+        id: &str,
+        placement: Option<i64>,
+        fragment_count: i32,
+    ) {
+        conn.execute(
+            "INSERT INTO data_blocks
+                 (id, modified_at, file_hash, fragment_count, added_bytes,
+                  placement_height, file_size)
+             VALUES (?, '', X'00', ?, 0, ?, 0)",
+            params![BlobId::from_str(id).unwrap(), fragment_count, placement],
+        )
+        .unwrap();
+    }
+
+    // Impact: the drain endpoint's selection half. Picking up a placed blob
+    // would re-run distribution for data already committed mesh-wide; missing
+    // an unplaced one leaves it stranded single-copy forever, since nothing
+    // else retries a failed distribution.
+    // Should: return only rows whose placement_height IS NULL.
+    // Should: order oldest-first, so the longest-stranded blobs drain first.
+    // Should: respect the caller's limit.
+    // Should not: include blobs that already carry a placement height.
+    #[test]
+    fn unplaced_selection_takes_only_null_placement_oldest_first() {
+        let conn = test_conn();
+        // UUIDv7: the leading 48 bits are a ms timestamp, so these are in
+        // creation order. Interleave placed rows to prove the filter bites.
+        seed_block(&conn, "01890a5d-0001-7000-8000-000000000001", None);
+        seed_block(&conn, "01890a5d-0002-7000-8000-000000000002", Some(42));
+        seed_block(&conn, "01890a5d-0003-7000-8000-000000000003", None);
+        seed_block(&conn, "01890a5d-0004-7000-8000-000000000004", Some(7));
+        seed_block(&conn, "01890a5d-0005-7000-8000-000000000005", None);
+
+        let all = get_unplaced_blob_ids(&conn, 100).unwrap();
+        assert_eq!(
+            all,
+            vec![
+                BlobId::from_str("01890a5d-0001-7000-8000-000000000001").unwrap(),
+                BlobId::from_str("01890a5d-0003-7000-8000-000000000003").unwrap(),
+                BlobId::from_str("01890a5d-0005-7000-8000-000000000005").unwrap(),
+            ],
+            "only unplaced blobs, in creation order"
+        );
+
+        let limited = get_unplaced_blob_ids(&conn, 2).unwrap();
+        assert_eq!(
+            limited,
+            all[..2],
+            "limit takes the oldest, not an arbitrary 2"
+        );
+
+        assert_eq!(count_unplaced_blobs(&conn).unwrap(), 3);
+    }
+
+    // Impact: the drain response reports remaining backlog from this count,
+    // so an operator knows whether another pass is needed. If it tracked the
+    // limit it would read as "done" while blobs were still stranded.
+    // Should: count every unplaced blob regardless of any drain limit.
+    // Should: report zero once every blob carries a placement height.
+    #[test]
+    fn unplaced_count_ignores_the_drain_limit() {
+        let conn = test_conn();
+        for i in 1..=5 {
+            seed_block(
+                &conn,
+                &format!("01890a5d-000{i}-7000-8000-00000000000{i}"),
+                None,
+            );
+        }
+        assert_eq!(get_unplaced_blob_ids(&conn, 2).unwrap().len(), 2);
+        assert_eq!(
+            count_unplaced_blobs(&conn).unwrap(),
+            5,
+            "count is the backlog, not the page"
+        );
+
+        conn.execute("UPDATE data_blocks SET placement_height = 1", [])
+            .unwrap();
+        assert_eq!(count_unplaced_blobs(&conn).unwrap(), 0);
+        assert!(get_unplaced_blob_ids(&conn, 100).unwrap().is_empty());
+    }
+
+    // Impact: this is what makes the operator drain repeatable. The drain
+    // enqueues blob ids fire-and-forget, so the same blob can be kicked while
+    // an earlier kick is still in flight, or after it has since been placed.
+    // The worker's only guard against re-distributing committed data is this
+    // query returning None — if it ever stopped filtering on placement, a
+    // second drain pass would re-push fragments for blobs already committed
+    // mesh-wide.
+    // Should: offer an unplaced blob whose fragments are all held locally.
+    // Should not: offer that same blob once a placement height is committed.
+    #[test]
+    fn distributable_blob_stops_offering_a_blob_once_it_is_placed() {
+        let conn = test_conn();
+        let id = "01890a5d-0001-7000-8000-000000000001";
+        let blob_id = BlobId::from_str(id).unwrap();
+        seed_block_with_fragments(&conn, id, None, 2);
+        for idx in 0..2u32 {
+            conn.execute(
+                "INSERT INTO fragment_hashes
+                     (data_block_id, chunk_number, local_index, fragment_id,
+                      fragment_hash, chunk_type, stored_locally)
+                 VALUES (?, 0, ?, '', ?, 0, TRUE)",
+                params![blob_id, idx, Blake3Hash::from_bytes([idx as u8; 32])],
+            )
+            .unwrap();
+        }
+
+        let offered = get_distributable_blob(&conn, &blob_id).unwrap();
+        assert!(
+            offered.is_some(),
+            "unplaced blob with a complete local fragment set is distributable"
+        );
+
+        // A placement commit lands (either from the first kick, or from a
+        // concurrent one) — the blob must drop out of the distributable set.
+        conn.execute(
+            "UPDATE data_blocks SET placement_height = 99 WHERE id = ?",
+            params![blob_id],
+        )
+        .unwrap();
+        assert!(
+            get_distributable_blob(&conn, &blob_id).unwrap().is_none(),
+            "a placed blob must never be re-distributed by a repeat drain"
+        );
+        // And it is no longer a drain candidate at all.
+        assert!(get_unplaced_blob_ids(&conn, 100).unwrap().is_empty());
     }
 }

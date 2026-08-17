@@ -163,16 +163,17 @@ fn park(gate: &'static str, detail: String) -> BootOutcome {
 }
 
 /// Gate 1's outcome for a version mismatch: one activation attempt when
-/// the deployment has a nix provider (RFC-021), the awaiting-upgrade park
-/// otherwise or on any failure. ALWAYS returns an outcome — a mismatch
-/// must never fall through to the later gates with the wrong binary.
+/// the deployment has an activation wrapper (RFC-021 nix, RFC-026
+/// macos-app), the awaiting-upgrade park otherwise or on any failure.
+/// ALWAYS returns an outcome — a mismatch must never fall through to the
+/// later gates with the wrong binary.
 fn activate_or_park(
     db_path: &str,
-    nix: Option<&crate::upgrade::nix_provider::NixEnv>,
+    activation: Option<&crate::upgrade::ActivationEnv>,
     required: u32,
     running: u32,
 ) -> BootOutcome {
-    match nix.map(|env| crate::upgrade::nix_provider::try_activate_with(env, required)) {
+    match activation.map(|env| env.try_activate(required)) {
         Some(Ok(())) => {
             tracing::info!(
                 required = %crate::version::format_code(required),
@@ -204,19 +205,19 @@ fn activate_or_park(
 /// The boot transition. `running_code` is injected by the caller
 /// (`version::effective_running_code()` in production) so gate tests
 /// never touch process env; the production wrapper also resolves the
-/// RFC-021 nix deployment contract from env.
+/// deployment's activation contract from env.
 pub fn boot_transition(db_path: &str, running_code: u32) -> BootOutcome {
-    let nix = crate::upgrade::nix_provider::NixEnv::from_env();
-    boot_transition_with(db_path, running_code, nix.as_ref())
+    let activation = crate::upgrade::ActivationEnv::from_env();
+    boot_transition_with(db_path, running_code, activation.as_ref())
 }
 
-/// `boot_transition` with the nix activation contract injected (None =
-/// no provider; tests construct a `NixEnv` directly instead of touching
-/// process env).
+/// `boot_transition` with the activation contract injected (None = no
+/// wrapper; tests construct an env directly instead of touching process
+/// env).
 pub fn boot_transition_with(
     db_path: &str,
     running_code: u32,
-    nix: Option<&crate::upgrade::nix_provider::NixEnv>,
+    activation: Option<&crate::upgrade::ActivationEnv>,
 ) -> BootOutcome {
     let db = Path::new(db_path);
     let next = next_path(db_path);
@@ -289,7 +290,7 @@ pub fn boot_transition_with(
     // sealed, so state A would return NoBoundary and it would never
     // cross; and a node parked by a failed gate must be able to rebuild
     // from peers rather than fail the same local gate forever.
-    if let Some(outcome) = staged_join_transition(db_path, running_code, nix, &mut conn) {
+    if let Some(outcome) = staged_join_transition(db_path, running_code, activation, &mut conn) {
         return outcome;
     }
 
@@ -344,7 +345,7 @@ pub fn boot_transition_with(
         None => return park("lineage", "sealed row missing target_version_code".into()),
     };
     if running_code != required {
-        return activate_or_park(db_path, nix, required, running_code);
+        return activate_or_park(db_path, activation, required, running_code);
     }
 
     // Gate 2: LINEAGE — construct the genesis and verify our own
@@ -593,7 +594,7 @@ fn checkpoint_and_swap(db_path: &str, conn: rusqlite::Connection) -> Result<(), 
 fn staged_join_transition(
     db_path: &str,
     running_code: u32,
-    nix: Option<&crate::upgrade::nix_provider::NixEnv>,
+    activation: Option<&crate::upgrade::ActivationEnv>,
     conn: &mut rusqlite::Connection,
 ) -> Option<BootOutcome> {
     use crate::regenesis::join;
@@ -627,7 +628,7 @@ fn staged_join_transition(
     if running_code != manifest.required_version_code {
         return Some(activate_or_park(
             db_path,
-            nix,
+            activation,
             manifest.required_version_code,
             running_code,
         ));
@@ -1951,7 +1952,8 @@ pub(crate) mod tests {
             true,
         );
 
-        let outcome = boot_transition_with(&db_path, TARGET + 1, Some(&env));
+        let activation = crate::upgrade::ActivationEnv::Nix(env.clone());
+        let outcome = boot_transition_with(&db_path, TARGET + 1, Some(&activation));
         assert!(
             matches!(outcome, BootOutcome::RestartIntoStaged { required: TARGET }),
             "got {outcome:?}"
@@ -1983,8 +1985,9 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&nix_dir).unwrap();
         // Configured provider, but nothing staged at all.
         let env = crate::upgrade::nix_provider::tests::test_env(&nix_dir);
+        let activation = crate::upgrade::ActivationEnv::Nix(env);
 
-        let outcome = boot_transition_with(&db_path, TARGET + 1, Some(&env));
+        let outcome = boot_transition_with(&db_path, TARGET + 1, Some(&activation));
         assert!(
             matches!(
                 outcome,
