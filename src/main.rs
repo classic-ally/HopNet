@@ -1328,7 +1328,13 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(resource_path) = app.path().resource_dir().ok() {
                 let tray_icon_path = resource_path.join("icons/icon.png");
                 if let Ok(icon) = tauri::image::Image::from_path(&tray_icon_path) {
-                    tray_builder = tray_builder.icon(icon);
+                    // Template mode is what makes the glyph visible on
+                    // macOS: the menu bar renders the icon's alpha channel
+                    // as a proper light/dark-adaptive template. Without it
+                    // a light logo on the light bar is an invisible blank
+                    // item — which macOS 26's overflow manager then happily
+                    // hides under the notch.
+                    tray_builder = tray_builder.icon(icon).icon_as_template(true);
                 }
             }
 
