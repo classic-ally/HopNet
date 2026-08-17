@@ -69,6 +69,14 @@ android {
         compose = true
         buildConfig = true
     }
+    testOptions {
+        unitTests {
+            // ApiClient references android.os.CancellationSignal /
+            // android.util.Log types on the JVM; with null signals no
+            // Android method actually runs.
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 dependencies {
@@ -91,6 +99,10 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
     testImplementation(libs.junit)
+    // TLS-capable fake node for JVM transport tests: the SPKI pin is
+    // computed from the HeldCertificate, exercising the real pinned client.
+    testImplementation(libs.mockwebserver)
+    testImplementation(libs.okhttp.tls)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))
