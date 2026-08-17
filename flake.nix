@@ -328,8 +328,8 @@
           # a new release.
           hopnet-desktop =
             let
-              version = "0.1.0-rc.2";
-              sha256 = "cfc0fe2e8262c02ccc8d392d650d1a124a4be78433a6e77ea0f48c9f53b41321";
+              version = "2026.8.5";
+              sha256 = "89778428691d9ca60b8a78bc2d30cdf81a3c0f5fec8913052625ead472a3ba7c";
             in
             pkgs.stdenvNoCC.mkDerivation {
               pname = "hopnet-desktop";
