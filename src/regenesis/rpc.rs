@@ -265,6 +265,13 @@ fn resolve_artifact(
     conn: &rusqlite::Connection,
     expected: &[u8; 32],
 ) -> Result<u64, String> {
+    // RFC-020 S5 note: the two recompute fallbacks below serialize at
+    // the CURRENT binary's shape. An artifact sealed by an older
+    // binary (the pre-split cutover artifact especially) can therefore
+    // only be served from the on-disk file — a recompute would produce
+    // new-shaped bytes, fail the hash check, and fall through to
+    // NotAvailable. Every node writes the file at seal and nothing
+    // deletes it, so the unavailable case needs mesh-wide file loss.
     let path = data_dir.join(seal::SEAL_ARTIFACT_FILENAME);
     if let Ok(bytes) = std::fs::read(&path)
         && blake3::hash(&bytes).as_bytes() == expected

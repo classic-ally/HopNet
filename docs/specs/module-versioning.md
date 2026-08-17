@@ -231,7 +231,12 @@ inside the boot transition, before the node is live.
       history-storage reclaim delivered at the boundary
     - the sealed original is never touched, so rollback stays
       possible until the new epoch decides its first block
-  - **the epoch join** (RFC-019 S7), split by what the joiner brings:
+  - **the epoch join** (RFC-019 S7), split by what the joiner brings —
+    implemented (S5) as one spliced build: the artifact is built and
+    verified AT ITS OWN SHAPE in a scratch database, fast-forwarded to
+    head there, and its exported rows transplanted into the
+    head-shaped target (the copy, or the live database for fresh
+    in-process joins, which never restart):
     - **from nothing (fresh join)**: replay each chain up to the
       ordinal the artifact's manifest names — the database now has
       the shape the artifact was written in. Node-local tables keep
@@ -596,10 +601,50 @@ cross.
     marker restores the park→rebuild self-heal before merge
   - staged join stays on `build_next_import` (S5's rework); the carry
     machinery survives only there; both paths commit via commit_timed
-- [ ] S5 — boot rework, join paths: replay-to-manifest, the
+- [x] S5 — boot rework, join paths: replay-to-manifest, the
       checkpoint splice, both joiner variants; the
       older-shaped-artifact orchestrator gate (fixture artifacts at
       back ordinals).
+  - ordinal-aware import: `read_section_headers` +
+    `import_snapshot_expecting` (accept a section at the
+    CALLER-expected fv — the materialized ordinal — instead of the
+    compiled head; shape safety unchanged). `resolve_import_plan`
+    turns headers into specs + expected fvs + per-module
+    materialization targets, loud on anything unplaceable
+  - the one-time host@3 mapping: frozen `PRE_SPLIT_HOST_SECTION` and
+    `PRE_SPLIT_CONSENSUS_SECTION` consts — table names never changed,
+    so mapping is section-membership only (`committed_tx_nonces`
+    routes to consensus); consensus@1 accepted at materialized
+    baseline 2 (covered-set-only bump). Self-retiring on the first
+    post-cutover seal
+  - THE SPLICE, refined at implementation: instead of pausing the
+    copy's fast-forward mid-chain (impossible backward when a
+    joiner's schema is newer than the artifact), the artifact is
+    built and roundtrip-VERIFIED AT ITS OWN SHAPE in a scratch
+    database (replay-to-targets → §Execution truncate of replayed
+    seeds → ordinal-aware import → serialize with the plan's specs ==
+    certified hash → fast-forward scratch to head), then its exported
+    rows are transplanted into the head-shaped target. The staged
+    join reuses S4's copy build with the transplant spliced before
+    genesis; `build_next_import` and the last ATTACH-carry machinery
+    are DELETED — node-local rides the copy on every path
+  - fresh joins never restart: artifact-at-head imports directly
+    (every epoch not following a schema migration); older-shaped
+    artifacts take the scratch build in-process on the pooled
+    connection. This supersedes the plan's "restart fallback"
+  - transplant FK discipline: enforcement OFF around whole-table
+    replacement (SQLite's own ALTER-procedure shape — node-local rows
+    reference the rows being replaced, and the deferred-FK counter
+    misfires on delete-then-reinsert), gated by an explicit
+    `foreign_key_check` refusal before commit
+  - `resolve_artifact`'s recompute fallbacks are head-shaped:
+    pre-split artifacts serve from the on-disk file only (noted in
+    code; every node writes the file at seal)
+  - evidence: synthetic pre-split artifact fixture (old-shape DB +
+    frozen specs + `serialize_snapshot`) spliced into a head database
+    with FK gate green; plan-refusal battery; the full staged-join,
+    fresh-join, and rollback families green over the unified build.
+    The REAL old-image container gate is S7's cutover rehearsal
 - [ ] S6 — vote-time dissent marker: when a validator's own snapshot
       hash mismatches a deciding `regenesis_commit`, persist the
       dissent as a node-local marker at observation time; the boot

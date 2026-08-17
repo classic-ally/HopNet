@@ -158,8 +158,12 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     legacy adopt-at-baseline path the cutover reuses, the release-tag
     tripwires (`scripts/check-chains.sh` in check-linux.yml), and the
     S4 copy+prune+fast-forward epoch build (sealing node crosses by
-    copying its own certified file; pruned history VACUUMed away);
-    S5 joins, S6 dissent marker, S7 cutover pending.
+    copying its own certified file; pruned history VACUUMed away), and
+    the S5 join rework (ordinal-aware import, the scratch-database
+    splice verified at the artifact's own shape, the self-retiring
+    host@3 cutover mapping, fresh joins never restarting;
+    build_next_import and the last carry machinery deleted);
+    S6 dissent marker, S7 cutover pending.
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

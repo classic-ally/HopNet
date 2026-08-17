@@ -627,6 +627,40 @@ pub async fn epoch_join_bootstrap(
     .await
 }
 
+/// Genesis + fresh consensus meta for an in-process join — one shape
+/// for the direct and scratch paths.
+fn install_join_genesis(
+    tx: &rusqlite::Connection,
+    block: &hopnet_consensus::types::Block,
+    cert: &hopnet_consensus::codec::WireCommitCertificate,
+    profile: &hopnet_consensus::config::QuorumProfile,
+    record: &genesis::EpochGenesisRecord,
+) -> Result<(), String> {
+    hopnet_consensus::store::install_genesis(tx, block, cert)
+        .map_err(|e| format!("install genesis: {e}"))?;
+    hopnet_consensus::store::meta_put(
+        tx,
+        hopnet_consensus::store::META_CHAIN_ID,
+        block.block_hash.as_bytes().as_slice(),
+    )
+    .map_err(|e| format!("chain id: {e}"))?;
+    hopnet_consensus::store::meta_put(
+        tx,
+        hopnet_consensus::store::META_QUORUM_PROFILE,
+        profile.as_str().as_bytes(),
+    )
+    .map_err(|e| format!("quorum profile: {e}"))?;
+    hopnet_consensus::store::meta_put(tx, genesis::META_EPOCH, &record.epoch.to_be_bytes())
+        .map_err(|e| format!("epoch: {e}"))?;
+    hopnet_consensus::store::meta_put(
+        tx,
+        genesis::META_EPOCH_GENESIS_HEIGHT,
+        &record.seal_height.to_be_bytes(),
+    )
+    .map_err(|e| format!("epoch genesis height: {e}"))?;
+    Ok(())
+}
+
 /// `epoch_join_bootstrap` over an explicit transport.
 pub async fn epoch_join_bootstrap_with(
     app_state: &AppState,
@@ -678,44 +712,91 @@ pub async fn epoch_join_bootstrap_with(
     let profile = hopnet_consensus::config::QuorumProfile::parse(&record.quorum_profile)
         .ok_or_else(|| format!("unknown quorum profile {:?}", record.quorum_profile))?;
 
-    // ONE transaction, mirroring the height-0 bootstrap's shape.
+    // The artifact's shape decides the path (RFC-020 S5): an artifact
+    // at every module's head imports directly (the common case — every
+    // epoch not following a schema migration); anything older-shaped
+    // (the pre-split cutover artifact, or back-ordinal sections after
+    // a migration boundary) is built and verified at ITS shape in a
+    // scratch database and transplanted — all in-process, no restart.
+    let headers = hopnet_common::snapshot::read_section_headers(&artifact)
+        .map_err(|e| format!("artifact headers: {e}"))?;
+    let plan = crate::db::snapshot::resolve_import_plan(&headers)
+        .map_err(|e| format!("import plan: {e}"))?;
+    let at_head = !plan.pre_split
+        && crate::db::chains::chains().iter().all(|c| {
+            plan.targets
+                .get(c.module)
+                .is_none_or(|target| *target == c.head())
+        });
+
     {
         let mut conn = app_state.db_pool.get().map_err(|e| e.to_string())?;
-        let tx = conn.transaction().map_err(|e| format!("tx: {e}"))?;
-        let report = crate::db::snapshot::import_snapshot_tx(&tx, &artifact)
-            .map_err(|e| format!("import: {e}"))?;
-        if !report.skipped.is_empty() {
-            // Same rule as the boot rebuild: a skipped section means this
-            // binary and the artifact disagree about the schema, and a
-            // partial import is not a state anyone can verify.
-            return Err(format!(
-                "snapshot import skipped sections {:?} — refusing a partial epoch join",
-                report.skipped
-            ));
+        if at_head {
+            // ONE transaction, mirroring the height-0 bootstrap's shape.
+            let tx = conn.transaction().map_err(|e| format!("tx: {e}"))?;
+            let report = crate::db::snapshot::import_snapshot_tx(&tx, &artifact)
+                .map_err(|e| format!("import: {e}"))?;
+            if !report.skipped.is_empty() {
+                // Same rule as the boot rebuild: a skipped section means
+                // this binary and the artifact disagree about the schema,
+                // and a partial import is not a state anyone can verify.
+                return Err(format!(
+                    "snapshot import skipped sections {:?} — refusing a partial epoch join",
+                    report.skipped
+                ));
+            }
+            install_join_genesis(&tx, &block, &cert, &profile, record)?;
+            crate::db::shared::commit_timed(tx).map_err(|e| format!("join commit: {e}"))?;
+        } else {
+            if plan.pre_split {
+                tracing::info!(
+                    "fresh join consuming a pre-split (cutover) artifact via the host@3 mapping"
+                );
+            }
+            let scratch_path = staging.join("scratch.db");
+            let _ = std::fs::remove_file(&scratch_path);
+            {
+                let sconn = rusqlite::Connection::open(&scratch_path)
+                    .map_err(|e| format!("scratch open: {e}"))?;
+                crate::db::shared::apply_connection_pragmas(&sconn)
+                    .map_err(|e| format!("scratch pragmas: {e}"))?;
+                crate::db::chains::build_artifact_db(
+                    &sconn,
+                    &plan,
+                    &artifact,
+                    &record.snapshot_hash,
+                )
+                .map_err(|e| format!("artifact build: {e}"))?;
+                sconn
+                    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .map_err(|e| format!("scratch checkpoint: {e}"))?;
+            }
+            conn.execute(
+                "ATTACH DATABASE ?1 AS scratch",
+                [scratch_path.to_string_lossy()],
+            )
+            .map_err(|e| format!("attach scratch: {e}"))?;
+            // FK enforcement off for the whole-table replacement (the
+            // SQLite-recommended shape; node-local rows reference the
+            // rows being replaced); the explicit foreign_key_check is
+            // the integrity gate.
+            conn.execute_batch("PRAGMA foreign_keys = OFF;")
+                .map_err(|e| format!("fk off: {e}"))?;
+            let spliced = (|| -> Result<(), String> {
+                let tx = conn.transaction().map_err(|e| format!("tx: {e}"))?;
+                crate::db::chains::transplant_from_scratch(&tx, &plan)
+                    .map_err(|e| format!("transplant: {e}"))?;
+                install_join_genesis(&tx, &block, &cert, &profile, record)?;
+                crate::db::chains::assert_fk_clean(&tx).map_err(|e| e.to_string())?;
+                crate::db::shared::commit_timed(tx).map_err(|e| format!("join commit: {e}"))
+            })();
+            // The pooled connection outlives this join: ALWAYS restore
+            // enforcement and detach, success or not.
+            let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+            let _ = conn.execute_batch("DETACH DATABASE scratch");
+            let _ = std::fs::remove_file(&scratch_path);
+            spliced?;
         }
-        hopnet_consensus::store::install_genesis(&tx, &block, &cert)
-            .map_err(|e| format!("install genesis: {e}"))?;
-        hopnet_consensus::store::meta_put(
-            &tx,
-            hopnet_consensus::store::META_CHAIN_ID,
-            block.block_hash.as_bytes().as_slice(),
-        )
-        .map_err(|e| format!("chain id: {e}"))?;
-        hopnet_consensus::store::meta_put(
-            &tx,
-            hopnet_consensus::store::META_QUORUM_PROFILE,
-            profile.as_str().as_bytes(),
-        )
-        .map_err(|e| format!("quorum profile: {e}"))?;
-        hopnet_consensus::store::meta_put(&tx, genesis::META_EPOCH, &record.epoch.to_be_bytes())
-            .map_err(|e| format!("epoch: {e}"))?;
-        hopnet_consensus::store::meta_put(
-            &tx,
-            genesis::META_EPOCH_GENESIS_HEIGHT,
-            &record.seal_height.to_be_bytes(),
-        )
-        .map_err(|e| format!("epoch genesis height: {e}"))?;
-        crate::db::shared::commit_timed(tx).map_err(|e| format!("join commit: {e}"))?;
     }
 
     // Keep every verified record — a joiner becomes a server.

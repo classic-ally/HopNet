@@ -325,6 +325,148 @@ pub fn fast_forward(conn: &mut rusqlite::Connection) -> Result<u32, SchemaError>
     Ok(applied)
 }
 
+/// Build an artifact's contents in a SCRATCH database at the
+/// ARTIFACT'S shape, verify it there, then fast-forward the scratch to
+/// head (RFC-020 S5). The scratch is disposable: its exported rows are
+/// transplanted into a head-shaped target afterwards; its node-local
+/// content is never used. `scratch` must be a fresh, empty database
+/// (own connection — chain step SQL is unqualified, so it cannot run
+/// against an ATTACHed schema).
+pub fn build_artifact_db(
+    scratch: &rusqlite::Connection,
+    plan: &crate::db::snapshot::ImportPlan,
+    artifact: &[u8],
+    expected_hash: &[u8; 32],
+) -> Result<(), SchemaError> {
+    let tx_like = scratch; // one autocommit connection; caller owns lifetime
+    // Materialize: covered modules at their artifact ordinals,
+    // everything else at head (absent modules keep their seeds — no
+    // checkpoint exists to replace them; they are not transplanted).
+    for chain in chains() {
+        let to = plan
+            .targets
+            .get(chain.module)
+            .copied()
+            .unwrap_or_else(|| chain.head());
+        hopnet_common::chain::replay(tx_like, chain, to)?;
+    }
+    // The §Execution truncate: replay planted seeds (contract rule 3);
+    // the artifact carries their certified, evolved descendants.
+    for table in covered_exported_tables(plan) {
+        tx_like.execute(&format!("DELETE FROM \"{table}\""), [])?;
+    }
+    // Ordinal-aware import at the artifact's shape; skips are fatal.
+    let report = {
+        // import needs a Transaction; scratch is ours alone, so a
+        // plain unchecked transaction is fine.
+        let tx = scratch.unchecked_transaction()?;
+        let report = hopnet_common::snapshot::import_snapshot_expecting(
+            &tx,
+            &plan.specs,
+            &plan.expected,
+            artifact,
+        )
+        .map_err(|e| SchemaError::InvalidStamp {
+            detail: format!("artifact import: {e}"),
+        })?;
+        tx.commit()?;
+        report
+    };
+    if !report.skipped.is_empty() {
+        return Err(SchemaError::InvalidStamp {
+            detail: format!("artifact import skipped sections: {:?}", report.skipped),
+        });
+    }
+    // Verify AT THE ARTIFACT'S SHAPE: re-serializing with the plan's
+    // specs (old names/fvs, header order) must reproduce the certified
+    // bytes. This is the roundtrip gate relocated where it can survive
+    // migrations.
+    let tx = scratch.unchecked_transaction()?;
+    let (roundtrip, _manifest) = hopnet_common::snapshot::serialize_snapshot(&tx, &plan.specs)
+        .map_err(|e| SchemaError::InvalidStamp {
+            detail: format!("roundtrip serialize: {e}"),
+        })?;
+    drop(tx);
+    if blake3::hash(&roundtrip).as_bytes() != expected_hash {
+        return Err(SchemaError::FingerprintMismatch {
+            context: "artifact roundtrip at artifact shape",
+            expected: hex::encode(expected_hash),
+            actual: blake3::hash(&roundtrip).to_hex().to_string(),
+        });
+    }
+    // Fast-forward the scratch to head so the transplant is
+    // head-shape → head-shape.
+    for chain in chains() {
+        let from = plan
+            .targets
+            .get(chain.module)
+            .copied()
+            .unwrap_or_else(|| chain.head());
+        hopnet_common::chain::advance(tx_like, chain, from, chain.head())?;
+    }
+    Ok(())
+}
+
+/// Every exported table the plan's artifact covers, in plan (= FK)
+/// order — the set the transplant replaces in the target.
+pub fn covered_exported_tables(plan: &crate::db::snapshot::ImportPlan) -> Vec<&'static str> {
+    plan.specs
+        .iter()
+        .flat_map(|s| s.tables.iter())
+        .filter(|t| t.role == hopnet_common::snapshot::TableRole::Exported)
+        .map(|t| t.name)
+        .collect()
+}
+
+/// Transplant the artifact-covered exported rows from an ATTACHed
+/// scratch (schema name `scratch`, already fast-forwarded to head)
+/// into the head-shaped target, inside the CALLER's transaction.
+///
+/// CONTRACT: the caller runs the connection with `foreign_keys = OFF`
+/// (set outside the transaction) and gates success on
+/// [`assert_fk_clean`] afterwards — the SQLite-recommended shape for
+/// whole-table replacement (its own 12-step ALTER procedure). Node-
+/// local rows referencing replaced exported rows make enforcement-
+/// during-replacement impossible in either order.
+pub fn transplant_from_scratch(
+    tx: &rusqlite::Connection,
+    plan: &crate::db::snapshot::ImportPlan,
+) -> Result<(), SchemaError> {
+    for table in covered_exported_tables(plan) {
+        tx.execute(&format!("DELETE FROM \"{table}\""), [])
+            .map_err(|e| SchemaError::InvalidStamp {
+                detail: format!("transplant delete {table}: {e}"),
+            })?;
+        tx.execute(
+            &format!("INSERT INTO \"{table}\" SELECT * FROM scratch.\"{table}\""),
+            [],
+        )
+        .map_err(|e| SchemaError::InvalidStamp {
+            detail: format!("transplant insert {table}: {e}"),
+        })?;
+    }
+    Ok(())
+}
+
+/// The explicit post-transplant integrity gate: zero rows from
+/// `PRAGMA foreign_key_check`, or a loud refusal naming the dangles.
+pub fn assert_fk_clean(conn: &rusqlite::Connection) -> Result<(), SchemaError> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+    let dangles: Vec<(String, i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    if !dangles.is_empty() {
+        return Err(SchemaError::InvalidStamp {
+            detail: format!(
+                "foreign key dangles after transplant (first {}): {:?}",
+                dangles.len().min(5),
+                &dangles[..dangles.len().min(5)]
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,6 +840,126 @@ mod tests {
 
     const STEP_FIXTURE_IDENTITY_0001_HASH: &str =
         "bf26241642c4ec3c060d50fd8552d3cf53fedd2d48a7db1dd01610b121cf693a";
+
+    /// A pre-split (cutover-era) artifact over the fixture rows: the
+    /// old-shape database is the all-baselines shape, serialized with
+    /// the frozen pre-split specs in the old section order.
+    fn pre_split_artifact() -> Vec<u8> {
+        let mut conn = baseline_db();
+        crate::db::snapshot::tests::seed(&conn);
+        let tx = conn.transaction().unwrap();
+        let specs: Vec<&'static hopnet_common::SectionSpec> = vec![
+            &crate::db::snapshot::PRE_SPLIT_HOST_SECTION,
+            &crate::db::snapshot::PRE_SPLIT_CONSENSUS_SECTION,
+            &hopnet_storage::store::SNAPSHOT_SECTION,
+            &hopnet_drive::db::SNAPSHOT_SECTION,
+            &hopnet_photos::db::SNAPSHOT_SECTION,
+            &hopnet_takeout::db::SNAPSHOT_SECTION,
+        ];
+        let (artifact, _manifest) =
+            hopnet_common::snapshot::serialize_snapshot(&tx, &specs).unwrap();
+        artifact
+    }
+
+    // Impact: the S7 cutover's joiners depend on this exact machinery
+    // — a pre-split artifact must resolve through the host@3 mapping,
+    // build and verify at its own shape, and transplant into a
+    // head-shaped database without violating a single constraint.
+    // Should: consume a pre-split artifact end to end via the scratch
+    // build and transplant, landing artifact rows (including
+    // committed_tx_nonces under its new consensus ownership) in a
+    // head-shaped, head-stamped database.
+    // Should not: disturb node-local rows in the target.
+    #[test]
+    fn pre_split_artifact_splices_into_a_head_database() {
+        let artifact = pre_split_artifact();
+        let headers = hopnet_common::snapshot::read_section_headers(&artifact).unwrap();
+        let plan = crate::db::snapshot::resolve_import_plan(&headers).unwrap();
+        assert!(plan.pre_split);
+        assert_eq!(plan.targets.get("identity"), Some(&0));
+        assert_eq!(plan.targets.get("consensus"), Some(&2));
+
+        // Scratch: build + verify at the artifact's shape, then head.
+        let scratch_dir = tempfile::tempdir().unwrap();
+        let scratch_path = scratch_dir.path().join("scratch.db");
+        {
+            let sconn = rusqlite::Connection::open(&scratch_path).unwrap();
+            build_artifact_db(&sconn, &plan, &artifact, blake3::hash(&artifact).as_bytes())
+                .unwrap();
+        }
+
+        // Target: head-installed, with a node-local row referencing an
+        // exported row (the FK case the transplant contract exists for).
+        let mut main = rusqlite::Connection::open_in_memory().unwrap();
+        main.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        install(&main).unwrap();
+        main.execute_batch(
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+             VALUES (1, 'local', X'01', X'02', X'03', X'04');
+             INSERT INTO this_node (internal_id, node_id, privkey) VALUES (1, 1, X'07');
+             INSERT INTO modification_log (inode_id, owner_id, modified_at_height)
+             VALUES ('i-local', 1, 5);",
+        )
+        .unwrap();
+
+        main.execute(
+            "ATTACH DATABASE ?1 AS scratch",
+            [scratch_path.to_string_lossy()],
+        )
+        .unwrap();
+        main.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        {
+            let tx = main.transaction().unwrap();
+            transplant_from_scratch(&tx, &plan).unwrap();
+            assert_fk_clean(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+        main.execute_batch("PRAGMA foreign_keys = ON; DETACH DATABASE scratch;")
+            .unwrap();
+
+        // Artifact rows landed; new consensus ownership included.
+        let alice: String = main
+            .query_row("SELECT username FROM users WHERE user_id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(alice, "alice");
+        let nonces: i64 = main
+            .query_row("SELECT COUNT(*) FROM committed_tx_nonces", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(nonces, 1);
+        // Node-local survived untouched; stamps still at head.
+        let mods: i64 = main
+            .query_row("SELECT COUNT(*) FROM modification_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mods, 1);
+        let stamps = read_stamps(&main).unwrap();
+        for chain in chains() {
+            assert_eq!(stamps.get(chain.module), Some(&chain.head()));
+        }
+    }
+
+    // Should: refuse artifact headers this binary cannot place — an
+    // unmappable pre-split version, an unknown section, an ordinal
+    // outside the module's chain.
+    #[test]
+    fn resolve_import_plan_refuses_unknowns() {
+        assert!(
+            crate::db::snapshot::resolve_import_plan(&[("host".into(), 2)])
+                .unwrap_err()
+                .contains("host@2")
+        );
+        assert!(
+            crate::db::snapshot::resolve_import_plan(&[("mystery".into(), 1)])
+                .unwrap_err()
+                .contains("unknown")
+        );
+        assert!(
+            crate::db::snapshot::resolve_import_plan(&[("identity".into(), 7)])
+                .unwrap_err()
+                .contains("outside")
+        );
+    }
 
     // Impact: "module names are section names" is load-bearing — the
     // ordinal stamp validates against the section registry, and the

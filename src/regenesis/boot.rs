@@ -663,15 +663,55 @@ fn staged_join_transition(
         ));
     }
 
-    // Rebuild with the SAME machinery the sealed path uses: certified
-    // import, node-local carry, genesis at H, fresh meta, roundtrip gate.
+    // Rebuild with the SAME copy machinery the sealed path uses
+    // (RFC-020 S5): the artifact's content is built and verified at
+    // the ARTIFACT's shape in a scratch database, then transplanted
+    // into the head-shaped copy — node-local state rides the copy, and
+    // the roundtrip gate runs where it survives migrations.
     let epoch_genesis = match staged_epoch_genesis(target) {
         Ok(g) => g,
         Err(e) => return Some(poison(&staging, e)),
     };
+    let headers = match hopnet_common::snapshot::read_section_headers(&artifact) {
+        Ok(h) => h,
+        Err(e) => return Some(poison(&staging, format!("artifact headers: {e}"))),
+    };
+    let plan = match crate::db::snapshot::resolve_import_plan(&headers) {
+        Ok(p) => p,
+        Err(e) => return Some(poison(&staging, format!("import plan: {e}"))),
+    };
+    if plan.pre_split {
+        tracing::info!(
+            "staged join consuming a pre-split (cutover) artifact via the host@3 mapping"
+        );
+    }
+    let scratch = staging.join("scratch.db");
+    let _ = std::fs::remove_file(&scratch);
+    if let Err(e) = (|| -> Result<(), String> {
+        let conn =
+            rusqlite::Connection::open(&scratch).map_err(|e| format!("scratch open: {e}"))?;
+        crate::db::shared::apply_connection_pragmas(&conn)
+            .map_err(|e| format!("scratch pragmas: {e}"))?;
+        crate::db::chains::build_artifact_db(&conn, &plan, &artifact, &target.record.snapshot_hash)
+            .map_err(|e| format!("artifact build: {e}"))?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| format!("scratch checkpoint: {e}"))?;
+        Ok(())
+    })() {
+        let _ = std::fs::remove_file(&scratch);
+        return Some(park("staged-join", e));
+    }
     let next = next_path(db_path);
     remove_with_sidecars(&next);
-    if let Err(e) = build_next_import(&next, db_path, &artifact, &epoch_genesis) {
+    let built = build_next_from_seal_with_splice(
+        &next,
+        db_path,
+        conn,
+        &epoch_genesis,
+        Some((&scratch, &plan)),
+    );
+    let _ = std::fs::remove_file(&scratch);
+    if let Err(e) = built {
         remove_with_sidecars(&next);
         return Some(park("staged-join", e));
     }
@@ -783,6 +823,20 @@ fn build_next_from_seal(
     old_conn: &rusqlite::Connection,
     epoch_genesis: &genesis::EpochGenesis,
 ) -> Result<(), String> {
+    build_next_from_seal_with_splice(next, old_db_path, old_conn, epoch_genesis, None)
+}
+
+/// The one epoch build (RFC-020 S4+S5): copy the local file, prune,
+/// bring the copy to head — and, when joining (splice present),
+/// transplant the artifact's exported rows (built and verified at the
+/// ARTIFACT's shape in the scratch database) before the genesis lands.
+fn build_next_from_seal_with_splice(
+    next: &Path,
+    old_db_path: &str,
+    old_conn: &rusqlite::Connection,
+    epoch_genesis: &genesis::EpochGenesis,
+    splice: Option<(&Path, &crate::db::snapshot::ImportPlan)>,
+) -> Result<(), String> {
     // The old WAL may hold committed state (the only other checkpoint
     // runs at swap time, after this build) — flush it so the file copy
     // is complete. No concurrent writer exists: pre-pool, pre-engine.
@@ -794,6 +848,21 @@ fn build_next_from_seal(
     let mut conn =
         rusqlite::Connection::open(next).map_err(|e| format!("open {}: {e}", next.display()))?;
     crate::db::shared::apply_connection_pragmas(&conn).map_err(|e| format!("pragmas: {e}"))?;
+    if let Some((scratch_path, _)) = splice {
+        // ATTACH must precede the transaction (SQLite refuses it
+        // inside one). FK enforcement goes OFF for the splice (the
+        // SQLite-recommended whole-table-replacement shape; node-local
+        // rows reference the rows being replaced) — the explicit
+        // foreign_key_check below is the integrity gate, and this
+        // connection is private to the build.
+        conn.execute(
+            "ATTACH DATABASE ?1 AS scratch",
+            [scratch_path.to_string_lossy()],
+        )
+        .map_err(|e| format!("attach scratch: {e}"))?;
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .map_err(|e| format!("fk off: {e}"))?;
+    }
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| format!("tx: {e}"))?;
@@ -840,13 +909,31 @@ fn build_next_from_seal(
         tracing::info!(applied, "epoch build fast-forwarded the copied database");
     }
 
+    // JOIN SPLICE (RFC-020 S5): both sides are at head shape now —
+    // replace the artifact-covered exported rows with the verified
+    // scratch content. Node-local state rode the copy and is untouched.
+    if let Some((_, plan)) = splice {
+        crate::db::chains::transplant_from_scratch(&tx, plan)
+            .map_err(|e| format!("transplant: {e}"))?;
+    }
+
     // Genesis + fresh meta AFTER the fast-forward, so the chain tables
     // are at head shape when the new epoch's rows land.
     install_epoch_genesis(&tx, epoch_genesis)?;
 
+    // The splice's integrity gate: the final state must be FK-clean
+    // (enforcement was off during whole-table replacement).
+    if splice.is_some() {
+        crate::db::chains::assert_fk_clean(&tx).map_err(|e| format!("{e}"))?;
+    }
+
     crate::db::shared::commit_timed(tx).map_err(|e| format!("commit: {e}"))?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .map_err(|e| format!("checkpoint: {e}"))?;
+    if splice.is_some() {
+        conn.execute_batch("DETACH DATABASE scratch")
+            .map_err(|e| format!("detach scratch: {e}"))?;
+    }
     // Reclaim the pruned epoch history (RFC-019's history-storage
     // payoff, delivered on this path): the copy carried decided_blocks
     // in full; post-prune those pages are dead weight.
@@ -889,102 +976,6 @@ fn install_epoch_genesis(
         &epoch_genesis.record.seal_height.to_be_bytes(),
     )
     .map_err(|e| format!("genesis height meta: {e}"))?;
-    Ok(())
-}
-
-/// Build the fresh epoch database at `next` from a CERTIFIED ARTIFACT
-/// (the staged-join path; until S5 reworks it): schema, certified
-/// import, node-local carry, genesis install and meta — ONE
-/// transaction, then checkpoint and close. Any error leaves `next` to
-/// be deleted by the caller; the old database is never written.
-fn build_next_import(
-    next: &Path,
-    old_db_path: &str,
-    artifact: &[u8],
-    epoch_genesis: &genesis::EpochGenesis,
-) -> Result<(), String> {
-    let mut conn =
-        rusqlite::Connection::open(next).map_err(|e| format!("open {}: {e}", next.display()))?;
-    crate::db::shared::apply_connection_pragmas(&conn).map_err(|e| format!("pragmas: {e}"))?;
-    crate::db::chains::install(&conn).map_err(|e| format!("schema install: {e}"))?;
-
-    // ATTACH must precede the transaction (SQLite refuses ATTACH inside
-    // one). Gate 1's exact version match is what makes blind `SELECT *`
-    // carries safe: both files carry the same binary's schema.
-    conn.execute("ATTACH DATABASE ?1 AS old", [old_db_path])
-        .map_err(|e| format!("attach old: {e}"))?;
-
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| format!("tx: {e}"))?;
-
-    // IMPORT: every section must land — a skipped section (unknown name,
-    // format version mismatch) would silently drop state, so it is fatal
-    // here even though the importer itself just reports it.
-    let report = crate::db::snapshot::import_snapshot_tx(&tx, artifact)
-        .map_err(|e| format!("import: {e}"))?;
-    if !report.skipped.is_empty() {
-        return Err(format!(
-            "import skipped sections (refusing to cross with partial state): {:?}",
-            report.skipped
-        ));
-    }
-
-    // NODE-LOCAL CARRY: whole tables owned by this node — everything in
-    // the node-local universe except the consensus trio (WAL and
-    // certificates die with the epoch; consensus_meta is written fresh
-    // below so the new epoch never inherits the sealed marker) and the
-    // ordinal stamp (RFC-020 S3: the next epoch's file was built by
-    // THIS binary's install(), which already stamped it at head — a
-    // carried old stamp would collide on PK and lie about the file).
-    for table in crate::db::snapshot::node_local_tables() {
-        if hopnet_consensus::store::NODE_LOCAL_TABLES.contains(&table) || table == "schema_ordinals"
-        {
-            continue;
-        }
-        tx.execute(
-            &format!("INSERT INTO {table} SELECT * FROM old.{table}"),
-            [],
-        )
-        .map_err(|e| format!("carry {table}: {e}"))?;
-    }
-    // Node-local COLUMNS of exported tables: the import restored their
-    // DDL defaults, but the local fragment store is untouched across the
-    // boundary — carry by primary-key join rather than rescanning disk
-    // (a rescan would reset self-verification and trigger a mesh-wide
-    // decrypt/verify storm at the worst possible moment).
-    tx.execute_batch(
-        "
-        UPDATE fragment_hashes SET stored_locally = COALESCE(
-            (SELECT o.stored_locally FROM old.fragment_hashes o
-             WHERE o.data_block_id = fragment_hashes.data_block_id
-               AND o.chunk_number = fragment_hashes.chunk_number
-               AND o.local_index = fragment_hashes.local_index),
-            0);
-        UPDATE fragment_inventory SET self_verified_height =
-            (SELECT o.self_verified_height FROM old.fragment_inventory o
-             WHERE o.fragment_hash = fragment_inventory.fragment_hash
-               AND o.node_id = fragment_inventory.node_id);
-    ",
-    )
-    .map_err(|e| format!("carry fragment columns: {e}"))?;
-
-    // Genesis at H + fresh consensus meta (shared with the seal path).
-    install_epoch_genesis(&tx, epoch_genesis)?;
-
-    // The strongest cross-check last: the fresh database must reproduce
-    // the certified artifact byte-for-byte (the roundtrip gate the S1
-    // tests prove, enforced at every real boundary).
-    let (roundtrip, _manifest) =
-        hopnet_common::snapshot::serialize_snapshot(&tx, &crate::db::snapshot::sections())
-            .map_err(|e| format!("roundtrip serialize: {e}"))?;
-    if *blake3::hash(&roundtrip).as_bytes() != epoch_genesis.record.snapshot_hash {
-        return Err("fresh database does not reproduce the certified artifact".into());
-    }
-
-    crate::db::shared::commit_timed(tx).map_err(|e| format!("commit: {e}"))?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .map_err(|e| format!("checkpoint: {e}"))?;
     Ok(())
 }
 

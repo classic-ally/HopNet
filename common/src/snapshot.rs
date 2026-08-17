@@ -154,8 +154,8 @@ pub struct NodeStateReport {
 
 #[cfg(feature = "database")]
 pub use engine::{
-    compute_manifest, import_snapshot, serialize_snapshot, ImportReport, ImportedSection,
-    SkipReason, SkippedSection, SnapshotError,
+    compute_manifest, import_snapshot, import_snapshot_expecting, read_section_headers,
+    serialize_snapshot, ImportReport, ImportedSection, SkipReason, SkippedSection, SnapshotError,
 };
 
 #[cfg(feature = "database")]
@@ -331,6 +331,26 @@ mod engine {
         sections: &[&SectionSpec],
         artifact: &[u8],
     ) -> Result<ImportReport, SnapshotError> {
+        let expected: std::collections::BTreeMap<String, u32> = sections
+            .iter()
+            .map(|s| (s.name.to_string(), s.format_version))
+            .collect();
+        import_snapshot_expecting(tx, sections, &expected, artifact)
+    }
+
+    /// Ordinal-aware import (RFC-020 S5): accept each section when its
+    /// artifact `format_version` equals the CALLER-SUPPLIED expected
+    /// value — the materialized database's ordinal for that module —
+    /// rather than the compiled spec's head. Shape safety is unchanged:
+    /// the canonical-columns check runs against the live (materialized)
+    /// schema, and the completeness check still requires every exported
+    /// table of the spec.
+    pub fn import_snapshot_expecting(
+        tx: &Transaction,
+        sections: &[&SectionSpec],
+        expected: &std::collections::BTreeMap<String, u32>,
+        artifact: &[u8],
+    ) -> Result<ImportReport, SnapshotError> {
         let mut cur = Cursor {
             buf: artifact,
             pos: 0,
@@ -355,15 +375,15 @@ mod engine {
             let table_count = cur.read_u32()?;
 
             let spec = sections.iter().copied().find(|s| s.name == name);
-            let skip = match spec {
-                None => Some(SkipReason::UnknownSection),
-                Some(s) if s.format_version != format_version => {
+            let skip = match (spec, expected.get(name)) {
+                (None, _) | (_, None) => Some(SkipReason::UnknownSection),
+                (Some(_), Some(want)) if *want != format_version => {
                     Some(SkipReason::FormatVersionMismatch {
                         artifact: format_version,
-                        registry: s.format_version,
+                        registry: *want,
                     })
                 }
-                Some(_) => None,
+                _ => None,
             };
 
             match skip {
@@ -392,6 +412,42 @@ mod engine {
             return Err(cur.malformed("trailing bytes after the last section"));
         }
         Ok(report)
+    }
+
+    /// The artifact's per-section identity — `(name, format_version)`
+    /// in artifact order (RFC-020 S5: the format_version IS the module
+    /// ordinal a joiner must materialize before importing). Performs
+    /// the full structural walk, so a malformed artifact errors here
+    /// rather than mid-import.
+    pub fn read_section_headers(artifact: &[u8]) -> Result<Vec<(String, u32)>, SnapshotError> {
+        let mut cur = Cursor {
+            buf: artifact,
+            pos: 0,
+        };
+        if artifact.len() < MAGIC.len() || &artifact[..MAGIC.len()] != MAGIC {
+            return Err(SnapshotError::BadMagic);
+        }
+        cur.pos = MAGIC.len();
+        let version = cur.read_u32()?;
+        if version != ARTIFACT_VERSION {
+            return Err(SnapshotError::UnsupportedArtifactVersion { found: version });
+        }
+        let section_count = cur.read_u32()?;
+        let mut headers = Vec::new();
+        for _ in 0..section_count {
+            let name = cur.read_name()?;
+            let format_version = cur.read_u32()?;
+            let table_count = cur.read_u32()?;
+            for _ in 0..table_count {
+                let unit = read_table_header(&mut cur)?;
+                walk_table_rows(&mut cur, &unit, |_| Ok(()))?;
+            }
+            headers.push((name.to_string(), format_version));
+        }
+        if !cur.done() {
+            return Err(cur.malformed("trailing bytes after the last section"));
+        }
+        Ok(headers)
     }
 
     fn import_section(

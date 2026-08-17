@@ -77,6 +77,130 @@ pub fn sections() -> Vec<&'static SectionSpec> {
     sections
 }
 
+/// The dissolved pre-split "host" section, verbatim from before the
+/// RFC-020 S1 split (e6011ff) — the ONE-TIME import mapping for
+/// artifacts sealed by pre-split binaries (§Cutover). Its tables land
+/// in identity/telemetry/consensus-owned tables (names never changed;
+/// only section membership moved). Self-retiring: the first
+/// post-cutover seal writes the new sections, so this fires only for
+/// artifacts of exactly the cutover boundary. FROZEN — the pre-split
+/// artifact format can never change again.
+pub const PRE_SPLIT_HOST_SECTION: SectionSpec = SectionSpec {
+    name: "host",
+    format_version: 3,
+    tables: &[
+        TableSpec::exported("sequences"),
+        TableSpec::exported("users"),
+        TableSpec::exported("nodes"),
+        TableSpec::exported("metrics"),
+        TableSpec::exported("fragment_request_metrics"),
+        TableSpec::exported("device_tokens"),
+        TableSpec::exported("committed_tx_nonces"),
+        TableSpec {
+            name: "regenesis_state",
+            role: snapshot::TableRole::DivergenceOnly,
+            excluded_columns: &[],
+        },
+    ],
+};
+
+/// The pre-split consensus section (fv 1): before S1 moved
+/// `committed_tx_nonces` and `regenesis_state` in, it covered only the
+/// crate-owned trio. Needed beside the host mapping — the current spec
+/// would demand `committed_tx_nonces` from a section that never
+/// carried it.
+pub const PRE_SPLIT_CONSENSUS_SECTION: SectionSpec = SectionSpec {
+    name: "consensus",
+    format_version: 1,
+    tables: &[
+        TableSpec::exported("validators"),
+        TableSpec::exported("hopnet_consensus_policy"),
+        TableSpec {
+            name: "decided_blocks",
+            role: snapshot::TableRole::DivergenceOnly,
+            excluded_columns: &[],
+        },
+    ],
+};
+
+/// How to consume one artifact: which specs to import with (possibly
+/// the frozen pre-split mappings), the expected per-section
+/// `format_version`s, and the per-module ordinal the database must be
+/// materialized at before importing (RFC-020 S5).
+#[derive(Debug)]
+pub struct ImportPlan {
+    pub specs: Vec<&'static SectionSpec>,
+    pub expected: std::collections::BTreeMap<String, u32>,
+    /// module name -> materialization ordinal. Modules absent from the
+    /// artifact are not listed — they stay at head and keep their
+    /// replayed/installed seeds (no checkpoint exists to replace them).
+    pub targets: std::collections::BTreeMap<&'static str, u32>,
+    /// True when the pre-split mapping fired (log/metric surface).
+    pub pre_split: bool,
+}
+
+/// Resolve an artifact's section headers into an import plan. Loud on
+/// anything unrecognized: an unknown section name, or an ordinal that
+/// is not a real position of the module's chain.
+pub fn resolve_import_plan(headers: &[(String, u32)]) -> Result<ImportPlan, String> {
+    let mut plan = ImportPlan {
+        specs: Vec::new(),
+        expected: std::collections::BTreeMap::new(),
+        targets: std::collections::BTreeMap::new(),
+        pre_split: false,
+    };
+    for (name, fv) in headers {
+        match name.as_str() {
+            "host" => {
+                if *fv != PRE_SPLIT_HOST_SECTION.format_version {
+                    return Err(format!(
+                        "pre-split artifact section host@{fv}: only host@3 (the cutover \
+                         boundary) is mappable — older epochs must rebuild"
+                    ));
+                }
+                plan.pre_split = true;
+                plan.specs.push(&PRE_SPLIT_HOST_SECTION);
+                plan.expected.insert(name.clone(), *fv);
+                // The host tables' new owners materialize at their
+                // baselines (identity/telemetry are born at 0; the
+                // consensus target comes from the consensus header).
+                plan.targets
+                    .insert("identity", crate::db::chains::IDENTITY_CHAIN.baseline());
+                plan.targets
+                    .insert("telemetry", crate::db::chains::TELEMETRY_CHAIN.baseline());
+            }
+            "consensus" if *fv == PRE_SPLIT_CONSENSUS_SECTION.format_version => {
+                // Covered-set-only bump (S1): shape of the crate trio
+                // is unchanged between 1 and 2, so materialize at the
+                // chain baseline (2) and accept the old label.
+                plan.pre_split = true;
+                plan.specs.push(&PRE_SPLIT_CONSENSUS_SECTION);
+                plan.expected.insert(name.clone(), *fv);
+                plan.targets.insert("consensus", 2);
+            }
+            _ => {
+                let spec = sections()
+                    .into_iter()
+                    .find(|s| s.name == name.as_str())
+                    .ok_or_else(|| format!("artifact section {name}@{fv} is unknown"))?;
+                let chain = crate::db::chains::chains()
+                    .into_iter()
+                    .find(|c| c.module == name.as_str())
+                    .ok_or_else(|| format!("no chain for module {name}"))?;
+                if !chain.contains(*fv) {
+                    return Err(format!(
+                        "artifact section {name}@{fv} names an ordinal outside the {name} chain"
+                    ));
+                }
+                plan.specs.push(spec);
+                plan.expected.insert(name.clone(), *fv);
+                plan.targets.insert(chain.module, *fv);
+            }
+        }
+    }
+    Ok(plan)
+}
+
 /// Union of every unit's node-local tables.
 pub fn node_local_tables() -> Vec<&'static str> {
     let mut tables = Vec::new();
@@ -142,7 +266,7 @@ pub fn compute_node_state(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashSet;
 
@@ -161,7 +285,7 @@ mod tests {
     /// section (all five crates, both roles, the REAL columns, and every
     /// FK chain) — fixed keys, no wall clock, so the artifact bytes are
     /// reproducible forever.
-    fn seed(conn: &rusqlite::Connection) {
+    pub(crate) fn seed(conn: &rusqlite::Connection) {
         conn.execute_batch(
             "INSERT INTO sequences VALUES ('users', 2);
              INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
