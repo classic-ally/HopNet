@@ -137,7 +137,9 @@ async fn start_engine_with_candidates(
         decided,
         round,
         mut events,
+        running,
     } = handle;
+    let _ = &running;
 
     let sync_inflight = Arc::new(AtomicBool::new(false));
 
@@ -869,7 +871,9 @@ async fn start_engine_production_with_chain(
         decided,
         round,
         events,
+        running,
     } = handle;
+    let _ = &running;
     let sync_inflight = Arc::new(AtomicBool::new(false));
     let _ = app_state.malachite.set(EngineHandle {
         input_tx: input_tx.clone(),

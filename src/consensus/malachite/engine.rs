@@ -269,7 +269,9 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         decided,
         round,
         events,
+        running,
     } = handle;
+    let _ = &running;
 
     // --- Settler: resolve queue notifiers as heights decide ---------------
     // Queue runtime: settlement must keep pace with decides under API load.
