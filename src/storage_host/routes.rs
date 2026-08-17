@@ -319,6 +319,107 @@ pub async fn post_fragment_inventory_self_check(
     }
 }
 
+/// Upper bound on one drain pass. The distribution channel is unbounded, so
+/// an unbounded drain would hand a whole backlog to four workers and the
+/// placement batcher in one go; passes are cheap, so cap and repeat instead.
+pub(crate) const MAX_DRAIN_LIMIT: i32 = 5_000;
+
+fn default_drain_limit() -> i32 {
+    500
+}
+
+#[derive(Deserialize)]
+pub struct DrainUnplacedParams {
+    #[serde(default = "default_drain_limit")]
+    limit: i32,
+}
+
+/// Validate and bound a requested drain limit.
+///
+/// Non-positive is an error (nothing to enqueue, and a negative LIMIT is a
+/// SQL foot-gun). Above the cap clamps rather than erroring: an operator
+/// asking for more than the cap means "as many as you can", and the drain is
+/// designed to be re-run.
+pub(crate) fn resolve_drain_limit(requested: i32) -> Result<i32, &'static str> {
+    if requested <= 0 {
+        return Err("limit must be positive");
+    }
+    Ok(requested.min(MAX_DRAIN_LIMIT))
+}
+
+/// POST /maintenance/drain-unplaced?limit=N
+///
+/// Re-kick blobs stranded at `placement_height IS NULL` onto the distribution
+/// pipeline. They get there when a distribution fails: the worker logs and
+/// drops the blob with no requeue, and tier-1 repair skips unplaced blobs by
+/// construction, so nothing else will ever retry them.
+///
+/// THREE THINGS THIS DOES NOT DO — read before relying on it:
+///
+/// 1. It is fire-and-forget. `notify_blob_committed` is a non-blocking send,
+///    so 200 means *enqueued*, never *placed*. The response cannot report
+///    placement success. Confirm by re-calling and reading `unplaced_total`.
+/// 2. It does not fix a broken transport. If distribution is failing for the
+///    underlying reason — a stale peer connection, a failure-threshold breach
+///    — this re-runs the same failures and drops the blobs again, leaving the
+///    count unchanged and the log full of fresh errors. Verify distribution
+///    works first (write one small file, confirm "Fragment distribution
+///    complete" in the node log), then drain.
+/// 3. It does not close the hole. New failures keep stranding new blobs. This
+///    buys manual recovery, nothing more.
+pub async fn post_drain_unplaced(
+    State(app_state): State<AppState>,
+    Query(params): Query<DrainUnplacedParams>,
+    Extension(uid): Extension<i32>,
+) -> impl IntoResponse {
+    tracing::info!(
+        "Unplaced-block drain triggered by user {} (limit: {})",
+        uid,
+        params.limit
+    );
+
+    let limit = match resolve_drain_limit(params.limit) {
+        Ok(limit) => limit,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "status": "error", "error": error })),
+            )
+                .into_response();
+        }
+    };
+    if limit != params.limit {
+        tracing::info!(
+            "Clamping drain limit {} to {} (max per pass)",
+            params.limit,
+            limit
+        );
+    }
+
+    match super::jobs::run_unplaced_drain(&app_state, limit).await {
+        Ok(result) => {
+            tracing::info!("Unplaced drain enqueued: {:?}", result);
+            (StatusCode::OK, Json(result)).into_response()
+        }
+        Err(e) => {
+            tracing::error!("Unplaced drain failed: {:?}", e);
+
+            #[derive(Serialize)]
+            struct ErrorResponse {
+                status: String,
+                error: String,
+            }
+
+            let response = ErrorResponse {
+                status: "error".to_string(),
+                error: format!("{:?}", e),
+            };
+
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct OrphanedFragmentsScanParams {
     #[serde(default = "default_grace_period_hours")]

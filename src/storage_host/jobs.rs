@@ -302,6 +302,87 @@ pub struct NetworkRebalancingResult {
     pub total_fragments_migrated: usize,
 }
 
+/// Operator drain for blobs stranded at `placement_height IS NULL`: re-kick
+/// them onto the distribution pipeline the same way a decided blob is kicked.
+///
+/// Exists because nothing else retries them. A failed `distribute_one` is
+/// logged and dropped with no requeue, and tier-1 repair skips unplaced blobs
+/// by construction (it diffs placement against a prior height that does not
+/// exist). A transient peer outage therefore strands every blob written
+/// during it, permanently and silently.
+///
+/// FIRE-AND-FORGET. `notify_blob_committed` is a non-blocking send onto the
+/// distribution channel, so this returns once the ids are enqueued — NOT once
+/// they are placed. Confirm by re-reading `unplaced_total` on a later call.
+///
+/// Re-running is safe: `distribute_one` guards on `get_distributable_blob`,
+/// which requires `placement_height IS NULL` and a complete local fragment
+/// set, so an already-placed or non-origin blob is a no-op in the worker.
+pub async fn run_unplaced_drain(
+    app_state: &AppState,
+    limit: i32,
+) -> Result<UnplacedDrainResult, Error> {
+    tracing::info!("Starting unplaced-block drain (limit {})", limit);
+
+    // Scoped checkout, dropped before the engine is touched — the data plane
+    // must never run while this task holds a pool connection.
+    let (blob_ids, unplaced_total) = {
+        let conn = app_state.db_pool.get().map_err(|e| {
+            tracing::error!("Failed to get database connection for unplaced drain: {e:?}");
+            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+                "Failed to get database connection: {e:?}"
+            )))))
+        })?;
+        let total = hopnet_storage::store::count_unplaced_blobs(&conn).map_err(|e| {
+            tracing::error!("Failed to count unplaced blobs: {e:?}");
+            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+                "Failed to count unplaced blobs: {e:?}"
+            )))))
+        })?;
+        let ids = hopnet_storage::store::get_unplaced_blob_ids(&conn, limit).map_err(|e| {
+            tracing::error!("Failed to select unplaced blobs: {e:?}");
+            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+                "Failed to select unplaced blobs: {e:?}"
+            )))))
+        })?;
+        (ids, total)
+    };
+
+    let Some(storage) = app_state.storage.get() else {
+        return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
+            "storage engine not running",
+        )))));
+    };
+
+    let enqueued = blob_ids.len();
+    for blob_id in blob_ids {
+        storage.notify_blob_committed(blob_id);
+    }
+
+    let result = UnplacedDrainResult {
+        unplaced_total,
+        enqueued,
+        limit,
+    };
+    tracing::info!(
+        "Unplaced drain enqueued {} of {} stranded blobs (placement is asynchronous; \
+         re-read unplaced_total to confirm progress)",
+        result.enqueued,
+        result.unplaced_total
+    );
+    Ok(result)
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct UnplacedDrainResult {
+    /// Every blob stuck unplaced, ignoring `limit` — the remaining backlog.
+    pub unplaced_total: i64,
+    /// How many were kicked onto the distribution channel this pass.
+    pub enqueued: usize,
+    /// The bound applied to this pass.
+    pub limit: i32,
+}
+
 /// Scheduled job handler for fragment inventory self-check
 /// Runs every 20-30 minutes to ensure node's inventory matches local fragment storage
 pub async fn handle_fragment_inventory_self_check(

@@ -748,6 +748,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     post(storage_host::routes::post_policy_tick),
                 )
                 .route(
+                    "/maintenance/drain-unplaced",
+                    post(storage_host::routes::post_drain_unplaced),
+                )
+                .route(
                     "/maintenance/upgrade-tick",
                     post(upgrade::routes::post_upgrade_tick),
                 )
