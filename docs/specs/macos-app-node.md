@@ -173,7 +173,14 @@ machine across one version-bump flip.
 - The runner is the trust root for this class. Its signing setup is
   currently imperative (login keychain, Actions secrets); hardening
   that is deployment-infrastructure work outside this repo, but the
-  dependency is named here.
+  dependency is named here. Roadmapped in nix-config: declare the
+  keychain unlock — the runner module unlocks the login keychain at
+  agent start (password via agenix) and sets the signing key's
+  partition list once, so release signing survives a reboot with no
+  interactive login (today a logged-out macbook silently breaks
+  releases; validated empirically during S1, where a fresh ssh
+  security session hit errSecInternalComponent until an interactive
+  unlock).
 
 ## Non-Goals
 
