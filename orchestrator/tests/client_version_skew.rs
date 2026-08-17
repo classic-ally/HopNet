@@ -32,8 +32,13 @@ impl TestScenario for ClientVersionSkew {
 
         println!("\nRunning checks:");
 
-        // 1. Header-less probe: 426 with the full policy readout.
-        let bare = reqwest::Client::new()
+        // 1. Header-less probe: 426 with the full policy readout. Nodes
+        // serve pinned-HTTPS with self-signed certs — every node-facing
+        // client must skip verification (a default reqwest client fails the
+        // handshake before the request leaves).
+        let bare = crate::insecure_client_builder()
+            .build()
+            .context("bare client")?
             .get(&health_url)
             .send()
             .await
@@ -58,7 +63,9 @@ impl TestScenario for ClientVersionSkew {
         }
 
         // 2. Stale header: same rejection.
-        let stale = reqwest::Client::new()
+        let stale = crate::insecure_client_builder()
+            .build()
+            .context("stale client")?
             .get(&health_url)
             .header(hopnet_common::compat::CLIENT_VERSION_HEADER, "20250101")
             .send()
