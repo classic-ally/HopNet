@@ -96,8 +96,14 @@ first slice.
   for SMAppService).
 - `ProgramArguments` points at a seed wrapper script — the
   `ExecStartPre` equivalent: run the newest-wins comparison (same
-  semantics as the Linux seed script, comparing stamped bundle
-  versions), then `exec "${profile}/Contents/MacOS/hopnet"`.
+  semantics as the Linux seed script, comparing bundle `--version`
+  answers), then `exec "${profile}/Contents/MacOS/HopNet"`.
+- The agent sets `HOPNET_AUTOSTART=1`: the app starts tray-only (no
+  window at login); the tray toggle creates the window on demand.
+- Single-instance: the app flocks the data dir at startup; the losing
+  process exits **0** on purpose, so a supervised agent losing the race
+  to a Finder-launched copy never restart-loops
+  (`SuccessfulExit = false` only restarts non-zero exits).
 - The profile is `${dataDir}/profile`, a symlink to a store .app;
   execve follows it at spawn. The wrapper's stable store path also
   sidesteps launchd's dislike of dangling program paths at load.
@@ -217,9 +223,25 @@ Each tracked, not forgotten:
       tag asserted equal on release builds and a `-g<sha>` suffix on
       dev builds; the release workflow gates tag == `v$version` before
       building.)*
-- [ ] S2 — `darwinModules.hopnet-desktop`: launchd user agent, seed
+- [x] S2 — `darwinModules.hopnet-desktop`: launchd user agent, seed
       wrapper, profile exec, `SuccessfulExit = false`; the three
       re-registration smoke tests across a real flip on a macbook.
+      *(As built, 2026-08-17: the module folds seeding and exec into one
+      wrapper (launchd has no ExecStartPre; coreutils supplies the
+      atomic `mv -T`), runs as the login user with `HOPNET_AUTOSTART=1`
+      for tray-only starts, and installs the package normally so
+      mac-app-util keeps Finder presence. Three product fixes landed
+      with it: tray-only autostart, the data-dir instance flock with
+      the deliberate exit-0 loser, and `flow::reregister_if_moved` — a
+      startup healer that re-registers the ingress agent when the
+      running bundle is not the one that registered it, marker file
+      beside the database, mock-tested in Linux CI. The
+      `hopnet-desktop` pin bump is BLOCKED on the next release: the
+      v2026.8.1–v2026.8.4 releases all have zero assets — the Swift
+      test-helper breakage fixed in this branch failed every CalVer
+      release build at stage 1, so `v0.1.0-rc.2` is still the newest
+      artifact-bearing release. Asset-attached availability, validated
+      empirically before the provider even exists.)*
 - [ ] S3 — the darwin provider: asset-keyed feed walk,
       `fetch-certified-artifact` staging with provenance, activation +
       crash-loop guard; an end-to-end boundary crossing (stage →

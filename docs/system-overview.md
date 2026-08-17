@@ -561,9 +561,19 @@ Cross-platform desktop application providing file management and network adminis
       workspace CalVer reaches `tauri.conf.json` via the Tauri
       crate-version fallback, both Info.plists via
       `scripts/macos/version.sh` check/write, and the zip name; the
-      release workflow gates tag == version). Remaining: S2 nix-darwin
-      module + supervision, S3 fetch-certified staging + activation,
-      S4 pin-bump automation.
+      release workflow gates tag == version). S2 shipped 2026-08-17:
+      `darwinModules.hopnet-desktop` (launchd user agent through the
+      RFC-021 profile indirection, newest-wins seed wrapper, exit-75
+      restarts via `SuccessfulExit = false`) plus three product fixes —
+      tray-only `HOPNET_AUTOSTART` launches, a data-dir instance flock
+      (loser exits 0, so a supervised agent never restart-loops against
+      a Finder-launched copy), and a startup SMAppService healer that
+      re-registers the ingress agent after a bundle move. Discovered en
+      route: releases v2026.8.1–v2026.8.4 all carry zero assets (the
+      u64-heights Swift breakage failed every CalVer release build), so
+      the `hopnet-desktop` pin bump waits on the next release.
+      Remaining: S3 fetch-certified staging + activation, S4 pin-bump
+      automation.
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
       Network Resilience pane reports margins to the model-checked invariants rather than
