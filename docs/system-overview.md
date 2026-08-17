@@ -160,6 +160,14 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     cutover exits the `initialize` regime. Implementation not
     started; ships as one PR (S1–S6 staged), merged only when the
     cutover slice is ready.
+  - **RFC-025 drafted**
+    ([RFC-025](specs/rpc-version-enforcement.md), Draft 2026-08-17):
+    RPC version enforcement — locked scopes refuse mixed-version
+    peers at the ALPN (mesh magic + exact CalVer), compat scopes
+    (status, regenesis, ping) serve a two-generation window so
+    stragglers stage across boundaries; typed refusals replace
+    silent bincode misdecode. Implementation not started; one PR
+    (S1–S6), the following release is the enforcement cutover.
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`
