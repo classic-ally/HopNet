@@ -12,7 +12,7 @@ public struct TestHelpers {
         public let fileProvider: HopNetFileProviderExtensionBase
         public let config: FileProviderConfig
         public let initialSignalCount: Int
-        public let initialConsensusHeight: Int32
+        public let initialConsensusHeight: UInt64
         public let initialRootItemCount: Int
         
         /// Capture initial test state for standardized test setup
@@ -406,7 +406,7 @@ public struct TestHelpers {
     
     /// Version type detection for NSFileProviderItemVersion data
     public enum VersionType {
-        case consensusHeight(Int32)
+        case consensusHeight(UInt64)
         case timestamp(Int64)
         case invalid
     }
@@ -421,9 +421,9 @@ public struct TestHelpers {
     
     /// Determine the type of version data (consensus height vs timestamp)
     public static func getVersionType(from versionData: Data) -> VersionType {
-        // Try to decode as Int32 (consensus height)
+        // Try to decode as UInt64 (consensus height)
         if versionData.count == MemoryLayout<UInt64>.size {
-            let height = versionData.withUnsafeBytes { $0.load(as: Int32.self) }
+            let height = versionData.withUnsafeBytes { $0.load(as: UInt64.self) }
             return .consensusHeight(height)
         }
         // Try to decode as Int64 (timestamp)
@@ -435,7 +435,7 @@ public struct TestHelpers {
     }
     
     /// Extract consensus height from NSFileProviderItem version
-    public static func getConsensusHeight(from item: NSFileProviderItem) throws -> Int32 {
+    public static func getConsensusHeight(from item: NSFileProviderItem) throws -> UInt64 {
         let (contentVersion, _) = extractVersionData(from: item)
         
         switch getVersionType(from: contentVersion) {
@@ -488,7 +488,7 @@ public struct TestHelpers {
     }
     
     /// Assert that version is greater than a baseline height
-    public static func assertVersionGreaterThan(item: NSFileProviderItem, baselineHeight: Int32) throws {
+    public static func assertVersionGreaterThan(item: NSFileProviderItem, baselineHeight: UInt64) throws {
         let currentHeight = try getConsensusHeight(from: item)
         guard currentHeight > baselineHeight else {
             throw TestError.assertionFailed("Version should be greater than \(baselineHeight) but got \(currentHeight) for item '\(item.filename)'")
@@ -689,7 +689,7 @@ public struct TestHelpers {
     
     /// Validate that specific items appear in change enumeration after an operation
     public static func validateChangeEnumeration(
-        initialHeight: Int32,
+        initialHeight: UInt64,
         expectedChangedItems: [String],
         operationDescription: String
     ) async throws {
@@ -994,7 +994,7 @@ public struct TestHelpers {
         )
         
         // Capture parent version before creation (for nested files)
-        let parentVersionBefore: Int32?
+        let parentVersionBefore: UInt64?
         if parentIdentifier != .rootContainer {
             let parentItem = try await getItemByIdentifier(parentIdentifier)
             parentVersionBefore = try getConsensusHeight(from: parentItem)
