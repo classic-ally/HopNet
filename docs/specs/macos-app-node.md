@@ -195,9 +195,21 @@ Each tracked, not forgotten:
 
 ## Implementation Slices
 
-- [ ] S1 — version identity: CalVer stamped through
+- [x] S1 — version identity: CalVer stamped through
       `tauri.conf.json`, both Info.plists, and the zip name; CI
       tag == version gate. Independently shippable; ships first.
+      *(As built, 2026-08-17: `scripts/macos/version.sh` is the single
+      parse — sourced for `WORKSPACE_VERSION`/`VERSION_CODE`, run as
+      `--check`/`--write` against the daemon's committed Info.plist, so
+      builds never dirty the tree and drift fails stage 0 plus a Linux
+      CI tripwire. `tauri.conf.json` carries no version key — Tauri 2
+      falls back to the crate's workspace CalVer, and stage 2 asserts
+      the built bundle answers it, so a Tauri bump can't silently
+      regress the fallback. The appex heredoc interpolates the same
+      pair; the zip name derives from the workspace version with the
+      tag asserted equal on release builds and a `-g<sha>` suffix on
+      dev builds; the release workflow gates tag == `v$version` before
+      building.)*
 - [ ] S2 — `darwinModules.hopnet-desktop`: launchd user agent, seed
       wrapper, profile exec, `SuccessfulExit = false`; the three
       re-registration smoke tests across a real flip on a macbook.

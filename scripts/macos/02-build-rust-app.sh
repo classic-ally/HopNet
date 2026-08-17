@@ -105,3 +105,15 @@ done
 echo "$APP_BUNDLE" > "$PROJECT_ROOT/scripts/macos/.app_bundle_path"
 
 echo "✅ Stage 2 completed: Main app built at $APP_BUNDLE"
+# RFC-026 S1: the bundle's stamped version is darwin's `--version` — the
+# honest-bytes read every staging strategy depends on. tauri.conf.json
+# carries no version key, so Tauri falls back to the crate's (workspace)
+# CalVer; assert the fallback held so a Tauri bump can never silently
+# regress it.
+source "$SCRIPT_DIR/version.sh"
+BUNDLE_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_BUNDLE/Contents/Info.plist")
+if [ "$BUNDLE_VERSION" != "$WORKSPACE_VERSION" ]; then
+    echo "❌ Bundle CFBundleShortVersionString '$BUNDLE_VERSION' != workspace version '$WORKSPACE_VERSION'"
+    exit 1
+fi
+echo "✅ Bundle version verified: $BUNDLE_VERSION"

@@ -18,11 +18,18 @@ fi
 APP_BUNDLE=$(cat "$APP_BUNDLE_PATH_FILE")
 APP_NAME=$(basename "$APP_BUNDLE")
 
-# Prefer exact tag; fall back to short SHA for dev builds
-if VERSION=$(git -C "$PROJECT_ROOT" describe --tags --exact-match 2>/dev/null); then
-  :
+# RFC-026 S1: the artifact name derives from the workspace version, never
+# from the tag. A release build (an exact-match tag exists) must agree with
+# it; a dev build carries the commit so it never impersonates a release.
+source "$SCRIPT_DIR/version.sh"
+if TAG=$(git -C "$PROJECT_ROOT" describe --tags --exact-match 2>/dev/null); then
+  if [ "$TAG" != "v${WORKSPACE_VERSION}" ]; then
+    echo "❌ Tag '$TAG' does not match workspace version 'v${WORKSPACE_VERSION}'"
+    exit 1
+  fi
+  VERSION="v${WORKSPACE_VERSION}"
 else
-  VERSION=$(git -C "$PROJECT_ROOT" rev-parse --short HEAD)
+  VERSION="v${WORKSPACE_VERSION}-g$(git -C "$PROJECT_ROOT" rev-parse --short HEAD)"
 fi
 
 ARCH=$(uname -m)

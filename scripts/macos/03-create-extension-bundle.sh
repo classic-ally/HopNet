@@ -9,6 +9,10 @@ SWIFT_PROJECT_DIR="$PROJECT_ROOT/apple/HopNetFileProvider"
 EXTENSION_NAME="HopNetFileProviderExtension"
 EXTENSION_BUNDLE_ID="com.hopnet.desktop.fileprovider"
 
+# RFC-026 S1: the appex answers the workspace CalVer like every other
+# bundle surface (the heredoc below interpolates these).
+source "$SCRIPT_DIR/version.sh"
+
 echo "📦 Stage 3: Creating FileProvider extension bundle..."
 
 # Read the app bundle path from previous stage
@@ -74,9 +78,9 @@ cat > "$EXTENSION_DIR/Contents/Info.plist" << EOF
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>$WORKSPACE_VERSION</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>$VERSION_CODE</string>
     <key>NSExtension</key>
     <dict>
         <key>NSExtensionFileProviderSupportsEnumeration</key>

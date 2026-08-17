@@ -553,6 +553,17 @@ Cross-platform desktop application providing file management and network adminis
       exit 75 into the new binary and pinning the held-state
       no-restart-loop, via the test-mode `HOPNET_MIN_CLIENT_OVERRIDE`
       gate seam)
+- [~] macOS app as a first-class node
+      ([RFC-026](specs/macos-app-node.md), Draft 2026-08-17):
+      certified-artifact staging + launchd supervision for the signed
+      app bundle — discharges RFC-021's deferred deployment class. S1
+      shipped 2026-08-17 (version identity through the bundle: the
+      workspace CalVer reaches `tauri.conf.json` via the Tauri
+      crate-version fallback, both Info.plists via
+      `scripts/macos/version.sh` check/write, and the zip name; the
+      release workflow gates tag == version). Remaining: S2 nix-darwin
+      module + supervision, S3 fetch-certified staging + activation,
+      S4 pin-bump automation.
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
       Network Resilience pane reports margins to the model-checked invariants rather than
