@@ -1561,3 +1561,64 @@ async fn download_unknown_blob_is_404() {
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+// Impact: POSIX rename(2) replaces an existing destination atomically —
+// "If newpath already exists, it will be atomically replaced". Refusing it
+// breaks every write-temp-then-rename client, which is the standard safe-save
+// idiom: rsync resuming over a --partial file, an editor saving an existing
+// file, and git's lockfile protocol (X.lock renamed over X). Measured on a
+// live mount: `git init` leaves a 36-byte config and no HEAD, because every
+// `git config` write after the first is a rename over an existing file.
+// Note the sibling `genuine_rename_conflict_still_answers_409` asserts the
+// OPPOSITE contract and must be inverted alongside this fix.
+// Should: replace an existing destination and carry the source's content.
+// Should not: answer 409 merely because the destination name is taken.
+#[tokio::test]
+async fn rename_replaces_an_existing_destination() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let occupant = b"occupant-content";
+    send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", occupant.len()),
+            Some("taken.txt"),
+            occupant.as_slice(),
+        )],
+    )
+    .await;
+
+    let mover = b"mover-content";
+    let (_, file) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", mover.len()),
+            Some("mover.txt"),
+            mover.as_slice(),
+        )],
+    )
+    .await;
+    let mover_id = file.unwrap().item.unwrap().id.unwrap();
+
+    let (status, _) = send_json::<MountMutationResponse>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": mover_id, "new_name": "taken.txt" }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::CONFLICT,
+        "POSIX rename must replace an existing destination, not refuse it: \
+         rsync resume, editor atomic-save and git's lockfile protocol all \
+         depend on rename-over-existing succeeding"
+    );
+    assert!(
+        status.is_success(),
+        "rename over an existing destination should succeed, got {status}"
+    );
+}
