@@ -578,8 +578,11 @@ Cross-platform desktop application providing file management and network adminis
       verification, provenance last) and activates via the RFC-021
       profile flip; `ActivationEnv` generalizes the tick/boot/seal/view
       seams over both wrapper classes; activation unattended by default
-      (tray-only relaunch). Remaining: S3 e2e boundary crossing on the
-      macbook, S4 pin-bump automation.
+      (tray-only relaunch). S3 e2e crossed 2026-08-17 on the macbook
+      (isolated fake feed + one-node scratch mesh): one tick staged the
+      certified 2026.8.99 artifact, regenesis_start → seal → unattended
+      flip → exit 75 → epoch 2 decided on the new bundle, 3.4 s seal-to-
+      cross; crash-loop probe clean. Remaining: S4 pin-bump automation.
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
       Network Resilience pane reports margins to the model-checked invariants rather than

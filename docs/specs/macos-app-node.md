@@ -254,11 +254,21 @@ Each tracked, not forgotten:
       release build at stage 1, so `v0.1.0-rc.2` is still the newest
       artifact-bearing release. Asset-attached availability, validated
       empirically before the provider even exists.)*
-- [~] S3 — the darwin provider: asset-keyed feed walk,
+- [x] S3 — the darwin provider: asset-keyed feed walk,
       `fetch-certified-artifact` staging with provenance, activation +
       crash-loop guard; an end-to-end boundary crossing (stage →
       decide → seal → flip + exit 75 → cross) on real hardware.
-      *(Implemented 2026-08-17, e2e crossing pending: `ForgejoRelease`
+      *(E2E crossed 2026-08-17 on the macbook, fully isolated — local
+      fake feed, uncommitted 2026.8.99 build, one-node scratch mesh:
+      one tick staged the certified artifact (asset-less newer release
+      correctly invisible; provenance + codesign verified on disk);
+      `regenesis_start` → seal at H=4 → unattended activation → exit
+      75 → launchd relaunch through the flipped profile → epoch 2
+      crossed and DECIDED (rollback window closed) — 3.4 s from seal
+      to cross. Post-cross: attestation converged, re-tick left the
+      profile untouched. Signing used the GUI-session launchctl
+      one-shot; staple skipped via the test-mode seam as specified.)*
+      *(Implemented 2026-08-17: `ForgejoRelease`
       grew a defaulted asset list + the artifact filename contract;
       the feed provider owns the by-tag fetch (404 = hold) and asset
       download; `MacAppProvider` stages by download → sha256 sidecar →
