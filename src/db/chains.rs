@@ -273,12 +273,12 @@ pub fn adopt_legacy(conn: &rusqlite::Connection) -> Result<(), SchemaError> {
     Ok(())
 }
 
-/// One fast-forward pass: validate stamps, apply the gap for every
-/// chain, re-stamp, verify the final fingerprint — all in one
-/// transaction, committed with the instrumented commit (project rule).
-pub fn fast_forward(conn: &mut rusqlite::Connection) -> Result<u32, SchemaError> {
-    let tx = conn.transaction()?;
-    let stamps = read_stamps(&tx)?;
+/// One fast-forward pass inside the CALLER's transaction (RFC-020 S4:
+/// the epoch boot transition owns the transaction): validate stamps,
+/// apply the gap for every chain, re-stamp, verify the final
+/// fingerprint. Never commits.
+pub fn fast_forward_tx(tx: &rusqlite::Connection) -> Result<u32, SchemaError> {
+    let stamps = read_stamps(tx)?;
 
     let chains = chains();
     for stamped_module in stamps.keys() {
@@ -300,11 +300,11 @@ pub fn fast_forward(conn: &mut rusqlite::Connection) -> Result<u32, SchemaError>
                 detail: format!("module {} stamped at unknown ordinal {from}", chain.module),
             });
         }
-        applied += hopnet_common::chain::advance(&tx, chain, from, chain.head())?;
+        applied += hopnet_common::chain::advance(tx, chain, from, chain.head())?;
     }
-    write_stamps(&tx)?;
+    write_stamps(tx)?;
 
-    let actual = schema_fingerprint(&tx)?;
+    let actual = schema_fingerprint(tx)?;
     let expected = reference_fingerprint(false)?;
     if actual != expected {
         return Err(SchemaError::FingerprintMismatch {
@@ -313,6 +313,14 @@ pub fn fast_forward(conn: &mut rusqlite::Connection) -> Result<u32, SchemaError>
             actual,
         });
     }
+    Ok(applied)
+}
+
+/// Standalone fast-forward: one transaction, committed with the
+/// instrumented commit (project rule). The boot dispatch's entry.
+pub fn fast_forward(conn: &mut rusqlite::Connection) -> Result<u32, SchemaError> {
+    let tx = conn.transaction()?;
+    let applied = fast_forward_tx(&tx)?;
     crate::db::shared::commit_timed(tx)?;
     Ok(applied)
 }

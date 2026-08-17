@@ -227,6 +227,8 @@ inside the boot transition, before the node is live.
     - copy the sealed database, fast-forward the copy
     - consensus-history tables are emptied in the copy, selected by
       registry table role, never a hand-written list
+    - the crossed file is VACUUMed after the prune — RFC-019's
+      history-storage reclaim delivered at the boundary
     - the sealed original is never touched, so rollback stays
       possible until the new epoch decides its first block
   - **the epoch join** (RFC-019 S7), split by what the joiner brings:
@@ -283,7 +285,9 @@ inside the boot transition, before the node is live.
   import is replaced by copy + fast-forward. The `build_next`
   crash-safe state machine, the atomic swap, and the rollback marker
   survive unchanged — only the content construction inside the
-  transaction changes.
+  transaction changes. (Landed at S4 as `build_next_from_seal`: copy +
+  derived prune + in-transaction fast-forward + VACUUM; the staged
+  join remains on the import build until S5.)
 - **"`initialize` redeemed as the permanent fresh-schema installer"**
   (gate 3's parenthetical): superseded — replay is the permanent
   installer, and `initialize` is deleted.
@@ -392,7 +396,10 @@ Ordered by when they can occur:
   boundary's vote-iff-match surfaces it, and RFC-019's recovery
   applies — anomalous nodes rebuild via the epoch join. Per-step
   golden fixtures (§Validation & Tripwires) exist to catch this class
-  in CI instead.
+  in CI instead. A diverged-but-outvoted validator is parked at the
+  crossing by the vote-time dissent marker (S6) — the copy path
+  cannot re-serialize to detect it, so the dissent is recorded when
+  it is observed.
 - **Crash mid-fast-forward**: the build is one transaction inside the
   boot state machine; retry from the sealed artifacts is idempotent
   (RFC-019 S6, unchanged).
@@ -469,7 +476,7 @@ Each tracked, not forgotten:
 ## Implementation Slices
 
 One PR, built and reviewed as ordered stages: each stage lands green
-on the branch, and the branch merges only once S6 is complete. The
+on the branch, and the branch merges only once S7 is complete. The
 release that follows the merge IS the cutover release, so no
 intermediate release ever ships a section change the live mesh cannot
 cross.
@@ -564,15 +571,45 @@ cross.
     shapes). The harness lands with the identity/0001 fixture:
     replay to the pre-step state, apply literal fixture rows, apply
     the step, hash-pin the canonical dump
-- [ ] S4 — boot rework, upgrade path: copy + fast-forward replaces
+- [x] S4 — boot rework, upgrade path: copy + fast-forward replaces
       fresh + import + carry for the sealing node; prune derived from
       registry roles; the regenesis-restart orchestrator scenario
       stays green.
+  - `build_next_from_seal`: checkpoint(TRUNCATE) on the held old conn
+    → `fs::copy` → ONE transaction: derived prune (every
+    DivergenceOnly table + every consensus node-local table — verified
+    to match the hand enumeration exactly; plain DELETEs, the rollback
+    clear_seal_state precedent) → in-tx schema dispatch (Stamped →
+    `fast_forward_tx`; LegacyUnstamped → `adopt_legacy` first — the
+    S7 cutover crossing is thereby mechanically complete already) →
+    genesis + meta AFTER the fast-forward, so chain tables are at head
+    shape → instrumented commit → checkpoint + VACUUM
+  - no artifact on this path: vote-iff-match certified these rows at
+    the seal, and re-serialization becomes impossible once section
+    format_versions move at a real migration; the artifact file stays
+    on disk serving joiners. The post-fast-forward schema fingerprint
+    is the integrity gate
+  - INTERIM, pinned by test
+    (`diverged_replica_crosses_until_dissent_marker`): a
+    diverged-but-outvoted replica now CROSSES — the import path's
+    roundtrip gate was doubling as its detector; the S6 dissent
+    marker restores the park→rebuild self-heal before merge
+  - staged join stays on `build_next_import` (S5's rework); the carry
+    machinery survives only there; both paths commit via commit_timed
 - [ ] S5 — boot rework, join paths: replay-to-manifest, the
       checkpoint splice, both joiner variants; the
       older-shaped-artifact orchestrator gate (fixture artifacts at
       back ordinals).
-- [ ] S6 — cutover release: baseline-adoption verification, the
+- [ ] S6 — vote-time dissent marker: when a validator's own snapshot
+      hash mismatches a deciding `regenesis_commit`, persist the
+      dissent as a node-local marker at observation time; the boot
+      transition parks a marked node at the boundary (GateFailed →
+      rebuild-from-peers) instead of crossing with diverged state.
+      Restores RFC-019's boundary self-healing under the copy path,
+      and is migration-proof where re-serialization cannot be. Flips
+      the `diverged_replica_crosses_until_dissent_marker` interim
+      test to expect the park.
+- [ ] S7 — cutover release: baseline-adoption verification, the
       cutover rehearsal scenario, release choreography — then the live
       mesh crosses. (The section split itself landed at S1; the
       `host@3` mapping lands with S5's join fixtures.)

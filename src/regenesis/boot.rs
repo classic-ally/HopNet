@@ -365,27 +365,18 @@ pub fn boot_transition_with(
         return park("lineage", e);
     }
 
-    // Gate 3: IMPORT — the certified artifact into a fresh database.
-    // File first; a missing or non-matching file falls back to
-    // recomputation from the sealed database (same rule as the
-    // spawn_engine artifact recovery).
-    let artifact_file = Path::new(db_path)
-        .parent()
-        .map(|p| p.join(seal::SEAL_ARTIFACT_FILENAME))
-        .unwrap_or_else(|| PathBuf::from(seal::SEAL_ARTIFACT_FILENAME));
-    let committed = epoch_genesis.record.snapshot_hash;
-    let artifact = match std::fs::read(&artifact_file) {
-        Ok(bytes) if *blake3::hash(&bytes).as_bytes() == committed => bytes,
-        _ => match seal::serialize_verified_artifact(&mut conn) {
-            Ok(bytes) => bytes,
-            Err(e) => return park("import", format!("artifact recompute: {e}")),
-        },
-    };
-
+    // Gate 3 (RFC-020 S4): BUILD BY COPY — no artifact on this path.
+    // The sealing node's own rows produced the certified hash at vote
+    // time (vote-iff-match), so the sealed database IS certified state;
+    // re-serialization is redundant today and impossible once section
+    // format_versions move at a real migration. The artifact file stays
+    // on disk untouched, serving joiners (S7). The post-fast-forward
+    // schema fingerprint inside the build is this path's integrity
+    // gate.
     remove_with_sidecars(&next);
-    if let Err(e) = build_next(&next, db_path, &artifact, &epoch_genesis) {
+    if let Err(e) = build_next_from_seal(&next, db_path, &conn, &epoch_genesis) {
         remove_with_sidecars(&next);
-        return park("import", e);
+        return park("build", e);
     }
 
     // The lineage record survives the boundary forever — written before
@@ -680,7 +671,7 @@ fn staged_join_transition(
     };
     let next = next_path(db_path);
     remove_with_sidecars(&next);
-    if let Err(e) = build_next(&next, db_path, &artifact, &epoch_genesis) {
+    if let Err(e) = build_next_import(&next, db_path, &artifact, &epoch_genesis) {
         remove_with_sidecars(&next);
         return Some(park("staged-join", e));
     }
@@ -777,11 +768,136 @@ fn poison(staging: &Path, detail: String) -> BootOutcome {
     park("staged-join", detail)
 }
 
-/// Build the fresh epoch database at `next`: schema, certified import,
-/// node-local carry, genesis install and meta — ONE transaction, then
-/// checkpoint and close. Any error leaves `next` to be deleted by the
-/// caller; the old database is never written.
-fn build_next(
+/// Build the next-epoch database FROM THE SEALED FILE (RFC-020 S4) —
+/// the path of the node that lived through the seal: checkpoint + copy,
+/// prune consensus history (derived from the registry's table roles,
+/// never a hand-written list), fast-forward the copy to this binary's
+/// schema head, install the new genesis — ONE transaction, then
+/// checkpoint + VACUUM. The sealed original is never written (rollback
+/// window). No artifact is read: the sealing node's own rows produced
+/// the certified hash at vote time (vote-iff-match), and the
+/// post-fast-forward schema fingerprint is this path's integrity gate.
+fn build_next_from_seal(
+    next: &Path,
+    old_db_path: &str,
+    old_conn: &rusqlite::Connection,
+    epoch_genesis: &genesis::EpochGenesis,
+) -> Result<(), String> {
+    // The old WAL may hold committed state (the only other checkpoint
+    // runs at swap time, after this build) — flush it so the file copy
+    // is complete. No concurrent writer exists: pre-pool, pre-engine.
+    old_conn
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|e| format!("old checkpoint: {e}"))?;
+    std::fs::copy(old_db_path, next).map_err(|e| format!("copy sealed db: {e}"))?;
+
+    let mut conn =
+        rusqlite::Connection::open(next).map_err(|e| format!("open {}: {e}", next.display()))?;
+    crate::db::shared::apply_connection_pragmas(&conn).map_err(|e| format!("pragmas: {e}"))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("tx: {e}"))?;
+
+    // PRUNE, derived from the registry: every DivergenceOnly table
+    // (live-mesh agreement state whose history dies with the epoch —
+    // decided_blocks, regenesis_state) plus every consensus-module
+    // node-local table (WAL, certificates, meta; meta's closed key set
+    // is fully reseeded below / by install_genesis). Plain DELETEs so
+    // a resumed build never errors on already-empty tables (the
+    // rollback clear_seal_state precedent). decided_blocks MUST be
+    // emptied before install_genesis: its plain INSERT at H would
+    // collide with the sealed final block.
+    for section in crate::db::snapshot::sections() {
+        for table in section.tables {
+            if table.role == hopnet_common::snapshot::TableRole::DivergenceOnly {
+                tx.execute(&format!("DELETE FROM {}", table.name), [])
+                    .map_err(|e| format!("prune {}: {e}", table.name))?;
+            }
+        }
+    }
+    for table in hopnet_consensus::store::NODE_LOCAL_TABLES {
+        tx.execute(&format!("DELETE FROM {table}"), [])
+            .map_err(|e| format!("prune {table}: {e}"))?;
+    }
+
+    // Schema dispatch inside the tx: the copy carries the OLD binary's
+    // stamps — exactly fast-forward's input. A pre-chain sealed
+    // database (the S6 cutover crossing) has no stamp at all and
+    // adopts at baseline; adopt's fingerprint check refuses anything
+    // that is not exactly the baseline shape.
+    match crate::db::chains::assess(&tx).map_err(|e| format!("assess: {e}"))? {
+        crate::db::chains::SchemaState::Stamped => {}
+        crate::db::chains::SchemaState::LegacyUnstamped => {
+            crate::db::chains::adopt_legacy(&tx).map_err(|e| format!("legacy adopt: {e}"))?;
+        }
+        crate::db::chains::SchemaState::Fresh => {
+            return Err("copied database has no tables".into());
+        }
+    }
+    let applied =
+        crate::db::chains::fast_forward_tx(&tx).map_err(|e| format!("fast-forward: {e}"))?;
+    if applied > 0 {
+        tracing::info!(applied, "epoch build fast-forwarded the copied database");
+    }
+
+    // Genesis + fresh meta AFTER the fast-forward, so the chain tables
+    // are at head shape when the new epoch's rows land.
+    install_epoch_genesis(&tx, epoch_genesis)?;
+
+    crate::db::shared::commit_timed(tx).map_err(|e| format!("commit: {e}"))?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|e| format!("checkpoint: {e}"))?;
+    // Reclaim the pruned epoch history (RFC-019's history-storage
+    // payoff, delivered on this path): the copy carried decided_blocks
+    // in full; post-prune those pages are dead weight.
+    conn.execute_batch("VACUUM;")
+        .map_err(|e| format!("vacuum: {e}"))?;
+    Ok(())
+}
+
+/// Genesis install + the fresh consensus meta writes, shared by both
+/// build paths. regenesis_state stays ABSENT — the canonical Normal
+/// encoding: the new epoch is born open.
+fn install_epoch_genesis(
+    tx: &rusqlite::Connection,
+    epoch_genesis: &genesis::EpochGenesis,
+) -> Result<(), String> {
+    let cert = genesis::synthetic_genesis_cert(&epoch_genesis.block);
+    hopnet_consensus::store::install_genesis(tx, &epoch_genesis.block, &cert)
+        .map_err(|e| format!("genesis install: {e}"))?;
+    hopnet_consensus::store::meta_put(
+        tx,
+        hopnet_consensus::store::META_CHAIN_ID,
+        epoch_genesis.block.block_hash.0.as_bytes(),
+    )
+    .map_err(|e| format!("chain id: {e}"))?;
+    hopnet_consensus::store::meta_put(
+        tx,
+        hopnet_consensus::store::META_QUORUM_PROFILE,
+        epoch_genesis.record.quorum_profile.as_bytes(),
+    )
+    .map_err(|e| format!("quorum profile: {e}"))?;
+    hopnet_consensus::store::meta_put(
+        tx,
+        genesis::META_EPOCH,
+        &epoch_genesis.record.epoch.to_be_bytes(),
+    )
+    .map_err(|e| format!("epoch meta: {e}"))?;
+    hopnet_consensus::store::meta_put(
+        tx,
+        genesis::META_EPOCH_GENESIS_HEIGHT,
+        &epoch_genesis.record.seal_height.to_be_bytes(),
+    )
+    .map_err(|e| format!("genesis height meta: {e}"))?;
+    Ok(())
+}
+
+/// Build the fresh epoch database at `next` from a CERTIFIED ARTIFACT
+/// (the staged-join path; until S5 reworks it): schema, certified
+/// import, node-local carry, genesis install and meta — ONE
+/// transaction, then checkpoint and close. Any error leaves `next` to
+/// be deleted by the caller; the old database is never written.
+fn build_next_import(
     next: &Path,
     old_db_path: &str,
     artifact: &[u8],
@@ -853,35 +969,8 @@ fn build_next(
     )
     .map_err(|e| format!("carry fragment columns: {e}"))?;
 
-    // Genesis at H + fresh consensus meta. regenesis_state stays ABSENT
-    // — the canonical Normal encoding: the new epoch is born open.
-    let cert = genesis::synthetic_genesis_cert(&epoch_genesis.block);
-    hopnet_consensus::store::install_genesis(&tx, &epoch_genesis.block, &cert)
-        .map_err(|e| format!("genesis install: {e}"))?;
-    hopnet_consensus::store::meta_put(
-        &tx,
-        hopnet_consensus::store::META_CHAIN_ID,
-        epoch_genesis.block.block_hash.0.as_bytes(),
-    )
-    .map_err(|e| format!("chain id: {e}"))?;
-    hopnet_consensus::store::meta_put(
-        &tx,
-        hopnet_consensus::store::META_QUORUM_PROFILE,
-        epoch_genesis.record.quorum_profile.as_bytes(),
-    )
-    .map_err(|e| format!("quorum profile: {e}"))?;
-    hopnet_consensus::store::meta_put(
-        &tx,
-        genesis::META_EPOCH,
-        &epoch_genesis.record.epoch.to_be_bytes(),
-    )
-    .map_err(|e| format!("epoch meta: {e}"))?;
-    hopnet_consensus::store::meta_put(
-        &tx,
-        genesis::META_EPOCH_GENESIS_HEIGHT,
-        &epoch_genesis.record.seal_height.to_be_bytes(),
-    )
-    .map_err(|e| format!("genesis height meta: {e}"))?;
+    // Genesis at H + fresh consensus meta (shared with the seal path).
+    install_epoch_genesis(&tx, epoch_genesis)?;
 
     // The strongest cross-check last: the fresh database must reproduce
     // the certified artifact byte-for-byte (the roundtrip gate the S1
@@ -893,7 +982,7 @@ fn build_next(
         return Err("fresh database does not reproduce the certified artifact".into());
     }
 
-    tx.commit().map_err(|e| format!("commit: {e}"))?;
+    crate::db::shared::commit_timed(tx).map_err(|e| format!("commit: {e}"))?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .map_err(|e| format!("checkpoint: {e}"))?;
     Ok(())
@@ -1777,6 +1866,13 @@ pub(crate) mod tests {
         // Lineage record readable, forever.
         let lineage = genesis::read_lineage(&genesis::lineage_path(dir.path(), 2)).unwrap();
         assert_eq!(lineage.record.epoch, 2);
+        // RFC-020 S4: the crossed file is stamped at every chain's head
+        // (the copy carried the old stamps; the build fast-forwarded and
+        // re-stamped).
+        let stamps = crate::db::chains::read_stamps(&conn).unwrap();
+        for chain in crate::db::chains::chains() {
+            assert_eq!(stamps.get(chain.module), Some(&chain.head()));
+        }
         drop(conn);
 
         // Next boot: state A — normal, and the retained file is kept.
@@ -1900,26 +1996,19 @@ pub(crate) mod tests {
     // Impact: "nothing is ever lost by a failed gate" — a refused
     // boundary must leave the sealed database byte-identical so abort/
     // retry/manual recovery all remain possible.
-    // Should: park on an import-gate failure (diverged replica: committed
-    // hash matches no recomputation) with the old database unchanged.
+    // Should: park on a build failure (a stamp naming an ordinal this
+    // binary's chains do not contain) with the old database unchanged.
     #[test]
-    fn import_gate_failure_leaves_old_database_untouched() {
+    fn build_gate_failure_leaves_old_database_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = sealed_db(dir.path());
-        // Diverge the replica's LOCAL STATE, not its record: mutate an
-        // exported table so no recomputation can reproduce the committed
-        // identity, while the committed hash and the block's
-        // `regenesis_commit` still agree with each other.
-        //
-        // Corrupting `regenesis_state.snapshot_hash` instead would now trip
-        // the LINEAGE gate first — the record would no longer match the
-        // commit the quorum certified — and this test would stop exercising
-        // the import gate it is named for. Divergence is a property of local
-        // state; a mangled record is a different failure.
+        // Poison the copy's fast-forward input: a stamp at an ordinal
+        // no chain contains. The build's InvalidStamp refusal must park
+        // and leave the sealed original byte-identical.
         {
             let conn = open(&db_path);
             conn.execute(
-                "UPDATE users SET username = 'diverged' WHERE user_id = 1",
+                "UPDATE schema_ordinals SET ordinal = 99 WHERE module = 'drive'",
                 [],
             )
             .unwrap();
@@ -1932,7 +2021,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 outcome,
-                BootOutcome::Parked(ParkReason::GateFailed { gate: "import", .. })
+                BootOutcome::Parked(ParkReason::GateFailed { gate: "build", .. })
             ),
             "got {outcome:?}"
         );
@@ -1942,6 +2031,99 @@ pub(crate) mod tests {
         // Surface populated for the status route (content asserted via
         // the ParkReason above — the global races with parallel tests).
         assert!(boundary_error().is_some());
+    }
+
+    // Impact: pins the S4 interim honestly — the copy path trusts the
+    // sealed file (vote-iff-match certified it), so a diverged-outvoted
+    // replica CROSSES undetected until the vote-time dissent marker
+    // stage (RFC-020 S6) parks it at the boundary. When that stage
+    // lands, this test flips to expecting a park.
+    // Should: cross a boundary whose local exported state diverged from
+    // the certified hash (interim behavior, superseded by S6).
+    #[test]
+    fn diverged_replica_crosses_until_dissent_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = sealed_db(dir.path());
+        {
+            let conn = open(&db_path);
+            conn.execute(
+                "UPDATE users SET username = 'diverged' WHERE user_id = 1",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        let outcome = boot_transition(&db_path, TARGET);
+        assert!(
+            matches!(outcome, BootOutcome::Transitioned { epoch: 2 }),
+            "got {outcome:?}"
+        );
+    }
+
+    // Impact: the S7 cutover crossing in miniature — a database sealed
+    // by the PRE-CHAIN binary has no schema_ordinals; the build must
+    // adopt it at baseline inside the transaction and land at head.
+    // Should: cross a legacy (unstamped) sealed database, adopting at
+    // baseline and stamping at head.
+    #[test]
+    fn legacy_sealed_database_adopts_and_crosses() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = sealed_db(dir.path());
+        // Simulate the pre-chain sealed shape: today head differs from
+        // baseline ONLY by schema_ordinals (identity 0001), so dropping
+        // it reproduces the baseline shape exactly.
+        {
+            let conn = open(&db_path);
+            conn.execute_batch("DROP TABLE schema_ordinals;").unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        let outcome = boot_transition(&db_path, TARGET);
+        assert!(
+            matches!(outcome, BootOutcome::Transitioned { epoch: 2 }),
+            "got {outcome:?}"
+        );
+        let conn = open(&db_path);
+        let stamps = crate::db::chains::read_stamps(&conn).unwrap();
+        for chain in crate::db::chains::chains() {
+            assert_eq!(stamps.get(chain.module), Some(&chain.head()));
+        }
+    }
+
+    // Should: reclaim the pruned epoch history — the crossed file is
+    // VACUUMed, so a history-heavy sealed database shrinks at the
+    // boundary instead of carrying dead pages into the new epoch.
+    #[test]
+    fn crossing_vacuums_the_pruned_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = sealed_db(dir.path());
+        // Bloat epoch-1 history below H with fat filler blocks.
+        {
+            let conn = open(&db_path);
+            let blob = vec![0xABu8; 8192];
+            for h in 100..300i64 {
+                conn.execute(
+                    "INSERT INTO decided_blocks (height, block_hash, round, block) \
+                     VALUES (?1, ?2, 0, ?3)",
+                    params![h, format!("filler-{h}").into_bytes(), blob],
+                )
+                .unwrap();
+            }
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        let before = std::fs::metadata(&db_path).unwrap().len();
+        let outcome = boot_transition(&db_path, TARGET);
+        assert!(
+            matches!(outcome, BootOutcome::Transitioned { epoch: 2 }),
+            "got {outcome:?}"
+        );
+        let after = std::fs::metadata(&db_path).unwrap().len();
+        assert!(
+            after < before / 2,
+            "expected the vacuumed file to shed the pruned history: {before} -> {after}"
+        );
     }
 
     // Should: park on lineage-gate failure — a certificate that does not
