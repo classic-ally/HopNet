@@ -333,6 +333,22 @@ impl hopnet_comms::RpcHandler for StatusScope {
                             local_epoch = my_epoch,
                             "handshake: peer is in a different epoch (needs epoch join / upgrade)"
                         );
+                        // An inbound ping carries the same signal as an
+                        // outbound pong (RFC-019 S7) — and a node being
+                        // probed by healthy peers has its own outbound
+                        // probe anchor perpetually refreshed by that very
+                        // contact, so the pong-side trigger can starve
+                        // for minutes. React here too: a peer AHEAD of us
+                        // means WE must rejoin. Idempotent —
+                        // spawn_epoch_join is CAS-guarded, and repeat
+                        // pings while a join is inflight no-op.
+                        if epoch > my_epoch {
+                            crate::regenesis::join::spawn_epoch_join(
+                                &app_state,
+                                crate::regenesis::join::JoinAnchor::OwnDb,
+                                vec![peer],
+                            );
+                        }
                     }
                 }
                 Err(_) => app_state.evidence.record_contact(peer.node_id),
