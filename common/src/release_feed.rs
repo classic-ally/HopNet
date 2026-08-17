@@ -14,6 +14,41 @@ pub struct ForgejoRelease {
     pub prerelease: bool,
     #[serde(default)]
     pub draft: bool,
+    /// Uploaded artifacts. Defaulted so channels that only care about tags
+    /// (nix builds from source) parse payloads without them unchanged; the
+    /// macOS app channel keys AVAILABILITY on these (RFC-026: a tag means
+    /// nothing until CI attaches the signed artifact).
+    #[serde(default)]
+    pub assets: Vec<ForgejoAsset>,
+}
+
+/// One uploaded release artifact.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForgejoAsset {
+    pub name: String,
+    pub browser_download_url: String,
+}
+
+/// The artifact filenames the macOS release workflow publishes for a
+/// version: the app zip and its sha256 sidecar
+/// (scripts/macos/06-package-zip.sh owns the writing half).
+pub fn app_asset_names(version: &str) -> (String, String) {
+    let zip = format!("HopNet-v{version}-arm64.app.zip");
+    let sha = format!("{zip}.sha256");
+    (zip, sha)
+}
+
+/// Find a release's app-zip + sha256 asset URLs, if both are attached.
+pub fn app_asset_urls(release: &ForgejoRelease, version: &str) -> Option<(String, String)> {
+    let (zip_name, sha_name) = app_asset_names(version);
+    let url_of = |name: &str| {
+        release
+            .assets
+            .iter()
+            .find(|a| a.name == name)
+            .map(|a| a.browser_download_url.clone())
+    };
+    Some((url_of(&zip_name)?, url_of(&sha_name)?))
 }
 
 /// A published release as the channels see it.
@@ -158,6 +193,38 @@ mod tests {
             flake_ref("https://git.bentley.sh/HopNet/HopNet.git"),
             "git+https://git.bentley.sh/HopNet/HopNet.git"
         );
+    }
+
+    // Impact: asset-attached availability is the macOS class's whole
+    // availability semantics — a tag with no artifact must read as
+    // nothing-to-stage, never as a half-available release.
+    // Should: return both asset URLs when the zip and its sha256 sidecar
+    //         are attached under the workflow's exact filenames.
+    // Should not: return anything when either sidecar or zip is missing.
+    #[test]
+    fn app_asset_urls_require_both_zip_and_sidecar() {
+        let full: ForgejoRelease = serde_json::from_str(
+            r#"{"tag_name": "v2026.8.5", "assets": [
+                {"name": "HopNet-v2026.8.5-arm64.app.zip", "browser_download_url": "https://x/zip"},
+                {"name": "HopNet-v2026.8.5-arm64.app.zip.sha256", "browser_download_url": "https://x/sha"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            app_asset_urls(&full, "2026.8.5"),
+            Some(("https://x/zip".into(), "https://x/sha".into()))
+        );
+
+        let zip_only: ForgejoRelease = serde_json::from_str(
+            r#"{"tag_name": "v2026.8.5", "assets": [
+                {"name": "HopNet-v2026.8.5-arm64.app.zip", "browser_download_url": "https://x/zip"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(app_asset_urls(&zip_only, "2026.8.5"), None);
+
+        let bare: ForgejoRelease = serde_json::from_str(r#"{"tag_name": "v2026.8.5"}"#).unwrap();
+        assert_eq!(app_asset_urls(&bare, "2026.8.5"), None);
     }
 
     // Impact: the tag ref is the one string in the upgrade channels that
