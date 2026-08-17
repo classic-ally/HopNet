@@ -142,9 +142,12 @@ first slice.
 - Supervision alone is a day-one win before any staging exists:
   same-version regenesis restarts (seal-work exit 75) complete
   unattended, which no macOS node can do today.
-- A desktop app relaunch is user-visible — the activation-visibility
-  default is an open question (§Open Questions), with the park + loud
-  GUI prompt as the conservative floor.
+- Activation is **unattended by default** (decided 2026-08-17,
+  resolving OQ1): with S2's tray-only autostart the relaunch is a tray
+  blip — no window, no dock icon — so fleet symmetry with the nix
+  nodes wins over a park-and-prompt that would need UI that doesn't
+  exist. Failure still parks; `upgrade.autoActivate = false` opts a
+  deployment out.
 
 ## Bundle Re-Registration Hazards
 
@@ -251,20 +254,32 @@ Each tracked, not forgotten:
       release build at stage 1, so `v0.1.0-rc.2` is still the newest
       artifact-bearing release. Asset-attached availability, validated
       empirically before the provider even exists.)*
-- [ ] S3 — the darwin provider: asset-keyed feed walk,
+- [~] S3 — the darwin provider: asset-keyed feed walk,
       `fetch-certified-artifact` staging with provenance, activation +
       crash-loop guard; an end-to-end boundary crossing (stage →
       decide → seal → flip + exit 75 → cross) on real hardware.
+      *(Implemented 2026-08-17, e2e crossing pending: `ForgejoRelease`
+      grew a defaulted asset list + the artifact filename contract;
+      the feed provider owns the by-tag fetch (404 = hold) and asset
+      download; `MacAppProvider` stages by download → sha256 sidecar →
+      `codesign --deep --strict` → staple (test-mode-gated skip for
+      unnotarized e2e bundles) → the bundle binary answering the tag →
+      provenance written last. `ActivationEnv` (enum over Nix/MacApp)
+      generalized the three hardcoded call sites — tick selection +
+      auto_stage, boot/seal hooks, readiness view — so both wrapper
+      classes share one seam; the flip and crash-loop guard are the nix
+      provider's verbatim. Module wires the env contract with
+      `upgrade.autoStage`/`autoActivate` defaulting on. Unit-tested on
+      Linux via stub codesign/stapler/ditto.)*
 - [ ] S4 — pin-bump automation in the release workflow, covering both
       HopNet's own flake and downstream consumers.
 
 ## Open Questions
 
-1. **Activation visibility.** Unattended flip-and-relaunch (fleet
-   symmetry) vs park + GUI prompt (desktop courtesy)? The conservative
-   floor is prompt-by-default with an opt-in to unattended; lifecycle
-   laziness (RFC-024's answer) may cover most cases once supervision
-   exists.
+1. ~~**Activation visibility.**~~ RESOLVED (2026-08-17): unattended by
+   default — S2's tray-only autostart makes the relaunch a tray blip,
+   so fleet symmetry wins; `upgrade.autoActivate = false` opts out, and
+   a park-and-prompt UI can arrive later without contract changes.
 2. **Pin-bump mechanism.** Direct workflow commit to master vs a PR
    the operator merges — the former is a bot writing to master, the
    latter reintroduces a human in the release path.

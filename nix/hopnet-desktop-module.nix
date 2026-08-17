@@ -111,6 +111,39 @@ in
       default = "info";
       description = "RUST_LOG for the node process.";
     };
+
+    upgrade = {
+      autoStage = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Download + verify newer certified artifacts proactively
+          (RFC-026 S3). Availability is asset-attached: a tag whose CI
+          run hasn't published the darwin zip yet is invisible.
+        '';
+      };
+
+      autoActivate = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Cross an upgrade boundary unattended: flip the exec profile to
+          the staged bundle and restart (exit 75; the agent relaunches
+          through the profile, tray-only). Off = park awaiting-upgrade
+          for the operator.
+        '';
+      };
+
+      releaseUrl = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Release feed override (HOPNET_UPGRADE_RELEASE_URL). Null
+          derives the Forgejo releases API from the crate's repository
+          field.
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -156,12 +189,22 @@ in
           # there would greet the user on each boot.
           HOPNET_AUTOSTART = "1";
           RUST_LOG = cfg.logLevel;
+          # RFC-026 S3: the certified-artifact upgrade contract. The
+          # profile the provider flips is the same one the wrapper execs.
+          HOPNET_UPGRADE_PROVIDER = "macos-app";
+          HOPNET_UPGRADE_PROFILE = profile;
+          HOPNET_UPGRADE_STAGE_DIR = "${cfg.dataDir}/staged";
+          HOPNET_UPGRADE_AUTO_STAGE = if cfg.upgrade.autoStage then "1" else "0";
+          HOPNET_UPGRADE_AUTO_ACTIVATE = if cfg.upgrade.autoActivate then "1" else "0";
         }
         // lib.optionalAttrs (cfg.relayUrl != null) {
           HOPNET_RELAY_URL = cfg.relayUrl;
         }
         // lib.optionalAttrs (cfg.fragmentsDir != null) {
           HOPNET_FRAGMENTS_DIR = cfg.fragmentsDir;
+        }
+        // lib.optionalAttrs (cfg.upgrade.releaseUrl != null) {
+          HOPNET_UPGRADE_RELEASE_URL = cfg.upgrade.releaseUrl;
         };
       };
     };

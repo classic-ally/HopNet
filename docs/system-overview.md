@@ -571,9 +571,15 @@ Cross-platform desktop application providing file management and network adminis
       re-registers the ingress agent after a bundle move. Discovered en
       route: releases v2026.8.1–v2026.8.4 all carry zero assets (the
       u64-heights Swift breakage failed every CalVer release build), so
-      the `hopnet-desktop` pin bump waits on the next release.
-      Remaining: S3 fetch-certified staging + activation, S4 pin-bump
-      automation.
+      the `hopnet-desktop` pin bump waits on the next release. S3
+      implemented 2026-08-17 (e2e crossing pending): the `macos-app`
+      provider stages the CI-certified artifact (asset-attached
+      availability, sha256 sidecar + codesign + staple + honest-bytes
+      verification, provenance last) and activates via the RFC-021
+      profile flip; `ActivationEnv` generalizes the tick/boot/seal/view
+      seams over both wrapper classes; activation unattended by default
+      (tray-only relaunch). Remaining: S3 e2e boundary crossing on the
+      macbook, S4 pin-bump automation.
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
       Network Resilience pane reports margins to the model-checked invariants rather than
