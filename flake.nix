@@ -94,7 +94,18 @@
           # of recompiling 400+ crates from scratch — big win on slow CI
           # boxes.
           commonArgs = {
-            src = craneLib.cleanCargoSource ./.;
+            # RFC-020 S1 introduced include_str!("...sql") frozen-baseline
+            # migrations across hopnet-storage/takeout/photos/drive and the
+            # top-level migrations/ dir. crane's default filterCargoSources
+            # only keeps .rs/.toml/Cargo.lock, so a plain cleanCargoSource
+            # strips those .sql files out from under the compile-time
+            # include_str! -- widen the filter to also keep .sql.
+            src = pkgs.lib.cleanSourceWith {
+              src = pkgs.lib.cleanSource ./.;
+              filter = path: type:
+                craneLib.filterCargoSources path type
+                || pkgs.lib.hasSuffix ".sql" (baseNameOf path);
+            };
             strictDeps = true;
 
             cargoExtraArgs = "--features skip-frontend --bin hopnet";
