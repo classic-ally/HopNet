@@ -163,7 +163,9 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     splice verified at the artifact's own shape, the self-retiring
     host@3 cutover mapping, fresh joins never restarting;
     build_next_import and the last carry machinery deleted);
-    S6 dissent marker, S7 cutover pending.
+    and the S6 vote-time dissent marker (diverged-but-outvoted
+    replicas park at the boundary and rebuild from peers); S7 cutover
+    pending.
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

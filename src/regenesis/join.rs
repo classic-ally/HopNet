@@ -636,6 +636,16 @@ fn install_join_genesis(
     profile: &hopnet_consensus::config::QuorumProfile,
     record: &genesis::EpochGenesisRecord,
 ) -> Result<(), String> {
+    // Belt-and-braces (RFC-020 S6): the fresh in-process path never
+    // wipes consensus_meta wholesale (unlike the epoch build's prune),
+    // and a join lands verified state — any dissent record is stale.
+    // Unreachable by a dissenter today (this path refuses non-empty
+    // exported tables), but cheap; the clear_seal_state precedent.
+    tx.execute(
+        "DELETE FROM consensus_meta WHERE key = ?1",
+        [crate::regenesis::seal::META_DISSENT_AT],
+    )
+    .map_err(|e| format!("dissent clear: {e}"))?;
     hopnet_consensus::store::install_genesis(tx, block, cert)
         .map_err(|e| format!("install genesis: {e}"))?;
     hopnet_consensus::store::meta_put(

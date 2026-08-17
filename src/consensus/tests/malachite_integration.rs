@@ -1046,7 +1046,16 @@ fn regenesis_seal_halts_mesh_and_writes_artifact() {
             assert_eq!(*e.decided.borrow(), seal_height, "decided past the seal");
         }
 
-        // Durable marker on every node.
+        // Durable marker on every node — and the RFC-020 S6 dissent
+        // marker splitting the mesh honestly: MockNetwork's node 0 runs
+        // the full post_initial_setup ceremony while nodes 1/2 receive
+        // hand-mirrored skeleton rows, so node 0's identity/storage
+        // sections genuinely diverge from the quorum's (latent fixture
+        // asymmetry — previously invisible because all three nodes race
+        // one artifact path and last-rename-wins hid node 0's refusal).
+        // That accident is exactly the diverged-but-outvoted scenario:
+        // nodes 1+2 decide the seal over node 0's vote-iff-match
+        // refusal, and node 0 must mark its dissent at apply time.
         for node in &network.nodes {
             let conn = node.app_state.db_pool.get().unwrap();
             assert_eq!(
@@ -1054,6 +1063,16 @@ fn regenesis_seal_halts_mesh_and_writes_artifact() {
                 Some(seal_height),
                 "seal marker missing"
             );
+            let dissent = crate::regenesis::seal::dissent_marker(&conn);
+            if node.node_id == 0 {
+                assert_eq!(
+                    dissent,
+                    Some(seal_height),
+                    "the diverged-outvoted replica must record its dissent"
+                );
+            } else {
+                assert!(dissent.is_none(), "healthy replica wrongly dissented");
+            }
         }
 
         // The artifact next to the (XDG-derived) database: byte-certified

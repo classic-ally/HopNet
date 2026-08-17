@@ -346,6 +346,14 @@ fn commit_seals_and_closes_the_window() {
     assert_eq!(state.seal_height, Some(9));
     assert_eq!(state.target_version_code, Some(20260800));
 
+    // RFC-020 S6: [7u8; 32] matches no honest recompute, so applying
+    // this commit IS the diverged-but-outvoted case — the dissent
+    // marker must have been written inside the same decide.
+    {
+        let conn = node.app_state.db_pool.get().unwrap();
+        assert_eq!(crate::regenesis::seal::dissent_marker(&conn), Some(9));
+    }
+
     for (function, payload) in [
         ("regenesis_commit", commit_payload([7u8; 32], 10, 20260800)),
         ("regenesis_abort", abort_payload()),
@@ -487,6 +495,12 @@ fn seal_artifact_written_only_on_hash_match() {
         commit_payload(honest, 9, 20260800),
     )
     .unwrap();
+
+    // RFC-020 S6: an honest apply (matching hash) leaves no dissent.
+    {
+        let conn = node.app_state.db_pool.get().unwrap();
+        assert!(crate::regenesis::seal::dissent_marker(&conn).is_none());
+    }
 
     let dir = std::env::temp_dir().join(format!("hopnet-seal-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

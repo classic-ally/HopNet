@@ -318,6 +318,22 @@ pub fn boot_transition_with(
         );
     }
 
+    // DISSENT GATE (RFC-020 S6), ahead of the version gate on purpose:
+    // a diverged replica must land in GateFailed (which arms the
+    // rebuild-from-peers self-heal), never in AwaitingUpgrade. The
+    // marker was written inside the decide at observation time — the
+    // copy path cannot re-verify (migrations make re-serialization
+    // impossible), so the marker IS the detector.
+    if let Some(h) = seal::dissent_marker(&conn) {
+        return park(
+            "dissent",
+            format!(
+                "this replica dissented from the deciding commit at height {h} — \
+                 diverged local state; rebuilding from peers via the epoch join"
+            ),
+        );
+    }
+
     // Gate 1: VERSION, exact. Refusal parks the node; the old database
     // stays live, the engine stays parked on the sealed marker. A nix
     // deployment gets one chance to activate its staged generation first
@@ -2024,15 +2040,16 @@ pub(crate) mod tests {
         assert!(boundary_error().is_some());
     }
 
-    // Impact: pins the S4 interim honestly — the copy path trusts the
-    // sealed file (vote-iff-match certified it), so a diverged-outvoted
-    // replica CROSSES undetected until the vote-time dissent marker
-    // stage (RFC-020 S6) parks it at the boundary. When that stage
-    // lands, this test flips to expecting a park.
-    // Should: cross a boundary whose local exported state diverged from
-    // the certified hash (interim behavior, superseded by S6).
+    // Impact: RFC-020 S6 — the copy path trusts the sealed file, so
+    // the dissent marker (written inside the decide when this replica
+    // observed its hash mismatching the deciding commit) is the ONLY
+    // detector of a diverged-but-outvoted replica; the park arms the
+    // rebuild-from-peers self-heal.
+    // Should: park a dissent-marked replica at the boundary, ahead of
+    // the version gate, with the sealed database untouched.
+    // Should not: build anything or retain a .sealed copy.
     #[test]
-    fn diverged_replica_crosses_until_dissent_marker() {
+    fn diverged_replica_parks_at_the_boundary() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = sealed_db(dir.path());
         {
@@ -2042,14 +2059,55 @@ pub(crate) mod tests {
                 [],
             )
             .unwrap();
+            // The marker the decide would have written at observation
+            // time (the fixture hand-writes seal state, so it
+            // hand-writes the dissent too).
+            hopnet_consensus::store::meta_put(&conn, seal::META_DISSENT_AT, &H.to_be_bytes())
+                .unwrap();
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                 .unwrap();
         }
+        let before = std::fs::read(&db_path).unwrap();
         let outcome = boot_transition(&db_path, TARGET);
+        assert!(
+            matches!(
+                outcome,
+                BootOutcome::Parked(ParkReason::GateFailed {
+                    gate: "dissent",
+                    ..
+                })
+            ),
+            "got {outcome:?}"
+        );
+        assert!(!next_path(&db_path).exists());
+        assert!(!sealed_path(&db_path).exists());
+        assert_eq!(std::fs::read(&db_path).unwrap(), before, "old db untouched");
+    }
+
+    // Impact: the marker's clearing is load-bearing — it rides the
+    // epoch build's consensus_meta prune, and a survivor would re-park
+    // the freshly rebuilt node forever.
+    // Should: clear the dissent marker when the replica rebuilds via
+    // the staged epoch join.
+    #[test]
+    fn rebuild_clears_the_dissent_marker() {
+        let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let fixture = join_fixture(dirs.0.path(), dirs.1.path());
+        {
+            let conn = rusqlite::Connection::open(&fixture.db_path).unwrap();
+            hopnet_consensus::store::meta_put(&conn, seal::META_DISSENT_AT, &H.to_be_bytes())
+                .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        fixture.stage(None);
+        let outcome = boot_transition(&fixture.db_path, TARGET);
         assert!(
             matches!(outcome, BootOutcome::Transitioned { epoch: 2 }),
             "got {outcome:?}"
         );
+        let conn = open(&fixture.db_path);
+        assert!(seal::dissent_marker(&conn).is_none());
     }
 
     // Impact: the S7 cutover crossing in miniature — a database sealed

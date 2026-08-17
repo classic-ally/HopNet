@@ -197,7 +197,37 @@ impl TransactionHandler for RegenesisCommitHandler {
         .map_err(|e| {
             tracing::error!("sealing: marker write failed inside the decide: {e}");
             DatabaseError::InsertError
-        })
+        })?;
+
+        // DISSENT OBSERVATION (RFC-020 S6): this node may be applying a
+        // commit it refused to vote for (vote-iff-match, outvoted, the
+        // block arrives via sync). Recompute the artifact hash NOW —
+        // inside the decide, the only migration-proof moment (a boot-time
+        // derivation would be re-serialization, which dies at the first
+        // format_version move) — and persist the dissent so the boot
+        // transition parks this replica for the rebuild-from-peers
+        // self-heal instead of crossing with diverged state. The
+        // COMPARISON never fails the apply (decided is decided); only a
+        // database error can, exactly like the seal marker above.
+        let local = crate::db::snapshot::compute_artifact_hash_tx(db_tx)?;
+        if local.as_bytes() != req.snapshot_hash.as_slice() {
+            tracing::warn!(
+                seal_height = req.seal_height,
+                local = %local.to_hex(),
+                "dissent: local state does not reproduce the deciding commit's \
+                 snapshot hash — marking this replica for rebuild at the boundary"
+            );
+            hopnet_consensus::store::meta_put(
+                db_tx,
+                crate::regenesis::seal::META_DISSENT_AT,
+                &req.seal_height.to_be_bytes(),
+            )
+            .map_err(|e| {
+                tracing::error!("dissent: marker write failed inside the decide: {e}");
+                DatabaseError::InsertError
+            })?;
+        }
+        Ok(())
     }
 }
 

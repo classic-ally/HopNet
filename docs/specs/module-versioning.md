@@ -645,15 +645,30 @@ cross.
     with FK gate green; plan-refusal battery; the full staged-join,
     fresh-join, and rollback families green over the unified build.
     The REAL old-image container gate is S7's cutover rehearsal
-- [ ] S6 — vote-time dissent marker: when a validator's own snapshot
+- [x] S6 — vote-time dissent marker: when a validator's own snapshot
       hash mismatches a deciding `regenesis_commit`, persist the
       dissent as a node-local marker at observation time; the boot
       transition parks a marked node at the boundary (GateFailed →
       rebuild-from-peers) instead of crossing with diverged state.
       Restores RFC-019's boundary self-healing under the copy path,
-      and is migration-proof where re-serialization cannot be. Flips
-      the `diverged_replica_crosses_until_dissent_marker` interim
-      test to expect the park.
+      and is migration-proof where re-serialization cannot be.
+  - `regenesis_dissent_at` in `consensus_meta`, written INSIDE the
+    decide transaction by the commit handler (the comparison never
+    fails the apply — decided is decided; only a database error can,
+    like the seal marker beside it). The asymmetry vs the seal
+    marker, recorded: dissent has NO derived-at-boot fallback —
+    derivation would be re-serialization, which dies at the first
+    format_version move; observation time is the only sound moment
+  - boot: the dissent gate runs ahead of the version gate (GateFailed
+    arms rebuild-from-peers; AwaitingUpgrade must never mask a
+    diverged replica); the staged join still crosses a marked node
+    (it runs before the sealed gates by design) and the epoch build's
+    consensus_meta prune clears the marker — asserted, load-bearing.
+    Belt: the fresh in-process join deletes the key explicitly
+  - the S4 interim test flipped to
+    `diverged_replica_parks_at_the_boundary`; apply-path units assert
+    marker-on-mismatch and no-marker-on-honest; the in-process
+    3-node seal asserts no healthy replica dissents
 - [ ] S7 — cutover release: baseline-adoption verification, the
       cutover rehearsal scenario, release choreography — then the live
       mesh crosses. (The section split itself landed at S1; the

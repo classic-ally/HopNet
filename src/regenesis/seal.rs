@@ -12,6 +12,14 @@ use crate::db::regenesis::RegenesisPhase;
 /// (consensus_meta sits outside the snapshot universe).
 pub const META_SEALED_AT: &str = "regenesis_sealed_at";
 
+/// consensus_meta key (RFC-020 S6): the terminal height at which this
+/// node observed its OWN artifact hash mismatching the deciding
+/// `regenesis_commit` — the diverged-but-outvoted case. Written inside
+/// the decide transaction at observation time; read by the boot
+/// transition, which parks a marked node for the rebuild-from-peers
+/// self-heal instead of letting it cross with diverged state.
+pub const META_DISSENT_AT: &str = "regenesis_dissent_at";
+
 /// The artifact next to the database (spec: Snapshot & Certificate).
 pub const SEAL_ARTIFACT_FILENAME: &str = "regenesis-snapshot.bin";
 
@@ -59,6 +67,21 @@ pub fn sealed_marker(conn: &rusqlite::Connection) -> Option<u64> {
          regenesis_state (the seal work did not finish; the boundary still stands)"
     );
     state.seal_height
+}
+
+/// Terminal height at which this node dissented from the deciding
+/// commit, if it did. Marker-only — deliberately NO derived fallback,
+/// unlike [`sealed_marker`]: deriving dissent at boot would mean
+/// re-serializing the sealed database and comparing to the committed
+/// hash, which stops being possible the moment a migration moves a
+/// section's format_version (the same reason RFC-020 S4 removed
+/// re-verification from the copy path). Observation time is the only
+/// sound moment, so the write lives inside the decide transaction.
+pub fn dissent_marker(conn: &rusqlite::Connection) -> Option<u64> {
+    let bytes = hopnet_consensus::store::meta_get(conn, META_DISSENT_AT).ok()??;
+    <[u8; 8]>::try_from(bytes.as_slice())
+        .ok()
+        .map(u64::from_be_bytes)
 }
 
 /// Where the artifact lives: the database file's parent directory.
