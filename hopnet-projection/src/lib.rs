@@ -453,6 +453,17 @@ pub trait Projection: Send + Sync {
         &[]
     }
 
+    // RFC-020 additions:
+
+    /// This projection's schema chain (RFC-020): the append-only
+    /// migration steps whose replay IS the module's schema. REQUIRED,
+    /// not defaulted — replay is the only installer, and a
+    /// defaulted-empty chain would let a projection silently install
+    /// nothing. The chain's module name must equal the snapshot
+    /// section's name, and its head ordinal the section's
+    /// `format_version` (both pinned by host registry tests).
+    fn chain(&self) -> &'static hopnet_common::Chain;
+
     // RFC-023 additions:
 
     /// Projection-wide default: the oldest client version code every

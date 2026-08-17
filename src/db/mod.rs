@@ -9,6 +9,7 @@ pub use {
 // Re-export CustomUUID from common module for backward compatibility
 pub use hopnet_common::CustomUUID;
 
+pub mod chains;
 pub mod consensus;
 pub mod debug;
 pub mod devices;

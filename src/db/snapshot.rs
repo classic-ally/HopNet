@@ -11,35 +11,44 @@ use hopnet_common::snapshot::{self, NodeStateReport, SectionSpec, TableSpec};
 
 use crate::db::DatabaseError;
 
-/// The host's own section: identity, membership inputs, telemetry, and
-/// device auth — everything consensus-replicated that no extracted crate
-/// owns. committed_tx_nonces is covered: rows are written and pruned only
-/// by consensus transactions, so honest nodes agree on it.
-pub const HOST_SECTION: SectionSpec = SectionSpec {
-    name: "host",
-    // v2: nodes gained the version-attestation columns (RFC-019 S3).
-    // v3: regenesis_state joined (RFC-019 S5) — divergence-checked,
-    //     never exported (epoch N+1 is born normal from the genesis
-    //     installer, the decided_blocks precedent).
-    format_version: 3,
+/// The identity module (RFC-020): who exists — users, nodes, device
+/// auth, and the id sequences behind them. Host-crate code, its own
+/// section: every other module FK-references these tables, which puts
+/// identity at the bottom of the module graph and first in manifest
+/// order.
+pub const IDENTITY_SECTION: SectionSpec = SectionSpec {
+    name: "identity",
+    // Born at 0 with the RFC-020 section split; the pre-split lineage
+    // ("host" v1-v3) is recorded by the cutover's one-time host@3
+    // import mapping, not by this number.
+    format_version: 0,
     tables: &[
         TableSpec::exported("sequences"),
         TableSpec::exported("users"),
         TableSpec::exported("nodes"),
-        TableSpec::exported("metrics"),
-        TableSpec::exported("fragment_request_metrics"),
         TableSpec::exported("device_tokens"),
-        TableSpec::exported("committed_tx_nonces"),
-        TableSpec {
-            name: "regenesis_state",
-            role: snapshot::TableRole::DivergenceOnly,
-            excluded_columns: &[],
-        },
     ],
 };
 
-/// Host-owned node-local tables — outside the snapshot universe entirely.
-pub const HOST_NODE_LOCAL_TABLES: &[&str] = &["this_node", "pending_fragment_requests"];
+/// The telemetry module (RFC-020): reliability observations about nodes.
+/// Host-crate code, its own section; leaf — nothing references it.
+pub const TELEMETRY_SECTION: SectionSpec = SectionSpec {
+    name: "telemetry",
+    // Born at 0 with the RFC-020 section split (see identity).
+    format_version: 0,
+    tables: &[
+        TableSpec::exported("metrics"),
+        TableSpec::exported("fragment_request_metrics"),
+    ],
+};
+
+/// Identity's node-local table — outside the snapshot universe entirely:
+/// this node's own key and settings singleton.
+pub const IDENTITY_NODE_LOCAL_TABLES: &[&str] = &["this_node"];
+
+/// Telemetry's node-local table — in-flight request tracking, per-node
+/// by construction.
+pub const TELEMETRY_NODE_LOCAL_TABLES: &[&str] = &["pending_fragment_requests"];
 
 /// All sections, in the install_schema walk order (= FK direction; the
 /// section order is therefore also a valid import insert order). The
@@ -50,7 +59,8 @@ pub const HOST_NODE_LOCAL_TABLES: &[&str] = &["this_node", "pending_fragment_req
 /// named unit = one SNAPSHOT_SECTION const + one line here.
 pub fn sections() -> Vec<&'static SectionSpec> {
     let mut sections: Vec<&'static SectionSpec> = vec![
-        &HOST_SECTION,
+        &IDENTITY_SECTION,
+        &TELEMETRY_SECTION,
         &hopnet_consensus::store::SNAPSHOT_SECTION,
         &hopnet_storage::store::SNAPSHOT_SECTION,
     ];
@@ -65,7 +75,8 @@ pub fn sections() -> Vec<&'static SectionSpec> {
 /// Union of every unit's node-local tables.
 pub fn node_local_tables() -> Vec<&'static str> {
     let mut tables = Vec::new();
-    tables.extend_from_slice(HOST_NODE_LOCAL_TABLES);
+    tables.extend_from_slice(IDENTITY_NODE_LOCAL_TABLES);
+    tables.extend_from_slice(TELEMETRY_NODE_LOCAL_TABLES);
     tables.extend_from_slice(hopnet_consensus::store::NODE_LOCAL_TABLES);
     tables.extend_from_slice(hopnet_storage::store::NODE_LOCAL_TABLES);
     for projection in crate::projections::manifests() {
@@ -251,6 +262,44 @@ mod tests {
         );
     }
 
+    // Impact: index and trigger ownership is implicit — an object
+    // belongs to its table's module (RFC-020) — so secondary DDL on an
+    // unclaimed table would silently escape both the divergence
+    // universe and the module chains.
+    // Should: attach every index, trigger, and view to a table the
+    // registry claims.
+    #[test]
+    fn secondary_ddl_attaches_to_claimed_tables() {
+        let pool = fresh_pool();
+        let conn = pool.get().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, tbl_name FROM sqlite_master \
+                 WHERE type IN ('index', 'trigger', 'view') \
+                 AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap();
+        let secondary: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!secondary.is_empty());
+
+        let mut claimed: HashSet<&'static str> = HashSet::new();
+        for section in sections() {
+            claimed.extend(section.tables.iter().map(|t| t.name));
+        }
+        claimed.extend(node_local_tables());
+
+        for (name, tbl_name) in secondary {
+            assert!(
+                claimed.contains(tbl_name.as_str()),
+                "{name} attaches to unclaimed table {tbl_name}"
+            );
+        }
+    }
+
     // Should: produce the pinned top hash and per-section hashes on a
     // freshly installed empty schema.
     // Impact: golden anchor for the whole assembly — any change to the
@@ -275,15 +324,19 @@ mod tests {
         assert_eq!(report.manifest.top_hash.to_hex(), EMPTY_TOP_HASH);
     }
 
-    const EMPTY_TOP_HASH: &str = "131ae3b061db3eb36dccb57b4272dc1ce137da50e1d8698ba0ae2d9fbe5137f5";
+    const EMPTY_TOP_HASH: &str = "b19855692e43ba13a91b3a92dcc8fa8fc99dc9f7df114541955001fbb164b351";
     const EMPTY_SECTION_HASHES: &[(&str, &str)] = &[
         (
-            "host",
-            "bd6624fc32983b3ae8f4ce149f34e291c281eefde17dde82b40ef0bb6cd2cc0c",
+            "identity",
+            "bdc36791213c84f1c5c191c10a66657ac58e0c0a76b10cab0ec82e36a67378f9",
+        ),
+        (
+            "telemetry",
+            "b4994290b2f8b7b813a66f541982c1f5ebc69c6c7a2d648442337709ee699079",
         ),
         (
             "consensus",
-            "3dd26220b0cf874b464ad2172c70a135204b75f22da4a02d31e482de660c2933",
+            "62d94827859d6760294d88f1e23528e2f7118808336bcb26a6ca458e6a50541b",
         ),
         (
             "storage",
@@ -323,10 +376,14 @@ mod tests {
     }
 
     const SEEDED_TOP_HASH: &str =
-        "d0f6c889a0f4d4b9c948fa4543bc493b3b63b4830f27ff02a10cdf30613c0ed8";
+        "caf9c201f6038ada0df30070aa8a1edc8c5010237c76d61a328948ddfc5e9bc5";
     const SEEDED_ARTIFACT_HASH: &str =
-        "102a43342034543420d6ef8164c0d81070d255faccedeb76ab7045d52d8d419f";
-    const SEEDED_ARTIFACT_LEN: usize = 5159;
+        "75d4e61f9ad3f62bcb2a6d11724f6769e3529bc0c46a68abc0209b4a0355ece1";
+    // 5159 pre-split + 25: the "host" section header (16 bytes) became
+    // identity (20) + telemetry (21) headers. Row bytes unchanged — the
+    // delta being exactly the header arithmetic is the cheap proof the
+    // RFC-020 S1 split moved no table content.
+    const SEEDED_ARTIFACT_LEN: usize = 5184;
 
     // Should: report identical manifests from the hash-only walk and the
     // full export, and byte-identical artifacts from two independently
@@ -400,7 +457,7 @@ mod tests {
             let tx = target.transaction().unwrap();
             let report = import_snapshot_tx(&tx, &artifact).unwrap();
             assert!(report.skipped.is_empty());
-            assert_eq!(report.imported.len(), 6);
+            assert_eq!(report.imported.len(), 7);
             tx.commit().unwrap();
         }
 
@@ -479,7 +536,7 @@ mod tests {
         let tx = target.transaction().unwrap();
         let report =
             hopnet_common::snapshot::import_snapshot(&tx, without_takeout, &artifact).unwrap();
-        assert_eq!(report.imported.len(), 5);
+        assert_eq!(report.imported.len(), 6);
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].name, "takeout");
         assert_eq!(

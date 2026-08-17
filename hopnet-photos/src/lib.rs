@@ -72,6 +72,10 @@ impl Projection for PhotosProjection {
         Some(&db::SNAPSHOT_SECTION)
     }
 
+    fn chain(&self) -> &'static hopnet_common::Chain {
+        &db::CHAIN
+    }
+
     /// Blob ids committed by this projection's transactions — the host
     /// feeds them to the storage engine's distribution kick. Without this
     /// override, photo fragments would never replicate beyond the upload

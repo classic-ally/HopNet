@@ -127,7 +127,7 @@ inside the boot transition, before the node is live.
          ├─ takeout     (→ users)
          └─ storage     (→ nodes)
               ├─ drive    (→ users, data_blocks)
-              └─ photos   (→ users, data_blocks)
+              └─ photos   (→ users, data_blocks, device_tokens)
 
   - **runtime read paths are not graph edges**: takeout materializes
     drive and photos data through their own `ProjectionExporter`
@@ -198,6 +198,12 @@ inside the boot transition, before the node is live.
      manifest order — always already fast-forwarded when it runs.
      Multi-module changes are one step per module, coordinated by
      manifest order, never by a shared ordinal.
+     - known tension, tolerated: `this_node` (identity's node-local
+       singleton) carries storage- and upgrade-owned settings
+       columns. Live code may keep reading them across modules, but
+       adding such a column via a step is identity's to do — another
+       module wanting one requests an identity step, or the columns
+       eventually migrate to a module-local table.
 - **Out of contract, refused by CI.** Serialization-config changes to
   a released table (`excluded_columns`, table role) and `DROP TABLE`
   are not yet supported — the chain records schema history, and the
@@ -339,22 +345,24 @@ as part of this RFC:
   reference becomes a generated, checked-in schema snapshot, kept for
   readability and CI-verified thereafter.
 - **Baseline ordinals adopt the existing numbering.** Sections
-  already carry `format_version`s (all at 1, host at 3, its v2/v3
-  history living only in code comments) — the field has been an
-  ordinal without a chain all along. Each surviving section's
-  baseline starts at its current value, so a cutover-epoch artifact
-  needs no number translation; the baseline file takes the ordinal as
-  its number (`drive/0001_init.sql`). The new `identity` and
-  `telemetry` sections start at 0 — their lineage from `host@3` is
-  recorded by the one-time mapping, not by fake numbering.
-- **The host section splits at the same moment.** `identity` and
-  `telemetry` become their own sections (Module Boundaries); a
-  one-time import mapping — artifact section `host@3` feeds the two
-  new baselines, each table routed to its new owner — serves joiners
-  whose artifact was sealed pre-split. The upgrade path never notices
-  (no import), and the mapping retires naturally: the first
-  post-cutover seal writes the new sections, so it only ever fires
-  for artifacts of exactly the cutover boundary.
+  already carry `format_version`s — the field has been an ordinal
+  without a chain all along. Each surviving section's baseline starts
+  at its current value, so a cutover-epoch artifact needs no number
+  translation; the baseline file takes the ordinal as its number
+  (`drive/0001_init.sql`, and `consensus/0002_init.sql` after its S1
+  covered-set move bumped it 1→2). The new `identity` and `telemetry`
+  sections start at 0 — their lineage from `host@3` is recorded by
+  the one-time mapping, not by fake numbering.
+- **The host section split reaches the mesh at this crossing.** The
+  registry split landed at S1 (branch-internal); the cutover boundary
+  is where a live mesh first observes it. A one-time import mapping —
+  artifact section `host@3` feeds the `identity` and `telemetry`
+  baselines, with `committed_tx_nonces` routed to `consensus`, each
+  table to its new owner — serves joiners whose artifact was sealed
+  pre-split. The upgrade path never notices (no import), and the
+  mapping retires naturally: the first post-cutover seal writes the
+  new sections, so it only ever fires for artifacts of exactly the
+  cutover boundary.
 - **Existing databases are stamped, not migrated.** Their shape IS
   the baseline by construction; the transition writes the ordinal
   stamp table, validates the schema fingerprint, and runs zero steps.
@@ -464,10 +472,36 @@ release that follows the merge IS the cutover release, so no
 intermediate release ever ships a section change the live mesh cannot
 cross.
 
-- [ ] S1 — chain machinery + parity: `migrations/` folders (generated
+- [x] S1 — chain machinery + parity: `migrations/` folders (generated
       baselines only), compile-time embedding, the replay primitive,
       and the parity gate proving replay ≡ `initialize`. Both regimes
-      coexist; zero behavior change.
+      coexist.
+  - landed with two recorded deviations, both decided at planning:
+    - the SECTION SPLIT moved forward from S6: `host` dissolved into
+      `identity`@0 + `telemetry`@0 at S1, so chains and sections never
+      disagree on module names during S1–S5. S6 keeps only cutover
+      mechanics. Registry goldens re-pinned at S1 (the seeded artifact
+      length delta is exactly the section-header arithmetic, +25 —
+      the cheap proof no table content moved)
+    - `committed_tx_nonces` and `regenesis_state` moved to the
+      CONSENSUS module: both FK-isolated and written only by consensus
+      machinery; consensus `format_version` 1→2, baseline
+      `0002_init.sql`. Section ownership only — their DDL stays in the
+      host-generated consensus baseline; a module is a
+      schema-ownership unit, not a crate
+  - runner in `hopnet-common::chain`: caller-owned transaction,
+    per-step SAVEPOINTs (a failing step reports module+ordinal with
+    its partial effects undone); chains registered via a required
+    `Projection::chain()` plus the host `db::chains` assembler
+    mirroring `sections()`; explicit `include_str!` step arrays
+  - baselines generated from `initialize` by a one-time bin, frozen,
+    generator deleted in the same stage. SQLite strips `IF NOT
+    EXISTS` from `sqlite_master` text, so dump-to-dump parity is
+    exact by construction — the consensus installer's idempotent DDL
+    needed no normalization
+  - gates: byte-exact `sqlite_master` parity (replay ≡ initialize),
+    chains≡sections mirror (names, order, head == format_version),
+    classified-at-birth extended to indexes/triggers/views
 - [ ] S2 — installer swap: fresh install and mesh creation run on
       replay; `initialize` deleted; the generated schema snapshot
       checked in and the parity gate retargeted to it.
@@ -482,9 +516,10 @@ cross.
       checkpoint splice, both joiner variants; the
       older-shaped-artifact orchestrator gate (fixture artifacts at
       back ordinals).
-- [ ] S6 — the split + cutover release: `identity`/`telemetry`
-      sections and baselines, the `host@3` one-time mapping, the
-      cutover rehearsal scenario — then the live mesh crosses.
+- [ ] S6 — cutover release: baseline-adoption verification, the
+      cutover rehearsal scenario, release choreography — then the live
+      mesh crosses. (The section split itself landed at S1; the
+      `host@3` mapping lands with S5's join fixtures.)
 
 ## Open Questions
 

@@ -461,7 +461,7 @@ mod tests {
                 artifact_version: 1,
                 top_hash: Blake3Hash::from_bytes([seed; 32]),
                 sections: vec![SectionManifest {
-                    name: "host".to_string(),
+                    name: "identity".to_string(),
                     format_version: 1,
                     section_hash: Blake3Hash::from_bytes([seed; 32]),
                     tables: tables

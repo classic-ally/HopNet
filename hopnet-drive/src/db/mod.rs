@@ -30,6 +30,18 @@ pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionS
 /// Node-local tables — outside the snapshot universe entirely.
 pub const NODE_LOCAL_TABLES: &[&str] = &["modification_log"];
 
+/// This module's schema chain (RFC-020): replay is the only installer.
+/// Head ordinal == SNAPSHOT_SECTION.format_version, pinned by host
+/// registry tests.
+pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
+    module: "drive",
+    steps: &[hopnet_common::Step::sql(
+        1,
+        "init",
+        include_str!("../../migrations/drive/0001_init.sql"),
+    )],
+};
+
 /// Current decided consensus height — the projection layer's canonical
 /// reader (RFC-017 Stage 3; this crate's verbatim SQL copy died with it,
 /// same 0-pre-genesis / RecallError semantics).

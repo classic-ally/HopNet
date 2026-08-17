@@ -1,4 +1,5 @@
 // HopNet Common Types Library
+pub mod chain;
 pub mod compat;
 pub mod db;
 pub mod devices;
@@ -22,6 +23,7 @@ pub mod views;
 pub mod db_impl;
 
 // Re-export commonly used types at the top level
+pub use chain::{Chain, Step, StepKind};
 pub use db::{
     CustomUUID, FileItem, ImportPathCounts, ImportPathRow, ImportPathStatus, ImportRecord,
     ImportStatus, InodeType, TakeoutRecord, TakeoutStatus,

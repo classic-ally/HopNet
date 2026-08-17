@@ -198,6 +198,18 @@ pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionS
 /// Node-local tables — outside the snapshot universe entirely.
 pub const NODE_LOCAL_TABLES: &[&str] = &["hopnet_storage_pins"];
 
+/// This module's schema chain (RFC-020): replay is the only installer.
+/// Head ordinal == SNAPSHOT_SECTION.format_version, pinned by host
+/// registry tests.
+pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
+    module: "storage",
+    steps: &[hopnet_common::Step::sql(
+        1,
+        "init",
+        include_str!("../migrations/storage/0001_init.sql"),
+    )],
+};
+
 /// Seed/overwrite mesh policy rows (genesis apply; later a settings tx).
 pub fn apply_policy_rows(
     db_tx: &rusqlite::Transaction,

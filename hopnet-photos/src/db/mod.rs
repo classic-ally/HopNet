@@ -73,6 +73,18 @@ pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionS
     ],
 };
 
+/// This module's schema chain (RFC-020): replay is the only installer.
+/// Head ordinal == SNAPSHOT_SECTION.format_version, pinned by host
+/// registry tests.
+pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
+    module: "photos",
+    steps: &[hopnet_common::Step::sql(
+        1,
+        "init",
+        include_str!("../../migrations/photos/0001_init.sql"),
+    )],
+};
+
 pub mod libraries;
 pub mod photos;
 

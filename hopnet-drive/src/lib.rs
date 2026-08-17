@@ -46,6 +46,10 @@ impl hopnet_projection::Projection for DriveProjection {
         Some(&db::SNAPSHOT_SECTION)
     }
 
+    fn chain(&self) -> &'static hopnet_common::Chain {
+        &db::CHAIN
+    }
+
     fn node_local_tables(&self) -> &'static [&'static str] {
         db::NODE_LOCAL_TABLES
     }

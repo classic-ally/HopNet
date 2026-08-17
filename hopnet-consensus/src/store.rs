@@ -167,12 +167,27 @@ pub fn install_schema(conn: &Connection) -> Result<(), StoreError> {
 /// across a boundary (DivergenceOnly).
 pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionSpec {
     name: "consensus",
-    format_version: 1,
+    // v2: committed_tx_nonces and regenesis_state moved in from the
+    // dissolved "host" section (RFC-020 S1 split) — both FK-isolated
+    // and written only by consensus machinery. Their DDL stays in the
+    // host crate's consensus baseline: a module is a schema-ownership
+    // unit, not a crate, and this crate never learns the app's
+    // transaction envelope.
+    format_version: 2,
     tables: &[
         hopnet_common::TableSpec::exported("validators"),
         hopnet_common::TableSpec::exported("hopnet_consensus_policy"),
+        hopnet_common::TableSpec::exported("committed_tx_nonces"),
         hopnet_common::TableSpec {
             name: "decided_blocks",
+            role: hopnet_common::TableRole::DivergenceOnly,
+            excluded_columns: &[],
+        },
+        // regenesis_state: divergence-checked, never exported — the
+        // next epoch is born Normal from the genesis installer
+        // (decided_blocks precedent, RFC-019 S5).
+        hopnet_common::TableSpec {
+            name: "regenesis_state",
             role: hopnet_common::TableRole::DivergenceOnly,
             excluded_columns: &[],
         },
