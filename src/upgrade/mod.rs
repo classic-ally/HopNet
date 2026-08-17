@@ -9,6 +9,7 @@
 pub mod git_release;
 pub mod handlers;
 pub mod jobs;
+pub mod macos_app;
 pub mod nix_provider;
 pub mod routes;
 
@@ -30,6 +31,60 @@ pub struct NodeStagedVersion {
     pub running_code: u32,
     pub staged_code: Option<u32>,
     pub attested_height: u64,
+}
+
+/// The deployment's activation contract, resolved from env per use site
+/// (the provider itself is never stored — mod.rs invariant). One enum
+/// rather than a trait: activation must stay synchronously callable from
+/// the seal-work thread and the pre-pool boot path, and there are exactly
+/// as many arms as deployment classes with a wrapper (RFC-021 nix,
+/// RFC-026 macos-app). Report-only deployments resolve to None and keep
+/// the git-release baseline.
+#[derive(Debug, Clone)]
+pub enum ActivationEnv {
+    Nix(nix_provider::NixEnv),
+    MacApp(macos_app::MacEnv),
+}
+
+impl ActivationEnv {
+    pub fn from_env() -> Option<Self> {
+        match std::env::var("HOPNET_UPGRADE_PROVIDER").ok().as_deref() {
+            Some("nix") => nix_provider::NixEnv::from_env().map(Self::Nix),
+            Some("macos-app") => macos_app::MacEnv::from_env().map(Self::MacApp),
+            _ => None,
+        }
+    }
+
+    pub fn provider_name(&self) -> &'static str {
+        match self {
+            Self::Nix(_) => "nix",
+            Self::MacApp(_) => "macos-app",
+        }
+    }
+
+    pub fn auto_stage(&self) -> bool {
+        match self {
+            Self::Nix(env) => env.auto_stage,
+            Self::MacApp(env) => env.auto_stage,
+        }
+    }
+
+    pub fn auto_activate(&self) -> bool {
+        match self {
+            Self::Nix(env) => env.auto_activate,
+            Self::MacApp(env) => env.auto_activate,
+        }
+    }
+
+    /// One activation attempt for the quorum-decided target. Sync on
+    /// purpose; the contract (verify staged bytes, crash-loop guard,
+    /// atomic flip, park-on-Err by the caller) is identical per arm.
+    pub fn try_activate(&self, required_code: u32) -> Result<(), String> {
+        match self {
+            Self::Nix(env) => nix_provider::try_activate_with(env, required_code),
+            Self::MacApp(env) => macos_app::try_activate_with(env, required_code),
+        }
+    }
 }
 
 /// The upgrade-provider seam (RFC-019): "readiness is deployment-

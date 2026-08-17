@@ -393,6 +393,14 @@
         default = hopnet-mount;
       };
 
+      # HopNet.app as a supervised launchd node (RFC-026 S2): the same
+      # profile indirection in launchd vocabulary, seeded from the
+      # signed-artifact package.
+      darwinModules = rec {
+        hopnet-desktop = import ./nix/hopnet-desktop-module.nix { inherit self; };
+        default = hopnet-desktop;
+      };
+
       # RFC-021 / RFC-024 end-to-end VM tests. Heavy (each builds a
       # second hopnet or hopnet-mount generation and boots VMs) — run
       # on demand:

@@ -10,15 +10,15 @@ use hopnet_common::views::{
 use crate::db::versions::MeshNodeVersions;
 use crate::upgrade::ProviderStatus;
 
-/// This deployment's boundary capabilities (RFC-021): resolved from the
-/// module-set env contract, so the operator learns "this node will park"
-/// from the advisory, not from a parked mesh.
+/// This deployment's boundary capabilities (RFC-021/RFC-026): resolved
+/// from the module-set env contract, so the operator learns "this node
+/// will park" from the advisory, not from a parked mesh.
 fn activation_view() -> ActivationView {
-    match crate::upgrade::nix_provider::NixEnv::from_env() {
+    match crate::upgrade::ActivationEnv::from_env() {
         Some(env) => ActivationView {
-            provider: "nix".into(),
-            can_stage: env.auto_stage,
-            auto_activate: env.auto_activate,
+            provider: env.provider_name().into(),
+            can_stage: env.auto_stage(),
+            auto_activate: env.auto_activate(),
         },
         None => ActivationView {
             provider: "git-release".into(),

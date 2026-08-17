@@ -23,6 +23,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: macOS version stamp check
+        # RFC-026 S1: catches a CalVer bump that forgot the daemon plist
+        # before a v* tag ever exists (grep-based, platform-independent).
+        run: bash scripts/macos/version.sh --check
+
       - name: Cache cargo registry + workspace target/
         # Full URL keeps the action source explicit and bypasses the default
         # data.forgejo.org lookup (which only mirrors actions/*).

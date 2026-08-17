@@ -114,8 +114,8 @@ pub fn run_seal_work(app_state: &AppState, seal_height: u64) {
             "sealed at the target version: requesting process restart"
         );
         app_state.restart_signal.notify_one();
-    } else if crate::upgrade::nix_provider::NixEnv::from_env().is_some_and(|env| {
-        match crate::upgrade::nix_provider::try_activate_with(&env, target) {
+    } else if crate::upgrade::ActivationEnv::from_env().is_some_and(|env| {
+        match env.try_activate(target) {
             Ok(()) => true,
             Err(reason) => {
                 tracing::warn!(%reason, "staged-generation activation failed; parking");
@@ -123,8 +123,9 @@ pub fn run_seal_work(app_state: &AppState, seal_height: u64) {
             }
         }
     }) {
-        // RFC-021: the staged generation for the target is now behind the
-        // profile — the same restart the == arm requests re-execs into it.
+        // RFC-021/026: the staged generation for the target is now behind
+        // the profile — the same restart the == arm requests re-execs into
+        // it.
         tracing::info!(
             version = %crate::version::format_code(target),
             "sealed and activated the staged generation: requesting process restart"

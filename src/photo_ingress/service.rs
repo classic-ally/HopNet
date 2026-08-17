@@ -8,7 +8,7 @@
 //! All three calls are XPC-backed and may block — handlers call them via
 //! `spawn_blocking`.
 
-use objc2_foundation::NSString;
+use objc2_foundation::{NSBundle, NSString};
 use objc2_service_management::SMAppService;
 use tracing::info;
 
@@ -39,6 +39,25 @@ fn map_status(raw: objc2_service_management::SMAppServiceStatus) -> AgentRegistr
 
 pub fn agent_status() -> AgentRegistration {
     map_status(unsafe { agent().status() })
+}
+
+/// The running app bundle's RESOLVED filesystem path, or None when not
+/// launched from a bundle (dev `cargo run`). SMAppService pins the agent to
+/// the resolved path at registration time — verified empirically: flipping
+/// the module's profile symlink does not move the daemon — so the resolved
+/// path is the identity that goes stale and the one the bundle-move healer
+/// must compare. Canonicalizing is what lets the healer see through the
+/// profile symlink the module launches us through (NSBundle reports the
+/// symlink path, which never changes across flips).
+pub fn current_bundle_path() -> Option<String> {
+    let bundle = NSBundle::mainBundle();
+    let raw = unsafe { bundle.bundlePath() }.to_string();
+    let path = std::fs::canonicalize(&raw)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(raw);
+    // A bare binary's "bundle path" is its parent directory; only a real
+    // .app bundle counts as an identity worth tracking.
+    path.ends_with(".app").then_some(path)
 }
 
 /// Register the bundled agent. Already-Enabled is a no-op (re-register

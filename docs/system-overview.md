@@ -571,6 +571,36 @@ Cross-platform desktop application providing file management and network adminis
       exit 75 into the new binary and pinning the held-state
       no-restart-loop, via the test-mode `HOPNET_MIN_CLIENT_OVERRIDE`
       gate seam)
+- [~] macOS app as a first-class node
+      ([RFC-026](specs/macos-app-node.md), Draft 2026-08-17):
+      certified-artifact staging + launchd supervision for the signed
+      app bundle — discharges RFC-021's deferred deployment class. S1
+      shipped 2026-08-17 (version identity through the bundle: the
+      workspace CalVer reaches `tauri.conf.json` via the Tauri
+      crate-version fallback, both Info.plists via
+      `scripts/macos/version.sh` check/write, and the zip name; the
+      release workflow gates tag == version). S2 shipped 2026-08-17:
+      `darwinModules.hopnet-desktop` (launchd user agent through the
+      RFC-021 profile indirection, newest-wins seed wrapper, exit-75
+      restarts via `SuccessfulExit = false`) plus three product fixes —
+      tray-only `HOPNET_AUTOSTART` launches, a data-dir instance flock
+      (loser exits 0, so a supervised agent never restart-loops against
+      a Finder-launched copy), and a startup SMAppService healer that
+      re-registers the ingress agent after a bundle move. Discovered en
+      route: releases v2026.8.1–v2026.8.4 all carry zero assets (the
+      u64-heights Swift breakage failed every CalVer release build), so
+      the `hopnet-desktop` pin bump waits on the next release. S3
+      implemented 2026-08-17 (e2e crossing pending): the `macos-app`
+      provider stages the CI-certified artifact (asset-attached
+      availability, sha256 sidecar + codesign + staple + honest-bytes
+      verification, provenance last) and activates via the RFC-021
+      profile flip; `ActivationEnv` generalizes the tick/boot/seal/view
+      seams over both wrapper classes; activation unattended by default
+      (tray-only relaunch). S3 e2e crossed 2026-08-17 on the macbook
+      (isolated fake feed + one-node scratch mesh): one tick staged the
+      certified 2026.8.99 artifact, regenesis_start → seal → unattended
+      flip → exit 75 → epoch 2 decided on the new bundle, 3.4 s seal-to-
+      cross; crash-loop probe clean. Remaining: S4 pin-bump automation.
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
       Network Resilience pane reports margins to the model-checked invariants rather than
