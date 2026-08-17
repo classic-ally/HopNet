@@ -52,7 +52,9 @@ impl MacEnv {
         let profile = std::env::var_os("HOPNET_UPGRADE_PROFILE").map(PathBuf::from);
         let stage_dir = std::env::var_os("HOPNET_UPGRADE_STAGE_DIR").map(PathBuf::from);
         let (Some(profile), Some(stage_dir)) = (profile, stage_dir) else {
-            warn!("HOPNET_UPGRADE_PROVIDER=macos-app but PROFILE/STAGE_DIR incomplete — provider disabled");
+            warn!(
+                "HOPNET_UPGRADE_PROVIDER=macos-app but PROFILE/STAGE_DIR incomplete — provider disabled"
+            );
             return None;
         };
         let knob = |key: &str| std::env::var(key).map(|v| v != "0").unwrap_or(true);
@@ -430,7 +432,11 @@ pub(crate) mod tests {
             auto_activate: true,
             codesign_bin: write_tool(dir, "fake-codesign", "exit 0"),
             xcrun_bin: write_tool(dir, "fake-xcrun", "exit 0"),
-            ditto_bin: write_tool(dir, "fake-ditto", r#"mkdir -p "$4" && tar -xf "$3" -C "$4""#),
+            ditto_bin: write_tool(
+                dir,
+                "fake-ditto",
+                r#"mkdir -p "$4" && tar -xf "$3" -C "$4""#,
+            ),
         }
     }
 
@@ -520,9 +526,10 @@ pub(crate) mod tests {
         block_on(provider(&env).finish_stage("2026.9.1", &artifact, "https://x/zip", "cafe"))
             .unwrap();
 
-        let prov: Provenance =
-            serde_json::from_str(&std::fs::read_to_string(env.provenance_path("2026.9.1")).unwrap())
-                .unwrap();
+        let prov: Provenance = serde_json::from_str(
+            &std::fs::read_to_string(env.provenance_path("2026.9.1")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(prov.version, "2026.9.1");
         assert_eq!(prov.asset_sha256, "cafe");
         assert!(!artifact.exists(), "archive deleted after staging");
@@ -539,8 +546,8 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&env.stage_dir).unwrap();
         let artifact = make_artifact(dir.path(), "2026.1.1");
 
-        let err = block_on(provider(&env).finish_stage("2026.9.1", &artifact, "u", "s"))
-            .unwrap_err();
+        let err =
+            block_on(provider(&env).finish_stage("2026.9.1", &artifact, "u", "s")).unwrap_err();
         assert!(matches!(err, ProviderError::Permanent(_)), "{err}");
         assert!(!env.provenance_path("2026.9.1").exists());
         assert!(verify_staged(&env, "2026.9.1").is_err());
@@ -557,8 +564,8 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&env.stage_dir).unwrap();
         let artifact = make_artifact(dir.path(), "2026.9.1");
 
-        let err = block_on(provider(&env).finish_stage("2026.9.1", &artifact, "u", "s"))
-            .unwrap_err();
+        let err =
+            block_on(provider(&env).finish_stage("2026.9.1", &artifact, "u", "s")).unwrap_err();
         assert!(matches!(err, ProviderError::Permanent(_)), "{err}");
         assert!(!env.provenance_path("2026.9.1").exists());
     }
