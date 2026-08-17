@@ -21,7 +21,10 @@ pub const IDENTITY_SECTION: SectionSpec = SectionSpec {
     // Born at 0 with the RFC-020 section split; the pre-split lineage
     // ("host" v1-v3) is recorded by the cutover's one-time host@3
     // import mapping, not by this number.
-    format_version: 0,
+    // v1: schema_ordinals joined (RFC-020 S3, step 0001) — node-local,
+    //     so the wire shape is unchanged; the bump is the ordinal
+    //     tracking chain position (ordinal IS format_version).
+    format_version: 1,
     tables: &[
         TableSpec::exported("sequences"),
         TableSpec::exported("users"),
@@ -42,9 +45,11 @@ pub const TELEMETRY_SECTION: SectionSpec = SectionSpec {
     ],
 };
 
-/// Identity's node-local table — outside the snapshot universe entirely:
-/// this node's own key and settings singleton.
-pub const IDENTITY_NODE_LOCAL_TABLES: &[&str] = &["this_node"];
+/// Identity's node-local tables — outside the snapshot universe
+/// entirely: this node's own key/settings singleton, and the ordinal
+/// stamp describing THIS FILE's chain position (RFC-020 S3; never
+/// consensus state, never carried across an epoch boundary).
+pub const IDENTITY_NODE_LOCAL_TABLES: &[&str] = &["this_node", "schema_ordinals"];
 
 /// Telemetry's node-local table — in-flight request tracking, per-node
 /// by construction.
@@ -324,11 +329,11 @@ mod tests {
         assert_eq!(report.manifest.top_hash.to_hex(), EMPTY_TOP_HASH);
     }
 
-    const EMPTY_TOP_HASH: &str = "b19855692e43ba13a91b3a92dcc8fa8fc99dc9f7df114541955001fbb164b351";
+    const EMPTY_TOP_HASH: &str = "975747a4e1c8931bfda722c9c3a2ae85831afc7da75454f6238e0e290f417c1b";
     const EMPTY_SECTION_HASHES: &[(&str, &str)] = &[
         (
             "identity",
-            "bdc36791213c84f1c5c191c10a66657ac58e0c0a76b10cab0ec82e36a67378f9",
+            "e2ba132a65c3c66a588ff5b917ba0248a853fe317a85cd5ec40fad771ce35356",
         ),
         (
             "telemetry",
@@ -376,9 +381,9 @@ mod tests {
     }
 
     const SEEDED_TOP_HASH: &str =
-        "caf9c201f6038ada0df30070aa8a1edc8c5010237c76d61a328948ddfc5e9bc5";
+        "74522360a2649b453f28d94091043f0e769336f7b044f88935dbae33d824d67e";
     const SEEDED_ARTIFACT_HASH: &str =
-        "75d4e61f9ad3f62bcb2a6d11724f6769e3529bc0c46a68abc0209b4a0355ece1";
+        "5e60c9ccb76178709b0b76dac430c963051931af336aa05e7632c7b5741d0fa8";
     // 5159 pre-split + 25: the "host" section header (16 bytes) became
     // identity (20) + telemetry (21) headers. Row bytes unchanged — the
     // delta being exactly the header arithmetic is the cheap proof the

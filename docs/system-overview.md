@@ -148,13 +148,16 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     evolution via per-module append-only migration chains — replay is
     the only installer, epoch boundaries fast-forward, and a one-time
     cutover exits the `initialize` regime. Ships as one PR (S1–S6
-    staged), merged only when the cutover slice is ready. S1–S2
+    staged), merged only when the cutover slice is ready. S1–S3
     complete on the working branch: `hopnet-common::chain` runner, the
-    identity/telemetry section split (pulled forward from S6, goldens
-    re-pinned), frozen per-module baselines, byte-exact parity gates —
-    and replay is now the ONLY installer (`initialize` and the
-    per-crate installer batches deleted; `migrations/schema.sql` is
-    the generated readable rendering); S3–S6 pending.
+    identity/telemetry section split (pulled forward from S6), frozen
+    per-module baselines, replay as the ONLY installer (`initialize`
+    deleted; `migrations/schema.sql` is the generated readable
+    rendering), the `schema_ordinals` stamp born as the chain's first
+    real step, boot fast-forward + fingerprint validation with the
+    legacy adopt-at-baseline path S6 will reuse, and the release-tag
+    tripwires (`scripts/check-chains.sh` in check-linux.yml);
+    S4–S6 pending.
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

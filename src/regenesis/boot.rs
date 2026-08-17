@@ -817,9 +817,13 @@ fn build_next(
     // NODE-LOCAL CARRY: whole tables owned by this node — everything in
     // the node-local universe except the consensus trio (WAL and
     // certificates die with the epoch; consensus_meta is written fresh
-    // below so the new epoch never inherits the sealed marker).
+    // below so the new epoch never inherits the sealed marker) and the
+    // ordinal stamp (RFC-020 S3: the next epoch's file was built by
+    // THIS binary's install(), which already stamped it at head — a
+    // carried old stamp would collide on PK and lie about the file).
     for table in crate::db::snapshot::node_local_tables() {
-        if hopnet_consensus::store::NODE_LOCAL_TABLES.contains(&table) {
+        if hopnet_consensus::store::NODE_LOCAL_TABLES.contains(&table) || table == "schema_ordinals"
+        {
             continue;
         }
         tx.execute(

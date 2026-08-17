@@ -75,6 +75,11 @@ CREATE TABLE device_tokens (
 
 CREATE INDEX idx_device_tokens_user_id ON device_tokens(user_id);
 
+CREATE TABLE schema_ordinals (
+    module          TEXT PRIMARY KEY,   -- == snapshot section name
+    ordinal         INTEGER NOT NULL    -- a real position of that module's chain
+);
+
 CREATE TABLE metrics (
                 from_node       INTEGER NOT NULL,
                 to_node         INTEGER NOT NULL,

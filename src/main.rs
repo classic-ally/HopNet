@@ -235,6 +235,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Set by a boundary gate refusal below; consumed once comms exist.
     let mut rebuild_from_peers = false;
+    // RFC-020 S3: a parked node keeps its sealed old-epoch database at
+    // the OLD ordinals by construction — schema validation must not
+    // install, fast-forward, or refuse over it.
+    let mut schema_parked = false;
     let pool = {
         // One code path for durable and disposable nodes alike — an ephemeral
         // node is a real SQLite file inside a throwaway directory, not a
@@ -275,6 +279,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!(?reason, "epoch boundary parked — engine will not start");
                 rebuild_from_peers =
                     matches!(reason, regenesis::boot::ParkReason::GateFailed { .. });
+                schema_parked = true;
             }
             regenesis::boot::BootOutcome::RestartIntoStaged { required } => {
                 // RFC-021: the nix provider flipped the profile to the
@@ -312,20 +317,36 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Check if database schema is initialized. An ephemeral node needs no
     // special case: its directory is new, so this is false on its own.
-    let conn = pool.get().unwrap();
+    let mut conn = pool.get().unwrap();
 
-    let schema_initialized =
-        db::shared::is_schema_initialized(&conn).expect("Failed to check schema status");
-
-    let init_result = if schema_initialized {
-        tracing::info!("Loading existing database schema");
+    // RFC-020 S3 boot dispatch: Fresh → install; Stamped →
+    // fast-forward (validates stamps + fingerprint); LegacyUnstamped →
+    // adopt at baseline iff the fingerprint agrees, then fast-forward.
+    // Errors PROPAGATE — a corrupt database must never read as fresh.
+    let init_result: Result<(), db::chains::SchemaError> = if schema_parked {
+        tracing::warn!("schema validation skipped: parked at an epoch boundary");
         Ok(())
     } else {
-        tracing::info!("Installing new database schema (chain replay)");
-        db::chains::install(&conn).map_err(|e| match e {
-            hopnet_common::chain::ChainError::Step { source, .. } => source,
-            other => rusqlite::Error::InvalidParameterName(other.to_string()),
-        })
+        db::chains::assess(&conn)
+            .map_err(db::chains::SchemaError::Db)
+            .and_then(|state| match state {
+                db::chains::SchemaState::Fresh => {
+                    tracing::info!("Installing new database schema (chain replay)");
+                    db::chains::install(&conn)
+                }
+                db::chains::SchemaState::Stamped => Ok(()),
+                db::chains::SchemaState::LegacyUnstamped => {
+                    tracing::info!("pre-stamp database: adopting at baseline (RFC-020 S3)");
+                    db::chains::adopt_legacy(&conn)
+                }
+            })
+            .and_then(|()| {
+                let applied = db::chains::fast_forward(&mut conn)?;
+                if applied > 0 {
+                    tracing::info!(applied, "schema fast-forwarded to head");
+                }
+                Ok(())
+            })
     };
 
     match init_result {

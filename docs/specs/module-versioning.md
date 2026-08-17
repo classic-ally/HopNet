@@ -305,13 +305,15 @@ inside the boot transition, before the node is live.
 
 ## Version Surfaces
 
-- **In the database: a node-local ordinal stamp.** A small meta table
-  records each module's current ordinal — the fast-forward's
-  validation input. Module names are section names: the registry
+- **In the database: a node-local ordinal stamp.** `schema_ordinals`
+  (`module TEXT PRIMARY KEY, ordinal INTEGER NOT NULL`) records each
+  module's current ordinal — the fast-forward's validation input.
+  Module names are section names: the registry
   (`src/db/snapshot.rs::sections()`) is the sole enumerator, and the
   stamp is validated against it at boot. Node-local role: the
   artifact carries its own ordinal record (the manifest), and the
-  stamp describes *this file*, not consensus state.
+  stamp describes *this file*, not consensus state — it is never
+  carried across an epoch boundary.
 - **In the snapshot artifact: inline, per section.** The artifact —
   the serialized snapshot file written at seal and fetched by joiners
   (RFC-019) — labels each section it contains with the module name
@@ -525,9 +527,43 @@ cross.
     named in the parity gate's failure message
   - `is_schema_initialized` survives unchanged (probes `this_node`);
     the S3 ordinal stamp replaces it
-- [ ] S3 — ordinal stamp + fast-forward + the CI suite: stamp table,
+- [x] S3 — ordinal stamp + fast-forward + the CI suite: stamp table,
       fingerprint validation, the release-tag tripwires, the
       golden-fixture harness.
+  - the stamp is the chain's FIRST real step: `identity/0001` creates
+    `schema_ordinals (module TEXT PRIMARY KEY, ordinal INTEGER NOT
+    NULL)` — node-local under identity, identity fv 0→1 (wire shape
+    unchanged; the ordinal tracks chain position). Dogfoods the whole
+    mechanism at once: a frozen step, golden re-pins, the first
+    fast-forward, the first per-step fixture
+  - boot dispatch: Fresh → install (stamped from birth; the follow-up
+    no-op fast-forward doubles as a free fingerprint audit); Stamped →
+    validate stamps + fast-forward in ONE instrumented transaction,
+    final fingerprint vs a fresh replay-to-head, mismatch fatal-loud;
+    LegacyUnstamped → adopt iff the fingerprint equals the
+    all-baselines shape — sound because stamps exist from S3 onward,
+    so a stampless database is by construction at baselines; this IS
+    §Cutover's "stamped, not migrated" path, built early for S6.
+    PARKED boots skip validation with a structured warn (a sealed
+    old-epoch database at old ordinals is expected; the rebuild path
+    stays reachable). `is_schema_initialized`'s blanket
+    error-means-fresh died with the old dispatch
+  - epoch carry: `schema_ordinals` joins the `build_next` skip list —
+    the next epoch's file is stamped at head by install(); a carried
+    stamp would collide and lie about the file
+  - tripwires: in-process (+1 contiguity; migrations folders ↔ chain
+    consts, both directions) and `scripts/check-chains.sh` as an
+    early check-linux.yml step (checkout gains full history + tags):
+    released-step freeze against the latest v-tag with the
+    `REDEFINES: <module>/<NNNN>` trailer escape, new-step placement
+    strictly above the tag head, duplicate ordinals, gaps — a missing
+    tag FAILS, never skips
+  - Open Question 2 RESOLVED: hand-written raw-SQL fixtures (the
+    snapshotter's population drives head-shaped typed APIs and
+    carries wall-clock timestamps — structurally wrong for historical
+    shapes). The harness lands with the identity/0001 fixture:
+    replay to the pre-step state, apply literal fixture rows, apply
+    the step, hash-pin the canonical dump
 - [ ] S4 — boot rework, upgrade path: copy + fast-forward replaces
       fresh + import + carry for the sealing node; prune derived from
       registry roles; the regenesis-restart orchestrator scenario
@@ -551,5 +587,8 @@ cross.
    by the final hash check (recommended); (b) config deltas in step
    front matter; (c) registry tombstones. Until resolved, CI refuses
    the affected changes (§Validation & Tripwires).
-2. Golden-fixture corpus: hand-written per step, or derived from the
-   snapshotter's existing fixture data? Decide at S3.
+2. ~~Golden-fixture corpus~~ — RESOLVED at S3: hand-written raw-SQL
+   fixtures per step, written against the step's predecessor shape
+   (literal keys, no wall clock). The snapshotter's population was
+   rejected: it drives HEAD's typed APIs and embeds wall-clock
+   timestamps. See the S3 ledger entry.

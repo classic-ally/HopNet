@@ -113,7 +113,7 @@ impl std::fmt::Display for ChainShapeError {
 impl std::error::Error for ChainShapeError {}
 
 #[cfg(feature = "database")]
-pub use engine::{replay, replay_all, ChainError};
+pub use engine::{advance, replay, replay_all, ChainError};
 
 #[cfg(feature = "database")]
 mod engine {
@@ -197,6 +197,37 @@ mod engine {
             replay(conn, chain, chain.head())?;
         }
         Ok(())
+    }
+
+    /// Fast-forward: apply the steps strictly above `from`, up to and
+    /// including `to`, against a database already at `from`. Both
+    /// bounds must be real chain positions. `from == to` is a no-op.
+    /// Same transaction discipline as [`replay`].
+    pub fn advance(
+        conn: &Connection,
+        chain: &Chain,
+        from: u32,
+        to: u32,
+    ) -> Result<u32, ChainError> {
+        chain.validate().map_err(ChainError::Shape)?;
+        for bound in [from, to] {
+            if !chain.contains(bound) {
+                return Err(ChainError::UnknownOrdinal {
+                    module: chain.module,
+                    ordinal: bound,
+                });
+            }
+        }
+        let mut applied = 0;
+        for step in chain
+            .steps
+            .iter()
+            .filter(|s| s.ordinal > from && s.ordinal <= to)
+        {
+            apply_step(conn, chain.module, step)?;
+            applied += 1;
+        }
+        Ok(applied)
     }
 
     impl Chain {
@@ -378,6 +409,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 0);
+    }
+
+    // Should: apply only the steps strictly above `from` when
+    // fast-forwarding a database that already holds the older shape.
+    // Should not: re-run the baseline against an existing database.
+    #[test]
+    fn advance_applies_only_the_gap() {
+        let c = conn();
+        replay(&c, &TWO_STEPS, 0).unwrap();
+        let applied = advance(&c, &TWO_STEPS, 0, TWO_STEPS.head()).unwrap();
+        assert_eq!(applied, 1);
+        assert_eq!(columns(&c, "t"), vec!["id", "v", "w"]);
+        // from == to is a no-op.
+        assert_eq!(advance(&c, &TWO_STEPS, 1, 1).unwrap(), 0);
+    }
+
+    // Should: refuse a fast-forward whose recorded position is not a
+    // real chain position.
+    #[test]
+    fn advance_refuses_unknown_bounds() {
+        let c = conn();
+        replay(&c, &TWO_STEPS, 0).unwrap();
+        assert!(matches!(
+            advance(&c, &TWO_STEPS, 7, 1),
+            Err(ChainError::UnknownOrdinal { ordinal: 7, .. })
+        ));
     }
 
     // Should: replay a set of chains to head in the given order.
