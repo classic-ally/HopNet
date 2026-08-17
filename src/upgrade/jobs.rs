@@ -73,15 +73,17 @@ pub async fn poll_provider(app_state: &AppState) -> bool {
     let url = env_url
         .or(settings.release_url)
         .unwrap_or_else(crate::upgrade::git_release::GitReleaseProvider::default_releases_url);
-    // Provider selection (RFC-021): a deployment that declares the nix
-    // contract gets staging + activation; everything else keeps the
-    // report-only v1 baseline.
-    let nix_env = crate::upgrade::nix_provider::NixEnv::from_env();
-    let provider: Box<dyn UpgradeProvider> = match &nix_env {
-        Some(env) => Box::new(crate::upgrade::nix_provider::NixUpgradeProvider::new(
-            env.clone(),
-            url,
-        )),
+    // Provider selection (RFC-021/RFC-026): a deployment that declares an
+    // activation contract gets staging + activation; everything else keeps
+    // the report-only v1 baseline.
+    let activation = crate::upgrade::ActivationEnv::from_env();
+    let provider: Box<dyn UpgradeProvider> = match &activation {
+        Some(crate::upgrade::ActivationEnv::Nix(env)) => Box::new(
+            crate::upgrade::nix_provider::NixUpgradeProvider::new(env.clone(), url),
+        ),
+        Some(crate::upgrade::ActivationEnv::MacApp(env)) => Box::new(
+            crate::upgrade::macos_app::MacAppProvider::new(env.clone(), url),
+        ),
         None => Box::new(crate::upgrade::git_release::GitReleaseProvider::new(url)),
     };
 
@@ -95,8 +97,8 @@ pub async fn poll_provider(app_state: &AppState) -> bool {
     // build retries on the cron cadence rather than looping. On success,
     // re-report so THIS tick's attestation already carries the staged
     // claim instead of waiting six hours.
-    if let (Some(env), Ok(report)) = (&nix_env, &result)
-        && env.auto_stage
+    if let (Some(env), Ok(report)) = (&activation, &result)
+        && env.auto_stage()
     {
         let running = crate::version::effective_running_code();
         let candidate = report
