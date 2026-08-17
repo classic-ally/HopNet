@@ -157,6 +157,12 @@ machine across one version-bump flip.
   bytes, the quietest possible failure. The app gains a startup check:
   registered bundle path ≠ its own path → re-register. Verified by
   flipping and confirming the running daemon's path.
+  *(Verified 2026-08-17, both halves: launchd pins the RESOLVED path
+  at registration — a profile flip does not move the daemon — and
+  NSBundle reports the unresolved profile path, so the healer
+  canonicalizes before comparing. Full move → heal → follow cycle
+  proven on scratch state: marker updates, re-registration re-pins,
+  the daemon respawns from the new bundle.)*
 - **Appex discovery.** Launch Services must find the FileProvider appex
   in the new bundle path (pluginkit registration on launch). Verified
   by exercising the domain after a flip.
@@ -165,6 +171,9 @@ machine across one version-bump flip.
   across versions — so grants should survive a store-path change.
   Verified across one real bump on live state before the class is
   called done.
+  *(Verified 2026-08-17: the daemon ran and published from two
+  different bundle paths with zero authorization prompts — the grant
+  followed the designated requirement, not the path.)*
 
 ## Release Pipeline Obligations
 
