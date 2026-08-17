@@ -925,6 +925,14 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 photo_ingress::routes::router(app_state.clone()),
             );
 
+            // RFC-026: heal a stale SMAppService registration left behind by
+            // a bundle move (an upgraded app's old store path still exists,
+            // so the stale registration keeps running old daemon bytes).
+            #[cfg(all(target_os = "macos", feature = "gui"))]
+            tokio::spawn(photo_ingress::routes::reregister_if_moved_at_startup(
+                app_state.clone(),
+            ));
+
             // Projection mounts (RFC-016 Stage 4). Host routes close over
             // AppState first; each projection's routers are Router<()> and
             // get nested under their declared auth class. Everything —
@@ -1140,6 +1148,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Single-instance guard: a second node on the same data dir shares the
+    // WAL database and silently loses the network bind. The loser exits 0
+    // on purpose — a supervised launchd agent losing this race to a
+    // Finder-launched copy must not restart-loop (`SuccessfulExit = false`
+    // only restarts non-zero exits). Held for the process lifetime.
+    // Ephemeral nodes are exempt: their per-pid tree is claimed by
+    // EphemeralGuard inside run_server, and data_dir() at this point would
+    // resolve to the durable directory they are precisely not using.
+    let _instance_lock = if hopnet::paths::ephemeral_requested() {
+        None
+    } else {
+        let data_dir = hopnet::paths::data_dir();
+        match hopnet::paths::try_claim_instance(&data_dir)? {
+            Some(lock) => Some(lock),
+            None => {
+                eprintln!(
+                    "hopnet: another instance already owns {}; exiting",
+                    data_dir.display()
+                );
+                return Ok(());
+            }
+        }
+    };
+
     #[cfg(feature = "gui")]
     {
         run_with_gui().await
@@ -1353,12 +1385,17 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .build(app)?;
 
-            // Create the main window using the helper function
-            let window = create_main_window(&app.handle(), port)?;
+            // Supervised launches (HOPNET_AUTOSTART, set by the launchd
+            // agent) start tray-only — the agent runs at every login and a
+            // window there would greet the user on each boot. The tray
+            // toggle creates the window on demand either way.
+            if std::env::var_os("HOPNET_AUTOSTART").is_none() {
+                let window = create_main_window(&app.handle(), port)?;
 
-            // Start visible (no dock icon due to Accessory policy)
-            window.show()?;
-            window.set_focus()?;
+                // Start visible (no dock icon due to Accessory policy)
+                window.show()?;
+                window.set_focus()?;
+            }
 
             Ok(())
         })

@@ -91,6 +91,40 @@ impl ProvisioningDeps for LiveDeps {
     fn remove_config(&self) {
         keychain::remove_photo_ingress_config();
     }
+
+    fn current_bundle_path(&self) -> Option<String> {
+        service::current_bundle_path()
+    }
+
+    fn stored_bundle_path(&self) -> Option<String> {
+        std::fs::read_to_string(bundle_path_marker())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn store_bundle_path(&self, path: &str) {
+        if let Err(e) = std::fs::write(bundle_path_marker(), path) {
+            tracing::warn!("photo-ingress bundle-path marker write failed: {e}");
+        }
+    }
+}
+
+/// Which bundle last registered the agent — plain file beside the database
+/// so the marker survives keychain wipes (it describes launchd state, not
+/// credentials).
+fn bundle_path_marker() -> std::path::PathBuf {
+    crate::paths::data_dir().join("photo-ingress-bundle-path")
+}
+
+/// Startup healer (RFC-026): re-register the agent when the running bundle
+/// is not the one that registered it. Spawned once from GUI startup.
+pub async fn reregister_if_moved_at_startup(app_state: AppState) {
+    match flow::reregister_if_moved(&LiveDeps { app_state }).await {
+        Ok(true) => tracing::info!("photo-ingress agent re-registered after bundle move"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("photo-ingress bundle-move check failed: {e}"),
+    }
 }
 
 async fn get_status(

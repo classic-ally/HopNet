@@ -36,6 +36,13 @@ pub(crate) trait ProvisioningDeps {
     // Keychain. `load_config` is the stored `(api_key, base_url)` pair.
     fn load_config(&self) -> Option<(String, String)>;
     fn remove_config(&self);
+
+    // Bundle identity (RFC-026). `current_bundle_path` is None when the
+    // process is not running from an .app bundle (dev `cargo run`); the
+    // stored path is whichever bundle last registered the agent.
+    fn current_bundle_path(&self) -> Option<String>;
+    fn stored_bundle_path(&self) -> Option<String>;
+    fn store_bundle_path(&self, path: &str);
 }
 
 /// Every route is owner-only: provisioning writes THIS Mac's keychain and
@@ -93,7 +100,42 @@ pub(crate) async fn enable(
     //    surfaced in the status for the caller to act on.
     let registration = deps.register_agent().await.map_err(internal)?;
 
+    // 3. Record which bundle registered — the identity the startup
+    //    bundle-move healer compares against (RFC-026).
+    if let Some(path) = deps.current_bundle_path() {
+        deps.store_bundle_path(&path);
+    }
+
     Ok(current_status(deps, registration))
+}
+
+/// Startup healer for the stale-registration hazard (RFC-026): SMAppService
+/// resolves the agent plist against the bundle that REGISTERED it, and after
+/// an upgrade the old bundle still exists (nix store keeps it), so a stale
+/// registration keeps running old daemon bytes — silently. Whenever the
+/// running bundle differs from the one that registered (or the marker is
+/// missing — a pre-RFC-026 install), re-register from this bundle.
+///
+/// Returns whether a re-registration happened.
+pub(crate) async fn reregister_if_moved(deps: &impl ProvisioningDeps) -> Result<bool, String> {
+    let Some(current) = deps.current_bundle_path() else {
+        return Ok(false); // not running from a bundle — nothing to heal
+    };
+    match deps.agent_status().await? {
+        AgentRegistration::Enabled => {}
+        // RequiresApproval means the user blocked the agent in Login Items —
+        // a re-register cannot help and may re-prompt. Anything else means
+        // nothing is registered to go stale.
+        _ => return Ok(false),
+    }
+    if deps.stored_bundle_path().as_deref() == Some(current.as_str()) {
+        return Ok(false);
+    }
+    // Unregister first: register_agent no-ops while status is Enabled.
+    deps.unregister_agent().await?;
+    deps.register_agent().await?;
+    deps.store_bundle_path(&current);
+    Ok(true)
 }
 
 pub(crate) async fn disable(
@@ -151,6 +193,9 @@ mod tests {
         unregister_fails: bool,
         revoke_fails: bool,
         register_requires_approval: bool,
+        agent_enabled: bool,
+        bundle_path: Option<String>,
+        stored_path: Mutex<Option<String>>,
     }
 
     impl MockDeps {
@@ -201,7 +246,11 @@ mod tests {
         }
 
         async fn agent_status(&self) -> Result<AgentRegistration, String> {
-            Ok(AgentRegistration::NotRegistered)
+            Ok(if self.agent_enabled {
+                AgentRegistration::Enabled
+            } else {
+                AgentRegistration::NotRegistered
+            })
         }
 
         async fn register_agent(&self) -> Result<AgentRegistration, String> {
@@ -232,6 +281,19 @@ mod tests {
         fn remove_config(&self) {
             self.log("remove");
             *self.token.lock().unwrap() = None;
+        }
+
+        fn current_bundle_path(&self) -> Option<String> {
+            self.bundle_path.clone()
+        }
+
+        fn stored_bundle_path(&self) -> Option<String> {
+            self.stored_path.lock().unwrap().clone()
+        }
+
+        fn store_bundle_path(&self, path: &str) {
+            self.log("store_path");
+            *self.stored_path.lock().unwrap() = Some(path.to_string());
         }
     }
 
@@ -369,6 +431,91 @@ mod tests {
 
         assert!(!resp.device_revoked);
         assert_eq!(deps.calls(), vec!["unregister", "remove"]);
+    }
+
+    // Should: record the registering bundle's path at enable time so the
+    // startup healer has an identity to compare against.
+    #[tokio::test]
+    async fn enable_records_the_registering_bundle_path() {
+        let deps = MockDeps {
+            bundle_path: Some("/nix/store/aaa/Applications/HopNet.app".into()),
+            ..Default::default()
+        };
+        enable(&deps, OWNER).await.unwrap();
+
+        assert_eq!(deps.calls(), vec!["mint", "register", "store_path"]);
+        assert_eq!(
+            deps.stored_bundle_path().as_deref(),
+            Some("/nix/store/aaa/Applications/HopNet.app")
+        );
+    }
+
+    // Impact: after an upgrade the old bundle still exists in the nix store,
+    // so a stale SMAppService registration keeps running old daemon bytes
+    // with no error anywhere — this healer is the only correction.
+    // Should: re-register (unregister first) when the running bundle differs
+    //         from the one that registered, and update the marker.
+    #[tokio::test]
+    async fn moved_bundle_reregisters_and_updates_marker() {
+        let deps = MockDeps {
+            agent_enabled: true,
+            bundle_path: Some("/nix/store/bbb/Applications/HopNet.app".into()),
+            stored_path: Mutex::new(Some("/nix/store/aaa/Applications/HopNet.app".into())),
+            ..Default::default()
+        };
+        let healed = reregister_if_moved(&deps).await.unwrap();
+
+        assert!(healed);
+        assert_eq!(deps.calls(), vec!["unregister", "register", "store_path"]);
+        assert_eq!(
+            deps.stored_bundle_path().as_deref(),
+            Some("/nix/store/bbb/Applications/HopNet.app")
+        );
+    }
+
+    // Should: treat a missing marker (pre-RFC-026 install) as moved — one
+    // healing re-registration adopts the running bundle.
+    #[tokio::test]
+    async fn missing_marker_heals_like_a_move() {
+        let deps = MockDeps {
+            agent_enabled: true,
+            bundle_path: Some("/nix/store/bbb/Applications/HopNet.app".into()),
+            ..Default::default()
+        };
+        assert!(reregister_if_moved(&deps).await.unwrap());
+        assert_eq!(deps.calls(), vec!["unregister", "register", "store_path"]);
+    }
+
+    // Should not: touch the registration when the running bundle matches the
+    // marker, when nothing is registered, or when not running from a bundle.
+    #[tokio::test]
+    async fn healer_leaves_settled_states_alone() {
+        // Same path: no-op.
+        let same = MockDeps {
+            agent_enabled: true,
+            bundle_path: Some("/Applications/HopNet.app".into()),
+            stored_path: Mutex::new(Some("/Applications/HopNet.app".into())),
+            ..Default::default()
+        };
+        assert!(!reregister_if_moved(&same).await.unwrap());
+        assert!(same.calls().is_empty());
+
+        // Not registered: never auto-enables, even when moved.
+        let unregistered = MockDeps {
+            bundle_path: Some("/nix/store/bbb/Applications/HopNet.app".into()),
+            stored_path: Mutex::new(Some("/nix/store/aaa/Applications/HopNet.app".into())),
+            ..Default::default()
+        };
+        assert!(!reregister_if_moved(&unregistered).await.unwrap());
+        assert!(unregistered.calls().is_empty());
+
+        // No bundle (dev run): nothing to compare.
+        let bare = MockDeps {
+            agent_enabled: true,
+            ..Default::default()
+        };
+        assert!(!reregister_if_moved(&bare).await.unwrap());
+        assert!(bare.calls().is_empty());
     }
 
     // Should: return success with device_revoked false when consensus

@@ -8,7 +8,7 @@
 //! All three calls are XPC-backed and may block — handlers call them via
 //! `spawn_blocking`.
 
-use objc2_foundation::NSString;
+use objc2_foundation::{NSBundle, NSString};
 use objc2_service_management::SMAppService;
 use tracing::info;
 
@@ -39,6 +39,19 @@ fn map_status(raw: objc2_service_management::SMAppServiceStatus) -> AgentRegistr
 
 pub fn agent_status() -> AgentRegistration {
     map_status(unsafe { agent().status() })
+}
+
+/// The running app bundle's filesystem path, or None when not launched from
+/// a bundle (dev `cargo run`). SMAppService resolves the agent plist against
+/// the bundle that REGISTERED it, so this is the identity the bundle-move
+/// healer compares (RFC-026: an upgraded app's old store path keeps
+/// existing, and a stale registration keeps running old daemon bytes).
+pub fn current_bundle_path() -> Option<String> {
+    let bundle = NSBundle::mainBundle();
+    let path = unsafe { bundle.bundlePath() }.to_string();
+    // A bare binary's "bundle path" is its parent directory; only a real
+    // .app bundle counts as an identity worth tracking.
+    path.ends_with(".app").then_some(path)
 }
 
 /// Register the bundled agent. Already-Enabled is a no-op (re-register
