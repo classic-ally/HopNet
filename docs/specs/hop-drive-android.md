@@ -78,9 +78,41 @@ on first load. Deliberately NOT auth-bound (biometric window): the
 provider is invoked in the background by DocumentsUI with no way to
 show an auth prompt.
 
+## Version compatibility (RFC-023)
+
+Identity: `app/build.gradle.kts` parses the workspace `Cargo.toml`
+CalVer at configure time (malformed → build failure) into
+`BuildConfig.HOPNET_CLIENT_VERSION_CODE`/`_NAME`; the pinned-client
+interceptor attaches `x-hopnet-client-version` next to the Bearer
+header, covering every request including the SSE watch stream.
+
+Rejection: a 426 whose body parses as `UpgradeRequiredResponse`
+(`net/Compat.kt`, hand-written mirror of `common/src/compat.rs`)
+throws a typed `UpgradeRequiredException` (subclass of
+`NodeHttpException`, so existing catch sites keep working) and raises
+the sticky `UpgradeState`. An episode is loud exactly once — one
+warning log, one system notification (`POST_NOTIFICATIONS`, requested
+in-context once a pairing exists; denial non-fatal), and the in-app
+banner above both tabs — and repeat 426s update it silently. Any
+successful device-token response clears the episode and cancels the
+notification, so a node rollback or app upgrade self-heals within one
+request. The watch loop parks at max backoff (30s re-probe) instead
+of spinning; idle-stop still bounds the thread's life. An unparseable
+426 body degrades to the generic error and never touches the state.
+
+Deferred: `min_node` preflight parity with the mount client (refusing
+a too-old node at pairing time). The 426 gate covers the dangerous
+direction; add the health-probe check at pairing when it earns its
+keep.
+
 ## Verification
 
 - `PairingPayloadTest` (JVM): payload v1 acceptance/rejection.
+- `VersionCodeTest` + `ApiClientCompatTest` (JVM): the Gradle-derived
+  code's invariants, and the RFC-023 transport behaviour against a
+  TLS MockWebServer whose SPKI pin is computed from its generated
+  certificate — header on every request, typed/sticky 426,
+  watch-stream parse, malformed-body degradation, 503 retry.
 - `LiveNodeTest` (instrumented, run against a real node):
   `./gradlew connectedDebugAndroidTest` with
   `-Pandroid.testInstrumentationRunnerArguments.{host,port,spki,token}`;
@@ -89,6 +121,17 @@ show an auth prompt.
   access. On NixOS build with
   `-Pandroid.aapt2FromMavenOverride=$ANDROID_HOME/build-tools/<v>/aapt2`
   and pin `buildToolsVersion` to the nix-provisioned SDK.
+- `UpgradeRequiredTest` (instrumented): RFC-023 end-to-end against a
+  second node whose minimum is raised via `HOPNET_MIN_CLIENT_OVERRIDE`,
+  passed as `-Pandroid.testInstrumentationRunnerArguments.upgraded{Host,Port,Spki,Token}`
+  (class self-skips when absent). Typed rejection, banner, watch park,
+  notification once-per-episode + clear-on-recovery.
+- One command: `nix develop .#android` then `scripts/android/e2e.sh` —
+  builds the node, boots current + min-raised nodes with TLS,
+  provisions device tokens, boots a headless emulator, and runs
+  assembleDebug + the JVM suite + the full instrumented suite against
+  both nodes (`10.0.2.2` host-loopback; the SPKI pin makes the
+  self-signed cert and hostname mismatch irrelevant).
 
 ## Change feed (push refresh)
 
@@ -128,3 +171,6 @@ most of it).
 - [ ] Retry queue for release-time upload failures
 - [x] Keystore-wrapped pairing storage (unlock-bound, StrongBox-first)
 - [ ] Camera E2E on a physical device (emulator uses manual pairing)
+- [x] RFC-023 client compat: identity header, typed 426, banner +
+      notification, watch park, forced-426 e2e harness (2026-08)
+- [ ] `min_node` preflight at pairing (mount-client parity)

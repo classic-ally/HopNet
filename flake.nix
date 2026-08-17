@@ -447,6 +447,47 @@
           # Pair it with HOPNET_EPHEMERAL_ROOT to place the disposable tree
           # somewhere other than $TMPDIR (see src/paths.rs).
         };
+      } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+        # Android SDK + emulator for android/HopDrive; drives
+        # scripts/android/e2e.sh. Separate nixpkgs import: the shared pkgs
+        # carries no config, and the SDK needs the license flag + unfree.
+        android =
+          let
+            androidPkgs = import nixpkgs {
+              inherit (pkgs.stdenv.hostPlatform) system;
+              config = {
+                allowUnfree = true;
+                android_sdk.accept_license = true;
+              };
+            };
+            androidComposition = androidPkgs.androidenv.composeAndroidPackages {
+              buildToolsVersions = [ "36.0.0" ];
+              platformVersions = [ "36" ];
+              includeEmulator = true;
+              includeSystemImages = true;
+              systemImageTypes = [ "google_apis" ];
+              abiVersions = [ "x86_64" ];
+            };
+            sdk = "${androidComposition.androidsdk}/libexec/android-sdk";
+          in
+          pkgs.mkShell {
+            buildInputs = [
+              androidComposition.androidsdk
+              androidPkgs.jdk17
+              # e2e driver builds and boots real nodes from this shell too
+              (pkgs.rust-bin.stable.latest.default)
+              pkgs.pkg-config
+              pkgs.openssl.dev
+              pkgs.jq
+              pkgs.curl
+            ];
+            ANDROID_HOME = sdk;
+            ANDROID_SDK_ROOT = sdk;
+            JAVA_HOME = "${androidPkgs.jdk17}";
+            # NixOS quirk (docs/specs/hop-drive-android.md): AGP must be
+            # pointed at the SDK's own aapt2, the store being read-only.
+            HOPNET_AAPT2 = "${sdk}/build-tools/36.0.0/aapt2";
+          };
       });
     };
 }
