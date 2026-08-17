@@ -97,286 +97,6 @@ pub mod photos;
 /// block fails the cleanup batch (fails closed, self-heals next pass).
 pub const EDIT_HISTORY_RETENTION_DAYS: i64 = 30;
 
-/// Install the photos projection's tables. Requires `users` (host) and
-/// `data_blocks` (hopnet-storage) to exist already — the host chains
-/// host DDL → consensus → storage → drive → photos → takeout.
-///
-/// `photo_operations.prior_data_block_id` and `new_data_block_id` are
-/// deliberately NOT FK-constrained: operation rows are retained
-/// indefinitely for audit (photos.md:581), but the blobs they reference
-/// become collectable after the edit-history window. A hard FK would
-/// raise SQLITE_CONSTRAINT on every orphan-cleanup pass once the first
-/// edit ages out — and that cleanup runs inside a consensus tx, so the
-/// failure would replay on every validator, forever. Soft-pointer-
-/// policed-by-provider is the design (photos.md:397-475).
-pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(
-        "
-        -- Shared libraries: multi-user key-distribution membership
-        -- (photos.md:155-176). There is no owner column — all members
-        -- have equal standing. The personal library is NULL on `photos`
-        -- (photos.md:57), not a sentinel row here. The name is encrypted
-        -- under the LIBRARY key (per-member wraps in shared_library_keys),
-        -- not a single-recipient ECDH seal — every member can render it.
-        CREATE TABLE shared_libraries (
-            id                       TEXT PRIMARY KEY,    -- UUIDv7
-            encrypted_name           BLOB NOT NULL,        -- ChaCha20-Poly1305 under library key
-            name_nonce               BLOB NOT NULL         -- 12-byte nonce
-        );
-
-        -- Library membership (N-way, no owner). Membership is the READ
-        -- GATE for shared photos: access-row existence alone is not
-        -- sufficient (pre-staged invitee wraps are inert without a row
-        -- here).
-        CREATE TABLE shared_library_members (
-            library_id               TEXT NOT NULL,
-            user_id                  INTEGER NOT NULL,
-
-            PRIMARY KEY (library_id, user_id),
-            FOREIGN KEY (library_id) REFERENCES shared_libraries(id),
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
-        );
-
-        -- Per-member wrapped library key (X25519 ECDH wrap, LIBRARY_KEY_
-        -- WRAP_DOMAIN, wrap id = library id bytes). Decrypts the library
-        -- name; the designed seam for the future library-scoped cloud
-        -- fingerprint key.
-        CREATE TABLE shared_library_keys (
-            library_id               TEXT NOT NULL,
-            user_id                  INTEGER NOT NULL,
-            ephemeral_pubkey         BLOB NOT NULL,        -- 32-byte X25519
-            wrapped_key              BLOB NOT NULL,        -- 48 bytes (32 key + 16 tag)
-
-            PRIMARY KEY (library_id, user_id),
-            FOREIGN KEY (library_id) REFERENCES shared_libraries(id),
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
-        );
-
-        -- Pending membership: consent pattern mirroring drive's
-        -- incoming_shares. The row carries the invitee's library-key wrap,
-        -- minted AT invite time, so accept needs no inviter online and the
-        -- library name renders in the invite listing. Access-row
-        -- pre-staging (the convergence worker) targets invitees too;
-        -- membership-gated reads keep everything invisible until accept.
-        CREATE TABLE shared_library_invites (
-            library_id               TEXT NOT NULL,
-            user_id                  INTEGER NOT NULL,     -- invitee
-            invited_by               INTEGER NOT NULL,
-            operation_id             TEXT NOT NULL,        -- UUIDv7, audit/ordering
-            ephemeral_pubkey         BLOB NOT NULL,        -- invitee's library-key wrap
-            wrapped_key              BLOB NOT NULL,
-
-            PRIMARY KEY (library_id, user_id),
-            FOREIGN KEY (library_id) REFERENCES shared_libraries(id),
-            FOREIGN KEY (user_id) REFERENCES users(user_id),
-            FOREIGN KEY (invited_by) REFERENCES users(user_id)
-        );
-
-        -- Photos: identity, tombstone. The encrypted_metadata blob carries
-        -- date/dimensions/EXIF/camera/GPS AND cross-asset grouping
-        -- (group_id, group_type, group_index, is_group_pick) — none
-        -- queryable at the consensus level (photos.md:7,30-32,85).
-        -- Grouping was folded into the encrypted blob (originally
-        -- photos.md:62-98 plaintext, amended): no consensus query needs
-        -- group awareness (deletion expands to a batch tx client-side;
-        -- burst rollup is a sidecar query at photos.md:338), and the
-        -- plaintext columns leaked structural correlation + photography
-        -- habits (group_type) without any offsetting consensus use.
-        CREATE TABLE photos (
-            id                       TEXT PRIMARY KEY,     -- UUIDv7 (upload timestamp)
-            library_id               TEXT,                 -- NULL = personal library
-            uploaded_by              INTEGER NOT NULL,
-            encrypted_metadata       BLOB NOT NULL,
-            metadata_nonce            BLOB NOT NULL,        -- 12-byte ChaCha20 nonce
-
-            -- Soft delete: NULL = active; 30-day retention window before
-            -- periodic cleanup hard-deletes the row + cascades.
-            deleted_at               TEXT,                 -- ISO 8601, NULL when active
-            deleted_by               INTEGER,
-
-            -- Cross-device asset identity: lowercase-hex keyed HMAC of the
-            -- source library's stable asset id (PHCloudIdentifier), keyed
-            -- per-user (RFC-014: no unkeyed function of plaintext in
-            -- replicated state). NULL = local-only asset, no dedupe.
-            -- Opaque to validators; enforced by the partial UNIQUE pair.
-            cloud_fingerprint        TEXT,
-
-            FOREIGN KEY (uploaded_by) REFERENCES users(user_id),
-            FOREIGN KEY (deleted_by) REFERENCES users(user_id),
-            FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
-        );
-
-        CREATE INDEX idx_photos_library ON photos(library_id);
-        CREATE INDEX idx_photos_deleted ON photos(deleted_at) WHERE deleted_at IS NOT NULL;
-
-        -- Dedupe uniqueness must be split: SQLite treats NULLs as distinct
-        -- in UNIQUE indexes, so a composite UNIQUE(library_id,
-        -- cloud_fingerprint) would never constrain personal (NULL-library)
-        -- rows. Fingerprints are per-user-keyed HMACs, so a global index
-        -- over personal rows is collision-safe across users.
-        CREATE UNIQUE INDEX idx_photos_fp_personal ON photos(cloud_fingerprint)
-            WHERE library_id IS NULL AND cloud_fingerprint IS NOT NULL;
-        CREATE UNIQUE INDEX idx_photos_fp_shared ON photos(library_id, cloud_fingerprint)
-            WHERE library_id IS NOT NULL AND cloud_fingerprint IS NOT NULL;
-
-        -- Per-user metadata decryption keys (photos.md:100-116). Mirrors
-        -- the storage substrate's `blob_access` pattern: each photo's
-        -- metadata has its own symmetric key, wrapped per-user via ECDH.
-        CREATE TABLE photo_metadata_access (
-            photo_id                 TEXT NOT NULL,
-            user_id                  INTEGER NOT NULL,
-            ephemeral_pubkey         BLOB NOT NULL,         -- 32-byte X25519
-            encrypted_metadata_key   BLOB NOT NULL,         -- 48 bytes (32 key + 16 tag)
-
-            PRIMARY KEY (photo_id, user_id),
-            FOREIGN KEY (photo_id) REFERENCES photos(id),
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
-        );
-
-        -- A photo's byte streams (original, edited, paired_video, etc.).
-        -- (photos.md:120-153). data_block_id FKs the storage substrate.
-        CREATE TABLE photo_resources (
-            photo_id                 TEXT NOT NULL,
-            resource_type            INTEGER NOT NULL,     -- 0=original,1=edited,2=paired_video,
-                                                          -- 3=adjustment_data,4=raw_alternate,7=edited_paired_video
-            data_block_id            TEXT NOT NULL,
-
-            PRIMARY KEY (photo_id, resource_type),
-            FOREIGN KEY (photo_id) REFERENCES photos(id),
-            FOREIGN KEY (data_block_id) REFERENCES data_blocks(id)
-        );
-
-        CREATE INDEX idx_photo_resources_data_block ON photo_resources(data_block_id);
-
-        -- Append-only operation log (photos.md:222-268). Enables undo,
-        -- audit trail, and retention-aware cleanup.
-        --
-        -- prior/new_data_block_id are SOFT pointers: operation rows are
-        -- retained indefinitely while the blobs they reference become
-        -- collectable after EDIT_HISTORY_RETENTION_DAYS. The
-        -- PhotosReferenceProvider enforces the window via UUIDv7 timestamp
-        -- filtering (photos.md:459-466). No FK — see install_schema doc.
-        CREATE TABLE photo_operations (
-            id                       TEXT PRIMARY KEY,    -- UUIDv7 (encodes timestamp)
-            library_id               TEXT,                -- denormalized filter, NOT FK
-            photo_id                 TEXT NOT NULL,
-            operation_type           INTEGER NOT NULL,    -- 0=add,1=content_edit,2=delete,
-                                                          -- 3=metadata_edit,4=album_add,5=album_remove,
-                                                          -- 6=favorite,7=unfavorite,8=restore
-            resource_type            INTEGER,             -- which resource (content ops only)
-            prior_data_block_id      TEXT,                -- soft pointer — see crate doc
-            new_data_block_id        TEXT,                -- soft pointer — see crate doc
-            operation_data           BLOB,                -- payload for non-content ops
-            performed_by             INTEGER NOT NULL,
-
-            FOREIGN KEY (photo_id) REFERENCES photos(id),
-            FOREIGN KEY (performed_by) REFERENCES users(user_id)
-        );
-
-        CREATE INDEX idx_photo_ops_photo ON photo_operations(photo_id);
-        CREATE INDEX idx_photo_ops_prior_data ON photo_operations(prior_data_block_id)
-            WHERE prior_data_block_id IS NOT NULL;
-        CREATE INDEX idx_photo_ops_new_data ON photo_operations(new_data_block_id)
-            WHERE new_data_block_id IS NOT NULL;
-        CREATE INDEX idx_photo_ops_library ON photo_operations(library_id);
-
-        -- Incremental sync feed: upserted by every handler (add, delete,
-        -- restore, edit, cleanup) so clients can poll for changes by
-        -- consensus height. NO FK — the feed row must survive hard-delete
-        -- so offline clients learn of the tombstone expiry.
-        CREATE TABLE photo_changes (
-            photo_id             TEXT PRIMARY KEY,
-            changed_at_height    INTEGER NOT NULL
-        );
-        CREATE INDEX idx_photo_changes_height ON photo_changes(changed_at_height);
-
-        -- Per-user VIEW-change signal: 'your visibility into this library
-        -- changed at height h' — written by membership/grant/revoke
-        -- handlers, consumed by the sidecar sync worker to trigger a
-        -- targeted library backfill or purge. Deliberately separate from
-        -- photo_changes, which records only changes to the photo itself;
-        -- a grant does not edit the photo. Upserted to the latest height.
-        CREATE TABLE photo_view_changes (
-            user_id              INTEGER NOT NULL,
-            library_id           TEXT NOT NULL,
-            changed_at_height    INTEGER NOT NULL,
-
-            PRIMARY KEY (user_id, library_id),
-            FOREIGN KEY (user_id) REFERENCES users(user_id),
-            FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
-        );
-
-        -- Albums: lightweight groupings (photos.md:178-205). A photo can
-        -- belong to multiple albums. Personal or shared.
-        CREATE TABLE photo_albums (
-            id                       TEXT PRIMARY KEY,    -- UUIDv7
-            library_id               TEXT,                -- NULL = personal album
-            encrypted_name           BLOB NOT NULL,
-            name_ephemeral_pubkey    BLOB NOT NULL,
-            created_by               INTEGER NOT NULL,
-
-            FOREIGN KEY (library_id) REFERENCES shared_libraries(id),
-            FOREIGN KEY (created_by) REFERENCES users(user_id)
-        );
-
-        CREATE TABLE photo_album_entries (
-            album_id                 TEXT NOT NULL,
-            photo_id                 TEXT NOT NULL,
-            sort_order               INTEGER,              -- user-defined ordering
-
-            PRIMARY KEY (album_id, photo_id),
-            FOREIGN KEY (album_id) REFERENCES photo_albums(id),
-            FOREIGN KEY (photo_id) REFERENCES photos(id)
-        );
-
-        -- Per-user favorites (photos.md:208-218).
-        CREATE TABLE photo_favorites (
-            photo_id                 TEXT NOT NULL,
-            user_id                  INTEGER NOT NULL,
-
-            PRIMARY KEY (photo_id, user_id),
-            FOREIGN KEY (photo_id) REFERENCES photos(id),
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
-        );
-
-        -- Ingress responsibility, per (user, scope): the single device
-        -- allowed to publish ingress mutations for a user within a scope —
-        -- NULL library_id is the personal partition, non-NULL a shared
-        -- library the user is a member of. Each member claims
-        -- independently for their own devices; cross-member dedup within a
-        -- shared library is the fingerprint pair's job, not
-        -- responsibility's. Claimed and transferred ONLY via the JWT claim
-        -- route (photo_ingress_claim) — daemons never auto-claim. Enforced
-        -- at thin-client route admission, not in handlers: the UNIQUE
-        -- fingerprint pair above is the correctness backstop for any
-        -- admission race. device_tokens is consensus-replicated, so the FK
-        -- and the handler's ownership check are deterministic on every
-        -- validator.
-        -- The composite PK owns shared-scope uniqueness AND gives the
-        -- debug state snapshot its deterministic ORDER BY (snapshot
-        -- hashing requires a declared PK). SQLite treats NULLs as
-        -- distinct even in a PRIMARY KEY (rowid-table quirk), so the PK
-        -- cannot constrain the personal (NULL-library) row — the partial
-        -- index below does, mirroring idx_photos_fp_personal.
-        CREATE TABLE photo_ingress_responsibility (
-            user_id                  INTEGER NOT NULL,
-            library_id               TEXT,                 -- NULL = personal scope
-            device_id                TEXT NOT NULL,
-            operation_id             TEXT NOT NULL,        -- UUIDv7, audit/ordering
-
-            PRIMARY KEY (user_id, library_id),
-            FOREIGN KEY (user_id) REFERENCES users(user_id),
-            FOREIGN KEY (device_id) REFERENCES device_tokens(id),
-            FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
-        );
-
-        CREATE UNIQUE INDEX idx_ingress_resp_personal
-            ON photo_ingress_responsibility(user_id)
-            WHERE library_id IS NULL;
-        ",
-    )
-}
-
 /// Drop the photos projection's tables (reverse dependency order:
 /// children first, since `PRAGMA foreign_keys = ON` is set on every
 /// pooled connection). Nothing in the host or other projections FKs
@@ -430,8 +150,8 @@ mod tests {
              );",
         )
         .unwrap();
-        hopnet_storage::store::install_schema(&conn).unwrap();
-        install_schema(&conn).unwrap();
+        hopnet_storage::store::CHAIN.install(&conn).unwrap();
+        CHAIN.install(&conn).unwrap();
 
         conn.execute("INSERT INTO users (user_id, username) VALUES (1, 'a')", [])
             .unwrap();
@@ -645,7 +365,7 @@ mod tests {
             "PRAGMA foreign_keys = OFF;", // isolate index semantics from FK setup
         )
         .unwrap();
-        install_schema(&conn).unwrap();
+        CHAIN.install(&conn).unwrap();
 
         let insert = |id: &str, lib: Option<&str>, fp: Option<&str>| {
             conn.execute(
@@ -685,7 +405,7 @@ mod tests {
     fn responsibility_partial_unique_index_semantics() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        install_schema(&conn).unwrap();
+        CHAIN.install(&conn).unwrap();
 
         let insert = |user: i32, lib: Option<&str>, dev: &str| {
             conn.execute(
@@ -733,7 +453,7 @@ mod tests {
     fn personal_scope_index_keeps_the_exported_row_order_total() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        install_schema(&conn).unwrap();
+        CHAIN.install(&conn).unwrap();
 
         let sql: String = conn
             .query_row(

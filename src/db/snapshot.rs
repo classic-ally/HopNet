@@ -148,7 +148,7 @@ mod tests {
             .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
             .build(manager)
             .unwrap();
-        crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
+        crate::db::chains::install(&pool.get().unwrap()).unwrap();
         pool
     }
 

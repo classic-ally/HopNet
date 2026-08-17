@@ -721,7 +721,7 @@ pub(crate) mod tests {
     fn sealed_pool(flip: bool) -> r2d2::Pool<crate::db::SqliteConnectionManager> {
         let manager = crate::db::SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
-        crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
+        crate::db::chains::install(&pool.get().unwrap()).unwrap();
         let conn = pool.get().unwrap();
 
         conn.execute(

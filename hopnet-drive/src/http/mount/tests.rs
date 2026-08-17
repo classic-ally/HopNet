@@ -289,8 +289,8 @@ fn setup_env(blob_bytes: Vec<u8>) -> TestEnv {
         )
         .unwrap();
         hopnet_consensus::store::install_schema(&conn).unwrap();
-        hopnet_storage::store::install_schema(&conn).unwrap();
-        crate::db::install_schema(&conn).unwrap();
+        hopnet_storage::store::CHAIN.install(&conn).unwrap();
+        crate::db::CHAIN.install(&conn).unwrap();
 
         let pubkey = x25519_dalek::PublicKey::from(&x25519_fixture());
         conn.execute(

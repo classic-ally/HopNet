@@ -441,7 +441,7 @@ fn create_test_app_state_on_manager(
     {
         let conn = pool.get().unwrap();
         if !crate::db::shared::is_schema_initialized(&conn).unwrap_or(false) {
-            crate::db::shared::initialize(&conn).unwrap();
+            crate::db::chains::install(&conn).unwrap();
         }
     }
 

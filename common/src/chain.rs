@@ -199,6 +199,14 @@ mod engine {
         Ok(())
     }
 
+    impl Chain {
+        /// Replay this one chain to head — the single-module installer
+        /// (tests installing a module plus hand-written upstream stubs).
+        pub fn install(&self, conn: &Connection) -> Result<(), ChainError> {
+            replay(conn, self, self.head())
+        }
+    }
+
     fn apply_step(conn: &Connection, module: &'static str, step: &Step) -> Result<(), ChainError> {
         let fail = |source| ChainError::Step {
             module,

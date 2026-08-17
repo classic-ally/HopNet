@@ -47,81 +47,6 @@ pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
 /// same 0-pre-genesis / RecallError semantics).
 pub(crate) use hopnet_projection::current_height;
 
-/// Install the drive's tables. Requires `users` (host) and `data_blocks`
-/// (hopnet-storage) to exist already.
-pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(
-        "
-        CREATE TABLE inodes (
-            -- stable identifier for FileProvider (UUIDv7 encodes creation time)
-            id              TEXT UNIQUE NOT NULL,
-            -- owner of this reference
-            owner_id        INTEGER REFERENCES users(user_id) NOT NULL,
-            -- denormalized deterministically encrypted string
-            -- enables fast folder listing queries without need for recursive parent_id
-            path            TEXT NOT NULL,
-            -- type of the inode
-            type            INTEGER NOT NULL CHECK(type IN (0, 1)),  -- 0=file, 1=folder
-            -- FK to the content block
-            data_id         TEXT REFERENCES data_blocks(id),
-
-            PRIMARY KEY     (owner_id, path)
-        );
-
-        -- 1. The MOST IMPORTANT index for listing folder contents.
-        -- Don't need text_pattern_ops due to ART index
-        CREATE INDEX idx_inodes_path ON inodes (path);
-
-        -- 2. An index to quickly find all inodes belonging to a specific user.
-        CREATE INDEX idx_inodes_owner ON inodes (owner_id);
-
-        -- 3. Index for FileProvider lookups by stable ID
-        CREATE INDEX idx_inodes_id ON inodes (id);
-
-        -- NOTE: modification_log is NOT consensus tracked - it's used for local FileProvider state delta computation
-        -- This table tracks all file/folder modifications to support incremental sync in FileProvider
-        -- It provides a unified change tracking mechanism for all file system operations
-        CREATE TABLE modification_log (
-            inode_id           TEXT NOT NULL,     -- Stable inode identifier
-            owner_id           INTEGER NOT NULL,
-            old_parent_id      TEXT,              -- Parent folder BEFORE modification (NULL for new items)
-            modified_at_height INTEGER NOT NULL,
-
-            PRIMARY KEY (inode_id, modified_at_height),
-            FOREIGN KEY (owner_id) REFERENCES users(user_id)
-        );
-
-        -- Index for efficient queries: what was modified for user X since height Y?
-        CREATE INDEX idx_modification_log_height ON modification_log (owner_id, modified_at_height);
-
-        -- Sharing: pending share invitations
-        CREATE TABLE incoming_shares (
-            id                       TEXT PRIMARY KEY,
-            data_block_id            TEXT NOT NULL,
-            sender_id                INTEGER NOT NULL,
-            recipient_id             INTEGER NOT NULL,
-            file_access              BLOB NOT NULL,
-            display_ephemeral_pubkey BLOB NOT NULL,
-            encrypted_display_name   BLOB NOT NULL,
-            FOREIGN KEY (data_block_id) REFERENCES data_blocks(id),
-            FOREIGN KEY (sender_id) REFERENCES users(user_id),
-            FOREIGN KEY (recipient_id) REFERENCES users(user_id)
-        );
-        CREATE INDEX idx_incoming_shares_recipient ON incoming_shares(recipient_id);
-        CREATE INDEX idx_incoming_shares_data_block ON incoming_shares(data_block_id);
-
-        -- Sharing: live-link membership
-        CREATE TABLE shares (
-            data_block_id   TEXT NOT NULL,
-            user_id         INTEGER NOT NULL,
-            PRIMARY KEY (data_block_id, user_id),
-            FOREIGN KEY (data_block_id) REFERENCES data_blocks(id),
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
-        );
-        ",
-    )
-}
-
 /// Drop the drive's tables (reverse dependency order). Nothing in the host
 /// or other projections FKs INTO drive tables, so this is a clean unit.
 pub fn uninstall_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
@@ -154,8 +79,8 @@ mod tests {
              CREATE TABLE nodes (node_id INTEGER PRIMARY KEY);",
         )
         .unwrap();
-        hopnet_storage::store::install_schema(&conn).unwrap();
-        install_schema(&conn).unwrap();
+        hopnet_storage::store::CHAIN.install(&conn).unwrap();
+        CHAIN.install(&conn).unwrap();
 
         conn.execute("INSERT INTO users (user_id, username) VALUES (1, 'a')", [])
             .unwrap();

@@ -145,8 +145,8 @@ mod tests {
              CREATE TABLE nodes (node_id INTEGER PRIMARY KEY);",
         )
         .unwrap();
-        hopnet_storage::store::install_schema(&conn).unwrap();
-        crate::db::install_schema(&conn).unwrap();
+        hopnet_storage::store::CHAIN.install(&conn).unwrap();
+        crate::db::CHAIN.install(&conn).unwrap();
         hopnet_common::db_impl::register_uuid_extract_timestamp(&conn).unwrap();
         conn.execute("INSERT INTO users (user_id, username) VALUES (1, 'a')", [])
             .unwrap();

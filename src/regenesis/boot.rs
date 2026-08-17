@@ -790,7 +790,7 @@ fn build_next(
     let mut conn =
         rusqlite::Connection::open(next).map_err(|e| format!("open {}: {e}", next.display()))?;
     crate::db::shared::apply_connection_pragmas(&conn).map_err(|e| format!("pragmas: {e}"))?;
-    crate::db::shared::initialize(&conn).map_err(|e| format!("schema install: {e}"))?;
+    crate::db::chains::install(&conn).map_err(|e| format!("schema install: {e}"))?;
 
     // ATTACH must precede the transaction (SQLite refuses ATTACH inside
     // one). Gate 1's exact version match is what makes blind `SELECT *`
@@ -933,7 +933,7 @@ pub(crate) mod tests {
         let db_path = dir.join("database.db").to_string_lossy().into_owned();
         let mut conn = rusqlite::Connection::open(&db_path).unwrap();
         crate::db::shared::apply_connection_pragmas(&conn).unwrap();
-        crate::db::shared::initialize(&conn).unwrap();
+        crate::db::chains::install(&conn).unwrap();
 
         conn.execute(
             "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
@@ -2025,7 +2025,7 @@ pub(crate) mod tests {
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
             crate::db::shared::apply_connection_pragmas(&conn).unwrap();
-            crate::db::shared::initialize(&conn).unwrap();
+            crate::db::chains::install(&conn).unwrap();
         }
         std::fs::write(next_path(&db_path), b"garbage").unwrap();
         std::fs::write(awaiting_upgrade_path(&db_path), b"2026.8.0").unwrap();

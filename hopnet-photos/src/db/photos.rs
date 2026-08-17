@@ -1255,8 +1255,8 @@ mod tests {
              CREATE TABLE consensus_meta (key TEXT PRIMARY KEY, value BLOB);",
         )
         .unwrap();
-        hopnet_storage::store::install_schema(&conn).unwrap();
-        crate::db::install_schema(&conn).unwrap();
+        hopnet_storage::store::CHAIN.install(&conn).unwrap();
+        crate::db::CHAIN.install(&conn).unwrap();
         conn.execute(
             "INSERT INTO users (user_id, x25519_pubkey) VALUES (1, x'00')",
             [],

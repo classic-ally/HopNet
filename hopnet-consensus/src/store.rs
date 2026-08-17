@@ -152,7 +152,13 @@ pub const META_CHAIN_ID: &str = "chain_id";
 /// Genesis-fixed; a post-genesis change requires its own consensus scheme.
 pub const META_QUORUM_PROFILE: &str = "quorum_profile";
 
-/// Install the consensus tables on any connection to the database (idempotent).
+/// Install the consensus tables on any connection (idempotent).
+///
+/// STANDALONE/TEST installer only (RFC-020 S2): the HopNet host
+/// installs by chain replay — its consensus baseline embeds this DDL
+/// plus the host-owned consensus tables — and a host-side parity pin
+/// (`src/db/chains.rs`) keeps this const agreeing with the chain.
+/// Embedders and this crate's own tests remain free to call it.
 pub fn install_schema(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(SCHEMA)?;
     Ok(())
@@ -330,6 +336,10 @@ impl SqliteStorage<OwnedConn> {
     /// The connection is held for the storage's lifetime (the host keeps it
     /// across heights).
     pub fn new(conn: Connection, commit: CommitFn) -> Result<Self, StoreError> {
+        // Standalone/embedder convenience: install the crate schema on
+        // the owned connection (idempotent). The HopNet host never
+        // comes through here — it wraps its pool via `from_handle`.
+        install_schema(&conn)?;
         Self::from_handle(OwnedConn(conn), commit)
     }
 }
@@ -339,7 +349,9 @@ impl<C: DerefMut<Target = Connection> + 'static> SqliteStorage<C> {
     /// storage shares the application pool's database — required for shared
     /// in-memory databases and for the pool-reserved production conn).
     pub fn from_handle(conn: C, commit: CommitFn) -> Result<Self, StoreError> {
-        install_schema(&conn)?;
+        // No DDL here (RFC-020 S2): the host installs schema by chain
+        // replay before any engine spawns; a spawn-time re-install was
+        // a second DDL authority outside the chain.
         Ok(Self { conn, commit })
     }
 

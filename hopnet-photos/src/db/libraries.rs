@@ -724,8 +724,8 @@ mod tests {
              CREATE TABLE consensus_meta (key TEXT PRIMARY KEY, value BLOB);",
         )
         .unwrap();
-        hopnet_storage::store::install_schema(&conn).unwrap();
-        super::super::install_schema(&conn).unwrap();
+        hopnet_storage::store::CHAIN.install(&conn).unwrap();
+        super::super::CHAIN.install(&conn).unwrap();
         for uid in 1..=3 {
             conn.execute(
                 "INSERT INTO users (user_id, x25519_pubkey) VALUES (?1, ?2)",

@@ -321,8 +321,11 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Loading existing database schema");
         Ok(())
     } else {
-        tracing::info!("Initializing new database schema");
-        db::shared::initialize(&conn)
+        tracing::info!("Installing new database schema (chain replay)");
+        db::chains::install(&conn).map_err(|e| match e {
+            hopnet_common::chain::ChainError::Step { source, .. } => source,
+            other => rusqlite::Error::InvalidParameterName(other.to_string()),
+        })
     };
 
     match init_result {

@@ -362,17 +362,15 @@ pub trait Projection: Send + Sync {
     /// in the dispatch table (linker-drop guard).
     fn tx_functions(&self) -> &'static [&'static str];
 
-    /// This projection's schema unit. The host installs units in
-    /// registration order (= FK direction) after the substrate's.
-    fn install_schema(&self, conn: &rusqlite::Connection) -> Result<(), rusqlite::Error>;
-
     /// The tables this projection owns and that are consensus-tracked
     /// (mutations replicated across all nodes). The host's divergence
     /// checker hashes each in addition to the host-owned
     /// `CONSENSUS_TABLES` list. Single source of truth: the projection's
-    /// `db::TABLES` const feeds both `install_schema`'s uninstall test
-    /// and this method, so the schema and the divergence coverage cannot
-    /// drift. Default: empty (a projection with no consensus tables).
+    /// `db::TABLES` const feeds both the uninstall symmetry test and
+    /// this method, so the schema and the divergence coverage cannot
+    /// drift. (Schema installation itself is `chain()` replay — RFC-020
+    /// S2 removed the per-projection installer.)
+    /// Default: empty (a projection with no consensus tables).
     fn tables(&self) -> &'static [&'static str] {
         &[]
     }

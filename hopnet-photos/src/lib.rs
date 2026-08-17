@@ -64,10 +64,6 @@ impl Projection for PhotosProjection {
         handlers::TX_FUNCTIONS
     }
 
-    fn install_schema(&self, conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-        db::install_schema(conn)
-    }
-
     fn snapshot_section(&self) -> Option<&'static hopnet_common::SectionSpec> {
         Some(&db::SNAPSHOT_SECTION)
     }

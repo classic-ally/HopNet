@@ -1162,8 +1162,8 @@ mod tests {
              CREATE TABLE consensus_meta (key TEXT PRIMARY KEY, value BLOB);",
         )
         .unwrap();
-        hopnet_storage::store::install_schema(&conn).unwrap();
-        crate::db::install_schema(&conn).unwrap();
+        hopnet_storage::store::CHAIN.install(&conn).unwrap();
+        crate::db::CHAIN.install(&conn).unwrap();
         // Real-shaped 32-byte pubkeys: the membership handlers resolve and
         // validate them (a short blob is a RecallError by design).
         for uid in [1, 2, 3] {

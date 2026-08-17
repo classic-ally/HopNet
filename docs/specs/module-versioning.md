@@ -502,9 +502,29 @@ cross.
   - gates: byte-exact `sqlite_master` parity (replay ≡ initialize),
     chains≡sections mirror (names, order, head == format_version),
     classified-at-birth extended to indexes/triggers/views
-- [ ] S2 — installer swap: fresh install and mesh creation run on
+- [x] S2 — installer swap: fresh install and mesh creation run on
       replay; `initialize` deleted; the generated schema snapshot
       checked in and the parity gate retargeted to it.
+  - `db::chains::install` is THE installer (replay to head + the
+    relocated validators shadowing gate). The monolithic batch, the
+    per-crate installer batches (storage/drive/photos/takeout), and
+    `Projection::install_schema` are all deleted — DDL text now exists
+    only in the frozen baselines (the old installers' between-statement
+    design prose lives in git history; in-statement comments survive
+    in the baselines)
+  - recorded nuance: hopnet-consensus KEEPS `install_schema` as its
+    standalone/embedder installer — its chain lives host-side, out of
+    the embeddable crate's reach. The spawn-time re-install in
+    `SqliteStorage::from_handle` (a second DDL authority at every
+    engine start) is deleted; `new()` keeps the convenience for
+    owned-connection embedders, and a host-side pin
+    (`consensus_standalone_installer_agrees_with_chain`) keeps the
+    crate const agreeing with the chain
+  - `migrations/schema.sql`: the generated, readable rendering of the
+    current schema — regenerated via an explicit `#[ignore]` test
+    named in the parity gate's failure message
+  - `is_schema_initialized` survives unchanged (probes `this_node`);
+    the S3 ordinal stamp replaces it
 - [ ] S3 — ordinal stamp + fast-forward + the CI suite: stamp table,
       fingerprint validation, the release-tag tripwires, the
       golden-fixture harness.
