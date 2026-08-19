@@ -634,6 +634,11 @@ Cross-platform desktop application providing file management and network adminis
       that owns no arithmetic: every figure comes from `hopnet_common::quorum`,
       `live_estimate`, `derive_view` or `db::resilience`. Replaces a pane that had drifted
       to `ceil(2v/3)` for quorum, wrong at every `v` divisible by 3.
+      Costed: the view is a full-table pass over `fragment_hashes` (~3 s at 427k
+      fragments), so it holds exactly ONE pool connection and the pane polls one
+      request at a time. A second checkout taken while the first was held let an
+      open pane exhaust the pool and shed the whole `/api` surface with 503
+      (issue #68). Caching the computation node-side is still open.
 - [x] Advanced file sharing controls and permissions (Phase 2a+2b backend, Phase 2c frontend)
 - [ ] Responsive mobile interface for thin client operations
 
