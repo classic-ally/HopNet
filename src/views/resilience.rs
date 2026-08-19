@@ -163,9 +163,12 @@ pub fn storage_view(
     // overlay that moves no bytes.
     let unreachable_members = unreachable_member_count(app_state, conn, &member_ids);
 
-    // Second checkout: get_node_storage_baselines takes an owned connection.
+    // Reuses the caller's connection. A second checkout here cost every
+    // request two of the pool's 32 connections and blocked for the full 2s
+    // checkout timeout while still holding the first, so a pane left open
+    // could shed the whole /api surface (issue #68).
     // Threshold 0.9 matches admin::routes, which is where this curve came from.
-    let curve = resilience::get_node_storage_baselines(app_state.db_pool.get())
+    let curve = resilience::get_node_storage_baselines(conn)
         .map(|baselines| resilience::generate_fault_tolerance_curve(baselines, 0.9))
         .unwrap_or_default();
 
@@ -209,7 +212,8 @@ pub fn mount_statfs_bytes(
         .map(|(_, bytes)| bytes)
         .sum();
 
-    let curve = resilience::get_node_storage_baselines(pool.get())
+    // Same single connection as the level rows above: see storage_view.
+    let curve = resilience::get_node_storage_baselines(&conn)
         .map(|baselines| resilience::generate_fault_tolerance_curve(baselines, 0.9))
         .unwrap_or_default();
     let total_gb = resilience::capacity_at_tolerance(&curve, STATFS_MIN_TOLERANCE);
@@ -260,4 +264,56 @@ fn unreachable_member_count(
             contact_age(view.as_ref(), origin, now) > deadline
         })
         .count() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Three same-sized nodes with a storage metric each — the minimum for a
+    /// non-empty capacity curve. `max_size(1)` is what makes this a test of the
+    /// connection budget rather than of the SQL, and `memory()` requires it
+    /// anyway: each connection would otherwise get its own database.
+    fn one_connection_pool() -> r2d2::Pool<SqliteConnectionManager> {
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
+            .build(SqliteConnectionManager::memory())
+            .expect("pool");
+        let conn = pool.get().expect("conn");
+        crate::db::chains::install(&conn).expect("schema");
+        conn.execute_batch(
+            "
+            INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+                VALUES (1, 'alice', x'00', x'00', x'00', x'00');
+            INSERT INTO nodes (node_id, name, owner, pubkey) VALUES
+                (1, 'node-1', 1, x'01'), (2, 'node-2', 1, x'02'), (3, 'node-3', 1, x'03');
+            INSERT INTO metrics (from_node, to_node, start_time, height, available,
+                                 storage_total_gb, storage_used_gb) VALUES
+                (1, 1, '2026-01-01T00:00:00Z', 1, 1, 1000, 100),
+                (1, 2, '2026-01-01T00:00:00Z', 1, 1, 1000, 100),
+                (1, 3, '2026-01-01T00:00:00Z', 1, 1, 1000, 100);
+            ",
+        )
+        .expect("fixture");
+        pool
+    }
+
+    // Impact: the capacity curve used to come from a SECOND pool checkout taken
+    // while the first was still held. Under pool pressure that checkout timed
+    // out, and the error was swallowed into an empty curve — so statfs reported
+    // zero total bytes and `df` rendered a healthy mesh as a full filesystem,
+    // silently. Holding one connection per call is what prevents it (issue #68).
+    // Should: report a non-zero capacity total from a single-connection pool.
+    #[test]
+    fn mount_statfs_needs_only_one_pool_connection() {
+        let pool = one_connection_pool();
+
+        let (total_bytes, _used_bytes) = mount_statfs_bytes(&pool).expect("statfs");
+
+        assert!(
+            total_bytes > 0,
+            "capacity collapsed to zero — a second connection was taken"
+        );
+    }
 }

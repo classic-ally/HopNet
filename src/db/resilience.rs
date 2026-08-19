@@ -212,107 +212,109 @@ pub fn unplaced_age_buckets(
 
 /// Get node storage baselines for fault tolerance curve generation
 /// Returns each node's total capacity and baseline usage for simulation
+///
+/// Borrows the connection rather than taking a checkout, matching
+/// `resilience_level_rows` above: callers that already hold one MUST reuse it.
+/// Taking a second checkout while the first was still held made a single
+/// request cost two of the pool's 32 connections, and blocked for the full 2s
+/// `connection_timeout` while holding the first — so pool pressure amplified
+/// instead of draining (issue #68).
 pub fn get_node_storage_baselines(
-    db_connection: Result<PooledConnection<SqliteConnectionManager>, r2d2::Error>,
+    conn: &PooledConnection<SqliteConnectionManager>,
 ) -> Result<Vec<NodeStorageBaseline>, DatabaseError> {
     let start_time = std::time::Instant::now();
 
-    match db_connection {
-        Ok(conn) => {
-            let query = r#"
-                WITH
-                -- Calculate original fragment counts per data block first
-                data_block_original_counts AS (
-                    SELECT
-                        fh.data_block_id,
-                        COUNT(*) as original_count
-                    FROM fragment_hashes fh
-                    WHERE fh.chunk_type = 0
-                    GROUP BY fh.data_block_id
-                ),
+    let query = r#"
+        WITH
+        -- Calculate original fragment counts per data block first
+        data_block_original_counts AS (
+            SELECT
+                fh.data_block_id,
+                COUNT(*) as original_count
+            FROM fragment_hashes fh
+            WHERE fh.chunk_type = 0
+            GROUP BY fh.data_block_id
+        ),
 
-                -- Calculate current HopNet storage per node
-                node_hopnet_storage AS (
-                    SELECT
-                        fi.node_id,
-                        SUM((CAST(db.file_size AS REAL) / MAX(dboc.original_count, 1)) * 1.1 / (1024.0 * 1024.0 * 1024.0)) as hopnet_storage_gb
-                    FROM fragment_inventory fi
-                    JOIN fragment_hashes fh ON fi.fragment_hash = fh.fragment_hash
-                    JOIN data_blocks db ON fh.data_block_id = db.id
-                    JOIN data_block_original_counts dboc ON db.id = dboc.data_block_id
-                    GROUP BY fi.node_id
-                ),
+        -- Calculate current HopNet storage per node
+        node_hopnet_storage AS (
+            SELECT
+                fi.node_id,
+                SUM((CAST(db.file_size AS REAL) / MAX(dboc.original_count, 1)) * 1.1 / (1024.0 * 1024.0 * 1024.0)) as hopnet_storage_gb
+            FROM fragment_inventory fi
+            JOIN fragment_hashes fh ON fi.fragment_hash = fh.fragment_hash
+            JOIN data_blocks db ON fh.data_block_id = db.id
+            JOIN data_block_original_counts dboc ON db.id = dboc.data_block_id
+            GROUP BY fi.node_id
+        ),
 
-                -- Get latest storage metrics for each node
-                latest_node_metrics AS (
-                    SELECT node_id, storage_total_gb, storage_used_gb FROM (
-                        SELECT
-                            to_node as node_id,
-                            storage_total_gb,
-                            storage_used_gb,
-                            ROW_NUMBER() OVER (PARTITION BY to_node ORDER BY height DESC, start_time DESC) as rn
-                        FROM metrics
-                        WHERE storage_total_gb > 0
-                    ) WHERE rn = 1
-                )
-
+        -- Get latest storage metrics for each node
+        latest_node_metrics AS (
+            SELECT node_id, storage_total_gb, storage_used_gb FROM (
                 SELECT
-                    n.node_id,
-                    n.name,
-                    COALESCE(n.name, 'Node ' || n.node_id) as display_name,
-                    lnm.storage_total_gb,
-                    -- Baseline: current usage minus HopNet = x=0 point on curve
-                    MAX(0.0, lnm.storage_used_gb - COALESCE(nhs.hopnet_storage_gb, 0.0)) as baseline_storage_gb
-                FROM nodes n
-                INNER JOIN latest_node_metrics lnm ON n.node_id = lnm.node_id
-                LEFT JOIN node_hopnet_storage nhs ON n.node_id = nhs.node_id
-                ORDER BY lnm.storage_total_gb DESC
-            "#;
+                    to_node as node_id,
+                    storage_total_gb,
+                    storage_used_gb,
+                    ROW_NUMBER() OVER (PARTITION BY to_node ORDER BY height DESC, start_time DESC) as rn
+                FROM metrics
+                WHERE storage_total_gb > 0
+            ) WHERE rn = 1
+        )
 
-            let mut stmt = conn.prepare(query).map_err(|e| {
-                tracing::error!(
-                    "Failed to prepare query for node storage baselines: {:?}",
-                    e
-                );
-                DatabaseError::ProcessingError
-            })?;
+        SELECT
+            n.node_id,
+            n.name,
+            COALESCE(n.name, 'Node ' || n.node_id) as display_name,
+            lnm.storage_total_gb,
+            -- Baseline: current usage minus HopNet = x=0 point on curve
+            MAX(0.0, lnm.storage_used_gb - COALESCE(nhs.hopnet_storage_gb, 0.0)) as baseline_storage_gb
+        FROM nodes n
+        INNER JOIN latest_node_metrics lnm ON n.node_id = lnm.node_id
+        LEFT JOIN node_hopnet_storage nhs ON n.node_id = nhs.node_id
+        ORDER BY lnm.storage_total_gb DESC
+    "#;
 
-            let rows = stmt
-                .query_map(params![], |row| {
-                    Ok(NodeStorageBaseline {
-                        node_id: row.get(0)?,
-                        name: row.get(1)?,
-                        display_name: row.get(2)?,
-                        storage_total_gb: row.get(3)?,
-                        baseline_storage_gb: row.get(4)?,
-                        source: hopnet_common::db::NodeSource::System,
-                        original_values: None,
-                    })
-                })
-                .map_err(|e| {
-                    tracing::error!(
-                        "Failed to execute query for node storage baselines: {:?}",
-                        e
-                    );
-                    DatabaseError::RecallError
-                })?;
+    let mut stmt = conn.prepare(query).map_err(|e| {
+        tracing::error!(
+            "Failed to prepare query for node storage baselines: {:?}",
+            e
+        );
+        DatabaseError::ProcessingError
+    })?;
 
-            let baselines: Vec<NodeStorageBaseline> = rows
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| DatabaseError::RecallError)?;
-
-            let computation_time_ms = start_time.elapsed().as_millis() as u64;
-
-            tracing::debug!(
-                "Retrieved storage baselines for {} nodes in {}ms",
-                baselines.len(),
-                computation_time_ms
+    let rows = stmt
+        .query_map(params![], |row| {
+            Ok(NodeStorageBaseline {
+                node_id: row.get(0)?,
+                name: row.get(1)?,
+                display_name: row.get(2)?,
+                storage_total_gb: row.get(3)?,
+                baseline_storage_gb: row.get(4)?,
+                source: hopnet_common::db::NodeSource::System,
+                original_values: None,
+            })
+        })
+        .map_err(|e| {
+            tracing::error!(
+                "Failed to execute query for node storage baselines: {:?}",
+                e
             );
+            DatabaseError::RecallError
+        })?;
 
-            Ok(baselines)
-        }
-        Err(_) => Err(DatabaseError::LockError),
-    }
+    let baselines: Vec<NodeStorageBaseline> = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| DatabaseError::RecallError)?;
+
+    let computation_time_ms = start_time.elapsed().as_millis() as u64;
+
+    tracing::debug!(
+        "Retrieved storage baselines for {} nodes in {}ms",
+        baselines.len(),
+        computation_time_ms
+    );
+
+    Ok(baselines)
 }
 
 /// Generate fault tolerance curve from node storage baselines

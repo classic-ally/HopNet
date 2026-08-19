@@ -66,12 +66,25 @@ async fn get_system_nodes_baseline(
     State(state): State<AppState>,
     Extension(uid): Extension<i32>,
 ) -> Result<Json<Vec<hopnet_common::db::NodeStorageBaseline>>, StatusCode> {
-    // Get current system nodes with their storage information
-    let nodes =
-        crate::db::resilience::get_node_storage_baselines(state.db_pool.get()).map_err(|e| {
+    // spawn_blocking like views::routes: the baseline query joins
+    // fragment_inventory against every fragment row, so on a large node it
+    // parks the calling thread for seconds. Run on the async runtime it
+    // parked a tokio worker for that whole time.
+    let nodes = tokio::task::spawn_blocking(move || {
+        let conn = state.db_pool.get().map_err(|e| {
+            tracing::error!(
+                "Failed to check out a connection for node baselines: {:?}",
+                e
+            );
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+        crate::db::resilience::get_node_storage_baselines(&conn).map_err(|e| {
             tracing::error!("Failed to get system nodes baseline: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        })
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
 
     Ok(Json(nodes))
 }
