@@ -382,7 +382,7 @@ pub async fn get_regenesis_status(
 
     // One blocking hop for everything that touches the DB or the
     // filesystem (rollback-window file check).
-    let (state, rollback_retained, chain_id) = {
+    let (state, rollback_retained, chain_id, schema_ordinals) = {
         let app_state = app_state.clone();
         tokio::task::spawn_blocking(move || {
             let conn = app_state
@@ -402,7 +402,17 @@ pub async fn get_regenesis_status(
                     .flatten()
                     .map(hex_lower)
                     .unwrap_or_default();
-            Ok::<_, StatusCode>((state, retained, chain_id))
+            // Empty rather than an error when the stamp table is absent
+            // (legacy database parked mid-boundary): the view must keep
+            // serving while an operator debugs exactly that state.
+            let schema_ordinals = crate::db::chains::read_stamps(&conn)
+                .unwrap_or_default()
+                .into_iter()
+                .map(
+                    |(module, ordinal)| hopnet_common::views::SchemaOrdinalView { module, ordinal },
+                )
+                .collect::<Vec<_>>();
+            Ok::<_, StatusCode>((state, retained, chain_id, schema_ordinals))
         })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??
@@ -427,5 +437,6 @@ pub async fn get_regenesis_status(
         boundary_error: crate::regenesis::boot::boundary_error(),
         rollback_retained,
         epoch_join: crate::regenesis::join::join_state(),
+        schema_ordinals,
     }))
 }

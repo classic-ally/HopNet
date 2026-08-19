@@ -236,4 +236,17 @@ pub struct RegenesisStatusView {
     /// is rebuilding from peers: fetching lineage, downloading the
     /// snapshot, staged and awaiting restart.
     pub epoch_join: Option<String>,
+    /// Per-module schema chain positions stamped in this database
+    /// (RFC-020 §Version Surfaces), sorted by module. Empty before the
+    /// database is stamped.
+    pub schema_ordinals: Vec<SchemaOrdinalView>,
+}
+
+/// One module's recorded schema chain position (RFC-020): the ordinal of
+/// the last migration step this database has applied.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct SchemaOrdinalView {
+    pub module: String,
+    pub ordinal: u32,
 }
