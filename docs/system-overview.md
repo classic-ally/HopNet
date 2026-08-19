@@ -174,8 +174,13 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     host@3 cutover mapping, fresh joins never restarting;
     build_next_import and the last carry machinery deleted), and
     the S6 vote-time dissent marker (diverged-but-outvoted
-    replicas park at the boundary and rebuild from peers); S7 cutover
-    (rehearsal + release) in progress.
+    replicas park at the boundary and rebuild from peers), and the S7
+    cutover: version 2026.8.6, `schema_ordinals` on the regenesis
+    status view, and the `regenesis-cutover` rehearsal green (a mesh
+    born on the v2026.8.5 image crosses into this build; a fresh node
+    joins through the pre-split artifact). All slices complete; only
+    the live-mesh crossing remains — release choreography in the S7
+    ledger entry.
   - **RFC-025 drafted**
     ([RFC-025](specs/rpc-version-enforcement.md), Draft 2026-08-17):
     RPC version enforcement — locked scopes refuse mixed-version

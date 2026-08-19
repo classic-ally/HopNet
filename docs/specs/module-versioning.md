@@ -669,10 +669,39 @@ cross.
     `diverged_replica_parks_at_the_boundary`; apply-path units assert
     marker-on-mismatch and no-marker-on-honest; the in-process
     3-node seal asserts no healthy replica dissents
-- [ ] S7 — cutover release: baseline-adoption verification, the
-      cutover rehearsal scenario, release choreography — then the live
-      mesh crosses. (The section split itself landed at S1; the
-      `host@3` mapping lands with S5's join fixtures.)
+- [x] S7 — cutover release: master merged (v2026.8.5 swept clean — no
+      schema DDL between the S1 freeze and the tag), workspace version
+      2026.8.6, the rehearsal, the release choreography. Only the live
+      crossing itself remains — an operator action, not a code slice.
+      (The section split itself landed at S1; the `host@3` mapping
+      landed with S5's join fixtures.)
+  - the regenesis status view gains `schema_ordinals` (module →
+    stamped ordinal; empty rather than erroring when the stamp table
+    is absent, because a parked legacy database is exactly the state
+    an operator debugs through this view) — the §Version Surfaces
+    operator vocabulary, and the rehearsal's crossing evidence
+  - `regenesis-cutover` (orchestrator): a mesh BORN on the v2026.8.5
+    image (loaded into the checkout's namespace by the new
+    `scripts/build-release-image.sh`) seals for this build's version
+    and each node is recreated onto this build's image with NO
+    version override — the binary's real identity crosses. Asserted
+    per node: epoch 2, the cutover version, every module stamped at
+    its chain head (adopt-at-baseline + fast-forward on a legacy
+    database). Then post-boundary decides; a fresh node joins THROUGH
+    the old-shape artifact (the host@3 mapping + scratch splice); and
+    lived-through ≡ fresh-joined state. Run green 9/9, divergence
+    clean across 37 tables; `regenesis-restart` and
+    `regenesis-awaiting-upgrade` re-run green post-bump
+  - release runbook (operator steps, in order): push the branch →
+    PR → merge in the Forgejo web UI → tag `v2026.8.6` on the merge
+    commit → releases publish → live mesh: stage 2026.8.6 via the
+    upgrade provider on every node, `POST
+    /consensus/regenesis/start` targeting 2026.8.6, let the mesh
+    drain and seal (nodes park awaiting-upgrade), swap each node's
+    binary, the mesh crosses at the boundary. The retained epoch-1
+    databases are the rollback window until the first post-boundary
+    decide; `schema_ordinals` on the status view is the
+    crossing-evidence check at each step
 
 ## Open Questions
 
