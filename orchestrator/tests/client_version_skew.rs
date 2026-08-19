@@ -109,6 +109,7 @@ impl TestScenario for ClientVersionSkew {
             &docker,
             mesh_id,
             node.node_id,
+            None,
             &[("HOPNET_UPGRADE_VERSION_OVERRIDE", "2020.1.1")],
         )
         .await

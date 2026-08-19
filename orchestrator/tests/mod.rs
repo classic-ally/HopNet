@@ -114,8 +114,33 @@ pub trait TestScenario: Send + Sync {
 /// Mesh-creation env for tests needing genesis-seeded config (applied by
 /// the auto-managed runner BEFORE create_mesh; caller-managed meshes must
 /// export these before `orchestrator create` for the same checks).
-pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
-    match test_name {
+pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, String)> {
+    // RFC-020 §Cutover rehearsal: the mesh is BORN on the last released
+    // image (load it under this ref with
+    // `scripts/build-release-image.sh v<old release>` first), and the
+    // staged claim is THIS build's version — the boundary targets the
+    // binary under test. Dynamic values, hence the early return.
+    if test_name == "regenesis-cutover" {
+        return vec![
+            (
+                "HOPNET_GENESIS_CONSENSUS_POLICY",
+                "probe_base=2;grace=1;s_full=6;p_prove=6".to_string(),
+            ),
+            (
+                "HOPNET_UPGRADE_STAGED_OVERRIDE",
+                env!("CARGO_PKG_VERSION").to_string(),
+            ),
+            (
+                "HOPNET_ORCH_IMAGE",
+                format!(
+                    "hopnet:{}-{}",
+                    crate::naming::checkout_hash(),
+                    regenesis::CUTOVER_OLD_RELEASE
+                ),
+            ),
+        ];
+    }
+    let pairs: Vec<(&'static str, &'static str)> = match test_name {
         "consensus-bft-quorum-loss" => vec![
             ("HOPNET_QUORUM_PROFILE", "bft"),
             // 1->4 formation batch is exposed; seed a small span so the
@@ -239,7 +264,8 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
             "probe_base=3;grace=1;s_full=6;p_prove=6",
         )],
         _ => vec![],
-    }
+    };
+    pairs.into_iter().map(|(k, v)| (k, v.to_string())).collect()
 }
 
 /// Preferred auto-mesh node count for tests whose premise needs a specific
@@ -257,6 +283,7 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         "regenesis-restart"
         | "regenesis-awaiting-upgrade"
         | "regenesis-nix-activation"
+        | "regenesis-cutover"
         | "straggler-rejoin"
         | "diverged-node-rebuild"
         | "regenesis-rollback" => Some(3),
@@ -407,6 +434,7 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
+        "regenesis-cutover" => regenesis::RegenesisCutover.run(mesh_id, nodes, flags).await,
         "evidence-observe" => {
             evidence_observe::EvidenceObserve
                 .run(mesh_id, nodes, flags)
@@ -604,6 +632,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "straggler-rejoin",
         "diverged-node-rebuild",
         "regenesis-rollback",
+        "regenesis-cutover",
         "mesh-growth",
         "auto-seam",
         "three-timescales",
