@@ -59,6 +59,10 @@ async fn boot_node() -> NodeGuard {
         .env("HOPNET_EPHEMERAL_DB", "1")
         .env("HOPNET_HTTP_PORT", port.to_string())
         .env("HOPNET_TEST_MODE", "1")
+        // Resilience numbers are TTL-cached node-side (issue #68). The stack
+        // tests assert what a scan produces, not what the cache remembers,
+        // so they read through to the DB every time.
+        .env("HOPNET_RESILIENCE_TTL_SECS", "0")
         // Loopback-only harness: skip the TLS listener (RFC-022), which
         // would otherwise fail-fast when concurrent test nodes — or a
         // real node on this machine — already hold 0.0.0.0:34632.

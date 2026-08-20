@@ -52,10 +52,19 @@ async fn get_upgrade_readiness(
 /// scan over `fragment_hashes x fragment_inventory` with per-block window
 /// functions, and the route this supersedes ran it straight on the async
 /// runtime.
+///
+/// The storage scan comes from the shared TTL cache, so a pane left open costs
+/// one scan per TTL for the whole node rather than one per poll (issue #68).
+/// The consensus half and the reachability overlay stay per-request: they are
+/// cheap, and they are the numbers that must not lag.
 async fn get_network_resilience(
     State(app_state): State<AppState>,
 ) -> Result<Json<ResiliencePaneView>, StatusCode> {
     let started = std::time::Instant::now();
+
+    let parts = crate::views::resilience::cached_storage_parts(&app_state)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let view = tokio::task::spawn_blocking(move || {
         let conn = app_state
@@ -65,7 +74,7 @@ async fn get_network_resilience(
 
         let consensus = crate::views::resilience::consensus_view(&app_state, &conn)
             .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-        let storage = crate::views::resilience::storage_view(&app_state, &conn);
+        let storage = crate::views::resilience::storage_view(&app_state, &conn, &parts);
 
         Ok::<_, StatusCode>(ResiliencePaneView { consensus, storage })
     })

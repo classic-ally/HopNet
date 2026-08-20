@@ -96,6 +96,11 @@ pub struct AppState {
     /// Per-peer liveness evidence (RFC-CONSENSUS-002 S3). One writer lock
     /// per authenticated exchange; classification is pure over snapshots.
     pub evidence: Arc<consensus::evidence::EvidenceMap>,
+    /// TTL cache for the resilience view's full-table storage scan, shared
+    /// by the pane, mount statfs and the admin baseline route (issue #68).
+    /// Single-flight: the cost is one scan per TTL for the whole node, not
+    /// one per reader.
+    pub resilience: Arc<views::resilience::ResilienceCache>,
     /// Restart request (RFC-019 S6): fired by the seal work when the
     /// epoch is sealed and this binary already runs the target version.
     /// The BINARY (main.rs) listens and exits with the documented
