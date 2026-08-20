@@ -447,6 +447,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 local_state_tx,
                 malachite: Arc::new(OnceCell::new()),
                 evidence: std::sync::Arc::new(consensus::evidence::EvidenceMap::new()),
+                resilience: std::sync::Arc::new(Default::default()),
                 storage: Arc::new(OnceCell::new()),
                 restart_signal: Arc::new(tokio::sync::Notify::new()),
                 epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),

@@ -491,6 +491,7 @@ fn create_test_app_state_on_manager(
         local_state_tx: tokio::sync::mpsc::channel(1).0,
         malachite: Arc::new(once_cell::sync::OnceCell::new()),
         evidence: std::sync::Arc::new(crate::consensus::evidence::EvidenceMap::new()),
+        resilience: std::sync::Arc::new(Default::default()),
         storage: Arc::new(once_cell::sync::OnceCell::new()),
         restart_signal: Arc::new(tokio::sync::Notify::new()),
         epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),

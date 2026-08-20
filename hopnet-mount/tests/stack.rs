@@ -59,6 +59,10 @@ async fn boot_node() -> NodeGuard {
         .env("HOPNET_EPHEMERAL_DB", "1")
         .env("HOPNET_HTTP_PORT", port.to_string())
         .env("HOPNET_TEST_MODE", "1")
+        // Resilience numbers are TTL-cached node-side (issue #68). The stack
+        // tests assert what a scan produces, not what the cache remembers,
+        // so they read through to the DB every time.
+        .env("HOPNET_RESILIENCE_TTL_SECS", "0")
         // Loopback-only harness: skip the TLS listener (RFC-022), which
         // would otherwise fail-fast when concurrent test nodes — or a
         // real node on this machine — already hold 0.0.0.0:34632.
@@ -935,20 +939,56 @@ async fn fuse_mount_smoke_against_live_node() {
 // must be closed to the unauthenticated and to unversioned clients.
 // Should: return capacity numbers through the transport with a valid
 // device token.
+// Should: account placed user bytes into `used` once a file is durable,
+// rather than reporting the empty-mesh zero forever.
 // Should not: answer statfs without a client version header (426, the
 // RFC-023 gate, before auth) or without a device token (401, after the
 // gate passes).
 #[tokio::test]
 async fn statfs_route_is_authed_and_shaped() {
     let node = boot_node().await;
-    let (api_key, _jwt) = provision(&node).await;
+    let (api_key, jwt) = provision(&node).await;
 
     let transport = HttpTransport::new(&node.base(), &api_key).unwrap();
     let info = transport.statfs().await.expect("statfs over transport");
-    // A fresh single-node mesh has no metrics rows yet, so both numbers
-    // are legitimately zero — the contract here is shape + auth, the
-    // capacity math itself is unit-tested in src/db/resilience.rs.
     assert_eq!(info.used_bytes, 0, "fresh node has no placed user data");
+
+    // `used` must track real placement, not stay at the empty-mesh zero.
+    // Zero is also what a failed capacity computation degrades to
+    // (`unwrap_or_default` on the curve), so a test that only ever sees an
+    // empty mesh cannot tell a working statfs from a broken one.
+    const SEEDED: &[u8] = b"statfs accounts placed bytes";
+    seed_file(&node, &jwt, &transport, "/Statfs", "statfs.txt", SEEDED).await;
+
+    let mut used = 0;
+    for _ in 0..50 {
+        used = transport
+            .statfs()
+            .await
+            .expect("statfs after seed")
+            .used_bytes;
+        if used > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        used,
+        SEEDED.len() as u64,
+        "placed block must land in `used` at tolerance >= 0"
+    );
+
+    // `total` stays zero here and that is correct, not a gap: it is
+    // `capacity_at_tolerance(curve, STATFS_MIN_TOLERANCE)` with a floor of
+    // 2, and a one-node mesh tolerates zero failures — so the curve's x=0
+    // point is already below the floor. A non-zero total needs >= 3 nodes,
+    // which this single-process harness cannot boot; that assertion belongs
+    // to an orchestrator mesh test.
+    let after = transport.statfs().await.expect("statfs after seed");
+    assert_eq!(
+        after.total_bytes, 0,
+        "one-node mesh is below the tolerance floor, so capacity is zero"
+    );
 
     let statfs_url = format!("{}/api/integrations/mount/statfs", node.base());
     let unversioned = reqwest::Client::new()

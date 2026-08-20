@@ -66,12 +66,17 @@ async fn get_system_nodes_baseline(
     State(state): State<AppState>,
     Extension(uid): Extension<i32>,
 ) -> Result<Json<Vec<hopnet_common::db::NodeStorageBaseline>>, StatusCode> {
-    // Get current system nodes with their storage information
-    let nodes =
-        crate::db::resilience::get_node_storage_baselines(state.db_pool.get()).map_err(|e| {
+    // Reads the resilience cache rather than rescanning: the baseline query
+    // joins fragment_inventory against every fragment row, so on a large node
+    // it costs seconds. Sharing the cache also keeps this route's numbers and
+    // the resilience pane's from drifting apart (issue #68).
+    let nodes = crate::views::resilience::cached_storage_parts(&state)
+        .await
+        .map_err(|e| {
             tracing::error!("Failed to get system nodes baseline: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        })?
+        .baselines;
 
     Ok(Json(nodes))
 }

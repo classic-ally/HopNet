@@ -42,23 +42,42 @@ pub fn capture(
         }
     });
 
-    results.insert(
-        "db::resilience::get_node_storage_baselines".into(),
-        wrap(|| resilience::get_node_storage_baselines(pool.get())),
-    );
+    // One checkout for both entries: get_node_storage_baselines borrows a
+    // connection now, and the capture pool is max_size(1).
+    match pool.get() {
+        Ok(conn) => {
+            results.insert(
+                "db::resilience::get_node_storage_baselines".into(),
+                wrap(|| resilience::get_node_storage_baselines(&conn)),
+            );
 
-    // generate_fault_tolerance_curve takes baselines + threshold, not a DB connection
-    results.insert("db::resilience::generate_fault_tolerance_curve".into(), {
-        match resilience::get_node_storage_baselines(pool.get()) {
-            Ok(baselines) => {
-                let curve = resilience::generate_fault_tolerance_curve(baselines, 0.5);
-                FunctionResult::Ok {
-                    value: serde_json::to_value(&curve).unwrap(),
+            // generate_fault_tolerance_curve takes baselines + threshold, not a DB connection
+            results.insert("db::resilience::generate_fault_tolerance_curve".into(), {
+                match resilience::get_node_storage_baselines(&conn) {
+                    Ok(baselines) => {
+                        let curve = resilience::generate_fault_tolerance_curve(baselines, 0.5);
+                        FunctionResult::Ok {
+                            value: serde_json::to_value(&curve).unwrap(),
+                        }
+                    }
+                    Err(e) => FunctionResult::Error {
+                        error_variant: format!("{:?}", e),
+                    },
                 }
-            }
-            Err(e) => FunctionResult::Error {
-                error_variant: format!("{:?}", e),
-            },
+            });
         }
-    });
+        Err(e) => {
+            for name in [
+                "db::resilience::get_node_storage_baselines",
+                "db::resilience::generate_fault_tolerance_curve",
+            ] {
+                results.insert(
+                    name.into(),
+                    FunctionResult::Error {
+                        error_variant: format!("{:?}", e),
+                    },
+                );
+            }
+        }
+    }
 }

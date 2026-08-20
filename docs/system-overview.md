@@ -634,6 +634,17 @@ Cross-platform desktop application providing file management and network adminis
       that owns no arithmetic: every figure comes from `hopnet_common::quorum`,
       `live_estimate`, `derive_view` or `db::resilience`. Replaces a pane that had drifted
       to `ceil(2v/3)` for quorum, wrong at every `v` divisible by 3.
+      Costed: the storage half is a full-table pass over `fragment_hashes` (~3 s
+      at 427k fragments), so it holds exactly ONE pool connection, the pane polls
+      one request at a time, and the result is TTL-cached node-side behind a
+      single-flight lock (60 s, `HOPNET_RESILIENCE_TTL_SECS`) shared with mount
+      statfs and the admin baseline route — a cache hit touches the pool zero
+      times. The live reachability overlay is deliberately outside the cache. A
+      second checkout taken while the first was held let an open pane exhaust the
+      pool and shed the whole `/api` surface with 503 (issue #68). Still open:
+      the scan is O(total fragments) each rescan — a node-local materialised
+      rollup of the member-independent per-block/per-node counts would make it
+      O(blocks x holders). Tracked as a follow-up, not blocking.
 - [x] Advanced file sharing controls and permissions (Phase 2a+2b backend, Phase 2c frontend)
 - [ ] Responsive mobile interface for thin client operations
 

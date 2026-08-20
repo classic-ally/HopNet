@@ -19,6 +19,12 @@
     // mesh, so fetching them separately would let them disagree about a node
     // across two round trips.
     async function load() {
+        // One outstanding request at a time. The node-side view is a full-table
+        // pass over fragment_hashes, which on a large node takes longer than the
+        // poll interval — without this the timer stacks scans until they exhaust
+        // the node's DB pool and it sheds its whole /api surface (issue #68).
+        if (loading) return;
+
         try {
             loading = true;
 
