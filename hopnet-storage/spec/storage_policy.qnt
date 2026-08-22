@@ -129,6 +129,7 @@ module storage_policy {
   const AUTO_REENCODE: bool       // policy: scrub re-encode of dead classes
   const MAX_GONE: int             // fault budget: permanent node losses
   const MAX_CORRUPT: int          // fault budget: single-copy corruptions
+  const MAX_DROPS: int            // fault budget: lost local-state marks (RFC-STORAGE-003)
   const CALM_BOUND: int           // recovery deadline in engine ticks
   const DELTA: int                // decay gate: ticks down before view drops a node
   const W: int                    // urgency watermark: live classes below W => re-encode now
@@ -153,6 +154,29 @@ module storage_policy {
   var repairCost: int             // pulls x1, re-encodes xK (bandwidth-shaped units)
   var goneCnt: int
   var corruptCnt: int
+  // RFC-STORAGE-003 pipeline state: the (confirmed, target) pair. Views,
+  // not heights — PLACE maps a member set straight to its assignment, so
+  // the view snapshot is the whole meaning of a placement height here.
+  var confirmedView: Set[int]     // view@placement_height; Set() encodes NULL (never confirmed)
+  var targetView: Set[int]        // view@desired_placement_height; never empty
+  // Per-class protected holders: the responsibility union of the
+  // confirmed epoch and EVERY declared-but-unconfirmed epoch — the
+  // model image of the transition record's snapshots in
+  // (placement_height, desired], memoized per class exactly as the S2
+  // Rust predicate will hold them. Grows at declare (union in the new
+  // epoch's assignment), resets at confirm (obligations collapse onto
+  // the confirmed epoch). Exists because protection must cover EVERY
+  // in-flight destination, not just the newest: an S0 Apalache
+  // counterexample showed a supersede-declare stripping the previous
+  // destination's freshly pulled copy — possibly the only real bytes —
+  // of protection, evictable through a ghost row. Obligations (and
+  // protections) lapse only at confirm, never at declare. (Encoded as
+  // the per-class memo rather than a set of views: a set-keyed
+  // PLACE.get inside the eviction guard forces symbolic table lookups
+  // that blow bounded checking from hours into days.)
+  var protectedBy: int -> Set[int]
+  var dropCnt: int                // lost marks spent (envDropMark)
+  var evictHarm: bool             // INV-EVICT-SAFE history bit (see envEvict)
 
   // === Derived ===
   val frags = 0.to(N_FRAGS - 1)
@@ -163,6 +187,25 @@ module storage_policy {
   // Responsible node for class f = injected-table lookup. The table is
   // total over non-empty subsets; memberView is always non-empty.
   def resp(f: int): int = PLACE.get(memberView).get(f)
+
+  // RFC-STORAGE-003: duties derive from the (confirmed, target) pair,
+  // never from the live view — placement height is record, not filter.
+  def respTarget(f: int): int = PLACE.get(targetView).get(f)
+
+  // The protection predicate — THE eviction guard, to be transliterated
+  // into one pure Rust function in S2 (reading the transition record's
+  // memoized view snapshots). A copy of class f on node n is protected
+  // iff any of:
+  //   - the blob was never confirmed (every copy is load-bearing);
+  //   - n is a protected holder: responsible under the confirmed view
+  //     (standing obligation) or under ANY declared-but-unconfirmed
+  //     epoch (the in-flight destinations; the current target always
+  //     among them). Protection lapses only at confirm — a
+  //     supersede-declare must never strip the previous destination's
+  //     copy.
+  // Pinning is implementation-only and deliberately absent here.
+  def protected(f: int, n: int): bool =
+    confirmedView == Set() or protectedBy.get(f).contains(n)
 
   // Smallest element — deterministic pick for the single item repaired
   // per tick. Linear (no arithmetic Apalache dislikes). Named distinctly
@@ -176,6 +219,8 @@ module storage_policy {
   val available = frags.filter(f => copies.get(f).intersect(upNodes).size() > 0).size() >= K
   // Conformant: every responsible node holds its class.
   val conformant = frags.forall(f => copies.get(f).contains(resp(f)))
+  // Conformant to the declared goal (RFC-STORAGE-003).
+  val conformantToTarget = frags.forall(f => copies.get(f).contains(respTarget(f)))
 
   // === Init: conformant, fresh views, everyone up ===
   action init = all {
@@ -189,6 +234,121 @@ module storage_policy {
     repairCost' = 0,
     goneCnt' = 0,
     corruptCnt' = 0,
+    confirmedView' = NODES,
+    targetView' = NODES,
+    protectedBy' = 0.to(N_FRAGS - 1).mapBy(f => Set(PLACE.get(NODES).get(f))),
+    dropCnt' = 0,
+    evictHarm' = false,
+  }
+
+  // RFC-STORAGE-003 birth: every class held only by the uploading origin,
+  // never confirmed, goal stamped at insert with the insert's own view.
+  // Checked in a zero-depart-budget config (scaled_verify_birth): a
+  // single-copy blob whose origin DISK dies pre-distribution is data loss
+  // by nature — the upload durability window every system has until first
+  // replication. Sleep, eviction pressure, corruption, and mark loss stay
+  // fully adversarial here; only whole-disk death is out of budget.
+  action initOriginHeldAt(origin: int): bool = all {
+    status' = NODES.mapBy(n => UP),
+    downFor' = NODES.mapBy(n => 0),
+    memberView' = NODES,
+    copies' = 0.to(N_FRAGS - 1).mapBy(f => Set(origin)),
+    invView' = 0.to(N_FRAGS - 1).mapBy(f => Set(origin)),
+    deleted' = false,
+    calm' = 0,
+    repairCost' = 0,
+    goneCnt' = 0,
+    corruptCnt' = 0,
+    confirmedView' = Set(),
+    targetView' = NODES,
+    protectedBy' = 0.to(N_FRAGS - 1).mapBy(f => Set(PLACE.get(NODES).get(f))),
+    dropCnt' = 0,
+    evictHarm' = false,
+  }
+
+  action initOriginHeld = {
+    nondet origin = NODES.oneOf()
+    initOriginHeldAt(origin)
+  }
+
+  // RFC-STORAGE-003 generalized region init: exhaustive bounded checking
+  // from EVERY protocol-consistent mid-pipeline neighborhood, not just
+  // from birth — the poor-woman's inductive step (bounded depth explores
+  // every neighborhood rather than the first steps after upload).
+  // Constraints:
+  //   - copies never sit on GONE disks; goneCnt matches the GONE count;
+  //   - budget-robust durability over PROTECTED copies: the state must
+  //     keep K + MAX_CORRUPT classes whose protection-predicate holder
+  //     survives every remaining depart set. Only protected copies
+  //     count — a class whose protectors are all gone or empty-handed
+  //     is killable for FREE (its ghost rows launder surplus evictions,
+  //     the fault that removed the protector already accounts for it in
+  //     the burst math: see evictLaunderAccountingTest), so counting it
+  //     as a survivor admits unreachable-break states, which is exactly
+  //     the counterexample Apalache produced against the naive
+  //     any-copy-counts constraint;
+  //   - belief is honest-or-stale, never fabricated: an entry is either
+  //     a real copy or a ghost row on a departed disk. Rows originate
+  //     from holders' self-attestation (true at attestation; S5 makes
+  //     them disk-verified), so fabricated positives are the lying-
+  //     attester case, outside the perimeter — and admitting them here
+  //     lets the checker kill classes for free (phantom-laundered
+  //     confirm + eviction belt). Known under-coverage, documented: a
+  //     legitimately evicted surplus leaves a stale-live entry until the
+  //     next sync; such entries are excluded from this init and instead
+  //     covered by the fault-anchoring argument and its witness.
+  action initMidFlight = {
+    nondet st = NODES.setOfMaps(Set(UP, DOWN, GONE)).oneOf()
+    nondet df = NODES.setOfMaps(0.to(DELTA)).oneOf()
+    nondet mv = NODES.powerset().exclude(Set(Set())).oneOf()
+    nondet cps = frags.setOfMaps(NODES.powerset()).oneOf()
+    nondet iv = frags.setOfMaps(NODES.powerset()).oneOf()
+    nondet cv = NODES.powerset().oneOf()
+    nondet tv = NODES.powerset().exclude(Set(Set())).oneOf()
+    // In-flight epochs bounded to the target plus at most one extra for
+    // tractability: a powerset-of-views draw explodes the symbolic init
+    // (2^15 candidate sets at this scale — measured in days of solver
+    // time). A chain of more than two unconfirmed epochs needs three
+    // storage-view transitions inside one confirm cycle, which the
+    // decay-gate hysteresis makes designed-rare; longer chains add one
+    // protected assignment per epoch with no new mechanics, and are
+    // exercised unboundedly by the simulations and witnesses.
+    nondet pvA = NODES.powerset().exclude(Set(Set())).oneOf()
+    nondet extraEpoch = Set(true, false).oneOf()
+    val inflight =
+      (if (cv == tv) Set() else Set(tv))
+        .union(if (extraEpoch and cv != tv) Set(pvA) else Set())
+    val pb = 0.to(N_FRAGS - 1).mapBy(f =>
+      (if (cv != Set()) Set(PLACE.get(cv).get(f)) else Set())
+        .union(inflight.map(v => PLACE.get(v).get(f))))
+    all {
+      NODES.filter(n => st.get(n) == GONE).size() <= MAX_GONE,
+      frags.forall(f => cps.get(f).forall(n => st.get(n) != GONE)),
+      frags.forall(f => iv.get(f).forall(n =>
+        cps.get(f).contains(n) or st.get(n) == GONE)),
+      NODES.powerset()
+        .filter(d => d.size() <= MAX_GONE - NODES.filter(n => st.get(n) == GONE).size())
+        .forall(d =>
+          frags.filter(f => cps.get(f).exclude(d).exists(n =>
+            cv == Set()
+              or PLACE.get(cv).get(f) == n
+              or pb.get(f).contains(n))).size() >= K + MAX_CORRUPT),
+      status' = st,
+      downFor' = df,
+      memberView' = mv,
+      copies' = cps,
+      invView' = iv,
+      deleted' = false,
+      calm' = 0,
+      repairCost' = 0,
+      goneCnt' = NODES.filter(n => st.get(n) == GONE).size(),
+      corruptCnt' = 0,
+      confirmedView' = cv,
+      targetView' = tv,
+      protectedBy' = pb,
+      dropCnt' = 0,
+      evictHarm' = false,
+    }
   }
 
   // === Environment actions (adversarial; all reset calm) ===
@@ -199,6 +359,8 @@ module storage_policy {
     downFor' = downFor.set(n, 0),
     memberView' = memberView, copies' = copies, invView' = invView, deleted' = deleted,
     calm' = 0, repairCost' = repairCost, goneCnt' = goneCnt, corruptCnt' = corruptCnt,
+    confirmedView' = confirmedView, targetView' = targetView,
+    protectedBy' = protectedBy, dropCnt' = dropCnt, evictHarm' = evictHarm,
   }
 
   action envSleep = all {
@@ -216,6 +378,8 @@ module storage_policy {
         downFor' = downFor.set(n, 0),
         memberView' = memberView, copies' = copies, invView' = invView, deleted' = deleted,
         calm' = 0, repairCost' = repairCost, goneCnt' = goneCnt, corruptCnt' = corruptCnt,
+        confirmedView' = confirmedView, targetView' = targetView,
+        protectedBy' = protectedBy, dropCnt' = dropCnt, evictHarm' = evictHarm,
       }
     }
   }
@@ -232,6 +396,8 @@ module storage_policy {
     copies' = 0.to(N_FRAGS - 1).mapBy(f => copies.get(f).exclude(Set(n))),
     memberView' = memberView, invView' = invView, deleted' = deleted,
     calm' = 0, repairCost' = repairCost, goneCnt' = goneCnt + 1, corruptCnt' = corruptCnt,
+    confirmedView' = confirmedView, targetView' = targetView,
+    protectedBy' = protectedBy, dropCnt' = dropCnt, evictHarm' = evictHarm,
   }
 
   action envDepart = all {
@@ -242,42 +408,107 @@ module storage_policy {
   }
 
   // Media corruption: one copy of one class silently dies.
+  action envCorruptN(f: int, n: int): bool = all {
+    corruptCnt < MAX_CORRUPT,
+    copies.get(f).contains(n),
+    copies' = copies.set(f, copies.get(f).exclude(Set(n))),
+    status' = status, downFor' = downFor, memberView' = memberView, invView' = invView,
+    deleted' = deleted, calm' = 0, repairCost' = repairCost,
+    goneCnt' = goneCnt, corruptCnt' = corruptCnt + 1,
+    confirmedView' = confirmedView, targetView' = targetView, protectedBy' = protectedBy,
+    dropCnt' = dropCnt, evictHarm' = evictHarm,
+  }
+
   action envCorrupt = all {
     corruptCnt < MAX_CORRUPT,
     frags.filter(f => copies.get(f).size() > 0).size() > 0,
     {
       nondet f = frags.filter(f => copies.get(f).size() > 0).oneOf()
       nondet n = copies.get(f).oneOf()
-      all {
-        copies' = copies.set(f, copies.get(f).exclude(Set(n))),
-        status' = status, downFor' = downFor, memberView' = memberView, invView' = invView,
-        deleted' = deleted, calm' = 0, repairCost' = repairCost,
-        goneCnt' = goneCnt, corruptCnt' = corruptCnt + 1,
-      }
+      envCorruptN(f, n)
     }
   }
 
   // Disk-pressure eviction (decision 4): pressure timing is the
-  // environment's; WHAT may be evicted is policy: only surplus (never
-  // the responsible copy), and only if the (possibly STALE) inventory
-  // view claims another holder exists — or the blob is deleted (GC).
+  // environment's; WHAT may be evicted is policy — the protection
+  // predicate (RFC-STORAGE-003), with the attested-other-holder belief
+  // check retained as a second belt, and deleted-blob GC unconditional.
+  // Belief may be stale or (under envDropMark) false; the predicate
+  // reads only agreed state.
+  def evictable(f: int, n: int): bool =
+    copies.get(f).contains(n) and isUp(n)
+      and (deleted
+        or (not(protected(f, n)) and invView.get(f).exclude(Set(n)).size() > 0))
+
+  // INV-EVICT-SAFE history condition: an eviction that empties an
+  // undeleted class's extant copy set WHILE BELIEF FOR THAT CLASS WAS
+  // TRUTHFUL is self-harm — definitionally a predicate/belt regression,
+  // since a truthful belt cannot claim a holder that does not exist.
+  // False-belief last-copy loss is the environment's doing, budgeted,
+  // and bounded by INV-DURABLE.
+  def evictWouldHarm(f: int, n: int): bool =
+    not(deleted)
+      and copies.get(f) == Set(n)
+      and invView.get(f).exclude(Set(n)).subseteq(copies.get(f).exclude(Set(n)))
+
+  action envEvictN(f: int, n: int): bool = all {
+    evictable(f, n),
+    // if-then-else, not `or`: a boolean `or` in assignment position is
+    // split into an action-level disjunction by the TLA translation,
+    // leaving evictHarm' unassigned on one branch (Apalache rejects it)
+    evictHarm' = if (evictWouldHarm(f, n)) true else evictHarm,
+    copies' = copies.set(f, copies.get(f).exclude(Set(n))),
+    status' = status, downFor' = downFor, memberView' = memberView, invView' = invView,
+    deleted' = deleted, calm' = 0, repairCost' = repairCost,
+    goneCnt' = goneCnt, corruptCnt' = corruptCnt,
+    confirmedView' = confirmedView, targetView' = targetView, protectedBy' = protectedBy,
+    dropCnt' = dropCnt,
+  }
+
   action envEvict = all {
-    frags.exists(f => copies.get(f).exists(n =>
-      isUp(n) and n != resp(f)
-        and (deleted or invView.get(f).exclude(Set(n)).size() > 0))),
+    frags.exists(f => NODES.exists(n => evictable(f, n))),
     {
-      nondet f = frags.filter(f => copies.get(f).exists(n =>
-        isUp(n) and n != resp(f)
-          and (deleted or invView.get(f).exclude(Set(n)).size() > 0))).oneOf()
-      nondet n = copies.get(f).filter(n =>
-        isUp(n) and n != resp(f)
-          and (deleted or invView.get(f).exclude(Set(n)).size() > 0)).oneOf()
-      all {
-        copies' = copies.set(f, copies.get(f).exclude(Set(n))),
-        status' = status, downFor' = downFor, memberView' = memberView, invView' = invView,
-        deleted' = deleted, calm' = 0, repairCost' = repairCost,
-        goneCnt' = goneCnt, corruptCnt' = corruptCnt,
-      }
+      nondet f = frags.filter(f => NODES.exists(n => evictable(f, n))).oneOf()
+      nondet n = NODES.filter(n => evictable(f, n)).oneOf()
+      envEvictN(f, n)
+    }
+  }
+
+  // RFC-STORAGE-003: the lossy-mark adversary — UNDER-claim only: a
+  // lost mark_local makes a real copy vanish from belief (unattested
+  // bytes, invisible to repair and to confirm evidence).
+  //
+  // The OVER-claim direction (a copy belief should no longer count) is
+  // deliberately NOT a fabricating action. Inventory rows originate
+  // solely from a holder's own self-attestation, so an over-claiming
+  // row was true at attestation time and went stale through a loss —
+  // which the model already represents as ordinary belief lag between
+  // faults/evictions and the sync rung, under adversarial scheduling.
+  // A FABRICATED positive (a row for bytes never held) is the lying/
+  // buggy-attester case, outside the fault-model perimeter — and
+  // provably must stay there: given one phantom entry, the checker
+  // kills a class for free (the phantom launders ConfirmPlacement,
+  // lapsing real obligations, and the eviction belt then trusts the
+  // same phantom — one lie spent twice). That counterexample is the
+  // formal justification for S5's disk-verified attestation rows.
+  action envDropMarkN(f: int, n: int): bool = all {
+    dropCnt < MAX_DROPS,
+    copies.get(f).contains(n),
+    invView.get(f).contains(n),
+    invView' = invView.set(f, invView.get(f).exclude(Set(n))),
+    status' = status, downFor' = downFor, memberView' = memberView, copies' = copies,
+    deleted' = deleted, calm' = 0, repairCost' = repairCost,
+    goneCnt' = goneCnt, corruptCnt' = corruptCnt, dropCnt' = dropCnt + 1,
+    confirmedView' = confirmedView, targetView' = targetView, protectedBy' = protectedBy,
+    evictHarm' = evictHarm,
+  }
+
+  action envDropMark = all {
+    dropCnt < MAX_DROPS,
+    {
+      nondet f = frags.oneOf()
+      nondet n = NODES.oneOf()
+      envDropMarkN(f, n)
     }
   }
 
@@ -287,6 +518,8 @@ module storage_policy {
     status' = status, downFor' = downFor, memberView' = memberView, copies' = copies,
     invView' = invView, calm' = 0, repairCost' = repairCost,
     goneCnt' = goneCnt, corruptCnt' = corruptCnt,
+    confirmedView' = confirmedView, targetView' = targetView,
+    protectedBy' = protectedBy, dropCnt' = dropCnt, evictHarm' = evictHarm,
   }
 
   // === The engine: one deterministic prioritized tick ===
@@ -303,8 +536,8 @@ module storage_policy {
   val viewTarget = NODES.filter(n => isUp(n) or downFor.get(n) < DELTA)
 
   val pullNeedy = frags.filter(f =>
-    not(copies.get(f).contains(resp(f)))
-      and isUp(resp(f))
+    not(copies.get(f).contains(respTarget(f)))
+      and isUp(respTarget(f))
       and copies.get(f).intersect(upNodes).size() > 0)
 
   val liveClassCount = frags.filter(f => copies.get(f).intersect(upNodes).size() > 0).size()
@@ -313,44 +546,101 @@ module storage_policy {
   // come back inside the decay window. Urgency overrides hope.
   val deadClasses = frags.filter(f => copies.get(f).intersect(upNodes).size() == 0)
   val reencodeReady = deadClasses.filter(f =>
-    isUp(resp(f)) and (
+    isUp(respTarget(f)) and (
       liveClassCount < W
         or copies.get(f).filter(n => status.get(n) == DOWN and downFor.get(n) < DELTA).size() == 0))
 
+  // Prioritized single-mutation ladder (RFC-STORAGE-003 order, decided
+  // in S0): view sync > declare > re-encode > pull > belief sync >
+  // confirm. Declare above the movers: fix the goal before moving bytes
+  // toward it. Re-encode outranks pull — liveness deficit first: a dead
+  // class is a durability hole, a misplaced one is not. Belief sync
+  // BELOW the movers: one sync lands after the moves and before the
+  // confirm — the faithful image of the implementation, whose inventory
+  // rows land via batched self-checks, not per-pull; it also makes
+  // CALM_BOUND linear at ~1 tick per moved class instead of 2. (The
+  // sync-above-movers alternative was measured too: same invariants,
+  // bound 19 instead of 13 on the scaled config — biased-step
+  // falsification found its worst trace at ~1 per 5M samples.)
   action engineTick = all {
     status' = status,
     deleted' = deleted,
     goneCnt' = goneCnt,
     corruptCnt' = corruptCnt,
+    dropCnt' = dropCnt,
+    evictHarm' = evictHarm,
     calm' = calm + 1,
     downFor' = nextDownFor,
-    // Prioritized single-mutation body over (memberView, invView, copies, repairCost):
     if (memberView != viewTarget and viewTarget.size() > 0) all {
       memberView' = viewTarget,
       invView' = invView, copies' = copies, repairCost' = repairCost,
-    } else if (invView != copies) all {
-      invView' = copies,
-      memberView' = memberView, copies' = copies, repairCost' = repairCost,
-    } else if (AUTO_PULL and not(deleted) and pullNeedy.size() > 0) all {
-      copies' = copies.set(least(pullNeedy),
-        copies.get(least(pullNeedy)).union(Set(resp(least(pullNeedy))))),
-      repairCost' = repairCost + 1,
-      memberView' = memberView, invView' = invView,
+      confirmedView' = confirmedView, targetView' = targetView,
+      protectedBy' = protectedBy,
+    } else if (not(deleted) and targetView != memberView) all {
+      // declare: the goal went stale — DeclarePlacementTarget under
+      // model names; duties downstream re-derive from the new target.
+      // The new epoch JOINS the in-flight set; protection of earlier
+      // destinations persists until confirm.
+      targetView' = memberView,
+      protectedBy' = 0.to(N_FRAGS - 1).mapBy(f =>
+        protectedBy.get(f).union(Set(PLACE.get(memberView).get(f)))),
+      memberView' = memberView, invView' = invView, copies' = copies,
+      repairCost' = repairCost, confirmedView' = confirmedView,
     } else if (AUTO_REENCODE and not(deleted)
         and reencodeReady.size() > 0 and liveClassCount >= K) all {
       copies' = copies.set(least(reencodeReady),
-        copies.get(least(reencodeReady)).union(Set(resp(least(reencodeReady))))),
+        copies.get(least(reencodeReady)).union(Set(respTarget(least(reencodeReady))))),
       repairCost' = repairCost + K,
       memberView' = memberView, invView' = invView,
+      confirmedView' = confirmedView, targetView' = targetView,
+      protectedBy' = protectedBy,
+    } else if (AUTO_PULL and not(deleted) and pullNeedy.size() > 0) all {
+      copies' = copies.set(least(pullNeedy),
+        copies.get(least(pullNeedy)).union(Set(respTarget(least(pullNeedy))))),
+      repairCost' = repairCost + 1,
+      memberView' = memberView, invView' = invView,
+      confirmedView' = confirmedView, targetView' = targetView,
+      protectedBy' = protectedBy,
+    } else if (invView != copies) all {
+      invView' = copies,
+      memberView' = memberView, copies' = copies, repairCost' = repairCost,
+      confirmedView' = confirmedView, targetView' = targetView,
+      protectedBy' = protectedBy,
+    } else if (not(deleted) and confirmedView != targetView
+        and frags.forall(f => invView.get(f).contains(respTarget(f)))) all {
+      // confirm: evidence complete — the guard reads BELIEF, exactly as
+      // ConfirmPlacement validation reads attested inventory rows.
+      // Obligations collapse onto the confirmed epoch: the in-flight
+      // set empties, superseded destinations become surplus.
+      confirmedView' = targetView,
+      protectedBy' = 0.to(N_FRAGS - 1).mapBy(f => Set(respTarget(f))),
+      memberView' = memberView, invView' = invView, copies' = copies,
+      repairCost' = repairCost, targetView' = targetView,
     } else all {
       memberView' = memberView, invView' = invView,
       copies' = copies, repairCost' = repairCost,
+      confirmedView' = confirmedView, targetView' = targetView,
+      protectedBy' = protectedBy,
     }
   }
 
   action step = any {
     envSleep, envWake, envDepart, envCorrupt,
-    envEvict, envDelete,
+    envEvict, envDelete, envDropMark,
+    engineTick,
+  }
+
+  // Falsification step for INV-CONVERGE (the CALM_BOUND counting
+  // method): the adversary may act until the engine has strung a few
+  // quiet ticks, then the trace is a pure calm window — random `step`
+  // traces essentially never produce CALM_BOUND consecutive engine
+  // ticks (~(1/8)^BOUND per trace), which is how v2's INV-RECOVER hole
+  // stayed hidden. Use: quint run --step calmProbeStep --invariant
+  // convergence --init {init,initOriginHeld,initMidFlight}. Any
+  // violation is a miscounted CALM_BOUND, with the trace as the
+  // counterexample.
+  action calmProbeStep = any {
+    all { calm <= 6, any { envSleep, envWake, envDepart, envCorrupt, envEvict, envDropMark } },
     engineTick,
   }
 
@@ -358,10 +648,35 @@ module storage_policy {
   // INV-DURABLE — core safety under the fault budget.
   val safety = deleted or durable
 
-  // INV-RECOVER — bounded self-healing: an uninterrupted engine window
-  // restores full conformance. Discriminates the policy variants:
-  // AUTO_PULL/AUTO_REENCODE = false (shipped policy) violates this.
-  val recovery = deleted or calm < CALM_BOUND or conformant
+  // INV-EVICT-SAFE — the system never self-harms: no eviction empties an
+  // undeleted class's extant copy set on truthful belief. Checked
+  // unconditionally, every budget enabled; a violation is definitionally
+  // a protection-predicate/belt regression (see envEvict). False-belief
+  // harm is the environment's, and INV-DURABLE bounds it.
+  val evictSafe = not(evictHarm)
+
+  // INV-CONVERGE — bounded convergence from ANY reachable pipeline state
+  // (subsumes v2's INV-RECOVER): an uninterrupted engine window finishes
+  // the job. Converged is the full fixpoint — bytes at the goal,
+  // paperwork done, goal fresh (assignment-equality, so a clean re-goal
+  // does not un-converge a blob), belief matching reality.
+  //
+  // The `available` precondition (S0 finding): convergence is promised
+  // only for calm windows in which the chunk is reconstructible from
+  // ONLINE nodes — you cannot converge what you cannot read. With most
+  // holders asleep, pulls have no source and re-encode is (correctly)
+  // gated on K live classes; the engine must idle without penalty until
+  // wake or decay. v2's INV-RECOVER had this same hole unstated — it was
+  // sim-unreachable (13 consecutive engine ticks after 3 sleeps is a
+  // ~1e-12 event per random trace) and Apalache only checked safety.
+  // `available` is monotone under engine ticks, so holding at check time
+  // means it held through the calm window being judged.
+  val converged =
+    conformantToTarget
+      and confirmedView == targetView
+      and PLACE.get(targetView) == PLACE.get(memberView)
+      and invView == copies
+  val convergence = deleted or calm < CALM_BOUND or not(available) or converged
 
   // INV-SPREAD — even-spread bridge lemma (feeds the 1/3-vs-2/3
   // membership-lag slack argument). Expected: holds for variants 0
@@ -370,7 +685,7 @@ module storage_policy {
     frags.filter(f => resp(f) == m).size()
       <= (N_FRAGS + memberView.size() - 1) / memberView.size())
 
-  val safetyAndRecovery = safety and recovery
+  val safetyAndConvergence = safety and evictSafe and convergence
 }
 
 // ============================================================
@@ -397,7 +712,7 @@ module scaled {
     NODES = NODES4, N_FRAGS = 6, K = 2,
     PLACE = buildTable(0, 6, NODES4, WEIGHT4),
     AUTO_PULL = true, AUTO_REENCODE = true,
-    MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
+    MAX_GONE = 1, MAX_CORRUPT = 1, MAX_DROPS = 1, CALM_BOUND = 13, DELTA = 3, W = 3
   ).*
 
   // WITNESS: permanent node loss heals fully (view decays the ghost,
@@ -445,7 +760,7 @@ module scaled_hrw {
     NODES = NODES4, N_FRAGS = 6, K = 2,
     PLACE = buildTable(1, 6, NODES4, WEIGHT4),
     AUTO_PULL = true, AUTO_REENCODE = true,
-    MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
+    MAX_GONE = 1, MAX_CORRUPT = 1, MAX_DROPS = 1, CALM_BOUND = 13, DELTA = 3, W = 3
   ).*
 
   // WITNESS: HRW moves NOTHING whose owner survived a member removal
@@ -472,7 +787,7 @@ module scaled_bal {
     NODES = NODES4, N_FRAGS = 6, K = 2,
     PLACE = buildTable(3, 6, NODES4, WEIGHT4),
     AUTO_PULL = true, AUTO_REENCODE = true,
-    MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
+    MAX_GONE = 1, MAX_CORRUPT = 1, MAX_DROPS = 1, CALM_BOUND = 13, DELTA = 3, W = 3
   ).*
 
   run healsAfterDepartBalTest =
@@ -494,6 +809,137 @@ module scaled_bal {
     init.then(envDepartN(1)).then(18.reps(_ => engineTick))
       .expect(conformant and repairCost == 2 * owned1.size() + movedSurvivors.size())
   }
+
+  // ===== RFC-STORAGE-003 witnesses: the pipeline is inside the loop =====
+
+  // WITNESS (headline): from birth — every class on one origin, never
+  // confirmed — a calm window suffices to reach the full converged
+  // fixpoint, whatever node uploaded.
+  run originHeldConvergesTest =
+    initOriginHeld.then(CALM_BOUND.reps(_ => engineTick)).expect(converged)
+
+  // WITNESS (regions): the origin-3 birth trace passes through the
+  // production stuck-point regions and exits them — mixed x unplaced
+  // mid-distribution, then conformant x unplaced (distribution done,
+  // paperwork not), then converged one confirm tick later. Node 3 owns
+  // only class 3 under the full view, so five classes move (one pull
+  // tick each), the belief sync lands on tick 6, confirm on tick 7.
+  run originHeldRegionTraceTest =
+    initOriginHeldAt(3)
+      .then(3.reps(_ => engineTick))
+      .expect(not(conformantToTarget) and confirmedView == Set())  // mixed x unplaced
+      .then(3.reps(_ => engineTick))
+      .expect(conformantToTarget and confirmedView == Set()
+        and not(converged))                                        // conformant x unplaced
+      .then(engineTick)
+      .expect(converged and confirmedView == targetView)
+
+  // WITNESS (drop-mark, under-claim): a lost mark_local diverges belief
+  // from truth; the belief-sync rung — the model form of the disk-truth
+  // sweep — restores it in one tick.
+  run dropMarkHealsTest =
+    init.then(envDropMarkN(0, 2))
+      .expect(not(converged))
+      .then(engineTick)
+      .expect(converged)
+
+  // WITNESS (over-claim = staleness): a corrupted sole copy leaves an
+  // over-claiming belief entry on a live node; one re-encode restores
+  // the bytes and the sweep rung restores belief.
+  run staleOverclaimHealsTest =
+    init.then(envCorruptN(0, 2))
+      .expect(not(converged))
+      .then(2.reps(_ => engineTick))
+      .expect(converged)
+
+  // WITNESS (the uploader-nukes-the-only-copy hole the predicate
+  // closes): mid-distribution, belief truthfully shows second holders
+  // for the pulled classes — the eviction belt would pass — yet every
+  // origin copy stays protected while placement_height is NULL.
+  run prematureEvictionSafeTest =
+    initOriginHeldAt(1)
+      .then(5.reps(_ => engineTick))
+      .expect(confirmedView == Set()
+        and frags.exists(f => invView.get(f).exclude(Set(1)).size() > 0)
+        and not(frags.exists(f => evictable(f, 1))))
+
+  // WITNESS (stale-belief eviction laundering is fault-anchored): one
+  // budgeted corrupt kills its class completely — the corrupted
+  // responsible's stale row launders eviction of the surviving surplus
+  // — but only that class: the per-class kill accounting behind the
+  // burst math holds, durability stands, and INV-EVICT-SAFE correctly
+  // stays quiet (the emptying eviction acted on false belief). This is
+  // the reachable remnant of the fabricated-belief break the perimeter
+  // excludes; see envDropMarkN.
+  run evictLaunderAccountingTest =
+    initOriginHeldAt(3)
+      .then(7.reps(_ => engineTick))
+      .expect(converged)
+      .then(envCorruptN(0, 2))
+      .then(envEvictN(0, 3))
+      .expect(copies.get(0) == Set() and durable and not(evictHarm))
+
+  // Should: lapse the origin's obligations at confirm — after the
+  // paperwork, its non-responsible copies are surplus and evictable
+  // under the attested-successor belt.
+  run originSurplusLapsesTest =
+    initOriginHeldAt(3)
+      .then(7.reps(_ => engineTick))
+      .expect(converged and frags.forall(f =>
+        respTarget(f) == 3 or evictable(f, 3)))
+
+  // WITNESS (supersede): the in-flight destination dies mid-handoff; the
+  // declare rung re-goals to the survivor view and the same machinery
+  // finishes there — no timeout, no special case.
+  run supersedeMidFlightTest =
+    initOriginHeldAt(3)
+      .then(4.reps(_ => engineTick))
+      .then(envDepartN(4))
+      .then(18.reps(_ => engineTick))
+      .expect(converged and not(memberView.contains(4)))
+
+  // WITNESS (CALM_BOUND tight, both directions): the counted worst
+  // window at this scale. Setup: birth at origin 2; node 4 departs and
+  // the first drain converges on {1,2,3} (11 ticks: 3 pre-decay pulls,
+  // view sync, declare, 4 pulls, belief sync, confirm). The adversary
+  // then prunes every surplus copy that would satisfy the {1,3} goal
+  // (three surgical evictions — all legal: surplus under the predicate,
+  // belt satisfied), and flaps the origin: sleep past the decay gate,
+  // wake, sleep again — the calm window opens with the origin DOWN at
+  // downFor 0 while the view already dropped it. The window then costs:
+  // 1 re-admission view sync + 2 hope-gated idle ticks (the decay gate
+  // re-runs) + 1 view sync + 1 declare + 2 re-encodes (origin-only
+  // classes now hopeless) + 4 pulls + 1 belief sync + 1 confirm = 13
+  // ticks. Twelve do not suffice; thirteen do. A ladder change that
+  // alters the count breaks this witness loudly — recount, then update
+  // CALM_BOUND and this comment together.
+  run calmTightnessTest =
+    initOriginHeldAt(2)
+      .then(envDepartN(4))
+      .then(11.reps(_ => engineTick))
+      .then(envEvictN(2, 1))
+      .then(envEvictN(3, 3))
+      .then(envEvictN(4, 1))
+      .then(envSleepN(2))
+      .then(4.reps(_ => engineTick))
+      .then(envWake)
+      .then(envSleepN(2))
+      .then((CALM_BOUND - 1).reps(_ => engineTick))
+      .expect(not(converged))
+      .then(engineTick)
+      .expect(converged)
+
+  // WITNESS (random regression): any short adversarial burst, then a
+  // CALM_BOUND window — the blob is converged, excused (unreadable), or
+  // deleted. This is the sampling half of the INV-CONVERGE regime run
+  // on every test invocation.
+  run randomBurstConvergenceTest =
+    initOriginHeld
+      .then(5.reps(_ => any {
+        envSleep, envWake, envDepart, envCorrupt, envEvict, envDropMark, engineTick }))
+      .then(CALM_BOUND.reps(_ => engineTick))
+      .expect(deleted or not(available) or converged)
+
 }
 
 // NEG: the currently-shipped policy — no automatic repair of any kind.
@@ -505,7 +951,7 @@ module scaled_neg {
     NODES = NODES4, N_FRAGS = 6, K = 2,
     PLACE = buildTable(0, 6, NODES4, WEIGHT4),
     AUTO_PULL = false, AUTO_REENCODE = false,
-    MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
+    MAX_GONE = 1, MAX_CORRUPT = 1, MAX_DROPS = 1, CALM_BOUND = 13, DELTA = 3, W = 3
   ).*
 
   // NEG WITNESS: with the shipped policy a permanent loss NEVER heals —
@@ -524,7 +970,7 @@ module scaled_tier1 {
     NODES = NODES4, N_FRAGS = 6, K = 2,
     PLACE = buildTable(0, 6, NODES4, WEIGHT4),
     AUTO_PULL = true, AUTO_REENCODE = false,
-    MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
+    MAX_GONE = 1, MAX_CORRUPT = 1, MAX_DROPS = 1, CALM_BOUND = 13, DELTA = 3, W = 3
   ).*
 
   // NEG WITNESS: pull-only repair heals membership moves but CANNOT
@@ -576,7 +1022,23 @@ module scaled_verify {
   import storage_policy(
     NODES = Set(1, 2, 3, 4), N_FRAGS = 6, K = 2, PLACE = BAL_TABLE,
     AUTO_PULL = true, AUTO_REENCODE = true,
-    MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
+    MAX_GONE = 1, MAX_CORRUPT = 1, MAX_DROPS = 1, CALM_BOUND = 13, DELTA = 3, W = 3
+  ).*
+}
+
+// Birth-window verification config (RFC-STORAGE-003): origin-held
+// safety. MAX_GONE = 0 — whole-disk death of the single-copy origin
+// pre-distribution is data loss by nature (the upload durability window
+// every system has until first replication), not a policy defect.
+// Everything else stays adversarial: sleep, eviction pressure, media
+// corruption, and mark loss — the uploader-nuking-the-only-copy hole is
+// exactly what this config checks the protection predicate against.
+module scaled_verify_birth {
+  import verify_table.*
+  import storage_policy(
+    NODES = Set(1, 2, 3, 4), N_FRAGS = 6, K = 2, PLACE = BAL_TABLE,
+    AUTO_PULL = true, AUTO_REENCODE = true,
+    MAX_GONE = 0, MAX_CORRUPT = 1, MAX_DROPS = 1, CALM_BOUND = 13, DELTA = 3, W = 3
   ).*
 }
 
@@ -728,6 +1190,15 @@ module table_guard {
 
 // Full-scale parameters (K=10, 30 classes, 10 nodes) for `quint run`.
 // Capped-HRW table over the powerset (built once on the Rust backend).
+// CALM_BOUND: analytic count under the S0 ladder — re-admission sync
+// (1) + idle re-decay (DELTA-1 = 4) + view sync (1) + declare (1) +
+// worst moves (N_FRAGS - origin's minimum load = 30 - 3 = 27) + belief
+// sync (1) + confirm (1) = 36, plus one staggered second flap cycle
+// (+2 sync/declare) => 38; set 40 with slack for mid-window re-goal
+// waste. Falsified via calmProbeStep at 20k+ samples per init at 38;
+// the tight-both-directions witness pair lives at the scaled size
+// (scaled_bal::calmTightnessTest), where the worst window is
+// constructible by hand.
 module full {
   import placement.*
   pure val NODES10 = 1.to(10)
@@ -737,6 +1208,7 @@ module full {
     NODES = NODES10, N_FRAGS = 30, K = 10,
     PLACE = buildTable(3, 30, NODES10, WEIGHT10),
     AUTO_PULL = true, AUTO_REENCODE = true,
-    MAX_GONE = 2, MAX_CORRUPT = 3, CALM_BOUND = 50, DELTA = 5, W = 19
+    MAX_GONE = 2, MAX_CORRUPT = 3, MAX_DROPS = 2, CALM_BOUND = 40, DELTA = 5, W = 19
   ).*
+
 }
