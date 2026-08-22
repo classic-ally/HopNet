@@ -67,6 +67,30 @@ jobs:
           nix develop --command cargo build --bin hopnet
           nix develop --command cargo test -p hopnet-mount --test stack
 
+  spec:
+    # Fast half of the formal-spec suite (RFC-STORAGE-003 S0): typecheck
+    # + Rust-backend witness/unit runs per config, seconds-scale. The
+    # Apalache exhaustive matrix (JVM, hours) stays a local ritual —
+    # see hopnet-storage/spec/README.md.
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: x86_64-linux
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: quint typecheck
+        working-directory: hopnet-storage
+        run: nix shell nixpkgs#nodejs -c npx --yes @informalsystems/quint typecheck spec/storage_policy.qnt
+
+      - name: quint test (witness suites, all configs)
+        working-directory: hopnet-storage
+        run: |
+          for m in scaled scaled_hrw scaled_bal scaled_neg scaled_tier1 table_guard; do
+            nix shell nixpkgs#nodejs -c npx --yes @informalsystems/quint test spec/storage_policy.qnt --main $m
+          done
+
   nix-build:
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: x86_64-linux
