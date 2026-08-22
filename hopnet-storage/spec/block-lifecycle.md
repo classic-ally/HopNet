@@ -194,10 +194,17 @@ surface per-urgency-tier time-to-conformance in the resilience pane.
     origin's copies safe between birth and first confirmation);
   - `confirmed` is set and n is responsible for f under
     `assignment(view@confirmed)` — the standing obligation;
-  - n is responsible for f under `assignment(view@target)` — the
-    in-flight destination; without this clause a pressure spike
+  - n is responsible for f under the assignment of ANY
+    declared-but-unconfirmed epoch — the transition record's view
+    snapshots in `(placement_height, desired]`, the current target
+    always among them. Without this clause a pressure spike
     mid-handoff evicts the newly pulled copy and the handoff
-    livelocks;
+    livelocks — and covering only the newest target is not enough
+    (S0 finding, by checker counterexample): a supersede-declare
+    would strip the previous destination's freshly pulled copy —
+    possibly the only real bytes — of protection, evictable through
+    a stale row. Protection lapses only at confirm, exactly as
+    obligations do;
   - the copy is pinned.
   Everything else is surplus: evictable, lazily, under the normal
   pressure-driven watermark rules, with the attested-other-holder
@@ -208,26 +215,54 @@ surface per-urgency-tier time-to-conformance in the resilience pane.
   free; computing the guard differently anywhere is the only way to
   reintroduce the loss, and single-sourcing forbids it.
 - **INV-EVICT-SAFE — the system never self-harms.** No eviction
-  step ever removes the last extant copy of a class. Encoded with a
-  one-bit history variable (set when an `envEvict` empties a
-  class's extant copy set; invariant: never set), and checked
-  unconditionally — under any fault interleaving, with every budget
-  spent — because eviction is the system's own action: the
-  environment may destroy copies, the system never may. The guard
-  is also checked indirectly (a too-weak predicate eventually fails
-  INV-DURABLE), but the direct form isolates blame: a violation is
-  definitionally the protection predicate's fault, no triage.
+  step ever removes the last extant copy of a class *on truthful
+  belief*. Encoded with a one-bit history variable (set when an
+  `envEvict` empties a class's extant copy set while belief for
+  that class was a subset of truth; invariant: never set), and
+  checked unconditionally — under any fault interleaving, with
+  every budget spent — because eviction is the system's own action:
+  the environment may destroy copies, the system never may.
+  - The truthful-belief condition is an S0 refinement, forced by a
+    checker counterexample: a fresh attestation can precede an
+    instant disk death (surplus holder n, sole responsible m dies
+    undetected, belief still names m, n evicts) — no recency scheme
+    closes that window, in the model or in the implementation.
+    Last-copy loss on *false* belief is therefore the environment's
+    harm, budgeted, and bounded by INV-DURABLE; the invariant's job
+    is blame isolation, and under a correct belt the truthful case
+    provably cannot fire — so a violation is definitionally a
+    predicate/belt regression, no triage.
 - **A new environment action: `envDropMark`.** The queue can lie to
   the database, the database lies to the mesh, and the mesh's belief
   is what eviction trusts — so the model gains the power to lie in
   exactly that way, and the proofs must still hold. `envDropMark`
-  desynchronizes `invView` from `copies` in either direction under a
-  drop budget (MAX_DROPS, the analogue of MAX_CORRUPT): the model
-  image of a full local-state channel dropping a `mark_local` (a
-  node holds bytes the mesh never learns about) or a `mark_remote`
-  (the mesh keeps believing in a copy it should not count). This
-  models an honest node whose bookkeeping went wrong — not a node
-  that lies; the lying node is outside the perimeter (see below).
+  under-claims: a real copy vanishes from belief under a drop budget
+  (MAX_DROPS, the analogue of MAX_CORRUPT) — the model image of a
+  full local-state channel dropping a `mark_local`, leaving bytes
+  the mesh never learns about. This models an honest node whose
+  bookkeeping went wrong — not a node that lies; the lying node is
+  outside the perimeter (see below).
+  - The over-claim direction (belief counting a copy it should not
+    — the dropped `mark_remote`) is deliberately NOT a fabricating
+    action; S0 finding. Inventory rows originate solely from a
+    holder's own self-attestation, so an over-claiming row was true
+    at attestation and went stale through a loss; the model already
+    represents that as belief lag between faults/evictions and the
+    sync rung, under fully adversarial scheduling. The
+    stale-laundering such rows enable is fault-anchored: every
+    class an eviction chain kills through a stale row traces to a
+    budgeted fault that already accounts for that class in the
+    burst math (witnessed: `evictLaunderAccountingTest`).
+  - A FABRICATED positive — a row for bytes never held — is
+    provably outside what the design can survive: handed one
+    phantom entry, the checker kills a class with no budget spent,
+    because the phantom launders ConfirmPlacement (real obligations
+    lapse against fake evidence) and the eviction belt then trusts
+    the same phantom — one lie spent twice. That counterexample is
+    the formal justification for S5's honest attestation: rows must
+    be disk-verified at write time precisely because confirm
+    validation and the eviction belt both stand on them. The
+    fabricating attester is the lying node, excluded with it.
   Consequences:
   - **Convergence forces disk-truth attestation.** The model's
     inventory-sync rung restores belief from truth (`invView' =
@@ -237,14 +272,14 @@ surface per-urgency-tier time-to-conformance in the resilience pane.
     counterexample. The only honest discharge is a mechanism that
     reads the disk: scan, compare, repair the flag and the
     attestation.
-  - **Safety must be re-proven under drops.** The existing
-    INV-DURABLE proof tolerates belief that is stale — lagging
-    truth — but never false — contradicting it. Over-claim aims new
-    adversary power at the one action that deletes bytes. The
-    widened protection predicate is expected to carry the proof
-    (obligations come from consensus columns; belief is demoted to
-    a second belt), but expected is not proved: the check runs with
-    the action enabled.
+  - **Safety must be re-proven under drops.** Stale belief aims at
+    the one action that deletes bytes, and the drop makes real
+    copies invisible to repair and to confirm evidence. The widened
+    protection predicate carries the proof (obligations come from
+    consensus columns; belief is demoted to a second belt) — proved,
+    not expected: the check runs with the action enabled, and the
+    stale-eviction chains the belt admits are fault-anchored per the
+    accounting witness above.
   - **The property schedules the mechanism.** Belief is dishonest
     for at most one disk-truth cycle, so the sweep's cadence enters
     the wall-clock convergence bound and is chosen from it, not
@@ -262,10 +297,23 @@ surface per-urgency-tier time-to-conformance in the resilience pane.
     the sweep cadence the bound already fixed.
 - **INV-CONVERGE.** At every moment, at least one of these holds:
   the blob was deleted, or the engine has not yet had CALM_BOUND
-  uninterrupted turns, or the blob is converged. Read backwards:
-  given enough uninterrupted turns, the engine finishes the job.
-  (Phrased as an always-true formula because that is what the
-  checker can verify — the same encoding INV-RECOVER already uses.)
+  uninterrupted turns, or the blob is unreadable from online nodes,
+  or the blob is converged. Read backwards: given enough
+  uninterrupted turns over a readable chunk, the engine finishes
+  the job. (Phrased as an always-true formula because that is what
+  the checker can verify — the same encoding INV-RECOVER already
+  uses.)
+  - The readability disjunct (`available`: K classes live on online
+    nodes) is an S0 finding: with most holders asleep, pulls have
+    no source and re-encode is correctly gated on K live classes,
+    so the engine must idle without penalty until wake or decay —
+    you cannot converge what you cannot read. v2's INV-RECOVER had
+    the same hole unstated; it survived because random simulation
+    cannot string CALM_BOUND consecutive engine ticks (~1e-12 per
+    trace) and Apalache only ever checked safety. `available` is
+    monotone under engine ticks (pull needs a live source,
+    re-encode needs K live), so holding at check time means it held
+    through the window being judged.
   "Converged" is four plain conditions:
   - the bytes are in the right places — every class sits on the
     node the goal assignment names;
@@ -298,6 +346,18 @@ surface per-urgency-tier time-to-conformance in the resilience pane.
     every pull (two ticks per class) or once after all pulls
     (N_FRAGS + 1) is decided by rung priority in the tick's ladder;
     the count, and thus CALM_BOUND, follows from that choice.
+  - S0 decided the ladder: view sync > declare > re-encode > pull >
+    belief sync > confirm — sync once, after the moves. It is the
+    faithful image of the implementation (inventory rows land via
+    batched self-checks, never per-pull), it puts re-encode above
+    pull (liveness deficit first, matching the duty ladder), and it
+    makes the bound linear at ~1 tick per moved class: 13 at the
+    scaled size, witnessed tight (12 provably insufficient — the
+    worst window is an origin flap that re-runs the decay gate over
+    a fully pruned surplus). The sync-after-every-pull alternative
+    measured 19 on the same config with the same invariants, and
+    would additionally promise a belief freshness the
+    implementation does not deliver.
   - The checker keeps the count honest in both directions: the
     invariant must pass at CALM_BOUND (it is enough) and a witness
     must fail at CALM_BOUND − 1 (it is tight). A miscount breaks
@@ -312,6 +372,14 @@ surface per-urgency-tier time-to-conformance in the resilience pane.
   - Safety — INV-DURABLE, INV-SPREAD, INV-EVICT-SAFE: exhaustive
     bounded model checking (Apalache), small depth, from all three
     inits, with `envDropMark` enabled.
+  - One budget asterisk (S0): from the origin-held init, INV-DURABLE
+    is checked with the depart budget zeroed — a single-copy blob
+    whose origin disk dies before first replication is data loss by
+    nature, the upload durability window every storage system has
+    until first replication; no placement policy can carry that
+    proof. Everything else stays adversarial from birth: sleep,
+    eviction pressure, corruption, mark loss. The window itself is
+    bounded by the same CALM_BOUND that bounds distribution.
   - Convergence — INV-CONVERGE: scripted witness runs from every
     region the stuck-point bullet names, plus large random
     simulation on the full-scale config. Exhaustive checking cannot
@@ -386,8 +454,11 @@ state to converged, with obligations never dropped in between.
       record; no per-blob assignment computation anywhere in
       declare's apply, which is row writes only.
   - Effect: `desired_placement_height = to`. Nobody's hold
-    obligation changes; the new responsibles under `view@to` gain a
-    pull duty, derived from the column itself.
+    obligation changes — and nobody's protection either: the new
+    epoch joins the in-flight set the predicate covers; earlier
+    destinations stay protected until confirm. The new responsibles
+    under `view@to` gain a pull duty, derived from the column
+    itself.
   - The columns record need, not activity. There is deliberately no
     cap on the in-flight set: capping declarations would make the
     control plane's liveness depend on data-plane capacity, and a
@@ -720,7 +791,7 @@ optimization and carries no proof obligation.
 
 ## Stages
 
-- **S0 — Model extension.** The `(confirmed, target)` pair,
+- [x] **S0 — Model extension.** The `(confirmed, target)` pair,
   `initOriginHeld`, `envDropMark`, the widened `envEvict` guard,
   declare/confirm rungs, INV-CONVERGE, INV-EVICT-SAFE; CALM_BOUND
   derived and witnessed tight (pass at bound, fail at bound − 1);
@@ -728,21 +799,47 @@ optimization and carries no proof obligation.
   `verify_table` and the spec README updated. Gate: every check in
   the regime table green. All rung-priority decisions are made
   here, before any Rust.
+  - Done 2026-08-22. Decisions and findings recorded in the Model
+    Extension bullets above: the ladder (view sync > declare >
+    re-encode > pull > belief sync > confirm; sync-below-movers,
+    matching the implementation's batched self-checks; measured 13
+    vs 19 for the alternative), CALM_BOUND = 13 at scaled size
+    (tight both directions, `calmTightnessTest`), the
+    truthful-belief refinement of INV-EVICT-SAFE, the `available`
+    precondition on INV-CONVERGE, the zero-depart budget for
+    the origin-held init (the upload window), the
+    fabricated-attestation exclusion (the phantom-laundered-confirm
+    counterexample that formally justifies S5), and the in-flight
+    epoch set (`pendingViews`): protection covers every
+    declared-but-unconfirmed destination, because the checker showed
+    a supersede-declare stripping the previous destination's only
+    real copy. Falsification method
+    institutionalized as `calmProbeStep`; the fast half of the
+    suite runs in CI (`check-linux.yml`, job `spec`).
 - **S1 — Schema and txs.** The two columns (NOT NULL, backfill),
   DeclarePlacementTarget and ConfirmPlacement handlers with full
   apply validation, the transition record memo. Rides RFC-020
   schema evolution. Gate: snapshotter parity on all touched DB
   functions; apply-side validation exercised by handler tests.
-- **S2 — The protection predicate.** One pure function; evictor and
-  reconciler both consume it; the unconfirmed-blob clause; a parity
-  test pinning it to the model's guard, table_guard-style. Lands
+- **S2 — The protection predicate.** One pure function consuming the
+  transition record's memoized snapshots (confirmed epoch plus every
+  in-flight epoch); evictor and reconciler both consume it; the
+  unconfirmed-blob clause; a parity test pinning it to the model's
+  guard, table_guard-style. Lands
   before any machinery that could delete: the safety net precedes
-  the acrobatics.
+  the acrobatics. Also lands the ITF trace-conformance seam: the
+  predicate evaluated against exported model-witness traces, the
+  first rung of replaying Quint executions against real code.
 - **S3 — Pull machinery.** Pull duties derived at declare-apply;
   fetch-with-recovery; awaited-send marks (backpressure); the
   serial worker's deficit-first duty ladder. The push pipeline,
   threshold, and blind placement batcher retire in the same stage —
-  no period with two distribution paths.
+  no period with two distribution paths. The trace-conformance
+  harness completes here: the reconciler's state machine driven by
+  exported witness traces (env actions injected, tick by tick),
+  asserting state agreement after every step — upgrading "the code
+  resembles the model" to "the code refuses to diverge from it on
+  every checked execution".
 - **S4 — The two passes.** Propose hook + grace rung (staleness);
   fulfillment sampling fused with the tick (confirm discovery).
   The missing-class scan and the LIMIT-1 rebalance rung retire.
