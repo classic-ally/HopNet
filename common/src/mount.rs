@@ -68,6 +68,33 @@ pub struct MountModifyRequest {
     pub new_parent_root: bool,
     /// New name; None = unchanged.
     pub new_name: Option<String>,
+    /// POSIX rename(2) semantics: atomically replace an occupied
+    /// destination (dir-over-empty-dir included). Default false =
+    /// RENAME_NOREPLACE, which is also what pre-replace daemons get.
+    #[serde(default)]
+    pub replace: bool,
+}
+
+/// Machine-readable discriminator on mount `/modify` 409s. Optional:
+/// pre-replace daemons ignore the body and keep mapping the bare status;
+/// a 409 *without* this body is a consensus rejection, not an occupancy
+/// verdict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountConflictBody {
+    pub code: MountConflictCode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MountConflictCode {
+    /// Destination occupied and replace was not requested (EEXIST).
+    Occupied,
+    /// Replace onto a non-empty folder (ENOTEMPTY).
+    NotEmpty,
+    /// File over a folder (EISDIR).
+    IsDirectory,
+    /// Folder over a file (ENOTDIR).
+    NotDirectory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

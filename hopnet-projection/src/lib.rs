@@ -85,6 +85,10 @@ pub enum DatabaseError {
     InvalidPayload,
     NotFound,
     ConflictError,      // Resource already exists at the specified location/identifier
+    /// Replace-rename onto a non-empty folder — the POSIX ENOTEMPTY verdict.
+    /// Distinct from ConflictError so the mount surface can answer a coded
+    /// 409 the daemon maps to ENOTEMPTY instead of EEXIST.
+    NotEmpty,
     AuthorizationError, // User or node not authorized for the operation
     ValidationError, // Data validation failed (e.g., cryptographic verification, consistency checks)
     /// Transient, node-local storage contention (SQLITE_BUSY / SQLITE_LOCKED).

@@ -404,6 +404,7 @@ pub async fn patch_item(
         new_encrypted_path: Some(new_encrypted_path),
         content_update: None,
         incoming_share_updates: None,
+        replace: false,
     };
 
     // Serialize payload

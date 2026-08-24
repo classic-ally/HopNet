@@ -3,7 +3,15 @@
 //! Wire types for the drive projection's consensus transactions — moved
 //! verbatim from the host's `files::handlers` / `shares::types` (the
 //! handlers themselves stay host-side until Stage D3). Serde field order
-//! is bincode-frozen; do not reorder.
+//! is bincode-frozen within a release; do not reorder.
+//!
+//! Evolution regime: these types are locked-class vocabulary (RFC-025) —
+//! they may evolve in place per release because regenesis (RFC-019) seals
+//! pre-boundary blocks behind the snapshot and RFC-025 exact-version-locks
+//! the consensus/txforward scopes. A release carrying such a change MUST
+//! NOT ship before RFC-025 enforcement is merged, and MUST activate at a
+//! regenesis boundary (RFC-021 staged flow) — see issue #62 for the first
+//! use of this regime (ModifyItemPayload.replace).
 
 use crate::model::Inode;
 use hopnet_common::CustomUUID;
@@ -38,6 +46,10 @@ pub struct ModifyItemPayload {
     pub content_update: Option<DriveContentUpdate>,
     // Phase 2b: Share propagation — pre-computed updates for pending incoming_shares
     pub incoming_share_updates: Option<Vec<IncomingShareUpdate>>,
+    /// POSIX rename(2): atomically replace an occupied destination
+    /// (delete-then-move inside the handler's transaction). Appended
+    /// 2026-08 under the RFC-025 evolution regime (module header).
+    pub replace: bool,
 }
 
 /// Drive-scoped content-update sub-payload (extracts with the projection).

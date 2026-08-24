@@ -721,6 +721,7 @@ pub async fn patch_files(
         new_encrypted_path: None,
         content_update: Some(crate::envelopes::DriveContentUpdate { blob_op }),
         incoming_share_updates,
+        replace: false,
     };
 
     {
@@ -736,6 +737,7 @@ pub async fn patch_files(
             payload.user_id,
             payload.inode_id.clone(),
             payload.new_encrypted_path.clone(),
+            false, // web API keeps refuse-to-replace semantics
             payload.content_update.clone().map(|u| u.blob_op),
             None,
             &state.fragments_dir,
