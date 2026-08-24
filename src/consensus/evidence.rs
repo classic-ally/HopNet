@@ -35,9 +35,18 @@ use hopnet_consensus::membership::{Band, ConsensusPolicy, band};
 /// dark(X); `bright_since` anchors the S5 bright span;
 /// `probes_since_contact` carries the S4 attestation floor (>= 2 probe
 /// attempts since last contact).
+///
+/// Two clocks (RFC-025 §Rejection & Diagnosability): `last_contact` is
+/// LIVENESS — refreshed only by locked-class exchanges and
+/// version-matched Pongs, and it alone drives vote-out, bands, and
+/// bright spans. `last_seen` is VISIBILITY — any authenticated sighting
+/// on any class (compat chatter included). Contact implies seen; a peer
+/// chatty on the compat class while unable to vote is visible, never
+/// live.
 #[derive(Debug, Clone, Copy)]
 pub struct PeerEvidence {
     pub last_contact: Instant,
+    pub last_seen: Option<Instant>,
     pub last_probe_at: Option<Instant>,
     pub probes_since_contact: u32,
     pub bright_since: Option<Instant>,
@@ -116,6 +125,19 @@ impl EvidenceMap {
         self.record_probe_sent_at(node_id, Instant::now());
     }
 
+    /// Visibility evidence (RFC-025): an authenticated compat-class
+    /// sighting. Makes the peer VISIBLE (last-seen, the status view),
+    /// never LIVE — the vote-out clock is untouched.
+    pub fn record_seen(&self, node_id: i32) {
+        self.record_seen_at(node_id, None, Instant::now());
+    }
+
+    /// Visibility that also proved a decided height (an inbound status
+    /// ping carries the prober's height).
+    pub fn record_seen_with_height(&self, node_id: i32, height: u64) {
+        self.record_seen_at(node_id, Some(height), Instant::now());
+    }
+
     /// Snapshot for classification and the debug route; sorted by node_id.
     pub fn snapshot(&self) -> Vec<(i32, PeerEvidenceView)> {
         let map = self.inner.lock();
@@ -129,23 +151,51 @@ impl EvidenceMap {
         let mut map = self.inner.lock();
         let entry = map.entry(node_id).or_insert(PeerEvidence {
             last_contact: now,
+            last_seen: Some(now),
             last_probe_at: None,
             probes_since_contact: 0,
             bright_since: Some(now),
             last_known_height: None,
         });
-        // Reset rule: a gap no band would tolerate restarts the bright
-        // span; sub-gap silences are the hysteresis grace for blips.
+        Self::touch_contact(entry, now, reset_gap);
+        if height.is_some() {
+            entry.last_known_height = height;
+        }
+    }
+
+    pub(crate) fn record_seen_at(&self, node_id: i32, height: Option<u64>, now: Instant) {
+        let origin = self.origin;
+        let mut map = self.inner.lock();
+        let entry = map.entry(node_id).or_insert(PeerEvidence {
+            // A never-contacted node keeps aging on the vote-out clock
+            // from origin — visibility is not liveness.
+            last_contact: origin,
+            last_seen: None,
+            last_probe_at: None,
+            probes_since_contact: 0,
+            bright_since: None,
+            last_known_height: None,
+        });
+        entry.last_seen = Some(now);
+        if height.is_some() {
+            entry.last_known_height = height;
+        }
+    }
+
+    /// The liveness mutation: contact implies seen, resets the probe
+    /// counter, and applies the bright-span reset rule — a gap no band
+    /// would tolerate restarts the span; sub-gap silences are the
+    /// hysteresis grace for blips. One home so every liveness writer
+    /// shares the rule.
+    fn touch_contact(entry: &mut PeerEvidence, now: Instant, reset_gap: Duration) {
         if entry.bright_since.is_none()
             || now.saturating_duration_since(entry.last_contact) > reset_gap
         {
             entry.bright_since = Some(now);
         }
         entry.last_contact = now;
+        entry.last_seen = Some(now);
         entry.probes_since_contact = 0;
-        if height.is_some() {
-            entry.last_known_height = height;
-        }
     }
 
     pub(crate) fn record_probe_sent_at(&self, node_id: i32, now: Instant) {
@@ -153,8 +203,9 @@ impl EvidenceMap {
         let mut map = self.inner.lock();
         let entry = map.entry(node_id).or_insert(PeerEvidence {
             // Never-contacted nodes keep aging from origin (the probe
-            // attempt is not contact).
+            // attempt is not contact — and not a sighting either).
             last_contact: origin,
+            last_seen: None,
             last_probe_at: None,
             probes_since_contact: 0,
             bright_since: None,
@@ -170,6 +221,16 @@ impl EvidenceMap {
 pub fn contact_age(view: Option<&PeerEvidenceView>, origin: Instant, now: Instant) -> Duration {
     match view {
         Some(v) => now.saturating_duration_since(v.last_contact),
+        None => now.saturating_duration_since(origin),
+    }
+}
+
+/// Visibility age (RFC-025): now − last sighting on ANY class, falling
+/// back to the liveness clock (contact implies seen; a probe-created
+/// entry has neither and ages from origin via last_contact).
+pub fn seen_age(view: Option<&PeerEvidenceView>, origin: Instant, now: Instant) -> Duration {
+    match view {
+        Some(v) => now.saturating_duration_since(v.last_seen.unwrap_or(v.last_contact)),
         None => now.saturating_duration_since(origin),
     }
 }
@@ -950,11 +1011,68 @@ mod tests {
     fn view(last_contact: Instant) -> PeerEvidenceView {
         PeerEvidence {
             last_contact,
+            last_seen: Some(last_contact),
             last_probe_at: None,
             probes_since_contact: 0,
             bright_since: Some(last_contact),
             last_known_height: None,
         }
+    }
+
+    // Impact: this pin IS the vote-out shield — compat chatter
+    // refreshing the liveness clock would shield a lagging validator
+    // from the vote-out it deserves (RFC-025 §Rejection).
+    // Should: record_seen move only the visibility timestamp, leaving
+    // last_contact, the probe counter, and the bright span untouched.
+    // Should not: create a liveness-bearing entry for a never-contacted
+    // node (it keeps aging from origin on the vote-out clock).
+    #[test]
+    fn seen_moves_only_the_visibility_clock() {
+        let map = EvidenceMap::new();
+        map.record_probe_sent_at(7, map.origin() + Duration::from_secs(1));
+        map.record_seen_at(7, Some(42), map.origin() + Duration::from_secs(2));
+
+        let snap = map.snapshot();
+        let (_, v) = snap.iter().find(|(id, _)| *id == 7).unwrap();
+        assert_eq!(v.last_contact, map.origin());
+        assert_eq!(v.last_seen, Some(map.origin() + Duration::from_secs(2)));
+        assert_eq!(v.probes_since_contact, 1);
+        assert_eq!(v.bright_since, None);
+        assert_eq!(v.last_known_height, Some(42));
+
+        // A brand-new entry created by record_seen alone: liveness ages
+        // from origin.
+        map.record_seen_at(8, None, map.origin() + Duration::from_secs(3));
+        let snap = map.snapshot();
+        let (_, v) = snap.iter().find(|(id, _)| *id == 8).unwrap();
+        assert_eq!(v.last_contact, map.origin());
+    }
+
+    // Should: contact imply seen — one authenticated locked exchange
+    // refreshes both clocks (visibility never reads older than liveness).
+    #[test]
+    fn contact_implies_seen() {
+        let map = EvidenceMap::new();
+        let t = map.origin() + Duration::from_secs(5);
+        map.record_at(9, None, t);
+        let snap = map.snapshot();
+        let (_, v) = snap.iter().find(|(id, _)| *id == 9).unwrap();
+        assert_eq!(v.last_contact, t);
+        assert_eq!(v.last_seen, Some(t));
+    }
+
+    // Should: seen_age fall back to the liveness clock when no sighting
+    // is recorded (probe-created entries age from origin on both).
+    #[test]
+    fn seen_age_falls_back_to_contact() {
+        let origin = Instant::now();
+        let now = origin + Duration::from_secs(10);
+        let mut v = view(origin + Duration::from_secs(4));
+        v.last_seen = None;
+        assert_eq!(seen_age(Some(&v), origin, now), Duration::from_secs(6));
+        v.last_seen = Some(origin + Duration::from_secs(8));
+        assert_eq!(seen_age(Some(&v), origin, now), Duration::from_secs(2));
+        assert_eq!(seen_age(None, origin, now), Duration::from_secs(10));
     }
 
     // Impact: this row WAS the production rejoin deadlock — a voted-out
