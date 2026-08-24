@@ -845,10 +845,66 @@ fn handshake_carries_epoch_and_refuses_mismatched_fetch() {
         StatusResponse::Pong {
             epoch,
             version_code,
+            floor,
+            head,
             ..
         },
         _,
     ) = bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
+    assert_eq!(epoch, 1);
+    assert_eq!(version_code, crate::version::effective_running_code());
+    // The Pong is the policy readout (RFC-025): the served window rides
+    // every answer.
+    assert_eq!(floor, hopnet_comms::alpn::compat_floor(hopnet_comms::alpn::COMPAT_HEAD));
+    assert_eq!(head, hopnet_comms::alpn::COMPAT_HEAD);
+}
+
+// Impact: the schema-evolution parity gate transposed to the wire — a
+// generation-1 reshape that strands generation-0 peers fails here at
+// mint time, not in the field.
+// Should: serve a generation-0-encoded Ping through the head handler
+// via the G0 adapter and produce a response the frozen generation-0
+// decoder reads back exactly (three fields, correct epoch and version).
+#[test]
+fn status_g0_roundtrip_through_the_head_adapter() {
+    // Reads `effective_running_code()` for the pong.
+    let _env = crate::test_env::lock_env();
+    use crate::consensus::status_compat_g0 as g0;
+
+    let node = MockNode::new(6);
+    register_node(&node);
+    let peer = hopnet_comms::PeerRef {
+        node_id: 43,
+        pubkey: [0u8; 32],
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let adapter = crate::consensus::evidence::StatusCompatG0 {
+        inner: std::sync::Arc::new(crate::consensus::evidence::StatusScope {
+            app_state: node.app_state.clone(),
+        }),
+    };
+    let g0_ping = bincode::serde::encode_to_vec(
+        &g0::StatusRequest::Ping {
+            decided_height: 3,
+            epoch: 1,
+            version_code: 20990100,
+        },
+        bincode::config::standard(),
+    )
+    .unwrap();
+    let raw = rt.block_on(hopnet_comms::RpcHandler::handle(&adapter, peer, g0_ping));
+    let (g0::StatusResponse::Pong {
+        decided_height,
+        epoch,
+        version_code,
+    }, consumed) =
+        bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
+    assert_eq!(consumed, raw.len(), "no trailing bytes for the old decoder");
+    assert_eq!(decided_height, 0);
     assert_eq!(epoch, 1);
     assert_eq!(version_code, crate::version::effective_running_code());
 }

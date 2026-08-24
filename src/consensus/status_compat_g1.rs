@@ -39,10 +39,72 @@ pub enum StatusRequest {
 pub enum StatusResponse {
     /// Current decided height (0 pre-genesis/pre-engine — reachability is
     /// a transport property; a zero height just fails catch-up gates),
-    /// plus the responder's (epoch, version) — see Ping.
+    /// plus the responder's (epoch, version) — see Ping — and its served
+    /// compat window: one round trip answers "can we talk, and if not,
+    /// why not" (RFC-025 §Rejection & Diagnosability). The window fields
+    /// sit LAST so a generation-0 decoder reads a valid prefix — defense
+    /// in depth for released binaries, not the normative path (that is
+    /// the generation-0 adapter).
     Pong {
         decided_height: u64,
         epoch: u64,
         version_code: u32,
+        floor: u32,
+        head: u32,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Impact: these bytes are the generation-1 wire contract — silent
+    // drift severs status probing between releases (wire.md).
+    // Should: encode the documented byte layout exactly — variant
+    // varint, then field varints in declaration order.
+    #[test]
+    fn g1_ping_golden() {
+        let bytes = bincode::serde::encode_to_vec(
+            &StatusRequest::Ping {
+                decided_height: 7,
+                epoch: 2,
+                version_code: 20260806,
+            },
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let expected: &[u8] = &[
+            0x00, // variant Ping
+            0x07, // decided_height
+            0x02, // epoch
+            0xFC, 0xC6, 0x27, 0x35, 0x01, // version_code 20260806 (u32 varint)
+        ];
+        assert_eq!(bytes, expected, "g1 Ping wire format drifted");
+    }
+
+    // Should: append the window fields after version_code — a
+    // generation-0 decoder reads a valid prefix.
+    #[test]
+    fn g1_pong_golden() {
+        let bytes = bincode::serde::encode_to_vec(
+            &StatusResponse::Pong {
+                decided_height: 7,
+                epoch: 2,
+                version_code: 20260806,
+                floor: 0,
+                head: 1,
+            },
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let expected: &[u8] = &[
+            0x00, // variant Pong
+            0x07, // decided_height
+            0x02, // epoch
+            0xFC, 0xC6, 0x27, 0x35, 0x01, // version_code 20260806
+            0x00, // floor
+            0x01, // head
+        ];
+        assert_eq!(bytes, expected, "g1 Pong wire format drifted");
+    }
 }

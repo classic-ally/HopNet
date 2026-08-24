@@ -333,6 +333,8 @@ impl hopnet_comms::RpcHandler for StatusScope {
                     decided_height,
                     epoch: my_epoch,
                     version_code: crate::version::effective_running_code(),
+                    floor: hopnet_comms::alpn::compat_floor(hopnet_comms::alpn::COMPAT_HEAD),
+                    head: hopnet_comms::alpn::COMPAT_HEAD,
                 },
                 bincode::config::standard(),
             )
@@ -341,15 +343,80 @@ impl hopnet_comms::RpcHandler for StatusScope {
     }
 }
 
+/// The generation-0 status adapter (RFC-025 §Evolution): a pure codec
+/// shim serving pre-enforcement dialers through the head handler.
+/// Request bytes pass through untouched — the G0 and G1 Pings are
+/// byte-identical (the equality golden in `status_compat_g0` is the
+/// license), which also preserves the undecodable-request semantics
+/// exactly. The head Pong is then narrowed to the G0 shape by dropping
+/// the window fields.
+pub struct StatusCompatG0 {
+    pub inner: std::sync::Arc<dyn hopnet_comms::RpcHandler>,
+}
+
+impl hopnet_comms::RpcHandler for StatusCompatG0 {
+    fn handle(
+        &self,
+        peer: hopnet_comms::PeerRef,
+        payload: Vec<u8>,
+    ) -> hopnet_comms::BoxFuture<'_, Vec<u8>> {
+        Box::pin(async move {
+            let head_response = self.inner.handle(peer, payload).await;
+            match bincode::serde::decode_from_slice::<StatusResponse, _>(
+                &head_response,
+                bincode::config::standard(),
+            ) {
+                Ok((
+                    StatusResponse::Pong {
+                        decided_height,
+                        epoch,
+                        version_code,
+                        ..
+                    },
+                    _,
+                )) => bincode::serde::encode_to_vec(
+                    &super::status_compat_g0::StatusResponse::Pong {
+                        decided_height,
+                        epoch,
+                        version_code,
+                    },
+                    bincode::config::standard(),
+                )
+                .unwrap_or_default(),
+                // The head handler always encodes a well-formed Pong;
+                // refuse to relay anything else to an old decoder.
+                Err(_) => Vec::new(),
+            }
+        })
+    }
+}
+
+/// Everything a Pong teaches the prober. S4 consumes `version_code` and
+/// `window` in classify_pong; S3 carries them so S4 needs no signature
+/// churn.
+pub struct PongInfo {
+    pub decided_height: u64,
+    pub epoch: u64,
+    pub version_code: u32,
+    /// The peer's served compat window (floor, head); None when a
+    /// generation-0 peer answered (pre-enforcement binaries have none).
+    pub window: Option<(u32, u32)>,
+}
+
 /// Fire one status probe; `timeout` = the policy grace g (one source of
 /// truth — the comms transport default is only the floor).
+///
+/// The Pong is decoded under the generation the connection's negotiated
+/// ALPN commits both sides to (RFC-025: no dialer ever guesses what a
+/// peer speaks) — the G1/G0 Pings are byte-identical, so only the
+/// response side is generation-dependent.
 pub async fn status_probe(
     comms: &hopnet_comms::IrohComms,
     peer: &hopnet_comms::PeerRef,
     my_decided_height: u64,
     my_epoch: u64,
     timeout: Duration,
-) -> Result<(u64, u64), String> {
+) -> Result<PongInfo, String> {
     let payload = bincode::serde::encode_to_vec(
         &StatusRequest::Ping {
             decided_height: my_decided_height,
@@ -359,23 +426,52 @@ pub async fn status_probe(
         bincode::config::standard(),
     )
     .map_err(|e| format!("encode: {e}"))?;
-    let raw = comms
-        .rpc(peer, "status", payload, timeout)
+    let (raw, generation) = comms
+        .rpc_negotiated(peer, "status", payload, timeout)
         .await
         .map_err(|e| format!("rpc: {e:?}"))?;
-    let (resp, _) =
-        bincode::serde::decode_from_slice::<StatusResponse, _>(&raw, bincode::config::standard())
-            .map_err(|e| format!("decode: {e}"))?;
-    let StatusResponse::Pong {
-        decided_height,
-        epoch,
-        version_code,
-    } = resp;
-    if epoch != my_epoch {
+    let info = if generation == 0 {
+        let (resp, _) = bincode::serde::decode_from_slice::<
+            super::status_compat_g0::StatusResponse,
+            _,
+        >(&raw, bincode::config::standard())
+        .map_err(|e| format!("decode (g0): {e}"))?;
+        let super::status_compat_g0::StatusResponse::Pong {
+            decided_height,
+            epoch,
+            version_code,
+        } = resp;
+        PongInfo {
+            decided_height,
+            epoch,
+            version_code,
+            window: None,
+        }
+    } else {
+        let (resp, _) = bincode::serde::decode_from_slice::<StatusResponse, _>(
+            &raw,
+            bincode::config::standard(),
+        )
+        .map_err(|e| format!("decode: {e}"))?;
+        let StatusResponse::Pong {
+            decided_height,
+            epoch,
+            version_code,
+            floor,
+            head,
+        } = resp;
+        PongInfo {
+            decided_height,
+            epoch,
+            version_code,
+            window: Some((floor, head)),
+        }
+    };
+    if info.epoch != my_epoch {
         tracing::warn!(
             peer = peer.node_id,
-            peer_epoch = epoch,
-            peer_version = %crate::version::format_code(version_code),
+            peer_epoch = info.epoch,
+            peer_version = %crate::version::format_code(info.version_code),
             local_epoch = my_epoch,
             "handshake: peer answered from a different epoch"
         );
@@ -384,7 +480,7 @@ pub async fn status_probe(
     // slept through a boundary while the mesh stayed quiet has nothing
     // else to learn from — no sync to fail, no gossip to arrive. The
     // pong is its only signal that it must rejoin.
-    Ok((decided_height, epoch))
+    Ok(info)
 }
 
 /// What a pong obliges the PROBER to do about its own state.
@@ -562,9 +658,8 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 let g = policy.grace;
                 let probe_state = app_state.clone();
                 tokio::spawn(async move {
-                    if let Ok((h, peer_epoch)) =
-                        status_probe(&comms, &peer, decided, my_epoch, g).await
-                    {
+                    if let Ok(pong) = status_probe(&comms, &peer, decided, my_epoch, g).await {
+                        let (h, peer_epoch) = (pong.decided_height, pong.epoch);
                         evidence.record_contact_with_height(peer.node_id, h);
                         match classify_pong(my_epoch, peer_epoch, decided, h) {
                             // The offline-through-regenesis case (RFC-019

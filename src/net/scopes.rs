@@ -82,7 +82,10 @@ pub fn build_registry(app_state: &AppState) -> ScopeRegistry {
         Arc::new(crate::consensus::evidence::StatusScope {
             app_state: app_state.clone(),
         });
-    scopes.rpc_compat("status", status.clone(), status);
+    let status_g0 = Arc::new(crate::consensus::evidence::StatusCompatG0 {
+        inner: status.clone(),
+    });
+    scopes.rpc_compat("status", status, status_g0);
     let regenesis: Arc<dyn hopnet_comms::RpcHandler> =
         Arc::new(crate::regenesis::rpc::RegenesisScope {
             app_state: app_state.clone(),
@@ -477,9 +480,13 @@ mod tests {
     // window's head.
     #[test]
     fn frozen_module_labels_match_the_served_window() {
-        use hopnet_comms::alpn::COMPAT_HEAD;
+        use hopnet_comms::alpn::{compat_floor, COMPAT_HEAD};
         assert_eq!(crate::consensus::status_compat_g1::GENERATION, COMPAT_HEAD);
         assert_eq!(crate::regenesis::compat_g1::GENERATION, COMPAT_HEAD);
+        assert_eq!(
+            crate::consensus::status_compat_g0::GENERATION,
+            compat_floor(COMPAT_HEAD)
+        );
     }
 
     #[test]
