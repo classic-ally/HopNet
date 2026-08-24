@@ -366,7 +366,8 @@ async fn watch_pokes_flow_end_to_end() {
 // Should: return from every mount mutation only after the transaction is
 // applied on this node — an IMMEDIATE follow-up read (no sleeps, no
 // polling) observes the effect. Create folder, create file with content,
-// rename, delete — the full mkdir && cd contract over real consensus.
+// rename, replace-rename, delete — the full mkdir && cd contract over
+// real consensus.
 // Impact: S6's reason to exist; before it, 2xx preceded local apply.
 #[tokio::test]
 async fn mutations_are_strict_read_your_writes() {
@@ -461,6 +462,59 @@ async fn mutations_are_strict_read_your_writes() {
             .unwrap()
             .is_none(),
         "old name immediately gone"
+    );
+
+    // Replace-rename (issue #62) — strict, over real consensus: a second
+    // file renamed over the survivor with replace, one inode left.
+    let form = reqwest::multipart::Form::new()
+        .text("parent_id", folder_id.clone())
+        .part(
+            "file_8",
+            reqwest::multipart::Part::bytes(b"REPLACER".to_vec()).file_name("shadow.txt"),
+        );
+    let response: serde_json::Value = client
+        .post(format!("{base}/create"))
+        .bearer_auth(&api_key)
+        .multipart(form)
+        .send()
+        .await
+        .expect("create shadow file")
+        .json()
+        .await
+        .expect("shadow response json");
+    let shadow_id = response["item"]["id"].as_str().expect("shadow id").to_string();
+
+    let response = client
+        .patch(format!("{base}/modify"))
+        .bearer_auth(&api_key)
+        .json(&serde_json::json!({
+            "id": shadow_id, "new_name": "renamed.txt", "replace": true,
+        }))
+        .send()
+        .await
+        .expect("replace modify");
+    assert!(
+        response.status().is_success(),
+        "replace-rename must succeed over consensus, got {}",
+        response.status()
+    );
+    let survivor = transport
+        .lookup(folder_item_id.clone(), "renamed.txt".to_string())
+        .await
+        .unwrap()
+        .expect("destination resolvable");
+    assert_eq!(
+        survivor.id,
+        ItemId::Inode(shadow_id.parse().unwrap()),
+        "the surviving inode must be the replace source, immediately"
+    );
+    assert!(
+        transport
+            .lookup(folder_item_id.clone(), "shadow.txt".to_string())
+            .await
+            .unwrap()
+            .is_none(),
+        "the source name is vacated, immediately"
     );
 
     // Delete recursively — strict.
@@ -912,6 +966,58 @@ async fn fuse_mount_smoke_against_live_node() {
             eprintln!("SMOKE: rename done");
             assert!(root.join("Kernel/renamed.txt").exists());
             assert!(!root.join("Kernel/note.txt").exists());
+
+            // POSIX replace (issue #62): rename over an occupied name —
+            // the exact write-temp-then-rename shape git and every
+            // atomic-save editor use. fsync first so the content is
+            // strictly uploaded before the read-back.
+            {
+                use std::io::Write;
+                let mut f = std::fs::File::create(root.join("Kernel/replacer.txt")).unwrap();
+                f.write_all(b"REPLACER").unwrap();
+                f.sync_all().unwrap();
+            }
+            std::fs::rename(
+                root.join("Kernel/replacer.txt"),
+                root.join("Kernel/renamed.txt"),
+            )
+            .expect("rename must replace an occupied destination");
+            eprintln!("SMOKE: replace-rename done");
+            assert_eq!(
+                std::fs::read(root.join("Kernel/renamed.txt")).unwrap(),
+                b"REPLACER",
+                "the destination must carry the source's bytes"
+            );
+            assert!(!root.join("Kernel/replacer.txt").exists());
+
+            // RENAME_NOREPLACE must still refuse with EEXIST.
+            std::fs::write(root.join("Kernel/noreplace.txt"), b"NR").unwrap();
+            let src = std::ffi::CString::new(
+                root.join("Kernel/noreplace.txt").into_os_string().into_encoded_bytes(),
+            )
+            .unwrap();
+            let dst = std::ffi::CString::new(
+                root.join("Kernel/renamed.txt").into_os_string().into_encoded_bytes(),
+            )
+            .unwrap();
+            let rc = unsafe {
+                libc::renameat2(
+                    libc::AT_FDCWD,
+                    src.as_ptr(),
+                    libc::AT_FDCWD,
+                    dst.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            assert_eq!(rc, -1, "NOREPLACE onto an occupied name must fail");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EEXIST),
+                "and the errno must be EEXIST"
+            );
+            eprintln!("SMOKE: NOREPLACE verified");
+            std::fs::remove_file(root.join("Kernel/noreplace.txt")).unwrap();
+
             std::fs::remove_file(root.join("Kernel/renamed.txt")).unwrap();
             eprintln!("SMOKE: unlink done");
             std::fs::remove_dir(root.join("Kernel")).unwrap();
@@ -929,6 +1035,82 @@ async fn fuse_mount_smoke_against_live_node() {
             .is_none(),
         "rmdir strict on the node too"
     );
+
+    // The field failure from issue #62, verbatim: git on the mount. Every
+    // `git config` write after the first renames config.lock over config;
+    // before the fix this left a 36-byte config, no HEAD, and "not a git
+    // repository".
+    eprintln!("SMOKE: git init");
+    tokio::task::spawn_blocking({
+        let root = root.clone();
+        move || {
+            let repo = root.join("Repo");
+            std::fs::create_dir(&repo).unwrap();
+            // cwd stays OFF the mount: watch-driven entry invalidation
+            // drops kernel dentries, and a process whose cwd dentry is
+            // dropped gets getcwd() = ENOENT (FUSE has no export
+            // support to reconnect it). Absolute GIT_DIR/GIT_WORK_TREE
+            // keep every git write — config.lock renamed over config —
+            // on the mount, which is what this smoke is for.
+            let git = |args: &[&str]| {
+                std::process::Command::new("git")
+                    .current_dir("/")
+                    .env("GIT_DIR", repo.join(".git"))
+                    .env("GIT_WORK_TREE", &repo)
+                    .args(args)
+                    .output()
+                    .expect("spawn git")
+            };
+            let out = git(&["init"]);
+            assert!(
+                out.status.success(),
+                "git init: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let head = std::fs::read_to_string(repo.join(".git/HEAD")).unwrap();
+            assert!(head.starts_with("ref:"), "HEAD must be a symref, got {head:?}");
+            // Two writes: the second renames config.lock over config —
+            // the deterministic-EEXIST path this fix exists for.
+            let out = git(&["config", "user.name", "hopnet-smoke"]);
+            assert!(
+                out.status.success(),
+                "git config write: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let out = git(&["config", "user.email", "smoke@hopnet.test"]);
+            assert!(
+                out.status.success(),
+                "second git config write (rename over existing): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // Round-trip with a short grace window for the close-tier
+            // upload to land.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let out = git(&["config", "user.name"]);
+                if out.status.success()
+                    && String::from_utf8_lossy(&out.stdout).trim() == "hopnet-smoke"
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "config must round-trip, last: {:?}",
+                    String::from_utf8_lossy(&out.stdout)
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            let out = git(&["status", "--porcelain"]);
+            assert!(
+                out.status.success(),
+                "git status must recognize the repository: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    })
+    .await
+    .unwrap();
+    eprintln!("SMOKE: git verified");
 
     watcher.abort();
     drop(session);
