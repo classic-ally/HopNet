@@ -27,7 +27,7 @@ mod iroh_impl;
 pub use iroh;
 #[cfg(feature = "iroh")]
 pub use iroh_impl::{
-    net_rt, Call, CallOptions, EndpointAddr, IrohComms, ScopeRegistry, HOPNET_ALPN,
+    net_rt, BindOptions, Call, CallOptions, EndpointAddr, IrohComms, ScopeRegistry, HOPNET_ALPN,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

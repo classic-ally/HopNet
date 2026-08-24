@@ -461,7 +461,7 @@ fn create_test_app_state_on_manager(
         .block_on(hopnet_comms::IrohComms::bind(
             signing_key.0.to_bytes(),
             directory,
-            None,
+            hopnet_comms::BindOptions::default(),
         ))
         .expect("test iroh comms");
 

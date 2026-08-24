@@ -420,7 +420,12 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             let comms = hopnet_comms::IrohComms::bind(
                 privatekey.to_bytes(),
                 directory,
-                std::env::var("HOPNET_RELAY_URL").ok(),
+                hopnet_comms::BindOptions {
+                    relay_url: std::env::var("HOPNET_RELAY_URL").ok(),
+                    // Pre-enforcement mode until S2 derives the mesh magic
+                    // from the anchor (RFC-025).
+                    magic: None,
+                },
             )
             .await
             .expect("Failed to create iroh comms");

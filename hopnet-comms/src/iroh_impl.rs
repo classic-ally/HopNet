@@ -14,12 +14,18 @@ use iroh::{Endpoint, PublicKey, SecretKey};
 use tokio::sync::RwLock;
 use tracing::Instrument;
 
+use crate::alpn::{self, AcceptTier};
 use crate::{
     BoxFuture, CommsError, FrameSink, PeerDirectory, PeerRef, ProtocolError, RpcHandler,
-    StreamHandler, TransportError, PING_SCOPE,
+    ScopeClass, StreamHandler, TransportError, PING_SCOPE,
 };
 
-pub(crate) enum ScopeEntry {
+pub(crate) struct ScopeEntry {
+    pub(crate) class: ScopeClass,
+    pub(crate) kind: ScopeKind,
+}
+
+pub(crate) enum ScopeKind {
     Rpc(Arc<dyn RpcHandler>),
     Streamed(Arc<dyn StreamHandler>),
 }
@@ -27,6 +33,10 @@ pub(crate) enum ScopeEntry {
 /// One handler per scope namespace. Duplicate registration — or claiming
 /// the reserved "ping" scope — panics at registration time (boot tripwire:
 /// a scope collision is a programming error, not a runtime condition).
+///
+/// Every registration names its ALPN class (RFC-025 §Scope Classes): the
+/// plain methods register locked scopes — the safe default, exact-version
+/// only — and the `_compat` variants register the windowed compat class.
 #[derive(Default)]
 pub struct ScopeRegistry {
     pub(crate) entries: HashMap<&'static str, ScopeEntry>,
@@ -37,14 +47,41 @@ impl ScopeRegistry {
         Self::default()
     }
 
-    /// Register a single-response handler for `scope`.
+    /// Register a single-response handler for `scope` (locked class).
     pub fn rpc(&mut self, scope: &'static str, handler: Arc<dyn RpcHandler>) {
-        self.insert(scope, ScopeEntry::Rpc(handler));
+        self.insert_classed(scope, ScopeClass::Locked, ScopeKind::Rpc(handler));
     }
 
-    /// Register a multi-frame handler for `scope`.
+    /// Register a multi-frame handler for `scope` (locked class).
     pub fn streamed(&mut self, scope: &'static str, handler: Arc<dyn StreamHandler>) {
-        self.insert(scope, ScopeEntry::Streamed(handler));
+        self.insert_classed(scope, ScopeClass::Locked, ScopeKind::Streamed(handler));
+    }
+
+    /// Register a single-response handler on the compat class. Compat is
+    /// an allowlist (RFC-025): admission requires a named cross-version
+    /// consumer and freezeable vocabulary.
+    pub fn rpc_compat(&mut self, scope: &'static str, handler: Arc<dyn RpcHandler>) {
+        self.insert_classed(scope, ScopeClass::Compat, ScopeKind::Rpc(handler));
+    }
+
+    /// Register a multi-frame handler on the compat class.
+    pub fn streamed_compat(&mut self, scope: &'static str, handler: Arc<dyn StreamHandler>) {
+        self.insert_classed(scope, ScopeClass::Compat, ScopeKind::Streamed(handler));
+    }
+
+    /// The registered class of `scope` — the authority for dial-side
+    /// family selection and the host's class-pin test.
+    pub fn class_of(&self, scope: &str) -> Option<ScopeClass> {
+        self.entries.get(scope).map(|e| e.class)
+    }
+
+    /// Every registered scope with its class, for the class-pin test.
+    pub fn scopes(&self) -> impl Iterator<Item = (&'static str, ScopeClass)> + '_ {
+        self.entries.iter().map(|(scope, entry)| (*scope, entry.class))
+    }
+
+    fn insert_classed(&mut self, scope: &'static str, class: ScopeClass, kind: ScopeKind) {
+        self.insert(scope, ScopeEntry { class, kind });
     }
 
     fn insert(&mut self, scope: &'static str, entry: ScopeEntry) {
@@ -65,8 +102,58 @@ impl ScopeRegistry {
 
 pub use iroh::EndpointAddr;
 
-/// ALPN protocol identifier for HopNet
-pub const HOPNET_ALPN: &[u8] = b"hopnet/1.0";
+/// The pre-enforcement ALPN, kept exported for harnesses that
+/// impersonate a legacy dialer (generation 0 — RFC-025 §Evolution).
+pub const HOPNET_ALPN: &[u8] = alpn::LEGACY_ALPN;
+
+/// The node's ALPN identity, settled once at bind (RFC-025 §The ALPN
+/// Scheme: every string known at bind, no committed-state reads).
+/// `magic: None` is pre-enforcement mode — legacy ALPN only, every scope
+/// served, today's semantics byte-for-byte (S2 derives the magic from
+/// the anchor; S5 gates bind on join-code entry).
+pub(crate) struct AlpnIdentity {
+    magic: Option<[u8; 4]>,
+    code: u32,
+    head: u32,
+}
+
+impl AlpnIdentity {
+    fn new(magic: Option<[u8; 4]>) -> Self {
+        Self {
+            magic,
+            code: hopnet_common::version::effective_running_code(),
+            head: alpn::COMPAT_HEAD,
+        }
+    }
+
+    fn serve_list(&self) -> Vec<Vec<u8>> {
+        match &self.magic {
+            Some(magic) => alpn::serve_list(magic, self.code, self.head),
+            None => vec![alpn::LEGACY_ALPN.to_vec()],
+        }
+    }
+
+    /// Accept-tier classification of a negotiated ALPN. Pre-enforcement
+    /// mode serves only the legacy string, so anything negotiated is
+    /// generation 0 by construction.
+    fn classify(&self, alpn_bytes: &[u8]) -> AcceptTier {
+        match &self.magic {
+            Some(magic) => alpn::classify_accept(magic, self.code, self.head, alpn_bytes),
+            None => AcceptTier::ServedCompat(0),
+        }
+    }
+}
+
+/// The class of an ACCEPTED connection, read once from the negotiated
+/// ALPN and threaded through dispatch. Locked and pre-enforcement
+/// connections serve every scope; a compat connection serves only
+/// compat-class scopes plus the transport ping (RFC-025 §Scope Classes).
+#[derive(Debug, Clone, Copy)]
+enum ConnClass {
+    PreEnforcement,
+    Locked,
+    Compat(u32),
+}
 
 /// Maximum frame size (8MB) - prevents allocation attacks from malicious peers
 const MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
@@ -217,6 +304,7 @@ async fn write_frame(
 /// [`PeerDirectory`].
 struct HookAdapter {
     directory: Arc<dyn PeerDirectory>,
+    identity: Arc<AlpnIdentity>,
 }
 
 impl std::fmt::Debug for HookAdapter {
@@ -229,7 +317,7 @@ impl EndpointHooks for HookAdapter {
     async fn before_registration<'a>(
         &'a self,
         remote_id: &'a iroh::EndpointId,
-        _alpn: &'a [u8],
+        alpn_bytes: &'a [u8],
         side: iroh::endpoint::Side,
     ) -> AfterHandshakeOutcome {
         // Only validate incoming (server-side) connections. Outgoing connections
@@ -239,13 +327,30 @@ impl EndpointHooks for HookAdapter {
             return AfterHandshakeOutcome::Accept;
         }
 
-        if self.directory.is_known(remote_id.as_bytes()).await {
-            AfterHandshakeOutcome::Accept
-        } else {
+        // Unknown-node first: strangers never learn our generation window.
+        if !self.directory.is_known(remote_id.as_bytes()).await {
             tracing::warn!("rejected iroh connection from unknown node: {}", remote_id);
-            AfterHandshakeOutcome::Reject {
-                error_code: 1u32.into(),
+            return AfterHandshakeOutcome::Reject {
+                error_code: alpn::REJECT_UNKNOWN_NODE.into(),
                 reason: b"unknown node".to_vec(),
+            };
+        }
+
+        match self.identity.classify(alpn_bytes) {
+            // The retired tier (RFC-025): TLS was accepted solely so this
+            // structured reject can name the floor.
+            AcceptTier::Retired { floor } => AfterHandshakeOutcome::Reject {
+                error_code: alpn::REJECT_COMPAT_RETIRED.into(),
+                reason: alpn::encode_retired_reason(floor, self.identity.code),
+            },
+            // Defensive: a negotiated ALPN we never listed is a transport
+            // bug, not a tier — refuse rather than misdispatch.
+            AcceptTier::Unknown => AfterHandshakeOutcome::Reject {
+                error_code: alpn::REJECT_UNKNOWN_NODE.into(),
+                reason: b"unknown alpn".to_vec(),
+            },
+            AcceptTier::ServedLocked | AcceptTier::ServedCompat(_) => {
+                AfterHandshakeOutcome::Accept
             }
         }
     }
@@ -256,6 +361,20 @@ impl EndpointHooks for HookAdapter {
 // ============================================================================
 
 type DedupMap = std::sync::Mutex<HashMap<u64, Arc<tokio::sync::OnceCell<Vec<u8>>>>>;
+
+/// Options for [`IrohComms::bind`].
+#[derive(Default)]
+pub struct BindOptions {
+    /// Self-hosted relay URL. When set, the endpoint uses ONLY this relay
+    /// (no n0 relays, no public discovery) and every dial pins the peer's
+    /// address to it. Reading the env var is host policy, not comms'.
+    pub relay_url: Option<String>,
+    /// Mesh magic (RFC-025): the 4-byte truncation of the anchor chain
+    /// id. None = pre-enforcement mode — bind and dial the legacy
+    /// `hopnet/1.0` only, all scopes served. S2 derives it from the
+    /// anchor at boot; S5 gates bind on join-code entry.
+    pub magic: Option<[u8; 4]>,
+}
 
 /// Options for [`IrohComms::open_call`].
 #[derive(Default)]
@@ -294,20 +413,32 @@ pub struct IrohComms {
     /// endpoint uses ONLY this relay (no n0 relays, no public discovery) and
     /// every dial pins the peer's address to it.
     custom_relay: Option<iroh::RelayUrl>,
+    identity: Arc<AlpnIdentity>,
     scopes: Arc<OnceLock<ScopeRegistry>>,
     started: Arc<AtomicBool>,
 }
 
 impl IrohComms {
     /// Bind the endpoint. `secret` is the node's raw Ed25519 secret key;
-    /// `relay_url` switches from the n0 preset (public relays + pkarr
-    /// discovery) to a single self-hosted relay with no address-lookup
-    /// services (reading the env var is host policy, not comms').
+    /// the ALPN identity (locked code + compat window, RFC-025) is settled
+    /// here from the workspace-unified effective-code seam and
+    /// `opts.magic` — see [`BindOptions`].
     pub async fn bind(
         secret: [u8; 32],
         directory: Arc<dyn PeerDirectory>,
-        relay_url: Option<String>,
+        opts: BindOptions,
     ) -> Result<Self, CommsError> {
+        Self::bind_with_identity(secret, directory, opts.relay_url, AlpnIdentity::new(opts.magic))
+            .await
+    }
+
+    async fn bind_with_identity(
+        secret: [u8; 32],
+        directory: Arc<dyn PeerDirectory>,
+        relay_url: Option<String>,
+        identity: AlpnIdentity,
+    ) -> Result<Self, CommsError> {
+        let identity = Arc::new(identity);
         let custom_relay: Option<iroh::RelayUrl> = match relay_url {
             Some(url) => Some(url.parse().map_err(|e| {
                 CommsError::Transport(TransportError::ConnectionFailed(format!(
@@ -322,6 +453,8 @@ impl IrohComms {
         // this is what pins the whole relay/keepalive machinery to net_rt.
         let bind_relay = custom_relay.clone();
         let hook_directory = directory.clone();
+        let hook_identity = identity.clone();
+        let serve_list = identity.serve_list();
         let endpoint = net_rt()
             .spawn(async move {
                 let builder = match &bind_relay {
@@ -336,9 +469,11 @@ impl IrohComms {
                 };
                 builder
                     .secret_key(SecretKey::from_bytes(&secret))
-                    .alpns(vec![HOPNET_ALPN.to_vec()])
+                    // Accept-list order IS TLS negotiation preference.
+                    .alpns(serve_list)
                     .hooks(HookAdapter {
                         directory: hook_directory,
+                        identity: hook_identity,
                     })
                     .bind()
                     .await
@@ -353,6 +488,7 @@ impl IrohComms {
             dedup: Arc::new(std::sync::Mutex::new(HashMap::new())),
             directory,
             custom_relay,
+            identity,
             scopes: Arc::new(OnceLock::new()),
             started: Arc::new(AtomicBool::new(false)),
         })
@@ -644,14 +780,38 @@ impl IrohComms {
         // The hook already vetted the peer; this resolves attribution only.
         let node_id = self.directory.node_id(&pubkey).await.unwrap_or(-1);
         let peer = PeerRef { node_id, pubkey };
-        tracing::debug!("accepted iroh connection from node {}", peer.node_id);
+
+        // The negotiated ALPN, read once per connection, is the class every
+        // stream on it dispatches under (RFC-025 §Scope Classes). The hook
+        // already rejected retired/unknown tiers; a disagreement here is a
+        // transport bug — refuse rather than misdispatch.
+        let conn_class = match &self.identity.magic {
+            None => ConnClass::PreEnforcement,
+            Some(_) => match self.identity.classify(conn.alpn()) {
+                AcceptTier::ServedLocked => ConnClass::Locked,
+                AcceptTier::ServedCompat(generation) => ConnClass::Compat(generation),
+                tier => {
+                    tracing::warn!(
+                        "dropping connection from node {} on unserved ALPN tier {:?}",
+                        peer.node_id,
+                        tier
+                    );
+                    return Ok(());
+                }
+            },
+        };
+        tracing::debug!(
+            "accepted iroh connection from node {} ({:?})",
+            peer.node_id,
+            conn_class
+        );
 
         loop {
             match conn.accept_bi().await {
                 Ok((send, recv)) => {
                     let comms = self.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = comms.handle_stream(send, recv, peer).await {
+                        if let Err(e) = comms.handle_stream(send, recv, peer, conn_class).await {
                             tracing::debug!("iroh stream error from node {}: {}", peer.node_id, e);
                         }
                     });
@@ -670,6 +830,7 @@ impl IrohComms {
         mut send: iroh::endpoint::SendStream,
         mut recv: iroh::endpoint::RecvStream,
         peer: PeerRef,
+        conn_class: ConnClass,
     ) -> Result<(), CommsError> {
         let envelope = read_envelope(&mut recv).await?;
         let span = tracing::debug_span!(
@@ -700,8 +861,24 @@ impl IrohComms {
                 return Ok(()); // drop the stream; the peer sees a stream error
             };
 
-            match entry {
-                ScopeEntry::Rpc(handler) => {
+            // Admissibility (RFC-025 §Scope Classes): a compat connection
+            // never carries locked traffic — a matched peer dials locked
+            // scopes on the locked family, so this only fires on a bug or
+            // a mismatched peer probing; same surface as unknown scope.
+            if let ConnClass::Compat(generation) = conn_class {
+                if entry.class == ScopeClass::Locked {
+                    tracing::warn!(
+                        "locked-class scope {:?} refused on compat connection \
+                         (generation {generation}, from node {})",
+                        envelope.scope,
+                        peer.node_id
+                    );
+                    return Ok(());
+                }
+            }
+
+            match &entry.kind {
+                ScopeKind::Rpc(handler) => {
                     // Receiver-side dedup: first caller computes; retried
                     // requests (same id) wait for and reuse the same bytes.
                     let cell = {
@@ -728,7 +905,7 @@ impl IrohComms {
                         CommsError::Transport(TransportError::StreamFailed(e.to_string()))
                     })
                 }
-                ScopeEntry::Streamed(handler) => {
+                ScopeKind::Streamed(handler) => {
                     // Multi-frame protocol: no dedup (the protocol owns
                     // idempotency); the handler drives the sink to completion.
                     let sink: Box<dyn FrameSink> = Box::new(IrohFrameSink { send });
@@ -896,10 +1073,10 @@ mod tests {
         server_directory: Arc<dyn PeerDirectory>,
         scopes: ScopeRegistry,
     ) -> (IrohComms, IrohComms, PeerRef) {
-        let a = IrohComms::bind(rand::random(), Arc::new(AllowAll), None)
+        let a = IrohComms::bind(rand::random(), Arc::new(AllowAll), BindOptions::default())
             .await
             .unwrap();
-        let b = IrohComms::bind(rand::random(), server_directory, None)
+        let b = IrohComms::bind(rand::random(), server_directory, BindOptions::default())
             .await
             .unwrap();
         b.start(scopes);
@@ -989,10 +1166,10 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
             }),
         );
-        let a = IrohComms::bind(rand::random(), Arc::new(AllowAll), None)
+        let a = IrohComms::bind(rand::random(), Arc::new(AllowAll), BindOptions::default())
             .await
             .unwrap();
-        let b = IrohComms::bind(rand::random(), Arc::new(DenyAll), None)
+        let b = IrohComms::bind(rand::random(), Arc::new(DenyAll), BindOptions::default())
             .await
             .unwrap();
         b.start(scopes);
