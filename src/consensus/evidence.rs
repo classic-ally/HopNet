@@ -353,9 +353,12 @@ impl hopnet_comms::RpcHandler for StatusScope {
                     },
                     _,
                 )) => {
+                    // Compat chatter (RFC-025): an inbound ping makes the
+                    // prober VISIBLE, never live — liveness rides locked
+                    // exchanges and version-matched Pongs only.
                     app_state
                         .evidence
-                        .record_contact_with_height(peer.node_id, decided_height);
+                        .record_seen_with_height(peer.node_id, decided_height);
                     if epoch != my_epoch {
                         tracing::warn!(
                             peer = peer.node_id,
@@ -382,7 +385,10 @@ impl hopnet_comms::RpcHandler for StatusScope {
                         }
                     }
                 }
-                Err(_) => app_state.evidence.record_contact(peer.node_id),
+                // The undecodable-request hole (RFC-025 §Rejection)
+                // closes here: a malformed request is a sighting, never
+                // contact — it no longer touches the vote-out clock.
+                Err(_) => app_state.evidence.record_seen(peer.node_id),
             }
             let decided_height = app_state
                 .malachite

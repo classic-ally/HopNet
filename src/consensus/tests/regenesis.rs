@@ -862,6 +862,67 @@ fn handshake_carries_epoch_and_refuses_mismatched_fetch() {
     assert_eq!(head, hopnet_comms::alpn::COMPAT_HEAD);
 }
 
+// Impact: this pin is the vote-out shield (RFC-025 §Rejection) — a
+// lagging validator chatty on the compat class must stay dark on the
+// liveness clock, or its chatter shields it from the vote-out it
+// deserves. Both directions of the undecodable-request hole close here.
+// Should: record only VISIBILITY (last_seen + height) for a decoded
+// inbound status ping, and visibility alone for an undecodable one.
+// Should not: move last_contact from either path.
+#[test]
+fn inbound_status_is_visibility_never_liveness() {
+    let _env = crate::test_env::lock_env();
+    use crate::consensus::evidence::StatusRequest;
+
+    let node = MockNode::new(7);
+    register_node(&node);
+    let peer = hopnet_comms::PeerRef {
+        node_id: 44,
+        pubkey: [0u8; 32],
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let status = crate::consensus::evidence::StatusScope {
+        app_state: node.app_state.clone(),
+    };
+    let evidence = &node.app_state.evidence;
+    let origin = evidence.origin();
+
+    // Decoded ping: visibility + height, liveness untouched.
+    let ping = bincode::serde::encode_to_vec(
+        &StatusRequest::Ping {
+            decided_height: 11,
+            epoch: 1,
+            version_code: crate::version::effective_running_code(),
+        },
+        bincode::config::standard(),
+    )
+    .unwrap();
+    rt.block_on(hopnet_comms::RpcHandler::handle(&status, peer, ping));
+    let snap = evidence.snapshot();
+    let (_, v) = snap.iter().find(|(id, _)| *id == 44).unwrap();
+    assert_eq!(v.last_contact, origin, "decoded ping must not touch liveness");
+    assert!(v.last_seen.is_some());
+    assert_eq!(v.last_known_height, Some(11));
+
+    // Undecodable request: the RFC's hole — sighting only.
+    let garbage_peer = hopnet_comms::PeerRef {
+        node_id: 45,
+        pubkey: [0u8; 32],
+    };
+    rt.block_on(hopnet_comms::RpcHandler::handle(
+        &status,
+        garbage_peer,
+        vec![0xFF, 0xFF, 0xFF],
+    ));
+    let snap = evidence.snapshot();
+    let (_, v) = snap.iter().find(|(id, _)| *id == 45).unwrap();
+    assert_eq!(v.last_contact, origin, "garbage must not touch liveness");
+    assert!(v.last_seen.is_some());
+}
+
 // Impact: the schema-evolution parity gate transposed to the wire — a
 // generation-1 reshape that strands generation-0 peers fails here at
 // mint time, not in the field.

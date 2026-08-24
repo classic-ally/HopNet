@@ -33,9 +33,11 @@ impl RegenesisScope {
                 };
             }
         };
-        // Reachability evidence: an authenticated, well-formed exchange —
-        // a straggler asking for lineage is very much reachable.
-        self.app_state.evidence.record_contact(peer.node_id);
+        // Visibility evidence (RFC-025): a straggler fetching lineage is
+        // very much REACHABLE — the status view says so — without
+        // brightening its seat; it is chatty on the compat class exactly
+        // while it cannot vote.
+        self.app_state.evidence.record_seen(peer.node_id);
         // Consensus-support plane: file + DB reads on the QUEUE runtime,
         // never the net runtime, never gated on an engine handle.
         let db_path = crate::db::shared::get_database_path();
