@@ -95,6 +95,11 @@ impl JoinTransport for CommsTransport {
         timeout: Duration,
     ) -> BoxFuture<'_, Result<RegenesisNetResponse, String>> {
         Box::pin(async move {
+            // Plain rpc is enough while generations 0 and 1 are
+            // byte-identical for this scope (the compat_g0 equality
+            // goldens); the first divergent mint moves this to
+            // rpc_negotiated and decodes per generation, like
+            // status_probe.
             let reply = self
                 .comms
                 .rpc(&peer, "regenesis", encode_payload(&req), timeout)

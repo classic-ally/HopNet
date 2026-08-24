@@ -296,6 +296,49 @@ mod tests {
         assert_eq!(updated, 1);
     }
 
+    // Impact: the cross-generation parity gate for the rejoin path — a
+    // reshape that breaks generation-0 dialers fails here at mint time.
+    // Should: serve generation-0-encoded requests through the head
+    // handler (the identity registration) and produce responses the
+    // frozen generation-0 decoder reads back exactly.
+    #[test]
+    fn regenesis_g0_roundtrip() {
+        use crate::regenesis::compat_g0 as g0;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = transitioned_db(dir.path());
+
+        let raw = crate::net::encode_payload(&g0::RegenesisNetRequest::EpochInfo);
+        let request: RegenesisNetRequest = crate::net::decode_payload(&raw).unwrap();
+        let response = serve_request(&db_path, request);
+        let bytes = crate::net::encode_payload(&response);
+        match crate::net::decode_payload::<g0::RegenesisNetResponse>(&bytes).unwrap() {
+            g0::RegenesisNetResponse::EpochInfo {
+                epoch,
+                lineage_from,
+                ..
+            } => {
+                assert_eq!(epoch, 2);
+                assert_eq!(lineage_from, Some(2));
+            }
+            _ => panic!("expected EpochInfo"),
+        }
+
+        let raw =
+            crate::net::encode_payload(&g0::RegenesisNetRequest::LineageFetch { from_epoch: 2 });
+        let request: RegenesisNetRequest = crate::net::decode_payload(&raw).unwrap();
+        let response = serve_request(&db_path, request);
+        let bytes = crate::net::encode_payload(&response);
+        match crate::net::decode_payload::<g0::RegenesisNetResponse>(&bytes).unwrap() {
+            g0::RegenesisNetResponse::Lineage { records } => {
+                assert_eq!(records.len(), 1);
+                // The blob is the straggler-parsed encoding — it must
+                // decode under the same codec the old binary uses.
+                genesis::decode_lineage(&records[0]).unwrap();
+            }
+            _ => panic!("expected Lineage"),
+        }
+    }
+
     // Should: report the epoch, decided height, genesis height, and the
     // lowest lineage record for a transitioned database.
     #[test]

@@ -10,6 +10,8 @@
 //! regenesis-seal-contract.md.
 
 pub mod boot;
+#[cfg(test)]
+pub mod compat_g0;
 pub mod compat_g1;
 pub mod gate;
 pub mod genesis;

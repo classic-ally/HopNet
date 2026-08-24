@@ -1386,3 +1386,4 @@ pub(crate) mod tests {
         assert!(verify_lineage_chain(&tampered, tofu).is_err());
     }
 }
+
