@@ -392,7 +392,10 @@ impl MockHandle {
     /// Arm the bare-409 shape for the next rename (consensus rejection /
     /// pre-replace node).
     pub fn arm_rename_bare_conflict(&self) {
-        self.state.lock().expect("mock poisoned").rename_bare_conflict = true;
+        self.state
+            .lock()
+            .expect("mock poisoned")
+            .rename_bare_conflict = true;
     }
 
     /// Script the node's reported version (the min_node input).

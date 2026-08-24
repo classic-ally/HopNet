@@ -482,7 +482,10 @@ async fn mutations_are_strict_read_your_writes() {
         .json()
         .await
         .expect("shadow response json");
-    let shadow_id = response["item"]["id"].as_str().expect("shadow id").to_string();
+    let shadow_id = response["item"]["id"]
+        .as_str()
+        .expect("shadow id")
+        .to_string();
 
     let response = client
         .patch(format!("{base}/modify"))
@@ -993,11 +996,15 @@ async fn fuse_mount_smoke_against_live_node() {
             // RENAME_NOREPLACE must still refuse with EEXIST.
             std::fs::write(root.join("Kernel/noreplace.txt"), b"NR").unwrap();
             let src = std::ffi::CString::new(
-                root.join("Kernel/noreplace.txt").into_os_string().into_encoded_bytes(),
+                root.join("Kernel/noreplace.txt")
+                    .into_os_string()
+                    .into_encoded_bytes(),
             )
             .unwrap();
             let dst = std::ffi::CString::new(
-                root.join("Kernel/renamed.txt").into_os_string().into_encoded_bytes(),
+                root.join("Kernel/renamed.txt")
+                    .into_os_string()
+                    .into_encoded_bytes(),
             )
             .unwrap();
             let rc = unsafe {
@@ -1068,7 +1075,10 @@ async fn fuse_mount_smoke_against_live_node() {
                 String::from_utf8_lossy(&out.stderr)
             );
             let head = std::fs::read_to_string(repo.join(".git/HEAD")).unwrap();
-            assert!(head.starts_with("ref:"), "HEAD must be a symref, got {head:?}");
+            assert!(
+                head.starts_with("ref:"),
+                "HEAD must be a symref, got {head:?}"
+            );
             // Two writes: the second renames config.lock over config —
             // the deterministic-EEXIST path this fix exists for.
             let out = git(&["config", "user.name", "hopnet-smoke"]);

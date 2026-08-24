@@ -84,7 +84,7 @@ pub enum DatabaseError {
     ProcessingError,
     InvalidPayload,
     NotFound,
-    ConflictError,      // Resource already exists at the specified location/identifier
+    ConflictError, // Resource already exists at the specified location/identifier
     /// Replace-rename onto a non-empty folder — the POSIX ENOTEMPTY verdict.
     /// Distinct from ConflictError so the mount surface can answer a coded
     /// 409 the daemon maps to ENOTEMPTY instead of EEXIST.

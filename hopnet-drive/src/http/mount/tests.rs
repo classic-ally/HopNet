@@ -1778,8 +1778,11 @@ async fn rename_replace_dir_over_nonempty_dir_is_not_empty() {
          to avoid reporting EEXIST"
     );
 
-    let (status, _) =
-        get_json::<MountItem>(&app, &format!("/lookup?parent_id={dest_id}&name=keepme.txt")).await;
+    let (status, _) = get_json::<MountItem>(
+        &app,
+        &format!("/lookup?parent_id={dest_id}&name=keepme.txt"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "nothing may be deleted on refusal");
 }
 
@@ -1901,11 +1904,16 @@ async fn rename_replace_moves_across_parents() {
         }),
     )
     .await;
-    assert!(status.is_success(), "move+replace must succeed, got {status}");
+    assert!(
+        status.is_success(),
+        "move+replace must succeed, got {status}"
+    );
 
-    let (status, found) =
-        get_json::<MountItem>(&app, &format!("/lookup?parent_id={folder_id}&name=target.txt"))
-            .await;
+    let (status, found) = get_json::<MountItem>(
+        &app,
+        &format!("/lookup?parent_id={folder_id}&name=target.txt"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let found = found.unwrap();
     assert_eq!(found.id.as_ref(), Some(&mover_id));
@@ -2049,4 +2057,41 @@ async fn rename_replace_leaves_blob_to_orphan_sweep() {
         )
         .unwrap();
     assert_eq!(sharer_rows, 1, "another user's reference must be untouched");
+}
+
+// Should: answer 400 for a rename onto the item's own current path,
+// replace or not — the kernel short-circuits same-dentry renames itself,
+// so this pins the HTTP surface's contract only.
+#[tokio::test]
+async fn rename_onto_self_is_400() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let content = b"self";
+    let (_, file) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", content.len()),
+            Some("self.txt"),
+            content.as_slice(),
+        )],
+    )
+    .await;
+    let id = file.unwrap().item.unwrap().id.unwrap();
+
+    for replace in [false, true] {
+        let (status, _) = send_json::<MountMutationResponse>(
+            &app,
+            "PATCH",
+            "/modify",
+            serde_json::json!({ "id": id, "new_name": "self.txt", "replace": replace }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "same-path rename (replace={replace}) keeps its 400 contract"
+        );
+    }
 }

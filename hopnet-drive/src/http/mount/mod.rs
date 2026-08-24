@@ -591,9 +591,12 @@ fn check_destination(
         }
         (InodeType::Folder, InodeType::Folder) => {
             drop(db_lock);
-            let empty =
-                db::fileprovider::is_folder_empty(state.db_pool.get(), dest_encrypted_path, user_id)
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let empty = db::fileprovider::is_folder_empty(
+                state.db_pool.get(),
+                dest_encrypted_path,
+                user_id,
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             if empty {
                 Ok(())
             } else {

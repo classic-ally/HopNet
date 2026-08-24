@@ -1737,9 +1737,7 @@ async fn rename_replaces_existing_destination() {
     );
     match core.getattr(dest.ino).await {
         Err(CoreError::NotFound) => {}
-        other => panic!(
-            "replaced item's attrs must be evicted, not served stale: {other:?}"
-        ),
+        other => panic!("replaced item's attrs must be evicted, not served stale: {other:?}"),
     }
 }
 
@@ -1819,7 +1817,12 @@ async fn watch_reports_replaced_destination_deleted() {
         panic!("file ids are inodes");
     };
     transport
-        .rename(src_uuid, Some(ItemId::Root), Some("target.txt".into()), true)
+        .rename(
+            src_uuid,
+            Some(ItemId::Root),
+            Some("target.txt".into()),
+            true,
+        )
         .await
         .expect("remote replace must succeed");
     handle.poke();

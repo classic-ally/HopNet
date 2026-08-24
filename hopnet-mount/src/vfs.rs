@@ -741,7 +741,11 @@ impl MountCore {
         // closes the response→delta window locally. Failure is ignored —
         // it is an optimization, not a correctness gate.
         let occupant_id = if replace {
-            match self.transport.lookup(new_parent.clone(), new_name.to_string()).await {
+            match self
+                .transport
+                .lookup(new_parent.clone(), new_name.to_string())
+                .await
+            {
                 Ok(Some(dest)) if dest.id != child.id => Some(dest.id),
                 _ => None,
             }
