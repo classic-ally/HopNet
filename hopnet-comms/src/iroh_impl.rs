@@ -116,17 +116,25 @@ pub fn net_rt() -> &'static tokio::runtime::Runtime {
 // request stream :  [8B request_id LE][1B scope_len][scope utf8][4B payload_len LE][payload]
 // response stream:  repeated frames of [4B len LE][bytes]   (rpc = exactly one frame)
 
+/// The request-stream header bytes, extracted pure so the envelope
+/// golden can pin them without a live endpoint (the byte layout is
+/// normative — hopnet-comms/docs/wire.md).
+fn encode_envelope_header(request_id: u64, scope: &str, payload_len: u32) -> Vec<u8> {
+    let mut header = Vec::with_capacity(8 + 1 + scope.len() + 4);
+    header.extend_from_slice(&request_id.to_le_bytes());
+    header.push(scope.len() as u8);
+    header.extend_from_slice(scope.as_bytes());
+    header.extend_from_slice(&payload_len.to_le_bytes());
+    header
+}
+
 async fn write_envelope(
     send: &mut iroh::endpoint::SendStream,
     request_id: u64,
     scope: &str,
     payload: &[u8],
 ) -> Result<(), CommsError> {
-    let mut header = Vec::with_capacity(8 + 1 + scope.len() + 4);
-    header.extend_from_slice(&request_id.to_le_bytes());
-    header.push(scope.len() as u8);
-    header.extend_from_slice(scope.as_bytes());
-    header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    let header = encode_envelope_header(request_id, scope, payload.len() as u32);
     send.write_all(&header)
         .await
         .map_err(|e| CommsError::Transport(TransportError::StreamFailed(e.to_string())))?;
@@ -791,6 +799,23 @@ mod tests {
     use super::*;
     use crate::{Rpc, RpcHandler, StreamHandler};
     use std::sync::atomic::AtomicUsize;
+
+    // Impact: the envelope header is the one framing every scope shares;
+    // silent drift here severs RPC between releases while every payload
+    // golden still passes (hopnet-comms/docs/wire.md).
+    // Should: encode the documented byte layout exactly — request id LE,
+    // one-byte scope length, scope utf8, payload length LE.
+    #[test]
+    fn envelope_header_golden() {
+        let header = encode_envelope_header(0x0123_4567_89ab_cdef, "status", 4);
+        let expected: &[u8] = &[
+            0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, // request_id LE
+            0x06, // scope_len
+            b's', b't', b'a', b't', b'u', b's', // scope
+            0x04, 0x00, 0x00, 0x00, // payload_len LE
+        ];
+        assert_eq!(header, expected, "envelope wire format drifted");
+    }
 
     /// Directory that knows every peer (loopback meshes).
     struct AllowAll;
