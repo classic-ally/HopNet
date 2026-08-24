@@ -155,6 +155,48 @@ enum ConnClass {
     Compat(u32),
 }
 
+/// Connection-cache key: one cached connection per peer per family. The
+/// compat entry may have negotiated any in-window generation — the
+/// negotiated ALPN, not the key, is the codec authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ConnKey {
+    Legacy,
+    Locked,
+    Compat,
+}
+
+/// What to offer on a dial. Compat dials offer the whole window in ONE
+/// handshake (`ConnectOptions::with_additional_alpns`) and TLS selects
+/// the highest mutual generation (RFC-025 §Settled Questions).
+enum DialPlan {
+    Single(Vec<u8>),
+    Multi { head: Vec<u8>, rest: Vec<Vec<u8>> },
+}
+
+impl AlpnIdentity {
+    fn conn_key(&self, class: ScopeClass) -> ConnKey {
+        match (&self.magic, class) {
+            (None, _) => ConnKey::Legacy,
+            (Some(_), ScopeClass::Locked) => ConnKey::Locked,
+            (Some(_), ScopeClass::Compat) => ConnKey::Compat,
+        }
+    }
+
+    fn dial_plan(&self, class: ScopeClass) -> DialPlan {
+        match (&self.magic, class) {
+            (None, _) => DialPlan::Single(alpn::LEGACY_ALPN.to_vec()),
+            (Some(magic), ScopeClass::Locked) => {
+                DialPlan::Single(alpn::locked_alpn(magic, self.code))
+            }
+            (Some(magic), ScopeClass::Compat) => {
+                let mut offer = alpn::compat_offer(magic, self.head);
+                let head = offer.remove(0);
+                DialPlan::Multi { head, rest: offer }
+            }
+        }
+    }
+}
+
 /// Maximum frame size (8MB) - prevents allocation attacks from malicious peers
 const MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 
@@ -404,8 +446,11 @@ impl Call {
 #[derive(Clone)]
 pub struct IrohComms {
     endpoint: Endpoint,
-    /// Connection cache keyed by node_id.
-    connections: Arc<RwLock<HashMap<i32, Connection>>>,
+    /// Connection cache: one entry per peer per ALPN family.
+    connections: Arc<RwLock<HashMap<(i32, ConnKey), Connection>>>,
+    /// Known-address hints (loopback tests / connect_to_addr): consulted
+    /// by every family's dial before falling back to discovery.
+    addr_hints: Arc<RwLock<HashMap<i32, EndpointAddr>>>,
     /// Receiver-side request dedup: request_id → response-byte cache.
     dedup: Arc<DedupMap>,
     directory: Arc<dyn PeerDirectory>,
@@ -485,6 +530,7 @@ impl IrohComms {
         Ok(Self {
             endpoint,
             connections: Arc::new(RwLock::new(HashMap::new())),
+            addr_hints: Arc::new(RwLock::new(HashMap::new())),
             dedup: Arc::new(std::sync::Mutex::new(HashMap::new())),
             directory,
             custom_relay,
@@ -573,7 +619,7 @@ impl IrohComms {
     ) -> Result<Call, CommsError> {
         let connect_budget = opts.connect_timeout.unwrap_or(CONNECTION_TIMEOUT);
         let conn = self
-            .get_connection_with_budget(peer, connect_budget)
+            .get_connection_with_budget(peer, connect_budget, self.scope_class(scope))
             .await?;
         let (mut send, recv) = conn
             .open_bi()
@@ -586,28 +632,95 @@ impl IrohComms {
         Ok(Call { recv })
     }
 
-    /// Remove a connection from the cache (e.g. on error, timeout, or the
-    /// forward client's NoAck eviction).
+    /// Remove a peer's connections from the cache (e.g. on error, timeout,
+    /// or the forward client's NoAck eviction). Evicts EVERY family's
+    /// entry: eviction is about the peer being a zombie, not a family.
     pub async fn remove_connection(&self, node_id: i32) {
         let mut connections = self.connections.write().await;
-        connections.remove(&node_id);
+        connections.retain(|(id, _), _| *id != node_id);
     }
 
-    /// Establish and cache a connection to a peer at a KNOWN address,
-    /// bypassing discovery. Used by in-process tests over loopback, where
-    /// endpoints know each other's bound sockets directly.
-    pub async fn connect_to_addr(
+    /// The registered ALPN class of `scope`, for dial-side family
+    /// selection. The transport ping is compat-class by definition;
+    /// unregistered scopes dial locked — the safe default (exact match).
+    fn scope_class(&self, scope: &str) -> ScopeClass {
+        if scope == PING_SCOPE {
+            return ScopeClass::Compat;
+        }
+        self.scopes
+            .get()
+            .and_then(|s| s.class_of(scope))
+            .unwrap_or(ScopeClass::Locked)
+    }
+
+    /// A refusal encoded in a QUIC close, if this is one (RFC-025):
+    /// `no_application_protocol` (crypto 0x178) → AlpnRejected; the hook's
+    /// COMPAT_RETIRED application close → CompatRetired.
+    fn refusal_from_close(reason: &iroh::endpoint::ConnectionError) -> Option<crate::RefusalError> {
+        use iroh::endpoint::{ConnectionError, TransportErrorCode, VarInt};
+        match reason {
+            ConnectionError::ConnectionClosed(close)
+                if close.error_code == TransportErrorCode::crypto(0x78) =>
+            {
+                Some(crate::RefusalError::AlpnRejected)
+            }
+            ConnectionError::ApplicationClosed(close)
+                if close.error_code == VarInt::from(alpn::REJECT_COMPAT_RETIRED) =>
+            {
+                let (floor, node_version) =
+                    alpn::parse_retired_reason(&close.reason).unwrap_or_else(|| {
+                        tracing::warn!("unparseable COMPAT_RETIRED reason bytes");
+                        (0, 0)
+                    });
+                Some(crate::RefusalError::CompatRetired {
+                    floor,
+                    node_version,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Walk a connect error's source chain for a structural refusal.
+    fn classify_connect_error(e: &(dyn std::error::Error + 'static)) -> Option<crate::RefusalError> {
+        let mut cursor: Option<&(dyn std::error::Error + 'static)> = Some(e);
+        while let Some(err) = cursor {
+            if let Some(conn_err) = err.downcast_ref::<iroh::endpoint::ConnectionError>() {
+                return Self::refusal_from_close(conn_err);
+            }
+            cursor = err.source();
+        }
+        None
+    }
+
+    /// One bounded dial on the net runtime (the per-connection driver is
+    /// spawned on the runtime that polls connect() — from the main runtime
+    /// it would starve under API load; the abort keeps cancelled dials
+    /// from accumulating). Refusals come back typed, never retryable.
+    async fn dial_bounded(
         &self,
+        dial_addr: EndpointAddr,
+        plan: DialPlan,
+        budget: Duration,
         node_id: i32,
-        addr: EndpointAddr,
-    ) -> Result<(), CommsError> {
-        // Same net-runtime dial routing as get_connection (driver placement).
+    ) -> Result<Connection, CommsError> {
         let endpoint = self.endpoint.clone();
-        let mut dial = net_rt().spawn(async move { endpoint.connect(addr, HOPNET_ALPN).await });
-        let conn = match tokio::time::timeout(CONNECTION_TIMEOUT, &mut dial).await {
+        let mut dial = net_rt().spawn(async move {
+            match plan {
+                DialPlan::Single(alpn_bytes) => endpoint.connect(dial_addr, &alpn_bytes).await,
+                DialPlan::Multi { head, rest } => {
+                    let opts = iroh::endpoint::ConnectOptions::new().with_additional_alpns(rest);
+                    let connecting = endpoint.connect_with_opts(dial_addr, &head, opts).await?;
+                    Ok(connecting.await?)
+                }
+            }
+        });
+        let conn = match tokio::time::timeout(budget, &mut dial).await {
             Err(_) => {
                 dial.abort();
-                return Err(CommsError::Transport(TransportError::Timeout));
+                return Err(CommsError::Transport(TransportError::ConnectionFailed(
+                    format!("connection to node {node_id} timed out after {budget:?}"),
+                )));
             }
             Ok(Err(join_err)) => {
                 return Err(CommsError::Transport(TransportError::ConnectionFailed(
@@ -615,26 +728,66 @@ impl IrohComms {
                 )));
             }
             Ok(Ok(Err(e))) => {
-                return Err(CommsError::Transport(TransportError::ConnectionFailed(
-                    e.to_string(),
-                )));
+                return Err(match Self::classify_connect_error(&e) {
+                    Some(refusal) => CommsError::Refused(refusal),
+                    None => {
+                        CommsError::Transport(TransportError::ConnectionFailed(e.to_string()))
+                    }
+                });
             }
             Ok(Ok(Ok(conn))) => conn,
         };
-        self.connections.write().await.insert(node_id, conn);
+        // A hook reject is racy dial-side: connect() may return Ok with the
+        // close already recorded. One immediate check keeps a refused
+        // connection out of the cache; a reject landing later surfaces on
+        // first use as a stream error → evict → redial → classified then.
+        if let Some(reason) = conn.close_reason() {
+            if let Some(refusal) = Self::refusal_from_close(&reason) {
+                return Err(CommsError::Refused(refusal));
+            }
+        }
+        Ok(conn)
+    }
+
+    /// Establish and cache a connection to a peer at a KNOWN address,
+    /// bypassing discovery. Used by in-process tests over loopback, where
+    /// endpoints know each other's bound sockets directly. The address is
+    /// remembered so later dials on ANY family reach the peer too.
+    pub async fn connect_to_addr(
+        &self,
+        node_id: i32,
+        addr: EndpointAddr,
+    ) -> Result<(), CommsError> {
+        self.addr_hints.write().await.insert(node_id, addr.clone());
+        let class = ScopeClass::Locked;
+        let conn = self
+            .dial_bounded(
+                addr,
+                self.identity.dial_plan(class),
+                CONNECTION_TIMEOUT,
+                node_id,
+            )
+            .await?;
+        self.connections
+            .write()
+            .await
+            .insert((node_id, self.identity.conn_key(class)), conn);
         Ok(())
     }
 
-    /// Get or establish a connection to a peer. Uses cached connection if
-    /// available; establishment is bounded by `connect_budget`.
+    /// Get or establish a connection to a peer on the family `class`
+    /// dials. Uses the cached connection if available; establishment is
+    /// bounded by `connect_budget`.
     async fn get_connection_with_budget(
         &self,
         peer: &PeerRef,
         connect_budget: Duration,
+        class: ScopeClass,
     ) -> Result<Connection, CommsError> {
+        let key = (peer.node_id, self.identity.conn_key(class));
         {
             let connections = self.connections.read().await;
-            if let Some(conn) = connections.get(&peer.node_id) {
+            if let Some(conn) = connections.get(&key) {
                 if conn.close_reason().is_none() {
                     return Ok(conn.clone());
                 }
@@ -647,46 +800,38 @@ impl IrohComms {
                 peer.node_id
             )))
         })?;
-        // With a self-hosted relay there is no discovery — pin the peer's
-        // address to our relay.
-        let dial_addr = {
-            let mut addr = EndpointAddr::new(peer_key);
-            if let Some(url) = &self.custom_relay {
-                addr = addr.with_relay_url(url.clone());
+        // A recorded address hint (loopback) wins; otherwise discovery —
+        // and with a self-hosted relay there is none, so the peer's
+        // address pins to our relay.
+        let dial_addr = match self.addr_hints.read().await.get(&peer.node_id) {
+            Some(hint) => hint.clone(),
+            None => {
+                let mut addr = EndpointAddr::new(peer_key);
+                if let Some(url) = &self.custom_relay {
+                    addr = addr.with_relay_url(url.clone());
+                }
+                addr
             }
-            addr
         };
-        // Dial ON the net runtime: the per-connection driver (ACKs, keepalives,
-        // retransmits) is spawned on the runtime that polls connect() — from
-        // the main runtime it would starve under API load. Abort the dial task
-        // on timeout so cancelled dials don't accumulate.
-        let endpoint = self.endpoint.clone();
-        let mut dial =
-            net_rt().spawn(async move { endpoint.connect(dial_addr, HOPNET_ALPN).await });
-        let node_id = peer.node_id;
-        let conn = match tokio::time::timeout(connect_budget, &mut dial).await {
-            Err(_) => {
-                dial.abort();
-                return Err(CommsError::Transport(TransportError::ConnectionFailed(
-                    format!("connection to node {node_id} timed out after {connect_budget:?}"),
-                )));
-            }
-            Ok(Err(join_err)) => {
-                return Err(CommsError::Transport(TransportError::ConnectionFailed(
-                    join_err.to_string(),
-                )));
-            }
-            Ok(Ok(Err(e))) => {
-                return Err(CommsError::Transport(TransportError::ConnectionFailed(
-                    e.to_string(),
-                )));
-            }
-            Ok(Ok(Ok(conn))) => conn,
-        };
+        let conn = self
+            .dial_bounded(
+                dial_addr,
+                self.identity.dial_plan(class),
+                connect_budget,
+                peer.node_id,
+            )
+            .await?;
+        if matches!(class, ScopeClass::Compat) {
+            tracing::debug!(
+                alpn = %String::from_utf8_lossy(conn.alpn()),
+                "compat dial to node {} negotiated",
+                peer.node_id
+            );
+        }
 
         {
             let mut connections = self.connections.write().await;
-            connections.insert(peer.node_id, conn.clone());
+            connections.insert(key, conn.clone());
         }
         Ok(conn)
     }
@@ -714,9 +859,10 @@ impl IrohComms {
         request_id: u64,
     ) -> Result<Vec<u8>, CommsError> {
         let span = tracing::debug_span!("rpc_req", id = %format!("{:016x}", request_id), to = peer.node_id);
+        let class = self.scope_class(scope);
         async {
             let conn = self
-                .get_connection_with_budget(peer, CONNECTION_TIMEOUT)
+                .get_connection_with_budget(peer, CONNECTION_TIMEOUT, class)
                 .await?;
 
             match Self::try_rpc(&conn, request_id, scope, &payload, timeout).await {
@@ -725,10 +871,11 @@ impl IrohComms {
                     // Transport error (timeout or stream failure) — connection
                     // may be zombie. Evict and retry once with a fresh
                     // connection, reusing the same request_id so the receiver
-                    // can deduplicate.
+                    // can deduplicate. Refused is NOT retryable (RFC-025): a
+                    // structural refusal never earns the evict-and-redial.
                     self.remove_connection(peer.node_id).await;
                     let conn = self
-                        .get_connection_with_budget(peer, CONNECTION_TIMEOUT)
+                        .get_connection_with_budget(peer, CONNECTION_TIMEOUT, class)
                         .await?;
                     Self::try_rpc(&conn, request_id, scope, &payload, timeout).await
                 }
