@@ -896,6 +896,27 @@ async fn handle_as_forwarder(
             resume_own_engine();
             (batch, DispatchOutcome::RetryNow)
         }
+        // Structural refusals (RFC-025): the retry cadence is still
+        // right — the proposer may rotate next height — but the cause
+        // gets named instead of dissolving into the generic warn.
+        Err(hopnet_comms::CommsError::Refused(hopnet_comms::RefusalError::AlpnRejected)) => {
+            crate::consensus::defuse::defuse_alpn_rejection(app_state, proposer_ref);
+            resume_own_engine();
+            (batch, DispatchOutcome::RetryAfterDelay)
+        }
+        Err(hopnet_comms::CommsError::Refused(hopnet_comms::RefusalError::CompatRetired {
+            floor,
+            node_version,
+        })) => {
+            tracing::error!(
+                peer = proposer,
+                peer_floor = floor,
+                peer_version = %crate::version::format_code(node_version),
+                "compat generation retired by proposer — fresh join required (RFC-025)"
+            );
+            resume_own_engine();
+            (batch, DispatchOutcome::RetryAfterDelay)
+        }
         Err(e) => {
             tracing::warn!("Failed to forward transactions to proposer: {:?}", e);
             resume_own_engine();

@@ -472,7 +472,7 @@ pub(crate) fn spawn_tip_poll(app_state: AppState) {
                 &engine.input_tx,
                 &mut decided,
                 &peers,
-                Some(app_state.evidence.clone()),
+                Some(&app_state),
             )
             .await
                 && !pivot_on_epoch_ahead(&app_state, &e)
@@ -645,7 +645,7 @@ pub(crate) fn spawn_driver(
                                     &mut decided,
                                     target.0,
                                     Some(hint_peer),
-                                    Some(app_state.evidence.clone()),
+                                    Some(&app_state),
                                 )
                                 .await
                                     && !pivot_on_epoch_ahead(&app_state, &e)
@@ -1011,7 +1011,6 @@ pub fn kick_sync_if_behind(app_state: &AppState, target: u64, hint_peer: i32) {
     let input_tx = engine.input_tx.clone();
     let mut decided = engine.decided.clone();
     let flag = engine.sync_inflight.clone();
-    let evidence = app_state.evidence.clone();
     let kick_state = app_state.clone();
     crate::consensus::queue::queue_rt().spawn(async move {
         if let Err(e) = sync::sync_to_target(
@@ -1023,7 +1022,7 @@ pub fn kick_sync_if_behind(app_state: &AppState, target: u64, hint_peer: i32) {
             &mut decided,
             target,
             Some(hint_peer),
-            Some(evidence),
+            Some(&kick_state),
         )
         .await
             && !pivot_on_epoch_ahead(&kick_state, &e)

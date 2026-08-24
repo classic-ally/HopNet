@@ -396,6 +396,7 @@ mod tests {
             // catch-up set this explicitly.
             last_known_height: Some(200),
             last_pong: None,
+            last_defuse_at: None,
         }
     }
 

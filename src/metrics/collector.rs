@@ -151,6 +151,10 @@ pub async fn collect_all_node_metrics(
                 );
                 (Some(avg_rtt), Some(variance), Some(jitter), true)
             }
+            // RFC-025 S4 note: a Refused error here reads as plain
+            // unavailability. Deliberately not defused — the ~10-minute
+            // grid is the lowest-value detector and the status prober
+            // names the state within one probe cadence anyway.
             Ok(Err(e)) => {
                 tracing::debug!(
                     "Latency measurement failed for node {}: {}",

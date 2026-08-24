@@ -219,7 +219,7 @@ async fn start_engine_with_candidates(
                                 &mut decided,
                                 target.0,
                                 Some(hint_peer),
-                                Some(app_state.evidence.clone()),
+                                Some(&app_state),
                             )
                             .await
                             {

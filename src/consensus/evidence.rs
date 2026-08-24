@@ -55,6 +55,9 @@ pub struct PeerEvidence {
     /// and the skew/stranded banner's source. Overwritten by every pong
     /// — a matched pong self-heals the banner.
     pub last_pong: Option<PongStamp>,
+    /// Defuser cooldown anchor (RFC-025): one resolution probe per peer
+    /// per cooldown, however many locked dials are failing.
+    pub last_defuse_at: Option<Instant>,
 }
 
 /// What the latest Pong claimed about a peer's identity.
@@ -169,6 +172,7 @@ impl EvidenceMap {
             bright_since: version_matched.then_some(now),
             last_known_height: None,
             last_pong: None,
+            last_defuse_at: None,
         });
         if version_matched {
             Self::touch_contact(entry, now, reset_gap);
@@ -177,6 +181,37 @@ impl EvidenceMap {
         }
         entry.last_known_height = Some(height);
         entry.last_pong = Some(stamp);
+    }
+
+    /// The peer's latest Pong identity, for the defuser's cache lookup —
+    /// a point read, cheaper than snapshot().
+    pub fn last_pong(&self, node_id: i32) -> Option<PongStamp> {
+        self.inner.lock().get(&node_id).and_then(|v| v.last_pong)
+    }
+
+    /// Defuser cooldown gate (RFC-025): true iff no defuse ran for this
+    /// peer within `cooldown` — and claims the slot atomically under the
+    /// map lock, so concurrent failing dials elect one resolver.
+    pub fn try_begin_defuse(&self, node_id: i32, cooldown: Duration, now: Instant) -> bool {
+        let origin = self.origin;
+        let mut map = self.inner.lock();
+        let entry = map.entry(node_id).or_insert(PeerEvidence {
+            last_contact: origin,
+            last_seen: None,
+            last_probe_at: None,
+            probes_since_contact: 0,
+            bright_since: None,
+            last_known_height: None,
+            last_pong: None,
+            last_defuse_at: None,
+        });
+        match entry.last_defuse_at {
+            Some(at) if now.saturating_duration_since(at) < cooldown => false,
+            _ => {
+                entry.last_defuse_at = Some(now);
+                true
+            }
+        }
     }
 
     /// Snapshot for classification and the debug route; sorted by node_id.
@@ -198,6 +233,7 @@ impl EvidenceMap {
             bright_since: Some(now),
             last_known_height: None,
             last_pong: None,
+            last_defuse_at: None,
         });
         Self::touch_contact(entry, now, reset_gap);
         if height.is_some() {
@@ -218,6 +254,7 @@ impl EvidenceMap {
             bright_since: None,
             last_known_height: None,
             last_pong: None,
+            last_defuse_at: None,
         });
         entry.last_seen = Some(now);
         if height.is_some() {
@@ -254,6 +291,7 @@ impl EvidenceMap {
             bright_since: None,
             last_known_height: None,
             last_pong: None,
+            last_defuse_at: None,
         });
         entry.last_probe_at = Some(now);
         entry.probes_since_contact = entry.probes_since_contact.saturating_add(1);
@@ -1158,6 +1196,7 @@ mod tests {
             bright_since: Some(last_contact),
             last_known_height: None,
             last_pong: None,
+            last_defuse_at: None,
         }
     }
 

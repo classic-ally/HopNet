@@ -2,6 +2,7 @@ pub use crate::{AppState, types::*};
 pub use types::*;
 
 pub mod barriers;
+pub mod defuse;
 pub mod dispatch;
 pub mod evidence;
 pub mod handlers;
