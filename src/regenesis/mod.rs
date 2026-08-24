@@ -10,6 +10,7 @@
 //! regenesis-seal-contract.md.
 
 pub mod boot;
+pub mod compat_g1;
 pub mod gate;
 pub mod genesis;
 pub mod handlers;

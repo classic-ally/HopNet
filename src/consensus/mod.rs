@@ -10,6 +10,7 @@ pub mod membership_guards;
 pub mod queue;
 pub mod routes;
 pub mod rpc;
+pub mod status_compat_g1;
 pub mod types;
 
 #[cfg(test)]

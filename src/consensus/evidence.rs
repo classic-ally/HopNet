@@ -259,39 +259,9 @@ pub fn live_estimate(
 // catch-up gate (last_known_height).
 // ============================================================================
 
-#[derive(serde::Serialize, serde::Deserialize)]
-pub enum StatusRequest {
-    /// Carries the PROBER's decided height: a probe teaches both sides —
-    /// the responder learns the prober's height here, the prober learns
-    /// the responder's from the Pong. Without this, steady-state probe
-    /// circularity (each side's probes keeping the other's view fresh)
-    /// leaves exactly one probe direction per pair and the responder
-    /// heightless.
-    ///
-    /// Also the hello of the (epoch, version) handshake (RFC-019 S6):
-    /// both sides learn each other's identity and log a structured
-    /// refusal on mismatch — turning the silent signature-domain failure
-    /// (chain_id is mixed into every vote) into a diagnosable one. The
-    /// responder still answers and records contact: reachability is a
-    /// transport fact, orthogonal to epoch membership.
-    Ping {
-        decided_height: u64,
-        epoch: u64,
-        version_code: u32,
-    },
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub enum StatusResponse {
-    /// Current decided height (0 pre-genesis/pre-engine — reachability is
-    /// a transport property; a zero height just fails catch-up gates),
-    /// plus the responder's (epoch, version) — see Ping.
-    Pong {
-        decided_height: u64,
-        epoch: u64,
-        version_code: u32,
-    },
-}
+// The wire vocabulary is generation-1 frozen inventory (RFC-025); the
+// scope below speaks the head types via these re-exports.
+pub use super::status_compat_g1::{StatusRequest, StatusResponse};
 
 /// Inbound status scope: mesh plane, inline on the net runtime — one
 /// watch borrow + one mutex write, no DB, no spawn.

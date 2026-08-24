@@ -469,6 +469,19 @@ mod tests {
     // metrics, setup, storage, txforward; compat: regenesis, status.
     // Should not: pass if any scope is added, removed, or reclassified
     // without this list changing.
+    // Impact: the cross-crate tie (RFC-025 §Placement) — the frozen
+    // modules' generation labels must match the window comms serves, or
+    // a COMPAT_HEAD bump without new head modules ships a mislabeled
+    // vocabulary.
+    // Should: pin every frozen module's GENERATION const to the served
+    // window's head.
+    #[test]
+    fn frozen_module_labels_match_the_served_window() {
+        use hopnet_comms::alpn::COMPAT_HEAD;
+        assert_eq!(crate::consensus::status_compat_g1::GENERATION, COMPAT_HEAD);
+        assert_eq!(crate::regenesis::compat_g1::GENERATION, COMPAT_HEAD);
+    }
+
     #[test]
     fn registry_matches_the_scope_class_table() {
         use hopnet_comms::ScopeClass::{Compat, Locked};
