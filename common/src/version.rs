@@ -9,10 +9,11 @@
 //! calendar order IS integer order. The string form exists only at the
 //! edges — Cargo.toml, release tags (`v{version}`), and display.
 //!
-//! These are the pure code helpers; each binary reads its own identity
-//! via `env!("CARGO_PKG_VERSION")` in its own crate (the node in
-//! `src/version.rs`, clients per RFC-023) so the token always names the
-//! bytes actually compiled.
+//! These are the pure code helpers plus the effective-code seam
+//! (RFC-025 — comms derives its ALPN identity from it); each binary
+//! reads its own identity via `env!("CARGO_PKG_VERSION")` in its own
+//! crate (the node in `src/version.rs`, clients per RFC-023) so the
+//! token always names the bytes actually compiled.
 
 /// The workspace CalVer code hopnet-common itself was compiled from.
 /// Excluded-workspace clients (crates/ingress-*) cannot inherit the
@@ -58,6 +59,30 @@ pub fn code_is_valid(code: u32) -> bool {
 /// the Cargo.toml/tag spelling).
 pub fn format_code(code: u32) -> String {
     format!("{}.{}.{}", code / 10_000, (code / 100) % 100, code % 100)
+}
+
+/// Test-mode gate for the override seams: debug builds and
+/// HOPNET_TEST_MODE. The overrides exist so orchestrator scenarios can
+/// make a release-image node CLAIM a different version without building
+/// a second image; production release binaries ignore them entirely.
+pub fn test_mode() -> bool {
+    cfg!(debug_assertions) || std::env::var("HOPNET_TEST_MODE").is_ok()
+}
+
+/// The binary's EFFECTIVE running version code: the workspace-unified
+/// compile-time token, unless test mode is on and
+/// `HOPNET_UPGRADE_VERSION_OVERRIDE` holds a well-formed CalVer token.
+/// A malformed override is ignored SILENTLY here — this crate carries no
+/// tracing; the node validates and warns once at boot (src/main.rs).
+pub fn effective_running_code() -> u32 {
+    if test_mode() {
+        if let Ok(v) = std::env::var("HOPNET_UPGRADE_VERSION_OVERRIDE") {
+            if let Some(code) = parse_code(&v) {
+                return code;
+            }
+        }
+    }
+    common_version_code()
 }
 
 #[cfg(test)]

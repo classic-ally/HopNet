@@ -106,6 +106,19 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     // tracing
     tracing_subscriber::fmt::init();
 
+    // The hoisted effective-code seam (hopnet_common::version) ignores a
+    // malformed override silently; validate once here so the operator
+    // still hears about it.
+    if version::test_mode()
+        && let Ok(v) = std::env::var("HOPNET_UPGRADE_VERSION_OVERRIDE")
+        && version::parse_code(&v).is_none()
+    {
+        tracing::warn!(
+            override_value = %v,
+            "ignoring malformed HOPNET_UPGRADE_VERSION_OVERRIDE"
+        );
+    }
+
     // RFC-015 boot tripwire: fail-stop immediately if the linker dropped a
     // projection's cross-crate inventory registrations.
     assert_projection_registrations();
