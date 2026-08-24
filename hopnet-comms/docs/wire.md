@@ -88,9 +88,46 @@ Frame cap: 8 MiB (`MAX_MESSAGE_SIZE`). Golden (request_id
 ef cd ab 89 67 45 23 01 06 73 74 61 74 75 73 04 00 00 00
 ```
 
-Payloads are opaque bytes; codecs belong to scope owners. The
-per-generation frozen vocabulary inventory is S3's deliverable and will
-be recorded here when generation 1 freezes.
+Payloads are opaque bytes; codecs belong to scope owners.
+
+## Frozen vocabulary inventory
+
+Payload codec everywhere: bincode 2 `config::standard()` (varint
+little-endian, positional — field and variant order IS the wire).
+Frozen modules live beside their owners, contain nothing but vocabulary
+and goldens, and are byte-frozen by `scripts/check-compat-freeze.sh`
+against the latest release tag; retirement deletes a module whole under
+a `RETIRES: compat_g<N>` commit trailer. Adapters live beside handlers
+in unfrozen files.
+
+### Generation 1 (head)
+
+| scope | types | module | goldens |
+|-------|-------|--------|---------|
+| status | `StatusRequest::Ping{decided_height, epoch, version_code}`, `StatusResponse::Pong{decided_height, epoch, version_code, floor, head}` | `src/consensus/status_compat_g1.rs` | in-module byte arrays |
+| regenesis | `RegenesisNetRequest` (EpochInfo, LineageFetch, SnapshotInfo, SnapshotChunk), `RegenesisNetResponse` (EpochInfo, Lineage, SnapshotInfo, SnapshotChunk, NotAvailable, Error) + `LINEAGE_FETCH_MAX`, `SNAPSHOT_CHUNK_MAX` | `src/regenesis/compat_g1.rs` | in-module byte arrays + the LineageRecord closure hex |
+
+Reached-into encodings (what the OLD binary parses — RFC-025 §Scope
+Classes): `Lineage.records` blobs are on-disk `LineageRecord` bytes
+(`src/regenesis/genesis.rs`), which the straggler decodes down through
+`EpochGenesisRecord`, `Block`, the transaction closure,
+`WireCommitCertificate`/`WireSig`, and the uuid/ed25519/bincode serde
+behavior underneath — all transitively pinned by the closure golden in
+`compat_g1.rs`. The snapshot artifact does NOT freeze (append + hash
+only; format is RFC-020's `ARTIFACT_VERSION`).
+
+### Generation 0 (pre-enforcement, in-window until the first mint)
+
+Identical to generation 1 minus the Pong's `(floor, head)` window
+fields. Status is served by the `StatusCompatG0` adapter (request bytes
+pass through — the G0/G1 Pings are byte-identical — and the Pong drops
+the window fields); regenesis is served by the head handler directly
+(generations byte-identical; the equality goldens in
+`src/regenesis/compat_g0.rs` are the license). Frozen shapes:
+`src/consensus/status_compat_g0.rs`, `src/regenesis/compat_g0.rs`.
+Pre-enforcement (magic-None) nodes serve generation-0 vocabulary on
+compat scopes — the negotiated ALPN is the codec authority on every
+pairing.
 
 ## Reject error-code registry
 

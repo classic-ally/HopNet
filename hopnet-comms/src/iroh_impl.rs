@@ -109,7 +109,9 @@ impl ScopeRegistry {
 
     /// Every registered scope with its class, for the class-pin test.
     pub fn scopes(&self) -> impl Iterator<Item = (&'static str, ScopeClass)> + '_ {
-        self.entries.iter().map(|(scope, entry)| (*scope, entry.class))
+        self.entries
+            .iter()
+            .map(|(scope, entry)| (*scope, entry.class))
     }
 
     fn insert_classed(&mut self, scope: &'static str, class: ScopeClass, kind: ScopeKind) {
@@ -441,9 +443,7 @@ impl EndpointHooks for HookAdapter {
                 error_code: alpn::REJECT_UNKNOWN_NODE.into(),
                 reason: b"unknown alpn".to_vec(),
             },
-            AcceptTier::ServedLocked | AcceptTier::ServedCompat(_) => {
-                AfterHandshakeOutcome::Accept
-            }
+            AcceptTier::ServedLocked | AcceptTier::ServedCompat(_) => AfterHandshakeOutcome::Accept,
         }
     }
 }
@@ -523,8 +523,13 @@ impl IrohComms {
         directory: Arc<dyn PeerDirectory>,
         opts: BindOptions,
     ) -> Result<Self, CommsError> {
-        Self::bind_with_identity(secret, directory, opts.relay_url, AlpnIdentity::new(opts.magic))
-            .await
+        Self::bind_with_identity(
+            secret,
+            directory,
+            opts.relay_url,
+            AlpnIdentity::new(opts.magic),
+        )
+        .await
     }
 
     async fn bind_with_identity(
@@ -717,8 +722,8 @@ impl IrohComms {
             ConnectionError::ApplicationClosed(close)
                 if close.error_code == VarInt::from(alpn::REJECT_COMPAT_RETIRED) =>
             {
-                let (floor, node_version) =
-                    alpn::parse_retired_reason(&close.reason).unwrap_or_else(|| {
+                let (floor, node_version) = alpn::parse_retired_reason(&close.reason)
+                    .unwrap_or_else(|| {
                         tracing::warn!("unparseable COMPAT_RETIRED reason bytes");
                         (0, 0)
                     });
@@ -732,7 +737,9 @@ impl IrohComms {
     }
 
     /// Walk a connect error's source chain for a structural refusal.
-    fn classify_connect_error(e: &(dyn std::error::Error + 'static)) -> Option<crate::RefusalError> {
+    fn classify_connect_error(
+        e: &(dyn std::error::Error + 'static),
+    ) -> Option<crate::RefusalError> {
         let mut cursor: Option<&(dyn std::error::Error + 'static)> = Some(e);
         while let Some(err) = cursor {
             if let Some(conn_err) = err.downcast_ref::<iroh::endpoint::ConnectionError>() {
@@ -780,9 +787,7 @@ impl IrohComms {
             Ok(Ok(Err(e))) => {
                 return Err(match Self::classify_connect_error(&e) {
                     Some(refusal) => CommsError::Refused(refusal),
-                    None => {
-                        CommsError::Transport(TransportError::ConnectionFailed(e.to_string()))
-                    }
+                    None => CommsError::Transport(TransportError::ConnectionFailed(e.to_string())),
                 });
             }
             Ok(Ok(Ok(conn))) => conn,
@@ -931,7 +936,8 @@ impl IrohComms {
                     let conn = self
                         .get_connection_with_budget(peer, CONNECTION_TIMEOUT, class)
                         .await?;
-                    let response = Self::try_rpc(&conn, request_id, scope, &payload, timeout).await?;
+                    let response =
+                        Self::try_rpc(&conn, request_id, scope, &payload, timeout).await?;
                     Ok((response, conn))
                 }
                 Err(e) => Err(e),
@@ -1557,7 +1563,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply, b"pong");
-        assert_eq!(negotiated_compat_alpn(&a, 2).await, alpn::compat_alpn(&MAGIC, 1));
+        assert_eq!(
+            negotiated_compat_alpn(&a, 2).await,
+            alpn::compat_alpn(&MAGIC, 1)
+        );
     }
 
     // Impact: the mint lifecycle depends on this — a straggler one
@@ -1585,7 +1594,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply, b"old");
-        assert_eq!(negotiated_compat_alpn(&a, 2).await, alpn::compat_alpn(&MAGIC, 1));
+        assert_eq!(
+            negotiated_compat_alpn(&a, 2).await,
+            alpn::compat_alpn(&MAGIC, 1)
+        );
         assert_eq!(prev_calls.load(Ordering::SeqCst), 1);
         assert_eq!(head_calls.load(Ordering::SeqCst), 0);
     }
@@ -1842,9 +1854,11 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), foreign.connect(loopback_addr(&b), b"hopnet/9.9"))
-                .await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            foreign.connect(loopback_addr(&b), b"hopnet/9.9"),
+        )
+        .await;
         // Tri-modal reject surface: error, timeout, or a dead connection.
         if let Ok(Ok(conn)) = result {
             assert!(
@@ -1891,7 +1905,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply, b"legacy");
-        assert_eq!(negotiated_compat_alpn(&a, 2).await, alpn::LEGACY_ALPN.to_vec());
+        assert_eq!(
+            negotiated_compat_alpn(&a, 2).await,
+            alpn::LEGACY_ALPN.to_vec()
+        );
     }
 
     // Impact: the S1 host-compatibility guarantee — production passes
@@ -1917,7 +1934,9 @@ mod tests {
             .unwrap();
         assert_eq!(reply, b"asis");
         let conns = a.connections.read().await;
-        let conn = conns.get(&(2, ConnKey::Legacy)).expect("legacy-keyed connection");
+        let conn = conns
+            .get(&(2, ConnKey::Legacy))
+            .expect("legacy-keyed connection");
         assert_eq!(conn.alpn(), alpn::LEGACY_ALPN);
     }
 }

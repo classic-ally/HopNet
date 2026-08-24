@@ -566,11 +566,22 @@ it as an ordinary upgrade regenesis. S-final trails independently
       `src/net/scopes.rs` tests, and the in-process fixtures bind
       a shared synthetic magic so the host suite soaks the
       enforced families.
-- [ ] S3 — generation 1 freezes: the frozen inventory (status +
+- [x] S3 — generation 1 freezes: the frozen inventory (status +
       regenesis vocabulary, LineageRecord), the Pong's window
       fields, per-type goldens, the cross-generation roundtrip
       harness, the release-tag CI tripwires, generation 0 served
-      for cutover (§Evolution)
+      for cutover (§Evolution). As built: vocabulary-only frozen
+      modules (`*compat_g<N>.rs`, glob-derived by the freeze
+      script) with re-exports at the old paths; adapters live
+      beside handlers, never in frozen files (the next mint edits
+      them); `rpc_compat`'s mandatory prev handler makes the
+      window invariant a compile error; pre-enforcement
+      (magic-None) nodes serve generation-0 vocabulary on compat
+      scopes; regenesis serves generation 0 with the head handler
+      under the byte-equality license; dialers decode per the
+      negotiated generation (`rpc_negotiated`/`PongInfo`);
+      retirement's deletion escape is a `RETIRES: compat_g<N>`
+      commit trailer (`scripts/check-compat-freeze.sh`).
 - [ ] S4 — diagnosability: the defuser, `classify_pong`'s
       VersionSkew/Stranded arms, the liveness/visibility split,
       status-view surfacing

@@ -221,7 +221,10 @@ mod tests {
             hopnet_consensus::codec::decode(&record.final_block).unwrap();
         assert_eq!(block.data.height, 7);
         assert_eq!(block.data.transactions.0.len(), 1);
-        assert_eq!(block.data.transactions.0[0].rpc.function, "regenesis_commit");
+        assert_eq!(
+            block.data.transactions.0[0].rpc.function,
+            "regenesis_commit"
+        );
         assert_eq!(
             hopnet_consensus::codec::encode(&block).unwrap(),
             record.final_block,

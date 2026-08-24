@@ -16,9 +16,8 @@ use crate::regenesis::{boot, genesis, seal};
 // The wire vocabulary is generation-1 frozen inventory (RFC-025); the
 // handler below speaks the head types via these re-exports.
 pub use super::compat_g1::{
-    RegenesisNetRequest, RegenesisNetResponse, LINEAGE_FETCH_MAX, SNAPSHOT_CHUNK_MAX,
+    LINEAGE_FETCH_MAX, RegenesisNetRequest, RegenesisNetResponse, SNAPSHOT_CHUNK_MAX,
 };
-
 
 pub struct RegenesisScope {
     pub(crate) app_state: AppState,

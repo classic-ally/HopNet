@@ -181,7 +181,7 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     joins through the pre-split artifact). All slices complete; only
     the live-mesh crossing remains — release choreography in the S7
     ledger entry.
-  - **RFC-025 S1+S2 landed (WIP branch)**
+  - **RFC-025 S1–S3 landed (WIP branch)**
     ([RFC-025](specs/rpc-version-enforcement.md), Draft 2026-08-17):
     RPC version enforcement — locked scopes refuse mixed-version
     peers at the ALPN (mesh magic + exact CalVer), compat scopes
@@ -196,8 +196,13 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     pre-enforcement until S5 closes the transient JoinDeliver gap
     (in-PR); scope classes registered per the RFC table and pinned
     by test; the host suite soaks enforced ALPNs via a shared
-    fixture magic. Next: S3 (generation-1 freezes). One PR (S1–S6),
-    the following release is the enforcement cutover.
+    fixture magic. S3 (generation-1 freezes): frozen compat_g
+    vocabulary modules with byte goldens (incl. the LineageRecord
+    closure), the Pong's served-window fields, generation-keyed
+    handler dispatch with the G0 adapter, dialers decoding per the
+    negotiated generation, and the check-compat-freeze.sh
+    release-tag tripwires in CI. Next: S4 (diagnosability). One PR
+    (S1–S6), the following release is the enforcement cutover.
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

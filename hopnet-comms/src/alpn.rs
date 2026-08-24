@@ -207,7 +207,10 @@ pub fn serve_list(magic: &[u8; 4], code: u32, head: u32) -> Vec<Vec<u8>> {
 /// their window and negotiation lands on the highest mutual generation
 /// (contract rule 2).
 pub fn compat_offer(magic: &[u8; 4], head: u32) -> Vec<Vec<u8>> {
-    vec![compat_alpn(magic, head), compat_alpn(magic, compat_floor(head))]
+    vec![
+        compat_alpn(magic, head),
+        compat_alpn(magic, compat_floor(head)),
+    ]
 }
 
 /// COMPAT_RETIRED reason bytes: `[0x01][floor u32 LE][node_version u32
@@ -273,8 +276,14 @@ mod tests {
         assert_eq!(compat_alpn(&MAGIC, 1), b"hopnet/9f3a01cc/compat/1");
         assert_eq!(compat_alpn(&MAGIC, 0), b"hopnet/1.0");
 
-        assert_eq!(parse_alpn(&MAGIC, b"hopnet/9f3a01cc/v/20260806"), ParsedAlpn::Locked(CODE));
-        assert_eq!(parse_alpn(&MAGIC, b"hopnet/9f3a01cc/compat/1"), ParsedAlpn::Compat(1));
+        assert_eq!(
+            parse_alpn(&MAGIC, b"hopnet/9f3a01cc/v/20260806"),
+            ParsedAlpn::Locked(CODE)
+        );
+        assert_eq!(
+            parse_alpn(&MAGIC, b"hopnet/9f3a01cc/compat/1"),
+            ParsedAlpn::Compat(1)
+        );
         assert_eq!(parse_alpn(&MAGIC, b"hopnet/1.0"), ParsedAlpn::Compat(0));
         // Legacy parses irrespective of magic — pre-enforcement dialers
         // know none.
@@ -309,14 +318,38 @@ mod tests {
     // foreign strings in unknown.
     #[test]
     fn classify_accept_three_tiers() {
-        assert_eq!(classify_accept(&MAGIC, CODE, 1, &locked_alpn(&MAGIC, CODE)), AcceptTier::ServedLocked);
-        assert_eq!(classify_accept(&MAGIC, CODE, 1, &locked_alpn(&MAGIC, CODE + 1)), AcceptTier::Unknown);
-        assert_eq!(classify_accept(&MAGIC, CODE, 1, &compat_alpn(&MAGIC, 1)), AcceptTier::ServedCompat(1));
-        assert_eq!(classify_accept(&MAGIC, CODE, 1, LEGACY_ALPN), AcceptTier::ServedCompat(0));
-        assert_eq!(classify_accept(&MAGIC, CODE, 3, LEGACY_ALPN), AcceptTier::Retired { floor: 2 });
-        assert_eq!(classify_accept(&MAGIC, CODE, 3, &compat_alpn(&MAGIC, 1)), AcceptTier::Retired { floor: 2 });
-        assert_eq!(classify_accept(&MAGIC, CODE, 1, &compat_alpn(&MAGIC, 2)), AcceptTier::Unknown);
-        assert_eq!(classify_accept(&MAGIC, CODE, 1, b"hopnet/9.9"), AcceptTier::Unknown);
+        assert_eq!(
+            classify_accept(&MAGIC, CODE, 1, &locked_alpn(&MAGIC, CODE)),
+            AcceptTier::ServedLocked
+        );
+        assert_eq!(
+            classify_accept(&MAGIC, CODE, 1, &locked_alpn(&MAGIC, CODE + 1)),
+            AcceptTier::Unknown
+        );
+        assert_eq!(
+            classify_accept(&MAGIC, CODE, 1, &compat_alpn(&MAGIC, 1)),
+            AcceptTier::ServedCompat(1)
+        );
+        assert_eq!(
+            classify_accept(&MAGIC, CODE, 1, LEGACY_ALPN),
+            AcceptTier::ServedCompat(0)
+        );
+        assert_eq!(
+            classify_accept(&MAGIC, CODE, 3, LEGACY_ALPN),
+            AcceptTier::Retired { floor: 2 }
+        );
+        assert_eq!(
+            classify_accept(&MAGIC, CODE, 3, &compat_alpn(&MAGIC, 1)),
+            AcceptTier::Retired { floor: 2 }
+        );
+        assert_eq!(
+            classify_accept(&MAGIC, CODE, 1, &compat_alpn(&MAGIC, 2)),
+            AcceptTier::Unknown
+        );
+        assert_eq!(
+            classify_accept(&MAGIC, CODE, 1, b"hopnet/9.9"),
+            AcceptTier::Unknown
+        );
     }
 
     // Impact: accept-side list order IS TLS negotiation preference — a

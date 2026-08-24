@@ -465,7 +465,9 @@ pub fn mesh_magic(
                  the epoch-1 chain id is unreachable"
             ));
         }
-        read_lineage(&lineage_path(data_dir, lowest))?.record.prev_chain_id
+        read_lineage(&lineage_path(data_dir, lowest))?
+            .record
+            .prev_chain_id
     };
     Ok(anchor_id[..4].try_into().expect("4-byte truncation of 32"))
 }
@@ -928,12 +930,7 @@ pub(crate) mod tests {
         // back-pointer. write_lineage produces the real epoch-2 record.
         let g = build_epoch_genesis(&conn).unwrap();
         write_lineage(dir.path(), &g).unwrap();
-        hopnet_consensus::store::meta_put(
-            &conn,
-            META_EPOCH,
-            &2u64.to_be_bytes(),
-        )
-        .unwrap();
+        hopnet_consensus::store::meta_put(&conn, META_EPOCH, &2u64.to_be_bytes()).unwrap();
         assert_eq!(mesh_magic(&conn, dir.path()).unwrap(), PREV_CHAIN[..4]);
     }
 
@@ -951,9 +948,11 @@ pub(crate) mod tests {
         let fresh = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
         crate::db::chains::install(&fresh.get().unwrap()).unwrap();
         let fresh_conn = fresh.get().unwrap();
-        assert!(mesh_magic(&fresh_conn, dir.path())
-            .unwrap_err()
-            .contains("no chain id"));
+        assert!(
+            mesh_magic(&fresh_conn, dir.path())
+                .unwrap_err()
+                .contains("no chain id")
+        );
 
         // Post-boundary states, on a sealed pool flipped to epoch 2.
         let pool = sealed_pool(false);
@@ -962,9 +961,11 @@ pub(crate) mod tests {
         hopnet_consensus::store::meta_put(&conn, META_EPOCH, &2u64.to_be_bytes()).unwrap();
 
         // No lineage records at all.
-        assert!(mesh_magic(&conn, dir.path())
-            .unwrap_err()
-            .contains("no lineage"));
+        assert!(
+            mesh_magic(&conn, dir.path())
+                .unwrap_err()
+                .contains("no lineage")
+        );
 
         // Lowest record above 2: refuse, never trust its back-pointer.
         let gap_dir = tempfile::tempdir().unwrap();
@@ -973,16 +974,20 @@ pub(crate) mod tests {
             std::fs::read(write_lineage(tmp.path(), &g).unwrap()).unwrap()
         };
         write_lineage_bytes(gap_dir.path(), 3, &valid).unwrap();
-        assert!(mesh_magic(&conn, gap_dir.path())
-            .unwrap_err()
-            .contains("expected 2"));
+        assert!(
+            mesh_magic(&conn, gap_dir.path())
+                .unwrap_err()
+                .contains("expected 2")
+        );
 
         // Corrupt epoch-2 file: the decode error propagates.
         let corrupt_dir = tempfile::tempdir().unwrap();
         write_lineage_bytes(corrupt_dir.path(), 2, &[0u8; 3]).unwrap();
-        assert!(mesh_magic(&conn, corrupt_dir.path())
-            .unwrap_err()
-            .contains("lineage decode"));
+        assert!(
+            mesh_magic(&conn, corrupt_dir.path())
+                .unwrap_err()
+                .contains("lineage decode")
+        );
     }
 
     // Should: report the lowest epoch present, and nothing for an absent
@@ -1386,4 +1391,3 @@ pub(crate) mod tests {
         assert!(verify_lineage_chain(&tampered, tofu).is_err());
     }
 }
-

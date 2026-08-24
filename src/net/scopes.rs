@@ -480,7 +480,7 @@ mod tests {
     // window's head.
     #[test]
     fn frozen_module_labels_match_the_served_window() {
-        use hopnet_comms::alpn::{compat_floor, COMPAT_HEAD};
+        use hopnet_comms::alpn::{COMPAT_HEAD, compat_floor};
         assert_eq!(crate::consensus::status_compat_g1::GENERATION, COMPAT_HEAD);
         assert_eq!(crate::regenesis::compat_g1::GENERATION, COMPAT_HEAD);
         assert_eq!(

@@ -855,7 +855,10 @@ fn handshake_carries_epoch_and_refuses_mismatched_fetch() {
     assert_eq!(version_code, crate::version::effective_running_code());
     // The Pong is the policy readout (RFC-025): the served window rides
     // every answer.
-    assert_eq!(floor, hopnet_comms::alpn::compat_floor(hopnet_comms::alpn::COMPAT_HEAD));
+    assert_eq!(
+        floor,
+        hopnet_comms::alpn::compat_floor(hopnet_comms::alpn::COMPAT_HEAD)
+    );
     assert_eq!(head, hopnet_comms::alpn::COMPAT_HEAD);
 }
 
@@ -897,12 +900,14 @@ fn status_g0_roundtrip_through_the_head_adapter() {
     )
     .unwrap();
     let raw = rt.block_on(hopnet_comms::RpcHandler::handle(&adapter, peer, g0_ping));
-    let (g0::StatusResponse::Pong {
-        decided_height,
-        epoch,
-        version_code,
-    }, consumed) =
-        bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
+    let (
+        g0::StatusResponse::Pong {
+            decided_height,
+            epoch,
+            version_code,
+        },
+        consumed,
+    ) = bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
     assert_eq!(consumed, raw.len(), "no trailing bytes for the old decoder");
     assert_eq!(decided_height, 0);
     assert_eq!(epoch, 1);
