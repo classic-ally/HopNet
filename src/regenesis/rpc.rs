@@ -138,7 +138,7 @@ pub(crate) fn serve_request(db_path: &str, request: RegenesisNetRequest) -> Rege
                 epoch: genesis::current_epoch(&conn),
                 decided_height,
                 epoch_genesis_height: genesis::epoch_genesis_height(&conn),
-                lineage_from: lowest_lineage_epoch(&data_dir),
+                lineage_from: genesis::lowest_lineage_epoch(&data_dir),
             }
         }
         RegenesisNetRequest::LineageFetch { from_epoch } => {
@@ -211,18 +211,6 @@ fn open_read_only(db_path: &str) -> Result<rusqlite::Connection, String> {
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| format!("busy_timeout: {e}"))?;
     Ok(conn)
-}
-
-fn lowest_lineage_epoch(data_dir: &std::path::Path) -> Option<u64> {
-    let dir = std::fs::read_dir(data_dir.join(genesis::LINEAGE_DIR)).ok()?;
-    dir.filter_map(|entry| {
-        let name = entry.ok()?.file_name().into_string().ok()?;
-        name.strip_prefix("epoch-")?
-            .strip_suffix(".bin")?
-            .parse::<u64>()
-            .ok()
-    })
-    .min()
 }
 
 /// The snapshot identity this node serves for `epoch`, or the honest
