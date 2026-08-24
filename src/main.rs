@@ -417,14 +417,40 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 pool.clone(),
                 setup_complete.clone(),
             ));
+            // RFC-025: the mesh magic — the anchor (epoch-1) chain id
+            // truncation, settled before bind so every ALPN is known
+            // without committed-state reads later. A set-up node that
+            // cannot derive its own mesh identity must not bind: a wrong
+            // or absent magic on a live member is a silent TLS partition,
+            // so derivation failure fail-stops (a half-set-up node —
+            // this_node without a malachite genesis — fails here too, by
+            // design; it cannot run consensus regardless). Parked nodes
+            // derive normally from the sealed old-epoch DB and stay
+            // dialable. A fresh node has no anchor yet and binds
+            // pre-enforcement (legacy ALPN only) until S5 gates bind on
+            // join-code entry.
+            //
+            // KNOWN TRANSIENT GAP (until S5, same PR): with the magic
+            // bound, the coordinator's locked-family "setup" dial
+            // (JoinDeliver, src/nodes/routes.rs) cannot reach a fresh
+            // node, which serves legacy only. S5 closes this — join-code
+            // entry binds the real families BEFORE JoinDeliver arrives —
+            // and the enforcement release ships S1-S6 together, so no
+            // supported deployment runs this intermediate state.
+            let magic = if startup_state_opt.is_some() {
+                match regenesis::genesis::mesh_magic(&conn, &paths::data_dir()) {
+                    Ok(magic) => Some(magic),
+                    Err(detail) => panic!("mesh magic derivation: {detail}"),
+                }
+            } else {
+                None
+            };
             let comms = hopnet_comms::IrohComms::bind(
                 privatekey.to_bytes(),
                 directory,
                 hopnet_comms::BindOptions {
                     relay_url: std::env::var("HOPNET_RELAY_URL").ok(),
-                    // Pre-enforcement mode until S2 derives the mesh magic
-                    // from the anchor (RFC-025).
-                    magic: None,
+                    magic,
                 },
             )
             .await
