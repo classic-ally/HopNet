@@ -181,20 +181,23 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     joins through the pre-split artifact). All slices complete; only
     the live-mesh crossing remains — release choreography in the S7
     ledger entry.
-  - **RFC-025 S1 in progress**
+  - **RFC-025 S1+S2 landed (WIP branch)**
     ([RFC-025](specs/rpc-version-enforcement.md), Draft 2026-08-17):
     RPC version enforcement — locked scopes refuse mixed-version
     peers at the ALPN (mesh magic + exact CalVer), compat scopes
     (status, regenesis, ping) serve a two-generation window so
     stragglers stage across boundaries; typed refusals replace
-    silent bincode misdecode. S1 (comms mechanism) landed on the
-    WIP branch: both ALPN families, native multi-ALPN compat offer,
-    typed `AlpnRejected`/`CompatRetired`, the retired reject tier,
-    the effective-code seam in hopnet-common, and the
-    `hopnet-comms/docs/wire.md` byte contract — production still
-    binds pre-enforcement (`magic: None`) until S2 derives the mesh
-    magic from the anchor. One PR (S1–S6), the following release is
-    the enforcement cutover.
+    silent bincode misdecode. S1 (comms mechanism): both ALPN
+    families, native multi-ALPN compat offer, typed
+    `AlpnRejected`/`CompatRetired`, the retired reject tier, the
+    `hopnet-comms/docs/wire.md` byte contract. S2 (host wiring):
+    set-up nodes derive the mesh magic from the anchor at boot
+    (fail-stop on underivable identity); fresh nodes bind
+    pre-enforcement until S5 closes the transient JoinDeliver gap
+    (in-PR); scope classes registered per the RFC table and pinned
+    by test; the host suite soaks enforced ALPNs via a shared
+    fixture magic. Next: S3 (generation-1 freezes). One PR (S1–S6),
+    the following release is the enforcement cutover.
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

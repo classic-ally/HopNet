@@ -543,7 +543,7 @@ design, so there is no incremental landing, and the mesh crosses
 it as an ordinary upgrade regenesis. S-final trails independently
 (blocked on RFC-020).
 
-- [~] S1 — comms mechanism: the two ALPN families, magic
+- [x] S1 — comms mechanism: the two ALPN families, magic
       injection, `COMPAT_HEAD` + window/retired arithmetic,
       generation-keyed dispatch and connection cache, typed
       `AlpnRejected`/`CompatRetired`, the retired reject tier, the
@@ -551,10 +551,21 @@ it as an ordinary upgrade regenesis. S-final trails independently
       multi-generation ALPN offer (native,
       `ConnectOptions::with_additional_alpns` — §Settled
       Questions), comms unit gates + envelope golden, and the
-      `hopnet-comms/docs/` wire document
-- [ ] S2 — host wiring: class-explicit registration
+      `hopnet-comms/docs/` wire document. As built:
+      `hopnet-comms/docs/wire.md` is the normative byte authority.
+- [x] S2 — host wiring: class-explicit registration
       (`rpc`/`rpc_compat`), the §Scope Classes table enacted, the
-      magic derived from the anchor at boot, the class pin test
+      magic derived from the anchor at boot, the class pin test.
+      As built: `mesh_magic` in `src/regenesis/genesis.rs` (the
+      anchor is consensus_meta's chain id at epoch 1, the lowest
+      lineage record's back-pointer past a boundary — which must
+      be epoch 2, else refuse); derivation failure fail-stops at
+      boot for set-up nodes; fresh nodes bind pre-enforcement
+      until S5 closes the JoinDeliver gap (documented at the bind
+      site); the class table is pinned by full-list equality in
+      `src/net/scopes.rs` tests, and the in-process fixtures bind
+      a shared synthetic magic so the host suite soaks the
+      enforced families.
 - [ ] S3 — generation 1 freezes: the frozen inventory (status +
       regenesis vocabulary, LineageRecord), the Pong's window
       fields, per-type goldens, the cross-generation roundtrip
