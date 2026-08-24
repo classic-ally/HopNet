@@ -736,6 +736,13 @@ impl IrohComms {
         }
     }
 
+    /// A structural refusal recorded on the connection's close, if any.
+    fn refusal_on(conn: &Connection) -> Option<crate::RefusalError> {
+        conn.close_reason()
+            .as_ref()
+            .and_then(Self::refusal_from_close)
+    }
+
     /// Walk a connect error's source chain for a structural refusal.
     fn classify_connect_error(
         e: &(dyn std::error::Error + 'static),
@@ -927,6 +934,14 @@ impl IrohComms {
             match Self::try_rpc(&conn, request_id, scope, &payload, timeout).await {
                 Ok(response) => Ok((response, conn)),
                 Err(e) if e.is_retryable() => {
+                    // A LATE hook reject (wire.md's third surfacing mode)
+                    // arrives as exactly this stream failure — the close
+                    // that caused it is recorded by now, so the refusal
+                    // classifies deterministically before any retry.
+                    if let Some(refusal) = Self::refusal_on(&conn) {
+                        self.remove_connection(peer.node_id).await;
+                        return Err(CommsError::Refused(refusal));
+                    }
                     // Transport error (timeout or stream failure) — connection
                     // may be zombie. Evict and retry once with a fresh
                     // connection, reusing the same request_id so the receiver
@@ -936,9 +951,18 @@ impl IrohComms {
                     let conn = self
                         .get_connection_with_budget(peer, CONNECTION_TIMEOUT, class)
                         .await?;
-                    let response =
-                        Self::try_rpc(&conn, request_id, scope, &payload, timeout).await?;
-                    Ok((response, conn))
+                    match Self::try_rpc(&conn, request_id, scope, &payload, timeout).await {
+                        Ok(response) => Ok((response, conn)),
+                        Err(e) if e.is_retryable() => {
+                            let refusal = Self::refusal_on(&conn);
+                            self.remove_connection(peer.node_id).await;
+                            match refusal {
+                                Some(r) => Err(CommsError::Refused(r)),
+                                None => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 Err(e) => Err(e),
             }
