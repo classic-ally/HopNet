@@ -4,6 +4,7 @@
     import ValidatorPool from './ValidatorPool.svelte';
     import ValidatorActivity from './ValidatorActivity.svelte';
     import { headroomStatus, type Band } from './headroomStatus';
+    import type { VersionSkewPeer, StrandedPeer } from '../../types';
 
     // Flat props mirroring GET /consensus/evidence's summary block, so wiring
     // is a field-for-field mapping later. Nothing here computes quorum
@@ -24,6 +25,12 @@
     export let totalNodes = 12;
     export let reachableUnseated = 3;
     export let unreachableUnseated = 2;
+
+    // RFC-025 S4: the persistent skew/stranded banner. Derived server-side
+    // per request and self-healing — an empty list means no banner.
+    export let versionSkew: VersionSkewPeer[] = [];
+    export let strandedPeers: StrandedPeer[] = [];
+    export let localVersion = '';
 
     $: profileLabel = profile === 'bft' ? 'BFT' : 'Majority';
 
@@ -57,6 +64,26 @@
     {#snippet headerRight()}
         <span class="text-lg font-semibold {status.tone}">{status.label}</span>
     {/snippet}
+
+    <!-- RFC-025: unsupported states scream — a persistent banner, never a
+         toast. Rows vanish on the next version-matched pong. -->
+    {#if versionSkew.length > 0 || strandedPeers.length > 0}
+        <div class="mb-4 rounded border border-red bg-red/10 p-3 text-sm" role="alert">
+            {#each versionSkew as peer (peer.node_id)}
+                <p class="text-red">
+                    Version skew: node {peer.node_id} runs {peer.version}, this node runs
+                    {localVersion} — same epoch, different build (unsupported).
+                </p>
+            {/each}
+            {#each strandedPeers as peer (peer.node_id)}
+                <p class="text-red">
+                    Node {peer.node_id} is stranded: its compat window
+                    [{peer.floor}, {peer.head}] excludes every generation this node
+                    speaks — it needs a fresh join with a current release.
+                </p>
+            {/each}
+        </div>
+    {/if}
 
     <FaultModel {v} {live} {faultBudget} {headroom} {band} />
 

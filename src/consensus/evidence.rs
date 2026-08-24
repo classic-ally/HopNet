@@ -317,6 +317,55 @@ pub fn seen_age(view: Option<&PeerEvidenceView>, origin: Instant, now: Instant) 
     }
 }
 
+/// The RFC-025 banner rows, derived per request from the snapshot (the
+/// awaiting_upgrade precedent: a predicate over persistent state, never
+/// a stored flag — the next matched pong overwrites the stamp and the
+/// rows vanish). Shared by the evidence route and the resilience view.
+pub fn version_banner_rows(
+    snap: &[(i32, PeerEvidenceView)],
+    local_version: u32,
+    compat_floor: u32,
+    compat_head: u32,
+    now: Instant,
+) -> (
+    Vec<hopnet_common::views::VersionSkewPeer>,
+    Vec<hopnet_common::views::StrandedPeer>,
+) {
+    let mut skew = Vec::new();
+    let mut stranded = Vec::new();
+    for (node_id, view) in snap {
+        let Some(stamp) = view.last_pong else {
+            continue;
+        };
+        match stamp.window {
+            Some((peer_floor, peer_head)) if compat_head < peer_floor => {
+                stranded.push(hopnet_common::views::StrandedPeer {
+                    node_id: *node_id,
+                    floor: peer_floor,
+                    head: peer_head,
+                });
+            }
+            None if compat_floor > 0 => {
+                stranded.push(hopnet_common::views::StrandedPeer {
+                    node_id: *node_id,
+                    floor: 0,
+                    head: 0,
+                });
+            }
+            _ => {
+                if stamp.version_code != local_version {
+                    skew.push(hopnet_common::views::VersionSkewPeer {
+                        node_id: *node_id,
+                        version: crate::version::format_code(stamp.version_code),
+                        pong_age_ms: now.saturating_duration_since(stamp.at).as_millis() as u64,
+                    });
+                }
+            }
+        }
+    }
+    (skew, stranded)
+}
+
 /// Observed bright span: now − bright_since, but only while the node is in
 /// contact under `band`'s deadline; a currently-dark node's span is zero.
 pub fn bright_span(
@@ -1145,11 +1194,13 @@ pub async fn get_evidence(State(app_state): State<crate::AppState>) -> impl Into
                 .map(|i| snap[i].1);
             let age = contact_age(view.as_ref(), origin, now);
             let span = bright_span(view.as_ref(), origin, &policy, est.band, now);
+            let local_version = crate::version::effective_running_code();
             serde_json::json!({
                 "node_id": id,
                 "seated": seated.contains(id),
                 "self": *id == my_id,
                 "age_ms": age.as_millis() as u64,
+                "seen_age_ms": seen_age(view.as_ref(), origin, now).as_millis() as u64,
                 "synthetic_age": view.is_none(),
                 "probes_since_contact": view.map(|v| v.probes_since_contact).unwrap_or(0),
                 "last_probe_age_ms": view
@@ -1157,6 +1208,23 @@ pub async fn get_evidence(State(app_state): State<crate::AppState>) -> impl Into
                     .map(|p| now.saturating_duration_since(p).as_millis() as u64),
                 "bright_span_ms": span.as_millis() as u64,
                 "last_known_height": view.and_then(|v| v.last_known_height),
+                "pong": view.and_then(|v| v.last_pong).map(|stamp| {
+                    let (floor, head) = stamp.window.unzip();
+                    serde_json::json!({
+                        "age_ms": now.saturating_duration_since(stamp.at).as_millis() as u64,
+                        "version": crate::version::format_code(stamp.version_code),
+                        "epoch": stamp.epoch,
+                        "floor": floor,
+                        "head": head,
+                        "skew": stamp.version_code != local_version,
+                        "stranded": match stamp.window {
+                            Some((peer_floor, _)) =>
+                                hopnet_comms::alpn::COMPAT_HEAD < peer_floor,
+                            None => hopnet_comms::alpn::compat_floor(
+                                hopnet_comms::alpn::COMPAT_HEAD) > 0,
+                        },
+                    })
+                }),
             })
         })
         .collect();
@@ -1173,6 +1241,8 @@ pub async fn get_evidence(State(app_state): State<crate::AppState>) -> impl Into
             "t_probe_ms": policy.t_probe(est.band).as_millis() as u64,
             "t_unresponsive_ms": policy.t_unresponsive(est.band).as_millis() as u64,
             "t_out_ms": policy.t_out(est.band).as_millis() as u64,
+            "local_version":
+                crate::version::format_code(crate::version::effective_running_code()),
         },
         "nodes": nodes,
     }))
@@ -1275,6 +1345,51 @@ mod tests {
             version_code: 20260806,
             window: Some((0, 1)),
         }
+    }
+
+    // Impact: the banner is derived, never stored — the next matched
+    // pong overwrites the stamp and the rows vanish (self-healing, the
+    // awaiting_upgrade precedent).
+    // Should: emit a skew row for a same-window build mismatch and a
+    // stranded row for a disjoint window; peers with no pong stay off
+    // the banner.
+    // Should not: put a stranded peer on the skew list too — stranded
+    // outranks.
+    #[test]
+    fn banner_rows_derive_from_stamps() {
+        let now = Instant::now();
+        let fresh = now - Duration::from_secs(3);
+        let mut matched = view(fresh);
+        matched.last_pong = Some(PongStamp {
+            at: fresh,
+            epoch: 1,
+            version_code: 20260806,
+            window: Some((0, 1)),
+        });
+        let mut skewed = view(fresh);
+        skewed.last_pong = Some(PongStamp {
+            at: fresh,
+            epoch: 1,
+            version_code: 20270101,
+            window: Some((0, 1)),
+        });
+        let mut stranded = view(fresh);
+        stranded.last_pong = Some(PongStamp {
+            at: fresh,
+            epoch: 1,
+            version_code: 20270101,
+            window: Some((2, 3)),
+        });
+        let silent = view(fresh);
+        let snap = vec![(1, matched), (2, skewed), (3, stranded), (4, silent)];
+
+        let (skew, stranded_rows) = version_banner_rows(&snap, 20260806, 0, 1, now);
+        assert_eq!(skew.len(), 1);
+        assert_eq!(skew[0].node_id, 2);
+        assert_eq!(skew[0].version, "2027.1.1");
+        assert_eq!(stranded_rows.len(), 1);
+        assert_eq!(stranded_rows[0].node_id, 3);
+        assert_eq!(stranded_rows[0].floor, 2);
     }
 
     // Impact: this row WAS the production rejoin deadlock — a voted-out
