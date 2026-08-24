@@ -543,12 +543,13 @@ design, so there is no incremental landing, and the mesh crosses
 it as an ordinary upgrade regenesis. S-final trails independently
 (blocked on RFC-020).
 
-- [ ] S1 — comms mechanism: the two ALPN families, magic
+- [~] S1 — comms mechanism: the two ALPN families, magic
       injection, `COMPAT_HEAD` + window/retired arithmetic,
       generation-keyed dispatch and connection cache, typed
       `AlpnRejected`/`CompatRetired`, the retired reject tier, the
       effective-code seam hoisted to hopnet-common, the
-      multi-generation ALPN offer (two-attempt fallback, §Settled
+      multi-generation ALPN offer (native,
+      `ConnectOptions::with_additional_alpns` — §Settled
       Questions), comms unit gates + envelope golden, and the
       `hopnet-comms/docs/` wire document
 - [ ] S2 — host wiring: class-explicit registration
@@ -579,20 +580,24 @@ it as an ordinary upgrade regenesis. S-final trails independently
 
 Both settled 2026-08-24, ahead of S1:
 
-1. **The dial-side generation offer: two-attempt fallback, no
-   fork change.** The dialer offers its head generation and, on
-   `AlpnRejected`, redials at G-1 — highest-mutual selection with
-   wire behaviour identical to a native multi-ALPN offer. The
-   second handshake is paid only when the dialer's head is ahead
-   of the peer's — mid-mint transitions and the generation-0
-   cutover — and once per peer, amortized by the generation-keyed
-   connection cache; the ~1s status prober rides the cached
-   connection. Decisive: the workspace already carries an iroh
-   fork for the registration hook, and every added patch is
-   rebase burden on every upstream bump — the fallback keeps the
-   fork's patch surface at exactly that hook, so S1 lands
-   entirely in-tree. REVISIT if upstream `connect` grows
-   multi-ALPN offering: swap it in, delete the fallback.
+1. **The dial-side generation offer: native multi-ALPN.**
+   Re-settled same day, superseding the two-attempt fallback: that
+   choice rested on a false premise — the pinned fork already
+   carries upstream's `ConnectOptions::with_additional_alpns`
+   (`Endpoint::connect_with_opts`), so the native offer needs NO
+   fork change either; the fallback's decisive criterion (patch
+   surface stays at exactly the registration hook) is satisfied
+   by both, and the fallback's costs (a second handshake per
+   mid-transition dial and across the whole generation-0 cutover,
+   plus disambiguating ALPN-reject from other dial failures
+   before redialing) buy nothing. Compat dials offer
+   `[head, head-1]` in one handshake; fork-pinned semantics
+   (`connect_multiple_alpn_negotiated`): accept-side list order
+   is preference order, dial-side order is irrelevant, the
+   highest mutual generation is selected — contract rule 2
+   holds literally. The negotiated generation is read from the
+   connection. Locked dials stay single-ALPN (one code per
+   node).
 2. **The join code without a human: an env/config bootstrap
    channel into the same entry seam.** `HOPNET_JOIN_CODE` (env
    wins over the config-file key — the `HOPNET_DB_*` precedence)
