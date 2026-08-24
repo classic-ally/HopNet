@@ -548,8 +548,8 @@ it as an ordinary upgrade regenesis. S-final trails independently
       generation-keyed dispatch and connection cache, typed
       `AlpnRejected`/`CompatRetired`, the retired reject tier, the
       effective-code seam hoisted to hopnet-common, the
-      multi-generation ALPN offer (fork change, or two-attempt
-      fallback), comms unit gates + envelope golden, and the
+      multi-generation ALPN offer (two-attempt fallback, §Settled
+      Questions), comms unit gates + envelope golden, and the
       `hopnet-comms/docs/` wire document
 - [ ] S2 — host wiring: class-explicit registration
       (`rpc`/`rpc_compat`), the §Scope Classes table enacted, the
@@ -563,8 +563,10 @@ it as an ordinary upgrade regenesis. S-final trails independently
       VersionSkew/Stranded arms, the liveness/visibility split,
       status-view surfacing
 - [ ] S5 — setup and join: the join-code entry gating endpoint
-      bind, JoinInfo carrying the anchor, the install-time anchor
-      check, the ceremony orchestrator scenario
+      bind (interactive and `HOPNET_JOIN_CODE`, §Settled
+      Questions), JoinInfo carrying the anchor, the install-time
+      anchor check, the ceremony orchestrator scenario (including
+      the headless wrong-code case)
 - [ ] S6 — orchestrator gates: the mixed-version mesh, the
       boundary crossing with a live straggler, the
       retired-generation dialer
@@ -573,15 +575,36 @@ it as an ordinary upgrade regenesis. S-final trails independently
       advisory's below-window report. Blocked on RFC-020 (the
       replicated schema change; see §Evolution).
 
-## Open Questions
+## Settled Questions
 
-1. **The dial-side generation offer**: native multi-ALPN offering
-   needs a small iroh fork change (`connect` takes a single ALPN
-   today); the two-attempt fallback dial needs none. Decide at S1
-   — the wire behaviour is identical, only handshake count
-   differs.
-2. **The join code without a human**: the Join Network flow assumes
-   an operator typing the code; orchestrator containers and nix
-   deployments join headless. An env/config channel for the code
-   is probably enough — but it must not become a second,
-   drift-prone identity source. Decide at S5.
+Both settled 2026-08-24, ahead of S1:
+
+1. **The dial-side generation offer: two-attempt fallback, no
+   fork change.** The dialer offers its head generation and, on
+   `AlpnRejected`, redials at G-1 — highest-mutual selection with
+   wire behaviour identical to a native multi-ALPN offer. The
+   second handshake is paid only when the dialer's head is ahead
+   of the peer's — mid-mint transitions and the generation-0
+   cutover — and once per peer, amortized by the generation-keyed
+   connection cache; the ~1s status prober rides the cached
+   connection. Decisive: the workspace already carries an iroh
+   fork for the registration hook, and every added patch is
+   rebase burden on every upstream bump — the fallback keeps the
+   fork's patch surface at exactly that hook, so S1 lands
+   entirely in-tree. REVISIT if upstream `connect` grows
+   multi-ALPN offering: swap it in, delete the fallback.
+2. **The join code without a human: an env/config bootstrap
+   channel into the same entry seam.** `HOPNET_JOIN_CODE` (env
+   wins over the config-file key — the `HOPNET_DB_*` precedence)
+   feeds the same code-entry seam as Join Network, read only in
+   the pre-anchor state. The install-time anchor check runs
+   unchanged, and after install the magic derives from the
+   installed anchor only — a stale value left behind in config is
+   inert, never a second identity source. A wrong code fails
+   headless the way it fails interactively: ceremony timeout,
+   error-level log, failed health. The orchestrator reads the
+   code from the coordinator — the Add Node surface exposes it
+   for humans anyway — and forwards it like `HOPNET_DB_*`. The
+   code is deliberately not a secret (it rides every ALPN
+   string), so plain config is fine; it IS the setup window's
+   brute-force barrier, so keep it out of public repos.
