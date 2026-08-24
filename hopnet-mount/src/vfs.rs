@@ -644,7 +644,35 @@ impl MountCore {
 
     fn map_create_err(e: TransportError) -> CoreError {
         match e {
-            TransportError::Conflict => CoreError::AlreadyExists,
+            TransportError::Conflict(_) => CoreError::AlreadyExists,
+            other => CoreError::Transport(other),
+        }
+    }
+
+    /// Rename's conflict mapping differs from create's: the node's coded
+    /// verdict discriminates the POSIX errnos, and a bare 409 under
+    /// replace-allowed is a consensus rejection — POSIX forbids EEXIST
+    /// there, so it surfaces as a transport error (EIO), logged.
+    fn map_rename_err(replace: bool, e: TransportError) -> CoreError {
+        use hopnet_common::mount::MountConflictCode as Code;
+        match e {
+            TransportError::Conflict(Some(Code::NotEmpty)) => CoreError::NotEmpty,
+            TransportError::Conflict(Some(Code::IsDirectory)) => CoreError::IsADirectory,
+            TransportError::Conflict(Some(Code::NotDirectory)) => CoreError::NotADirectory,
+            TransportError::Conflict(code @ (Some(Code::Occupied) | None)) => {
+                if replace {
+                    // Occupied despite replace=true is a server bug or a
+                    // pre-replace node; bare is a consensus rejection.
+                    // Either way the kernel must not hear EEXIST.
+                    tracing::warn!(
+                        ?code,
+                        "conflict on a replace-allowed rename; reporting EIO, not EEXIST"
+                    );
+                    CoreError::Transport(TransportError::Conflict(code))
+                } else {
+                    CoreError::AlreadyExists
+                }
+            }
             other => CoreError::Transport(other),
         }
     }
@@ -687,13 +715,15 @@ impl MountCore {
         Ok((NodeAttr { ino, item }, fh))
     }
 
-    /// rename/move: strict.
+    /// rename/move: strict. `replace` = POSIX semantics (false is
+    /// RENAME_NOREPLACE).
     pub async fn rename(
         &self,
         parent_ino: u64,
         name: &str,
         new_parent_ino: u64,
         new_name: &str,
+        replace: bool,
     ) -> Result<(), CoreError> {
         let parent = self.ids.get(parent_ino).ok_or(CoreError::NotFound)?;
         let new_parent = self.ids.get(new_parent_ino).ok_or(CoreError::NotFound)?;
@@ -705,12 +735,33 @@ impl MountCore {
         let ItemId::Inode(uuid) = &child.id else {
             return Err(CoreError::NotFound);
         };
+        // Best-effort destination pre-lookup: a replacing rename kills the
+        // occupant, whose cached attrs must not outlive it. The /changes
+        // deletion delta is the backstop for every other daemon; this
+        // closes the response→delta window locally. Failure is ignored —
+        // it is an optimization, not a correctness gate.
+        let occupant_id = if replace {
+            match self.transport.lookup(new_parent.clone(), new_name.to_string()).await {
+                Ok(Some(dest)) if dest.id != child.id => Some(dest.id),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let mutated = self
             .transport
-            .rename(uuid.clone(), Some(new_parent), Some(new_name.to_string()))
+            .rename(
+                uuid.clone(),
+                Some(new_parent),
+                Some(new_name.to_string()),
+                replace,
+            )
             .await
-            .map_err(Self::map_create_err)?;
+            .map_err(|e| Self::map_rename_err(replace, e))?;
         self.attrs.invalidate(&child.id);
+        if let Some(occupant_id) = occupant_id {
+            self.attrs.invalidate(&occupant_id);
+        }
         if let Some(item) = mutated.item {
             self.attrs.insert(item);
         }
@@ -738,7 +789,7 @@ impl MountCore {
             .delete(uuid.clone(), false)
             .await
             .map_err(|e| match e {
-                TransportError::Conflict => CoreError::NotEmpty,
+                TransportError::Conflict(_) => CoreError::NotEmpty,
                 other => CoreError::Transport(other),
             })?;
         self.attrs.invalidate(&child.id);

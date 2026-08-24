@@ -55,6 +55,7 @@ pub enum CallRecord {
         id: CustomUUID,
         new_parent: Option<ItemId>,
         new_name: Option<String>,
+        replace: bool,
     },
     Delete {
         id: CustomUUID,
@@ -94,6 +95,9 @@ struct MockState {
     /// When Some((min_client, node_version)), watch/health/changes
     /// answer the RFC-023 gate's refusal — the stale-client scenario.
     upgrade_required: Option<(u32, u32)>,
+    /// When true, the next rename answers a BARE conflict (no code) —
+    /// the consensus-rejection / pre-replace-node shape.
+    rename_bare_conflict: bool,
     /// Version the mock node reports in its health payload.
     node_version: u32,
 }
@@ -142,6 +146,7 @@ impl MockTransport {
                 used_bytes: 25 * 1024 * 1024 * 1024,
             }),
             upgrade_required: None,
+            rename_bare_conflict: false,
             node_version: crate::version_code(),
         }));
         (
@@ -384,6 +389,12 @@ impl MockHandle {
         self.state.lock().expect("mock poisoned").upgrade_required = gate;
     }
 
+    /// Arm the bare-409 shape for the next rename (consensus rejection /
+    /// pre-replace node).
+    pub fn arm_rename_bare_conflict(&self) {
+        self.state.lock().expect("mock poisoned").rename_bare_conflict = true;
+    }
+
     /// Script the node's reported version (the min_node input).
     pub fn set_node_version(&self, code: u32) {
         self.state.lock().expect("mock poisoned").node_version = code;
@@ -593,7 +604,7 @@ impl NodeTransport for MockTransport {
                     name: name.clone(),
                 });
                 if child_by_name(&locked, &parent, &name).is_some() {
-                    return Err(TransportError::Conflict);
+                    return Err(TransportError::Conflict(None));
                 }
             }
             let handle = MockHandle {
@@ -629,7 +640,7 @@ impl NodeTransport for MockTransport {
                     bytes: bytes.clone(),
                 });
                 if child_by_name(&locked, &parent, &name).is_some() {
-                    return Err(TransportError::Conflict);
+                    return Err(TransportError::Conflict(None));
                 }
             }
             let handle = MockHandle {
@@ -693,32 +704,72 @@ impl NodeTransport for MockTransport {
         id: CustomUUID,
         new_parent: Option<ItemId>,
         new_name: Option<String>,
+        replace: bool,
     ) -> BoxFuture<'_, Result<crate::transport::Mutated, TransportError>> {
+        use hopnet_common::mount::MountConflictCode as Code;
         let state = self.state.clone();
         Box::pin(async move {
             let item_id = ItemId::Inode(id.clone());
-            let (target_parent, target_name) = {
+            // Mirrors the node's POSIX matrix: coded conflicts, occupant
+            // removed (with a journal deletion — the /changes contract)
+            // before the move.
+            let (target_parent, target_name, occupant) = {
                 let mut locked = state.lock().expect("mock poisoned");
                 locked.calls.push(CallRecord::Rename {
                     id,
                     new_parent: new_parent.clone(),
                     new_name: new_name.clone(),
+                    replace,
                 });
+                if std::mem::take(&mut locked.rename_bare_conflict) {
+                    return Err(TransportError::Conflict(None));
+                }
                 let Some(current) = locked.items.get(&item_id) else {
                     return Err(TransportError::Protocol("item gone".to_string()));
                 };
+                let source_kind = current.kind.clone();
                 let target_parent = new_parent.unwrap_or_else(|| current.parent.clone());
                 let target_name = new_name.unwrap_or_else(|| current.name.clone());
+                let mut occupant = None;
                 if let Some(existing) = child_by_name(&locked, &target_parent, &target_name) {
                     if existing != item_id {
-                        return Err(TransportError::Conflict);
+                        if !replace {
+                            return Err(TransportError::Conflict(Some(Code::Occupied)));
+                        }
+                        let existing_kind = locked
+                            .items
+                            .get(&existing)
+                            .map(|i| i.kind.clone())
+                            .expect("occupant present");
+                        match (&source_kind, &existing_kind) {
+                            (ItemKind::File { .. }, ItemKind::Folder) => {
+                                return Err(TransportError::Conflict(Some(Code::IsDirectory)));
+                            }
+                            (ItemKind::Folder, ItemKind::File { .. }) => {
+                                return Err(TransportError::Conflict(Some(Code::NotDirectory)));
+                            }
+                            (ItemKind::Folder, ItemKind::Folder) => {
+                                let non_empty = locked
+                                    .children
+                                    .get(&existing)
+                                    .is_some_and(|c| !c.is_empty());
+                                if non_empty {
+                                    return Err(TransportError::Conflict(Some(Code::NotEmpty)));
+                                }
+                            }
+                            (ItemKind::File { .. }, ItemKind::File { .. }) => {}
+                        }
+                        occupant = Some(existing);
                     }
                 }
-                (target_parent, target_name)
+                (target_parent, target_name, occupant)
             };
             let handle = MockHandle {
                 state: state.clone(),
             };
+            if let Some(occupant) = occupant {
+                handle.remove(&occupant);
+            }
             handle.rename(&item_id, target_parent, &target_name);
             let locked = state.lock().expect("mock poisoned");
             Ok(crate::transport::Mutated {
@@ -744,7 +795,7 @@ impl NodeTransport for MockTransport {
                 }
                 let has_children = locked.children.get(&item_id).is_some_and(|c| !c.is_empty());
                 if has_children && !recursive {
-                    return Err(TransportError::Conflict);
+                    return Err(TransportError::Conflict(None));
                 }
             }
             let handle = MockHandle {
