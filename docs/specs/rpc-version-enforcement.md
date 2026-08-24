@@ -582,9 +582,26 @@ it as an ordinary upgrade regenesis. S-final trails independently
       negotiated generation (`rpc_negotiated`/`PongInfo`);
       retirement's deletion escape is a `RETIRES: compat_g<N>`
       commit trailer (`scripts/check-compat-freeze.sh`).
-- [ ] S4 — diagnosability: the defuser, `classify_pong`'s
+- [x] S4 — diagnosability: the defuser, `classify_pong`'s
       VersionSkew/Stranded arms, the liveness/visibility split,
-      status-view surfacing
+      status-view surfacing. As built: two clocks on the evidence
+      record (contact ⊆ seen; `record_seen*` never touches the
+      vote-out clock — the three compat writers flipped, closing the
+      undecodable-StatusRequest hole); `absorb_pong` gates liveness
+      on version match and caches the PongStamp (the defuser's cache
+      and the banner's source, self-healing); classify_pong takes
+      SelfView vs PongInfo with arm order EpochJoin → Stranded →
+      VersionSkew → KickSync; both new states SCREAM at error level.
+      The defuser (`src/consensus/defuse.rs`) resolves AlpnRejected
+      against the stamp (freshness = the Lazy probe cadence, per-peer
+      cooldown electing one resolver) and hooks the sync driver
+      (FetchError::Refused — a named strike; CompatRetired SCREAMS
+      directly) and the txforward error arm; storage classify and the
+      metrics grid defer with in-code notes; gossip has no error path
+      by design — the prober is the idle backstop. Surfacing: banner
+      rows on ConsensusPanelView + additive /consensus/evidence
+      fields; the resilience reachability counters ride the
+      visibility clock (deliberate divergence from `live`).
 - [ ] S5 — setup and join: the join-code entry gating endpoint
       bind (interactive and `HOPNET_JOIN_CODE`, §Settled
       Questions), JoinInfo carrying the anchor, the install-time

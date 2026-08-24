@@ -156,6 +156,15 @@ transport checks `close_reason()` once after every successful dial;
 callers only ever see the typed `CommsError::Refused` — never a partial
 exchange.
 
+Host-side consumption (RFC-025 S4): `AlpnRejected` from a locked dial
+is DEFUSED — resolved against the peer's latest Pong (cache or one
+status probe) into version-skew, epoch-ahead, or transport-anomaly —
+at the consensus sync driver and the transaction-forward path;
+`CompatRetired` needs no probe (the reason bytes already name the
+floor) and is logged at error level directly. Gossip broadcast has no
+per-peer error channel by design; the ~1s status prober is the idle
+backstop that names any mismatched peer within one probe cadence.
+
 ## Generation 0 service (cutover)
 
 While `COMPAT_HEAD == 1`, generation 0 is in-window: the legacy ALPN is
