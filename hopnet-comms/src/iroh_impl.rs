@@ -1378,4 +1378,316 @@ mod tests {
             }),
         );
     }
+
+    // ------------------------------------------------------------------
+    // RFC-025 enforcement (identity-injected binds)
+    // ------------------------------------------------------------------
+
+    const MAGIC: [u8; 4] = [0x9f, 0x3a, 0x01, 0xcc];
+    const CODE: u32 = 20260806;
+
+    /// Bind with an injected ALPN identity — the only way to vary code or
+    /// COMPAT_HEAD in-process (both are compile-time in production).
+    async fn bind_for_test(magic: Option<[u8; 4]>, code: u32, head: u32) -> IrohComms {
+        IrohComms::bind_with_identity(
+            rand::random(),
+            Arc::new(AllowAll),
+            None,
+            AlpnIdentity { magic, code, head },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn compat_echo(calls: &Arc<AtomicUsize>) -> ScopeRegistry {
+        let mut scopes = ScopeRegistry::new();
+        scopes.rpc_compat(
+            "st",
+            Arc::new(Echo {
+                calls: calls.clone(),
+            }),
+        );
+        scopes
+    }
+
+    async fn negotiated_compat_alpn(comms: &IrohComms, node_id: i32) -> Vec<u8> {
+        comms
+            .connections
+            .read()
+            .await
+            .get(&(node_id, ConnKey::Compat))
+            .expect("compat connection cached")
+            .alpn()
+            .to_vec()
+    }
+
+    // Should: negotiate the head generation between two same-window peers
+    // over a single compat connection, cached under the compat family.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compat_dial_negotiates_head_between_matched_pair() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let a = bind_for_test(Some(MAGIC), CODE, 1).await;
+        let b = bind_for_test(Some(MAGIC), CODE, 1).await;
+        b.start(compat_echo(&calls));
+        a.start(compat_echo(&Arc::new(AtomicUsize::new(0))));
+        let peer_b = PeerRef {
+            node_id: 2,
+            pubkey: b.local_pubkey(),
+        };
+        a.connect_to_addr(2, loopback_addr(&b)).await.unwrap();
+
+        let reply = a
+            .rpc(&peer_b, "st", b"pong".to_vec(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(reply, b"pong");
+        assert_eq!(negotiated_compat_alpn(&a, 2).await, alpn::compat_alpn(&MAGIC, 1));
+    }
+
+    // Impact: the mint lifecycle depends on this — a straggler one
+    // generation behind must keep talking through the head's adapter.
+    // Should: negotiate the previous generation when the dialer's window
+    // trails the server's, in a single connect (no second dial).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mixed_window_pair_negotiates_previous_generation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let a = bind_for_test(Some(MAGIC), CODE, 1).await; // offers [1, 0]
+        let b = bind_for_test(Some(MAGIC), CODE, 2).await; // serves [2, 1]
+        b.start(compat_echo(&calls));
+        a.start(compat_echo(&Arc::new(AtomicUsize::new(0))));
+        let peer_b = PeerRef {
+            node_id: 2,
+            pubkey: b.local_pubkey(),
+        };
+        a.connect_to_addr(2, loopback_addr(&b)).await.unwrap();
+
+        let reply = a
+            .rpc(&peer_b, "st", b"old".to_vec(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(reply, b"old");
+        assert_eq!(negotiated_compat_alpn(&a, 2).await, alpn::compat_alpn(&MAGIC, 1));
+    }
+
+    // Should: refuse a below-window dialer with the structured
+    // CompatRetired naming the server's floor and version — regardless of
+    // which of the racy reject surfaces (connect error, recorded close,
+    // or first-use failure then redial) delivers it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retired_dialer_gets_structured_compat_retired() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let a = bind_for_test(Some(MAGIC), CODE, 1).await; // offers [1, 0] — both retired
+        let b = bind_for_test(Some(MAGIC), CODE, 3).await; // window [2, 3]
+        b.start(compat_echo(&calls));
+        a.start(compat_echo(&Arc::new(AtomicUsize::new(0))));
+        let peer_b = PeerRef {
+            node_id: 2,
+            pubkey: b.local_pubkey(),
+        };
+        // Locked family still matches (same code) — record the addr hint.
+        a.connect_to_addr(2, loopback_addr(&b)).await.unwrap();
+
+        // The hook reject is racy dial-side; a first attempt may surface
+        // as a generic stream fault before the close lands. Retry briefly:
+        // the classification must converge on the typed refusal.
+        let mut refusal = None;
+        for _ in 0..5 {
+            match a
+                .rpc(&peer_b, "st", b"x".to_vec(), Duration::from_secs(3))
+                .await
+            {
+                Err(CommsError::Refused(r)) => {
+                    refusal = Some(r);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                Ok(_) => panic!("retired dialer must not get service"),
+            }
+        }
+        match refusal {
+            Some(crate::RefusalError::CompatRetired {
+                floor,
+                node_version,
+            }) => {
+                assert_eq!(floor, 2, "reject must name the server's floor");
+                assert_eq!(node_version, CODE);
+            }
+            other => panic!("expected CompatRetired, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Should: serve a locked scope between exact-code peers, and refuse a
+    // one-release-newer dialer with the typed AlpnRejected.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn locked_family_exact_match_accept_and_reject() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut scopes = ScopeRegistry::new();
+        scopes.rpc(
+            "lk",
+            Arc::new(Echo {
+                calls: calls.clone(),
+            }),
+        );
+        let a = bind_for_test(Some(MAGIC), CODE, 1).await;
+        let b = bind_for_test(Some(MAGIC), CODE, 1).await;
+        b.start(scopes);
+        a.start(ScopeRegistry::new());
+        let peer_b = PeerRef {
+            node_id: 2,
+            pubkey: b.local_pubkey(),
+        };
+        a.connect_to_addr(2, loopback_addr(&b)).await.unwrap();
+        let reply = a
+            .rpc(&peer_b, "lk", b"hi".to_vec(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(reply, b"hi");
+
+        // A skewed release: exact-match refuses at TLS.
+        let c = bind_for_test(Some(MAGIC), CODE + 1, 1).await;
+        c.start(ScopeRegistry::new());
+        let result = c.connect_to_addr(3, loopback_addr(&b)).await;
+        match result {
+            Err(CommsError::Refused(crate::RefusalError::AlpnRejected)) => {}
+            other => panic!("expected Refused(AlpnRejected), got {other:?}"),
+        }
+    }
+
+    // Impact: the admissibility rule — compat connections must never carry
+    // state-permuting traffic, whatever a peer's registry claims.
+    // Should not: dispatch a locked-class scope arriving over a compat
+    // connection; the dialer sees the unknown-scope surface, the handler
+    // never runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn locked_scope_refused_on_compat_connection() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        // B registers "lk" as LOCKED; A (mis)registers it as compat, so
+        // A's dial rides the compat family.
+        let mut b_scopes = ScopeRegistry::new();
+        b_scopes.rpc(
+            "lk",
+            Arc::new(Echo {
+                calls: calls.clone(),
+            }),
+        );
+        let mut a_scopes = ScopeRegistry::new();
+        a_scopes.rpc_compat(
+            "lk",
+            Arc::new(Echo {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let a = bind_for_test(Some(MAGIC), CODE, 1).await;
+        let b = bind_for_test(Some(MAGIC), CODE, 1).await;
+        b.start(b_scopes);
+        a.start(a_scopes);
+        let peer_b = PeerRef {
+            node_id: 2,
+            pubkey: b.local_pubkey(),
+        };
+        a.connect_to_addr(2, loopback_addr(&b)).await.unwrap();
+
+        let result = a
+            .rpc(&peer_b, "lk", b"x".to_vec(), Duration::from_secs(3))
+            .await;
+        assert!(result.is_err(), "locked scope over compat must not serve");
+        assert!(
+            !matches!(result, Err(CommsError::Refused(_))),
+            "stream drop is the unknown-scope surface, not a refusal"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Should: fail TLS negotiation for an ALPN outside the grammar, with
+    // no scope handler ever invoked (foreign traffic exercises no HopNet
+    // code).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_alpn_fails_tls() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let b = bind_for_test(Some(MAGIC), CODE, 1).await;
+        b.start(compat_echo(&calls));
+
+        let foreign = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), foreign.connect(loopback_addr(&b), b"hopnet/9.9"))
+                .await;
+        // Tri-modal reject surface: error, timeout, or a dead connection.
+        if let Ok(Ok(conn)) = result {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(3), conn.closed())
+                    .await
+                    .is_ok(),
+                "foreign-ALPN connection must die"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Impact: pins the deliberate cutover caveat — the locked family is
+    // magic-gated, but generation 0 is the magic-less legacy string, so
+    // cross-mesh protection cannot cover legacy-compatible compat dials
+    // until the first real mint retires it (wire.md).
+    // Should: refuse a mismatched-magic dialer on the locked family with
+    // AlpnRejected.
+    // Should not: refuse its compat dial while generation 0 is in-window —
+    // it negotiates the legacy string by design.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn magic_mismatch_locked_rejected_compat_falls_to_legacy() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let a = bind_for_test(Some([0x01, 0x02, 0x03, 0x04]), CODE, 1).await;
+        let b = bind_for_test(Some(MAGIC), CODE, 1).await;
+        b.start(compat_echo(&calls));
+        a.start(compat_echo(&Arc::new(AtomicUsize::new(0))));
+        let peer_b = PeerRef {
+            node_id: 2,
+            pubkey: b.local_pubkey(),
+        };
+
+        // Locked dial: no mutual ALPN (different magic) — typed refusal.
+        // The addr hint is recorded before the dial, so the compat dial
+        // below still knows where B lives.
+        let result = a.connect_to_addr(2, loopback_addr(&b)).await;
+        match result {
+            Err(CommsError::Refused(crate::RefusalError::AlpnRejected)) => {}
+            other => panic!("expected Refused(AlpnRejected), got {other:?}"),
+        }
+
+        let reply = a
+            .rpc(&peer_b, "st", b"legacy".to_vec(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(reply, b"legacy");
+        assert_eq!(negotiated_compat_alpn(&a, 2).await, alpn::LEGACY_ALPN.to_vec());
+    }
+
+    // Impact: the S1 host-compatibility guarantee — production passes
+    // magic: None until S2, and behavior must be byte-identical to
+    // pre-enforcement.
+    // Should: serve a locked-registered scope over the legacy ALPN when
+    // both peers run pre-enforcement mode.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn magic_none_serves_legacy_everything() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut scopes = ScopeRegistry::new();
+        scopes.rpc(
+            "lk",
+            Arc::new(Echo {
+                calls: calls.clone(),
+            }),
+        );
+        let (a, _b, peer_b) = pair(Arc::new(AllowAll), scopes).await;
+
+        let reply = a
+            .rpc(&peer_b, "lk", b"asis".to_vec(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(reply, b"asis");
+        let conns = a.connections.read().await;
+        let conn = conns.get(&(2, ConnKey::Legacy)).expect("legacy-keyed connection");
+        assert_eq!(conn.alpn(), alpn::LEGACY_ALPN);
+    }
 }
