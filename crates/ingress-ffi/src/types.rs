@@ -193,6 +193,9 @@ pub struct FfiDaemonOptions {
     pub publish_device_token: Option<String>,
     /// Publish tick cadence (seconds).
     pub publish_interval_secs: u64,
+    /// Uploads in flight per scope during a publish pass. Clamped to >= 1.
+    /// The claim batch is derived as `2 *` this, mirroring the fetch path.
+    pub publish_concurrency: u32,
 }
 
 /// Lifecycle knobs for the one-shot `cleanup` subcommand.

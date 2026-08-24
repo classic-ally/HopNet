@@ -279,7 +279,7 @@ impl<F: ResourceFetcher> Scheduler<F> {
                                 let result = crate::publish::run_publish_pass(
                                     &shared.store,
                                     &shared.data_dir.spool(),
-                                    publisher.as_ref(),
+                                    &publisher,
                                     &shared.config.publish,
                                     crate::publish::PassWork {
                                         claimed,

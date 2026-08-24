@@ -35,6 +35,9 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use tokio::task::JoinSet;
 
 use chrono::Utc;
 
@@ -52,9 +55,16 @@ use crate::store::StateStore;
 pub struct PublishConfig {
     /// Tick cadence; same class as sidecar replication.
     pub interval: std::time::Duration,
-    /// Photos claimed per pass. Small: claimed photos are registered
-    /// inflight for the duration, deferring their PhotoKit events.
+    /// Photos claimed per pass. Held at `concurrency * 2` so the in-flight
+    /// window stays full without deferring more PhotoKit events than a pass
+    /// can actually clear — claimed photos are registered inflight for the
+    /// whole pass.
     pub batch: i64,
+    /// Uploads in flight per scope. Only the network call is parallel; every
+    /// DB write and counter update is applied serially by the parent as
+    /// results join, which keeps the `max_connections(1)` single-writer
+    /// invariant intact.
+    pub concurrency: usize,
     /// Attempts before a photo is terminal (operator reset required).
     pub retry_cap: i64,
     /// Transient-failure backoff (base 60s, max 6h — publish failures are
@@ -66,7 +76,8 @@ impl Default for PublishConfig {
     fn default() -> Self {
         Self {
             interval: std::time::Duration::from_secs(60),
-            batch: 4,
+            batch: 32,
+            concurrency: 16,
             retry_cap: 5,
             backoff: BackoffConfig {
                 base: std::time::Duration::from_secs(60),
@@ -402,7 +413,7 @@ pub struct PassWork {
 pub async fn run_publish_pass(
     store: &StateStore,
     spool: &SpoolPaths,
-    publisher: &dyn Publisher,
+    publisher: &Arc<dyn Publisher>,
     cfg: &PublishConfig,
     work: PassWork,
     state: &mut PublishState,
@@ -504,7 +515,7 @@ struct ScopeWork {
 async fn run_scope_pass(
     store: &StateStore,
     spool: &SpoolPaths,
-    publisher: &dyn Publisher,
+    publisher: &Arc<dyn Publisher>,
     cfg: &PublishConfig,
     scope: Option<&str>,
     work: ScopeWork,
@@ -647,35 +658,76 @@ async fn run_scope_pass(
             .await;
     }
 
-    for (photo, fingerprint) in remaining {
-        let mut item = match assemble_item(store, spool, &photo).await? {
-            Ok(item) => item,
-            Err(skip) => {
-                match skip {
-                    AssembleSkip::MissingDescriptor => {
-                        report.missing_descriptor += 1;
-                        let _ = store
-                            .append_log(
-                                "publish_descriptor_missing",
-                                Some(&photo.photo_id),
-                                None,
-                            )
-                            .await;
-                    }
-                    // `assemble_item` never returns it — a first publish
-                    // always has something to say — but the arm keeps the
-                    // two assemblers' skip vocabulary shared.
-                    AssembleSkip::NothingToDo => {}
-                    AssembleSkip::Transient(msg) => {
-                        record_failure(store, cfg, &photo, &msg, report).await?;
-                    }
-                }
-                continue;
-            }
-        };
-        item.cloud_fingerprint = fingerprint;
+    // Uploads run `cfg.concurrency`-wide; everything else stays serial. Each
+    // task does nothing but the network call and hands back its photo, so all
+    // DB writes and both `report`/`state` mutations are applied right here as
+    // results join — no folding, no shared locks, and the store's
+    // single-writer pool is never contended by the pass itself.
+    //
+    // Park is drain-then-stop: the first `NodeUnreachable` closes the spawn
+    // gate, but tasks already in flight are joined and their outcomes applied.
+    // Photos never spawned burn no attempt, preserving the guarantee that
+    // matters; in-flight peers may burn one, which `retry_cap` absorbs.
+    let mut pending = remaining.into_iter();
+    let mut tasks: JoinSet<(PhotoRecord, std::result::Result<PublishOutcome, PublishError>)> =
+        JoinSet::new();
+    // Clamped: a 0 window would join an empty set immediately and drop the
+    // whole batch silently rather than publishing it.
+    let window = cfg.concurrency.max(1);
+    let permits = Arc::new(tokio::sync::Semaphore::new(window));
+    let mut parked = false;
 
-        match publisher.publish(item).await {
+    loop {
+        while !parked && tasks.len() < window {
+            let Some((photo, fingerprint)) = pending.next() else {
+                break;
+            };
+            let mut item = match assemble_item(store, spool, &photo).await? {
+                Ok(item) => item,
+                Err(skip) => {
+                    match skip {
+                        AssembleSkip::MissingDescriptor => {
+                            report.missing_descriptor += 1;
+                            let _ = store
+                                .append_log(
+                                    "publish_descriptor_missing",
+                                    Some(&photo.photo_id),
+                                    None,
+                                )
+                                .await;
+                        }
+                        // `assemble_item` never returns it — a first publish
+                        // always has something to say — but the arm keeps the
+                        // two assemblers' skip vocabulary shared.
+                        AssembleSkip::NothingToDo => {}
+                        AssembleSkip::Transient(msg) => {
+                            record_failure(store, cfg, &photo, &msg, report).await?;
+                        }
+                    }
+                    continue;
+                }
+            };
+            item.cloud_fingerprint = fingerprint;
+
+            let publisher = publisher.clone();
+            let permit = permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore open");
+            tasks.spawn(async move {
+                let outcome = publisher.publish(item).await;
+                drop(permit);
+                (photo, outcome)
+            });
+        }
+
+        let Some(joined) = tasks.join_next().await else {
+            break;
+        };
+        let (photo, outcome) = joined.expect("publish task panicked");
+
+        match outcome {
             Ok(outcome) => {
                 crate::store::photos::mark_published(store.pool(), &photo.photo_id, Utc::now())
                     .await?;
@@ -700,7 +752,10 @@ async fn run_scope_pass(
                         .await;
                 }
                 report.parked = true;
-                return Ok(ScopeControl::ParkAll);
+                // Close the spawn gate rather than returning: the outer loop
+                // keeps joining so in-flight uploads still record an outcome.
+                // Photos never spawned stay untouched and burn no attempt.
+                parked = true;
             }
             Err(PublishError::Rejected(msg)) => {
                 crate::store::photos::record_publish_failure(
@@ -726,6 +781,12 @@ async fn run_scope_pass(
         }
     }
 
+    // Every upload has joined by here, so propagation below still runs
+    // strictly after publishing — the ordering the handlers require.
+    if parked {
+        return Ok(ScopeControl::ParkAll);
+    }
+
     // --- Propagation: tell the mesh what Photos did to already-published
     // photos, in an order the handlers accept.
     //
@@ -738,17 +799,17 @@ async fn run_scope_pass(
     // edit handlers reject a photo the mesh still believes is tombstoned.
     // A restore-then-edit in one pass would otherwise burn an attempt on a
     // ConflictError and only converge next pass.
-    if propagate_tombstones(store, publisher, cfg, restore, state, report).await?
+    if propagate_tombstones(store, publisher.as_ref(), cfg, restore, state, report).await?
         == ScopeControl::ParkAll
     {
         return Ok(ScopeControl::ParkAll);
     }
-    if propagate_edits(store, spool, publisher, cfg, edit, state, report).await?
+    if propagate_edits(store, spool, publisher.as_ref(), cfg, edit, state, report).await?
         == ScopeControl::ParkAll
     {
         return Ok(ScopeControl::ParkAll);
     }
-    if propagate_tombstones(store, publisher, cfg, delete, state, report).await?
+    if propagate_tombstones(store, publisher.as_ref(), cfg, delete, state, report).await?
         == ScopeControl::ParkAll
     {
         return Ok(ScopeControl::ParkAll);

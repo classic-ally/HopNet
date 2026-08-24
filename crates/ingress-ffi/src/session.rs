@@ -488,6 +488,10 @@ impl IngressSession {
             cleanup_interval: std::time::Duration::from_secs(options.cleanup_interval_secs.max(1)),
             publish: ingress_core::publish::PublishConfig {
                 interval: std::time::Duration::from_secs(options.publish_interval_secs.max(1)),
+                concurrency: options.publish_concurrency.max(1) as usize,
+                // Keep the in-flight window full without deferring more
+                // PhotoKit events than one pass can clear (fetch path idiom).
+                batch: (options.publish_concurrency.max(1) as i64) * 2,
                 ..ingress_core::publish::PublishConfig::default()
             },
             ..SchedulerConfig::default()

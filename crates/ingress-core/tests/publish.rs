@@ -98,11 +98,26 @@ struct FakePublisher {
 }
 
 impl FakePublisher {
-    fn ok() -> Self {
+    /// Constructors hand back an `Arc` because `run_publish_pass` spawns the
+    /// uploads and so needs an owned, `'static` publisher. Field access still
+    /// reads through the `Arc`, so assertions are unchanged.
+    fn ok() -> Arc<Self> {
         Self::with_fallback(|| Ok(PublishOutcome::Published))
     }
 
-    fn with_fallback(fallback: fn() -> Result<PublishOutcome, PublishError>) -> Self {
+    /// `ok()` with an upload gate — hold permits at 0 to freeze publishes
+    /// mid-flight and observe how many the pass has in the air at once.
+    fn gated(gate: Arc<tokio::sync::Semaphore>) -> Arc<Self> {
+        let mut fake = Self::build(|| Ok(PublishOutcome::Published));
+        fake.gate = Some(gate);
+        Arc::new(fake)
+    }
+
+    fn with_fallback(fallback: fn() -> Result<PublishOutcome, PublishError>) -> Arc<Self> {
+        Arc::new(Self::build(fallback))
+    }
+
+    fn build(fallback: fn() -> Result<PublishOutcome, PublishError>) -> Self {
         Self {
             scripted: Mutex::new(Vec::new()),
             fallback,
@@ -266,6 +281,10 @@ async fn rig() -> Rig {
             publish: PublishConfig {
                 interval: Duration::from_secs(3600),
                 batch: 8,
+                // Serial by default so every existing test keeps the exact
+                // sequencing it asserts; the concurrent paths get their own
+                // tests that raise this explicitly.
+                concurrency: 1,
                 retry_cap: 5,
                 backoff: BackoffConfig {
                     base: Duration::ZERO,
@@ -364,7 +383,7 @@ async fn photo(rig: &Rig, id: &PhotoId) -> ingress_core::PhotoRecord {
         .unwrap()
 }
 
-async fn pass(rig: &Rig, publisher: &FakePublisher, state: &mut PublishState) -> ingress_core::publish::PublishReport {
+async fn pass(rig: &Rig, publisher: &Arc<FakePublisher>, state: &mut PublishState) -> ingress_core::publish::PublishReport {
     let claimed = claim(rig).await;
     let propagatable = claim_tombstone_propagatable(&rig.store, &rig.config.publish, &HashSet::new())
         .await
@@ -372,10 +391,11 @@ async fn pass(rig: &Rig, publisher: &FakePublisher, state: &mut PublishState) ->
     let editable = claim_editable(&rig.store, &rig.config.publish, &HashSet::new())
         .await
         .unwrap();
+    let dynamic: Arc<dyn Publisher> = publisher.clone();
     run_publish_pass(
         &rig.store,
         &rig.data_dir.spool(),
-        publisher,
+        &dynamic,
         &rig.config.publish,
         PassWork {
             claimed,
@@ -487,6 +507,10 @@ async fn already_published_outcome_stamps_photo() {
 // Should: park the pass on an unreachable node, log the edge exactly once
 // across consecutive parked passes, and log recovery once on success.
 // Should not: consume retry attempts for photos in a parked batch.
+//
+// The rig pins `concurrency: 1`, so "the batch aborts" here means the very
+// next photo. Above 1 the guarantee narrows to photos never spawned — see
+// `park_drains_inflight_uploads_before_stopping`.
 #[tokio::test(flavor = "multi_thread")]
 async fn unreachable_node_parks_without_consuming_attempts() {
     let rig = rig().await;
@@ -673,9 +697,7 @@ async fn daemon_tick_publishes_and_defers_events() {
     // Publisher blocks until released — the photo stays inflight while we
     // push an event for it.
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let mut publisher = FakePublisher::ok();
-    publisher.gate = Some(gate.clone());
-    let publisher = Arc::new(publisher);
+    let publisher = FakePublisher::gated(gate.clone());
 
     let (handle, rx) = DaemonHandle::new();
     let scheduler = Scheduler::new(
@@ -1135,10 +1157,11 @@ async fn assemble_skips_mesh_unbound() {
 
     let publisher = FakePublisher::ok();
     let mut state = PublishState::default();
+    let dynamic: Arc<dyn Publisher> = publisher.clone();
     let report = run_publish_pass(
         &rig.store,
         &rig.data_dir.spool(),
-        &publisher,
+        &dynamic,
         &rig.config.publish,
         PassWork {
             claimed,
@@ -1288,7 +1311,7 @@ async fn adoption_evicts_spool_bytes() {
 /// pending delete.
 async fn publish_then_tombstone(
     rig: &Rig,
-    publisher: &FakePublisher,
+    publisher: &Arc<FakePublisher>,
     state: &mut PublishState,
     local_id: &str,
 ) -> PhotoId {
@@ -1968,10 +1991,11 @@ async fn converged_photo_does_not_burn_an_edit_attempt() {
     // The shape of a claim whose divergence was repaired before the pass
     // reached it — a concurrent refetch, or a resource back mid-flight.
     let stale_claim = photo(&rig, &id).await;
+    let dynamic: Arc<dyn Publisher> = publisher.clone();
     let report = run_publish_pass(
         &rig.store,
         &rig.data_dir.spool(),
-        &publisher,
+        &dynamic,
         &rig.config.publish,
         PassWork {
             editable: vec![stale_claim],
@@ -1992,4 +2016,158 @@ async fn converged_photo_does_not_burn_an_edit_attempt() {
     assert_eq!(row.edit_publish_attempts, 0);
     assert!(row.edit_publish_next_retry_at.is_none());
     assert!(row.edit_publish_last_error.is_none());
+}
+
+// ----------------------------------------------------------- publish concurrency
+
+// Impact: the serial loop capped a pass at one upload at a time, which left a
+// 22k-photo backlog draining at ~1/min while the spool it feeds off filled the
+// disk. Throughput here is a storage-reclamation lever, not just speed.
+// Should: publish every claimed photo when uploads run concurrently.
+// Should: stamp each one exactly once regardless of completion order.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_uploads_publish_every_photo() {
+    let mut rig = rig().await;
+    rig.config.publish.concurrency = 4;
+
+    let mut ids = Vec::new();
+    for n in 0..8 {
+        let local = format!("photo-{n}");
+        ids.push(materialize(&rig, &local, local.as_bytes()).await);
+    }
+
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.published, 8);
+    assert_eq!(report.failed + report.gave_up, 0);
+    assert!(!report.parked);
+
+    // Completion order is not deterministic under concurrency — assert the
+    // set, not the sequence.
+    let mut seen: Vec<String> = publisher
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().to_string())
+        .collect();
+    let mut want: Vec<String> = ids.iter().map(|p| p.as_str().to_string()).collect();
+    seen.sort();
+    want.sort();
+    assert_eq!(seen, want, "every claimed photo is uploaded exactly once");
+
+    for id in &ids {
+        assert!(photo(&rig, id).await.published_at.is_some());
+    }
+}
+
+// Impact: park exists so a rebooting node costs no retry budget. Concurrency
+// narrows that guarantee — peers already in flight cannot be un-sent — and the
+// line has to fall somewhere defensible: photos never spawned stay pristine.
+// Should: park the pass and record the unreachable edge once.
+// Should not: burn an attempt on any photo the pass never started.
+#[tokio::test(flavor = "multi_thread")]
+async fn park_drains_inflight_uploads_before_stopping() {
+    let mut rig = rig().await;
+    rig.config.publish.concurrency = 2;
+
+    let mut ids = Vec::new();
+    for n in 0..6 {
+        let local = format!("photo-{n}");
+        ids.push(materialize(&rig, &local, local.as_bytes()).await);
+    }
+
+    let publisher =
+        FakePublisher::with_fallback(|| Err(PublishError::NodeUnreachable("refused".into())));
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert!(report.parked);
+    assert_eq!(report.published, 0);
+
+    // The spawn gate closes on the first unreachable result, so the pass can
+    // never have started more than the in-flight window.
+    let started = publisher.calls.load(Ordering::Relaxed) as usize;
+    assert!(
+        started <= rig.config.publish.concurrency,
+        "park must not keep spawning: {started} started"
+    );
+
+    // Whatever was never spawned is untouched — no attempt, no error text.
+    let mut untouched = 0;
+    for id in &ids {
+        let row = photo(&rig, id).await;
+        assert!(row.published_at.is_none());
+        if row.publish_attempts == 0 {
+            untouched += 1;
+            assert!(row.publish_last_error.is_none());
+        }
+    }
+    assert!(
+        untouched >= ids.len() - started,
+        "every unstarted photo keeps a clean retry ledger"
+    );
+}
+
+// Impact: the in-flight window is what bounds memory and disk pressure while
+// multi-GB originals stream; an unbounded spawn would defeat the point.
+// Should: hold no more than `concurrency` uploads open at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrency_bounds_uploads_in_flight() {
+    let mut rig = rig().await;
+    rig.config.publish.concurrency = 3;
+    // Claim all nine so the window genuinely has more work than it can hold.
+    rig.config.publish.batch = 9;
+
+    for n in 0..9 {
+        let local = format!("photo-{n}");
+        materialize(&rig, &local, local.as_bytes()).await;
+    }
+
+    // Zero permits: every upload blocks inside the publisher after recording
+    // its entry, so `calls` reads as the number currently in flight.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let publisher = FakePublisher::gated(gate.clone());
+
+    let store = rig.store.clone();
+    let spool = rig.data_dir.spool();
+    let cfg = rig.config.publish.clone();
+    let claimed = claim(&rig).await;
+    let dynamic: Arc<dyn Publisher> = publisher.clone();
+    let pass_task = tokio::spawn(async move {
+        let mut state = PublishState::default();
+        run_publish_pass(
+            &store,
+            &spool,
+            &dynamic,
+            &cfg,
+            PassWork {
+                claimed,
+                ..Default::default()
+            },
+            &mut state,
+        )
+        .await
+        .unwrap()
+    });
+
+    // Let the window fill, then confirm it stopped at the bound.
+    for _ in 0..500 {
+        if publisher.calls.load(Ordering::Relaxed) >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        publisher.calls.load(Ordering::Relaxed),
+        3,
+        "a fourth upload must wait for a permit"
+    );
+
+    gate.add_permits(100);
+    let report = pass_task.await.unwrap();
+    assert_eq!(report.published, 9);
 }

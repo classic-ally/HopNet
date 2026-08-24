@@ -2083,6 +2083,11 @@ public struct FfiDaemonOptions: Equatable, Hashable {
      * Publish tick cadence (seconds).
      */
     public var publishIntervalSecs: UInt64
+    /**
+     * Uploads in flight per scope during a publish pass. Clamped to >= 1.
+     * The claim batch is derived as `2 *` this, mirroring the fetch path.
+     */
+    public var publishConcurrency: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2100,7 +2105,11 @@ public struct FfiDaemonOptions: Equatable, Hashable {
          */publishNodeUrl: String?, publishDeviceToken: String?, 
         /**
          * Publish tick cadence (seconds).
-         */publishIntervalSecs: UInt64) {
+         */publishIntervalSecs: UInt64, 
+        /**
+         * Uploads in flight per scope during a publish pass. Clamped to >= 1.
+         * The claim batch is derived as `2 *` this, mirroring the fetch path.
+         */publishConcurrency: UInt32) {
         self.fetchConcurrency = fetchConcurrency
         self.retryCap = retryCap
         self.retryBaseSecs = retryBaseSecs
@@ -2112,6 +2121,7 @@ public struct FfiDaemonOptions: Equatable, Hashable {
         self.publishNodeUrl = publishNodeUrl
         self.publishDeviceToken = publishDeviceToken
         self.publishIntervalSecs = publishIntervalSecs
+        self.publishConcurrency = publishConcurrency
     }
 
     
@@ -2140,7 +2150,8 @@ public struct FfiConverterTypeFfiDaemonOptions: FfiConverterRustBuffer {
                 cleanupIntervalSecs: FfiConverterUInt64.read(from: &buf), 
                 publishNodeUrl: FfiConverterOptionString.read(from: &buf), 
                 publishDeviceToken: FfiConverterOptionString.read(from: &buf), 
-                publishIntervalSecs: FfiConverterUInt64.read(from: &buf)
+                publishIntervalSecs: FfiConverterUInt64.read(from: &buf), 
+                publishConcurrency: FfiConverterUInt32.read(from: &buf)
         )
     }
 
@@ -2156,6 +2167,7 @@ public struct FfiConverterTypeFfiDaemonOptions: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.publishNodeUrl, into: &buf)
         FfiConverterOptionString.write(value.publishDeviceToken, into: &buf)
         FfiConverterUInt64.write(value.publishIntervalSecs, into: &buf)
+        FfiConverterUInt32.write(value.publishConcurrency, into: &buf)
     }
 }
 
