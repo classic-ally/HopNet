@@ -1293,6 +1293,15 @@ fn regenesis_transition_restarts_into_epoch_2() {
         carried_profile, profile_meta,
         "quorum profile carried verbatim"
     );
+    // Should: derive the boot mesh magic from the reopened database
+    // exactly as main.rs will — the anchor (epoch-1) identity, unchanged
+    // by the rotation, recovered from the lineage back-pointer past the
+    // boundary (RFC-025).
+    {
+        let conn = app_state2.db_pool.get().unwrap();
+        let magic = crate::regenesis::genesis::mesh_magic(&conn, &lineage_dir).unwrap();
+        assert_eq!(&magic[..], &prev_chain[..4]);
+    }
     app_state2.node_id.set(0).unwrap();
     app_state2.user_id.set(0).unwrap();
     app_state2
