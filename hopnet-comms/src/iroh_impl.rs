@@ -26,7 +26,13 @@ pub(crate) struct ScopeEntry {
 }
 
 pub(crate) enum ScopeKind {
-    Rpc(Arc<dyn RpcHandler>),
+    /// `prev` is the previous-generation adapter — `Some` iff the scope
+    /// is compat-class (the window invariant, RFC-025 contract rule 4,
+    /// enforced at registration by `rpc_compat`'s mandatory parameter).
+    Rpc {
+        head: Arc<dyn RpcHandler>,
+        prev: Option<Arc<dyn RpcHandler>>,
+    },
     Streamed(Arc<dyn StreamHandler>),
 }
 
@@ -49,7 +55,14 @@ impl ScopeRegistry {
 
     /// Register a single-response handler for `scope` (locked class).
     pub fn rpc(&mut self, scope: &'static str, handler: Arc<dyn RpcHandler>) {
-        self.insert_classed(scope, ScopeClass::Locked, ScopeKind::Rpc(handler));
+        self.insert_classed(
+            scope,
+            ScopeClass::Locked,
+            ScopeKind::Rpc {
+                head: handler,
+                prev: None,
+            },
+        );
     }
 
     /// Register a multi-frame handler for `scope` (locked class).
@@ -59,12 +72,31 @@ impl ScopeRegistry {
 
     /// Register a single-response handler on the compat class. Compat is
     /// an allowlist (RFC-025): admission requires a named cross-version
-    /// consumer and freezeable vocabulary.
-    pub fn rpc_compat(&mut self, scope: &'static str, handler: Arc<dyn RpcHandler>) {
-        self.insert_classed(scope, ScopeClass::Compat, ScopeKind::Rpc(handler));
+    /// consumer and freezeable vocabulary. `prev` — the
+    /// previous-generation adapter (or the same Arc when the vocabularies
+    /// are byte-identical) — is mandatory: a compat scope always serves
+    /// exactly the window [head-1, head], so "forgot the adapter" is a
+    /// compile error, not a field incident.
+    pub fn rpc_compat(
+        &mut self,
+        scope: &'static str,
+        head: Arc<dyn RpcHandler>,
+        prev: Arc<dyn RpcHandler>,
+    ) {
+        self.insert_classed(
+            scope,
+            ScopeClass::Compat,
+            ScopeKind::Rpc {
+                head,
+                prev: Some(prev),
+            },
+        );
     }
 
-    /// Register a multi-frame handler on the compat class.
+    /// Register a multi-frame handler on the compat class. Head-only: no
+    /// streamed compat scope exists today, so there is no prev slot to
+    /// carry — a future streamed compat admission grows one alongside
+    /// its named cross-version consumer.
     pub fn streamed_compat(&mut self, scope: &'static str, handler: Arc<dyn StreamHandler>) {
         self.insert_classed(scope, ScopeClass::Compat, ScopeKind::Streamed(handler));
     }
@@ -109,8 +141,9 @@ pub const HOPNET_ALPN: &[u8] = alpn::LEGACY_ALPN;
 /// The node's ALPN identity, settled once at bind (RFC-025 §The ALPN
 /// Scheme: every string known at bind, no committed-state reads).
 /// `magic: None` is pre-enforcement mode — legacy ALPN only, every scope
-/// served, today's semantics byte-for-byte (S2 derives the magic from
-/// the anchor; S5 gates bind on join-code entry).
+/// served, speaking the GENERATION-0 vocabulary on compat scopes (it IS
+/// the pre-enforcement world; S2 derives the magic from the anchor; S5
+/// gates bind on join-code entry).
 pub(crate) struct AlpnIdentity {
     magic: Option<[u8; 4]>,
     code: u32,
@@ -140,6 +173,23 @@ impl AlpnIdentity {
         match &self.magic {
             Some(magic) => alpn::classify_accept(magic, self.code, self.head, alpn_bytes),
             None => AcceptTier::ServedCompat(0),
+        }
+    }
+
+    /// The generation a DIALED connection's negotiated ALPN commits both
+    /// sides to. Compat connections only by contract; a locked ALPN here
+    /// is a caller bug — answer head (the locked family always speaks
+    /// head vocabulary) and note it.
+    fn generation_of(&self, alpn_bytes: &[u8]) -> u32 {
+        match &self.magic {
+            None => 0,
+            Some(magic) => match alpn::parse_alpn(magic, alpn_bytes) {
+                alpn::ParsedAlpn::Compat(g) => g,
+                parsed => {
+                    tracing::debug!("generation_of on non-compat ALPN ({parsed:?})");
+                    self.head
+                }
+            },
         }
     }
 }
@@ -848,8 +898,12 @@ impl IrohComms {
         let request_id: u64 = rand::random();
         self.rpc_with_id(peer, scope, payload, timeout, request_id)
             .await
+            .map(|(response, _)| response)
     }
 
+    /// Returns the response bytes AND the connection that served the
+    /// successful attempt — its negotiated ALPN is the codec authority
+    /// (`rpc_negotiated`); plain rpc discards it.
     async fn rpc_with_id(
         &self,
         peer: &PeerRef,
@@ -857,7 +911,7 @@ impl IrohComms {
         payload: Vec<u8>,
         timeout: Duration,
         request_id: u64,
-    ) -> Result<Vec<u8>, CommsError> {
+    ) -> Result<(Vec<u8>, Connection), CommsError> {
         let span = tracing::debug_span!("rpc_req", id = %format!("{:016x}", request_id), to = peer.node_id);
         let class = self.scope_class(scope);
         async {
@@ -866,7 +920,7 @@ impl IrohComms {
                 .await?;
 
             match Self::try_rpc(&conn, request_id, scope, &payload, timeout).await {
-                Ok(response) => Ok(response),
+                Ok(response) => Ok((response, conn)),
                 Err(e) if e.is_retryable() => {
                     // Transport error (timeout or stream failure) — connection
                     // may be zombie. Evict and retry once with a fresh
@@ -877,13 +931,32 @@ impl IrohComms {
                     let conn = self
                         .get_connection_with_budget(peer, CONNECTION_TIMEOUT, class)
                         .await?;
-                    Self::try_rpc(&conn, request_id, scope, &payload, timeout).await
+                    let response = Self::try_rpc(&conn, request_id, scope, &payload, timeout).await?;
+                    Ok((response, conn))
                 }
                 Err(e) => Err(e),
             }
         }
         .instrument(span)
         .await
+    }
+
+    /// Like [`Rpc::rpc`], returning the generation the connection's
+    /// negotiated ALPN commits both sides to — the codec authority for
+    /// decoding the response (RFC-025: "no dialer ever guesses what a
+    /// peer speaks"). Compat scopes only by contract.
+    pub async fn rpc_negotiated(
+        &self,
+        peer: &PeerRef,
+        scope: &'static str,
+        payload: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<(Vec<u8>, u32), CommsError> {
+        let request_id: u64 = rand::random();
+        let (response, conn) = self
+            .rpc_with_id(peer, scope, payload, timeout, request_id)
+            .await?;
+        Ok((response, self.identity.generation_of(conn.alpn())))
     }
 
     /// Attempt a single request on an existing connection. `timeout` covers
@@ -1025,7 +1098,38 @@ impl IrohComms {
             }
 
             match &entry.kind {
-                ScopeKind::Rpc(handler) => {
+                ScopeKind::Rpc { head, prev } => {
+                    // Generation-keyed dispatch (RFC-025 §Evolution): the
+                    // negotiated ALPN is the codec authority for every
+                    // stream on the connection. Pre-enforcement mode IS
+                    // the generation-0 world; a matched peer's locked
+                    // connection speaks head.
+                    let handler = if entry.class == ScopeClass::Compat {
+                        let generation = match conn_class {
+                            ConnClass::Compat(g) => g,
+                            ConnClass::PreEnforcement => 0,
+                            ConnClass::Locked => self.identity.head,
+                        };
+                        if generation == self.identity.head {
+                            head
+                        } else if generation == alpn::compat_floor(self.identity.head) {
+                            prev.as_ref()
+                                .expect("compat scope registered without prev handler")
+                        } else {
+                            // Unreachable via classify_accept; refuse
+                            // rather than misdecode.
+                            tracing::warn!(
+                                "no handler for generation {generation} of scope {:?} \
+                                 (from node {})",
+                                envelope.scope,
+                                peer.node_id
+                            );
+                            return Ok(());
+                        }
+                    } else {
+                        head
+                    };
+
                     // Receiver-side dedup: first caller computes; retried
                     // requests (same id) wait for and reuse the same bytes.
                     let cell = {
@@ -1294,7 +1398,7 @@ mod tests {
             .rpc_with_id(&peer_b, "echo", b"x".to_vec(), Duration::from_secs(5), id)
             .await
             .unwrap();
-        assert_eq!(r1, r2);
+        assert_eq!(r1.0, r2.0);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -1399,15 +1503,27 @@ mod tests {
         .unwrap()
     }
 
-    fn compat_echo(calls: &Arc<AtomicUsize>) -> ScopeRegistry {
+    /// A compat "st" scope with SEPARATE head/prev handlers so tests can
+    /// assert which generation served.
+    fn compat_echo_windowed(
+        head_calls: &Arc<AtomicUsize>,
+        prev_calls: &Arc<AtomicUsize>,
+    ) -> ScopeRegistry {
         let mut scopes = ScopeRegistry::new();
         scopes.rpc_compat(
             "st",
             Arc::new(Echo {
-                calls: calls.clone(),
+                calls: head_calls.clone(),
+            }),
+            Arc::new(Echo {
+                calls: prev_calls.clone(),
             }),
         );
         scopes
+    }
+
+    fn compat_echo(calls: &Arc<AtomicUsize>) -> ScopeRegistry {
+        compat_echo_windowed(calls, calls)
     }
 
     async fn negotiated_compat_alpn(comms: &IrohComms, node_id: i32) -> Vec<u8> {
@@ -1447,13 +1563,16 @@ mod tests {
     // Impact: the mint lifecycle depends on this — a straggler one
     // generation behind must keep talking through the head's adapter.
     // Should: negotiate the previous generation when the dialer's window
-    // trails the server's, in a single connect (no second dial).
+    // trails the server's, in a single connect (no second dial), and
+    // dispatch to the PREVIOUS-generation handler.
+    // Should not: invoke the head handler for a floor-negotiated stream.
     #[tokio::test(flavor = "multi_thread")]
     async fn mixed_window_pair_negotiates_previous_generation() {
-        let calls = Arc::new(AtomicUsize::new(0));
+        let head_calls = Arc::new(AtomicUsize::new(0));
+        let prev_calls = Arc::new(AtomicUsize::new(0));
         let a = bind_for_test(Some(MAGIC), CODE, 1).await; // offers [1, 0]
         let b = bind_for_test(Some(MAGIC), CODE, 2).await; // serves [2, 1]
-        b.start(compat_echo(&calls));
+        b.start(compat_echo_windowed(&head_calls, &prev_calls));
         a.start(compat_echo(&Arc::new(AtomicUsize::new(0))));
         let peer_b = PeerRef {
             node_id: 2,
@@ -1467,6 +1586,119 @@ mod tests {
             .unwrap();
         assert_eq!(reply, b"old");
         assert_eq!(negotiated_compat_alpn(&a, 2).await, alpn::compat_alpn(&MAGIC, 1));
+        assert_eq!(prev_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(head_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Impact: this seam is what makes a mint non-breaking for in-window
+    // stragglers — the floor generation gets its own codec path.
+    // Should: route a floor-negotiated connection's streams to the prev
+    // handler and a head-negotiated connection's to the head handler.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generation_dispatch_selects_the_floor_handler() {
+        let head_calls = Arc::new(AtomicUsize::new(0));
+        let prev_calls = Arc::new(AtomicUsize::new(0));
+        // Same window on both sides: negotiation lands on head.
+        let a = bind_for_test(Some(MAGIC), CODE, 2).await;
+        let b = bind_for_test(Some(MAGIC), CODE, 2).await;
+        b.start(compat_echo_windowed(&head_calls, &prev_calls));
+        a.start(compat_echo(&Arc::new(AtomicUsize::new(0))));
+        let peer_b = PeerRef {
+            node_id: 2,
+            pubkey: b.local_pubkey(),
+        };
+        a.connect_to_addr(2, loopback_addr(&b)).await.unwrap();
+        a.rpc(&peer_b, "st", b"x".to_vec(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(head_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(prev_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Impact: pins D2 — pre-enforcement mode IS the generation-0 world,
+    // so a real legacy straggler probing a magic-None enforcement binary
+    // receives generation-0 bytes it can decode.
+    // Should: serve compat scopes with the prev handler and locked scopes
+    // with the head handler when both peers run pre-enforcement mode.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pre_enforcement_serves_generation_zero_vocabulary() {
+        let head_calls = Arc::new(AtomicUsize::new(0));
+        let prev_calls = Arc::new(AtomicUsize::new(0));
+        let locked_calls = Arc::new(AtomicUsize::new(0));
+        let mut scopes = compat_echo_windowed(&head_calls, &prev_calls);
+        scopes.rpc(
+            "lk",
+            Arc::new(Echo {
+                calls: locked_calls.clone(),
+            }),
+        );
+        let a = bind_for_test(None, CODE, 1).await;
+        let b = bind_for_test(None, CODE, 1).await;
+        b.start(scopes);
+        a.start(compat_echo(&Arc::new(AtomicUsize::new(0))));
+        let peer_b = PeerRef {
+            node_id: 2,
+            pubkey: b.local_pubkey(),
+        };
+        a.connect_to_addr(2, loopback_addr(&b)).await.unwrap();
+
+        a.rpc(&peer_b, "st", b"x".to_vec(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        a.rpc(&peer_b, "lk", b"y".to_vec(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(prev_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(head_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(locked_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Should: report the generation the negotiated ALPN commits both
+    // sides to — head between matched enforcement peers, zero when the
+    // server (or the dialer itself) is pre-enforcement.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpc_negotiated_reports_the_connection_generation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // Matched enforcement pair → head.
+        let a = bind_for_test(Some(MAGIC), CODE, 1).await;
+        let b = bind_for_test(Some(MAGIC), CODE, 1).await;
+        b.start(compat_echo(&calls));
+        a.start(compat_echo(&Arc::new(AtomicUsize::new(0))));
+        let peer_b = PeerRef {
+            node_id: 2,
+            pubkey: b.local_pubkey(),
+        };
+        a.connect_to_addr(2, loopback_addr(&b)).await.unwrap();
+        let (_, generation) = a
+            .rpc_negotiated(&peer_b, "st", b"x".to_vec(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(generation, 1);
+
+        // Enforcement dialer reaching a pre-enforcement server → 0.
+        let c = bind_for_test(None, CODE, 1).await;
+        c.start(compat_echo(&calls));
+        let peer_c = PeerRef {
+            node_id: 3,
+            pubkey: c.local_pubkey(),
+        };
+        a.connect_to_addr(3, loopback_addr(&c)).await.ok();
+        let (_, generation) = a
+            .rpc_negotiated(&peer_c, "st", b"x".to_vec(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(generation, 0);
+
+        // Pre-enforcement dialer → 0 by construction.
+        let d = bind_for_test(None, CODE, 1).await;
+        d.start(ScopeRegistry::new());
+        d.connect_to_addr(2, loopback_addr(&b)).await.unwrap();
+        let (_, generation) = d
+            .rpc_negotiated(&peer_b, "st", b"x".to_vec(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(generation, 0);
     }
 
     // Should: refuse a below-window dialer with the structured
@@ -1571,13 +1803,11 @@ mod tests {
                 calls: calls.clone(),
             }),
         );
+        let dummy: Arc<dyn RpcHandler> = Arc::new(Echo {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
         let mut a_scopes = ScopeRegistry::new();
-        a_scopes.rpc_compat(
-            "lk",
-            Arc::new(Echo {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-        );
+        a_scopes.rpc_compat("lk", dummy.clone(), dummy);
         let a = bind_for_test(Some(MAGIC), CODE, 1).await;
         let b = bind_for_test(Some(MAGIC), CODE, 1).await;
         b.start(b_scopes);

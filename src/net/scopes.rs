@@ -75,19 +75,19 @@ pub fn build_registry(app_state: &AppState) -> ScopeRegistry {
     // default: each admission has a named cross-version consumer. status:
     // diagnosing any mismatched peer (the Pong is the policy readout);
     // regenesis: RFC-019 S7 stragglers staging on the old binary. The
-    // class-pin test below is the table's enforcement.
-    scopes.rpc_compat(
-        "status",
+    // class-pin test below is the table's enforcement. Generation 0 is
+    // served by the same handler as the head while the vocabularies are
+    // byte-identical (the compat_g0 equality goldens are the license).
+    let status: Arc<dyn hopnet_comms::RpcHandler> =
         Arc::new(crate::consensus::evidence::StatusScope {
             app_state: app_state.clone(),
-        }),
-    );
-    scopes.rpc_compat(
-        "regenesis",
+        });
+    scopes.rpc_compat("status", status.clone(), status);
+    let regenesis: Arc<dyn hopnet_comms::RpcHandler> =
         Arc::new(crate::regenesis::rpc::RegenesisScope {
             app_state: app_state.clone(),
-        }),
-    );
+        });
+    scopes.rpc_compat("regenesis", regenesis.clone(), regenesis);
     scopes
 }
 
