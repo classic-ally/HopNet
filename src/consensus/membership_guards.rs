@@ -395,6 +395,7 @@ mod tests {
             // Fresh height so the catch-up gate passes; tests overriding
             // catch-up set this explicitly.
             last_known_height: Some(200),
+            last_pong: None,
         }
     }
 
