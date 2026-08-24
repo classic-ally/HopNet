@@ -83,9 +83,12 @@ pub enum TransportError {
     Protocol(String),
     /// Credentials rejected.
     Unauthorized,
-    /// Mutation conflicts with current state (name taken, folder not
-    /// empty) — maps to EEXIST/ENOTEMPTY by op context.
-    Conflict,
+    /// Mutation conflicts with current state. The payload is the node's
+    /// coded verdict when it sent one (occupied / not_empty /
+    /// is_directory / not_directory — POSIX discrimination for rename);
+    /// None = a bare 409, which for a replace-allowed rename means a
+    /// consensus rejection, not occupancy.
+    Conflict(Option<hopnet_common::mount::MountConflictCode>),
     /// Consensus wait timed out — outcome UNKNOWN; callers must not
     /// assume either applied or not.
     OutcomeUnknown,
@@ -105,7 +108,10 @@ impl std::fmt::Display for TransportError {
             TransportError::Unavailable(why) => write!(f, "node unavailable: {why}"),
             TransportError::Protocol(why) => write!(f, "protocol error: {why}"),
             TransportError::Unauthorized => write!(f, "credentials rejected"),
-            TransportError::Conflict => write!(f, "conflicts with current state"),
+            TransportError::Conflict(code) => match code {
+                Some(code) => write!(f, "conflicts with current state ({code:?})"),
+                None => write!(f, "conflicts with current state"),
+            },
             TransportError::OutcomeUnknown => write!(f, "consensus wait timed out"),
             TransportError::UpgradeRequired {
                 surface,
@@ -237,6 +243,8 @@ pub trait NodeTransport: Send + Sync {
         id: CustomUUID,
         new_parent: Option<ItemId>,
         new_name: Option<String>,
+        // POSIX replace semantics; false = RENAME_NOREPLACE.
+        replace: bool,
     ) -> BoxFuture<'_, Result<Mutated, TransportError>>;
 
     fn delete(

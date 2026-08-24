@@ -464,9 +464,19 @@ impl Filesystem for HopFs {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: fuser::RenameFlags,
+        flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
+        // POSIX default is replace; NOREPLACE is the opt-out the kernel
+        // sends for renameat2(RENAME_NOREPLACE). EXCHANGE and WHITEOUT
+        // are not supported — refuse rather than silently degrade.
+        if flags.contains(fuser::RenameFlags::RENAME_EXCHANGE)
+            || flags.contains(fuser::RenameFlags::RENAME_WHITEOUT)
+        {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let replace = !flags.contains(fuser::RenameFlags::RENAME_NOREPLACE);
         let (Some(name), Some(newname)) = (
             name.to_str().map(String::from),
             newname.to_str().map(String::from),
@@ -476,7 +486,10 @@ impl Filesystem for HopFs {
         };
         let core = self.core.clone();
         self.rt.spawn(async move {
-            match core.rename(parent.0, &name, newparent.0, &newname).await {
+            match core
+                .rename(parent.0, &name, newparent.0, &newname, replace)
+                .await
+            {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(errno(&e)),
             }

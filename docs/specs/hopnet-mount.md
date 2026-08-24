@@ -273,6 +273,27 @@ Per-blob sparse files in `$XDG_CACHE_HOME/hopnet/content/{blob_id}`.
   - `unlink`/`rmdir` → delete; non-recursive rmdir, 409 → ENOTEMPTY
   - metadata ops are strict-inline (respond after consensus decides,
     per Node HTTP Surface)
+- rename POSIX semantics (issue #62, 2026-08-24): rename atomically
+  REPLACES an occupied destination — delete-then-move inside the one
+  consensus transaction; the replaced blob defers to the orphan sweep
+  exactly like an explicit delete, and the replaced inode surfaces in
+  `/changes.deleted_ids` (every daemon's invalidation signal):
+  - `RENAME_NOREPLACE` honoured (`replace: false` on the wire — also the
+    serde default, so pre-replace daemons keep today's refuse behavior);
+    `RENAME_EXCHANGE`/`RENAME_WHITEOUT` → EINVAL
+  - dir over empty dir replaces; dir over non-empty dir → ENOTEMPTY;
+    file↔dir mismatches → EISDIR/ENOTDIR (kernel enforces these for
+    FUSE; the node answers them for the HTTP surface anyway)
+  - conflict-code contract: mount `/modify` 409s carry an optional JSON
+    body `{"code": ...}` — `occupied` | `not_empty` | `is_directory` |
+    `not_directory`; a BARE 409 is a consensus rejection, which under
+    replace=true maps to EIO (POSIX forbids EEXIST there), never to
+    EEXIST
+  - consensus wire: `ModifyItemPayload` gained a trailing `replace`
+    field IN PLACE — first use of the RFC-025 evolution regime; the
+    carrying release must not ship before RFC-025 enforcement is merged
+    and must activate at a regenesis boundary (envelope header + issue
+    #62 record the constraint)
 - upload semantics — two-tier durability:
   - `release()` (close) kicks a background upload and returns; the file
     stays readable locally from staging (read-your-writes); durable

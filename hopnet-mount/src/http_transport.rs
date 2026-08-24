@@ -186,7 +186,14 @@ async fn parse_mutation(response: reqwest::Response) -> Result<Mutated, Transpor
         return Err(TransportError::Unauthorized);
     }
     if status == reqwest::StatusCode::CONFLICT {
-        return Err(TransportError::Conflict);
+        // The coded body is optional: pre-replace nodes (and the
+        // consensus-rejection path) send a bare 409.
+        let code = response
+            .json::<hopnet_common::mount::MountConflictBody>()
+            .await
+            .ok()
+            .map(|body| body.code);
+        return Err(TransportError::Conflict(code));
     }
     if status == reqwest::StatusCode::GATEWAY_TIMEOUT {
         return Err(TransportError::OutcomeUnknown);
@@ -474,6 +481,7 @@ impl NodeTransport for HttpTransport {
         id: CustomUUID,
         new_parent: Option<ItemId>,
         new_name: Option<String>,
+        replace: bool,
     ) -> BoxFuture<'_, Result<Mutated, TransportError>> {
         Box::pin(async move {
             let (new_parent_id, new_parent_root) = match new_parent {
@@ -486,6 +494,7 @@ impl NodeTransport for HttpTransport {
                 "new_parent_id": new_parent_id,
                 "new_parent_root": new_parent_root,
                 "new_name": new_name,
+                "replace": replace,
             });
             // Mutations wait on consensus (bounded by the node's 120 s);
             // use the upload client so 30 s doesn't cut the wait short.

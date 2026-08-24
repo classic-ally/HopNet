@@ -470,6 +470,11 @@ pub fn modify_item(
     user_id: i32,
     inode_id: CustomUUID,
     new_encrypted_path: Option<String>,
+    // POSIX rename(2) replace: an occupied destination of compatible type
+    // is deleted (delete_files, same transaction) instead of answering
+    // ConflictError. Folder-over-non-empty-folder is NotEmpty; a
+    // file<->folder type mismatch is InvalidPayload.
+    replace: bool,
     // None = no content change; Some(None) = content cleared (data_id NULL);
     // Some(Some(op)) = new blob registered via the substrate apply.
     content_update: Option<Option<hopnet_storage::store::BlobInsertOp>>,
@@ -532,17 +537,46 @@ pub fn modify_item(
             }
         }
 
-        // Check if the new path already exists (exclude current inode to allow "move to same location")
-        let new_exists: bool = db_tx
+        // Destination occupancy (exclude current inode to allow "move to
+        // same location"). This is the authoritative POSIX rename matrix —
+        // it runs identically at preflight, validation, and apply, so the
+        // verdict is deterministic across all consensus phases.
+        let occupant: Option<hopnet_common::InodeType> = db_tx
             .query_row(
-                "SELECT COUNT(*) > 0 FROM inodes WHERE path = ? AND owner_id = ? AND id != ?",
+                "SELECT type FROM inodes WHERE path = ? AND owner_id = ? AND id != ?",
                 params![new_path, user_id, inode_id],
                 |row| row.get(0),
             )
+            .optional()
             .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
 
-        if new_exists {
-            return Err(DatabaseError::ConflictError); // Path already occupied
+        if let Some(occupant_type) = occupant {
+            if !replace {
+                return Err(DatabaseError::ConflictError); // Path already occupied
+            }
+            if occupant_type != item_type {
+                // file-over-folder / folder-over-file; the route answers
+                // the coded 409 first — this is the consensus backstop.
+                return Err(DatabaseError::InvalidPayload);
+            }
+            if occupant_type == hopnet_common::InodeType::Folder {
+                let dest_children: i64 = db_tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM inodes WHERE path LIKE ? AND owner_id = ?",
+                        params![format!("{}/%", new_path), user_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
+                if dest_children > 0 {
+                    return Err(DatabaseError::NotEmpty);
+                }
+            }
+            // Compatible occupant: POSIX replace = delete-then-move in this
+            // same transaction. delete_files logs the deletion for the
+            // /changes feed (daemon invalidation), scrubs share rows, and
+            // leaves data_blocks to the orphan sweep — identical to an
+            // explicit delete.
+            delete_files(db_tx, new_path.clone(), user_id, block_height)?;
         }
 
         let rows_updated = match item_type {

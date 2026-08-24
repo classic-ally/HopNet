@@ -142,6 +142,7 @@ impl TransactionHandler for ModifyItemHandler {
                     payload_data.user_id,
                     payload_data.inode_id.clone(),
                     payload_data.new_encrypted_path.clone(),
+                    payload_data.replace,
                     payload_data.content_update.clone().map(|u| u.blob_op),
                     payload_data.incoming_share_updates.clone(),
                     ctx.fragments_dir,
