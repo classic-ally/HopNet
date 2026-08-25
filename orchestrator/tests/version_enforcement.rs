@@ -419,7 +419,9 @@ impl TestScenario for RetiredDialer {
         // 2. The real mesh code: the target adopts OUR magic and starts
         // serving its (raised) families; setup_complete stays false — the
         // code flips nothing, only JoinInfo install does.
-        let mesh_code = crate::get_mesh_code(&docker, mesh_id, runtime).await?;
+        let mesh_code = crate::get_mesh_code(&docker, mesh_id, runtime)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("mesh has no join-code channel (pre-RFC-025 image?)"))?;
         crate::submit_join_code(&docker, mesh_id, target_id, runtime, &mesh_code).await?;
         let magic = alpn::parse_mesh_code(&mesh_code)
             .ok_or_else(|| anyhow::anyhow!("unparseable mesh code {mesh_code}"))?;

@@ -114,7 +114,9 @@ impl TestScenario for MeshGrowth {
         .await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
 
-        let mesh_code = crate::get_mesh_code(&docker, mesh_id, runtime).await?;
+        let mesh_code = crate::get_mesh_code(&docker, mesh_id, runtime)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("mesh has no join-code channel (pre-RFC-025 image?)"))?;
         let wrong_code: String = {
             // Flip the first nibble, keeping the shape valid.
             let mut chars: Vec<char> = mesh_code.chars().collect();

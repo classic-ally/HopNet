@@ -701,7 +701,20 @@ async fn create_mesh(
                 // before setup_node_0 runs).
                 if containers.len() > 1 {
                     let mesh_code = match get_mesh_code(docker, mesh_id, runtime).await {
-                        Ok(c) => c,
+                        Ok(Some(c)) => {
+                            println!("Mesh code: {}", c);
+                            Some(c)
+                        }
+                        // A mesh born on a pre-enforcement image (the
+                        // RFC-020 cutover rehearsal): no join-code
+                        // channel exists and none is needed — old fresh
+                        // nodes bind legacy immediately.
+                        Ok(None) => {
+                            println!(
+                                "Coordinator predates the join-code channel; registering directly"
+                            );
+                            None
+                        }
                         Err(e) => {
                             println!("Failed to read the mesh code from node 0: {}", e);
                             if !no_cleanup {
@@ -711,7 +724,6 @@ async fn create_mesh(
                             return Err(anyhow::anyhow!("Mesh creation failed: no mesh code"));
                         }
                     };
-                    println!("Mesh code: {}", mesh_code);
                     for (node_index, (container_name, _container_id, _node_ip)) in
                         containers.iter().enumerate().skip(1)
                     {
@@ -722,7 +734,9 @@ async fn create_mesh(
                         );
 
                         if let Err(e) = async {
-                            submit_join_code(docker, mesh_id, node_id, runtime, &mesh_code).await?;
+                            if let Some(code) = &mesh_code {
+                                submit_join_code(docker, mesh_id, node_id, runtime, code).await?;
+                            }
                             register_node_with_node_0(
                                 docker,
                                 mesh_id,
@@ -865,7 +879,10 @@ pub(crate) async fn add_nodes_to_mesh(
     // against a code-less endpoint. Same HTTP seam as create_mesh (one
     // code path, deliberately not env).
     let mesh_code = get_mesh_code(docker, mesh_id, runtime).await?;
-    println!("Mesh code: {}", mesh_code);
+    match &mesh_code {
+        Some(code) => println!("Mesh code: {}", code),
+        None => println!("Coordinator predates the join-code channel; registering directly"),
+    }
 
     // Register new nodes with node 0 (triggers catch-up based bootstrap)
     for (container_name, _container_id, _node_ip) in &new_containers {
@@ -877,7 +894,9 @@ pub(crate) async fn add_nodes_to_mesh(
             node_id, container_name
         );
 
-        submit_join_code(docker, mesh_id, node_id, runtime, &mesh_code).await?;
+        if let Some(code) = &mesh_code {
+            submit_join_code(docker, mesh_id, node_id, runtime, code).await?;
+        }
         if let Err(e) =
             register_node_with_node_0(docker, mesh_id, node_id, container_name, runtime).await
         {
@@ -1423,11 +1442,16 @@ pub async fn get_jwt_token(
 
 /// Read the coordinator's mesh code (RFC-025 S5) from the JWT-protected
 /// regenesis-status view. Exists only after node 0's genesis.
+/// Read the coordinator's mesh code. `Ok(None)` means the status view has
+/// NO `mesh_code` field at all — a pre-enforcement (pre-RFC-025) image,
+/// which has no join-code channel to feed; the caller registers directly
+/// (old fresh nodes bind legacy immediately, no TLS-dead window). A
+/// present-but-null field is transient (pre-genesis) and stays an error.
 pub(crate) async fn get_mesh_code(
     docker: &Docker,
     mesh_id: u32,
     runtime: sys::ContainerRuntime,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let token = get_jwt_token(docker, mesh_id, 0, runtime).await?;
     let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
     let (host, port) = addresses
@@ -1446,10 +1470,13 @@ pub(crate) async fn get_mesh_code(
         .error_for_status()?
         .json()
         .await?;
-    body.get("mesh_code")
-        .and_then(|c| c.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("coordinator has no mesh code yet (pre-genesis?)"))
+    match body.get("mesh_code") {
+        None => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(|s| Some(s.to_string()))
+            .ok_or_else(|| anyhow::anyhow!("coordinator has no mesh code yet (pre-genesis?)")),
+    }
 }
 
 /// The relay's HOST-reachable URL. Podman (rootless: no host->container
