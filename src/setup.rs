@@ -340,6 +340,32 @@ pub async fn post_setup(
                 .setup_complete
                 .store(true, std::sync::atomic::Ordering::Relaxed);
 
+            // The genesis node minted the mesh identity THIS instant —
+            // adopt it on the live endpoint (RFC-025 S5). Without this
+            // the coordinator stays deferred (TLS-dead, dials erroring)
+            // until its next restart, and no node could ever be added.
+            {
+                let magic = app_state
+                    .db_pool
+                    .get()
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                    .and_then(|conn| {
+                        crate::regenesis::genesis::mesh_magic(&conn, &crate::paths::data_dir())
+                            .map_err(|e| {
+                                tracing::error!("mesh magic after genesis: {e}");
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            })
+                    })?;
+                app_state.comms.adopt_magic(magic).await.map_err(|e| {
+                    tracing::error!("adopting the genesis mesh magic: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+                tracing::info!(
+                    code = %hopnet_comms::alpn::format_mesh_code(&magic),
+                    "mesh identity minted and adopted at genesis"
+                );
+            }
+
             // Genesis is installed and identity set — start the consensus
             // engine (paused on-demand at height 1 until work arrives).
             if let Err(e) = crate::consensus::malachite::engine::spawn_engine(&app_state) {
