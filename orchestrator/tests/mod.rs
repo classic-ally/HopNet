@@ -56,6 +56,7 @@ mod three_timescales;
 mod tier_membership;
 mod tls_pinning;
 mod upload_and_confirm_placement;
+mod version_enforcement;
 mod vote_out;
 
 /// Represents the result of a test scenario execution
@@ -279,6 +280,9 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         // 6 nodes: forms in the majority region (seats 5 + pooled spare, or
         // 6); the test adds the 7th itself to watch the seam get crossed.
         "auto-seam" => Some(6),
+        // The mixed-version gate holds one of three seats out of the
+        // locked class; majority (AUTO at v=3) keeps the pair deciding.
+        "mixed-version-mesh" => Some(3),
         // Boundary scenarios are written against a 3-node mesh.
         "regenesis-restart"
         | "regenesis-awaiting-upgrade"
@@ -401,6 +405,11 @@ pub async fn run_test_by_name(
         }
         "auto-seam" => auto_seam::AutoSeam.run(mesh_id, nodes, flags).await,
         "mesh-growth" => mesh_growth::MeshGrowth.run(mesh_id, nodes, flags).await,
+        "mixed-version-mesh" => {
+            version_enforcement::MixedVersionMesh
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "three-timescales" => {
             three_timescales::ThreeTimescales
                 .run(mesh_id, nodes, flags)
@@ -634,6 +643,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "regenesis-rollback",
         "regenesis-cutover",
         "mesh-growth",
+        "mixed-version-mesh",
         "auto-seam",
         "three-timescales",
         "evidence-drives-voteout",

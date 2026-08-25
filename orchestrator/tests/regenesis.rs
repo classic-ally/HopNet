@@ -100,7 +100,11 @@ async fn decided_height(node: &NodeInfo) -> Result<u64> {
 /// its whole deadline on a container that will never exit — reporting a
 /// node that restarted in seconds as "did not restart". Volumes were
 /// already filtered this way in `main.rs`; the container lookups were not.
-async fn find_container_id(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<String> {
+pub(crate) async fn find_container_id(
+    docker: &Docker,
+    mesh_id: u32,
+    node_id: u32,
+) -> Result<String> {
     let mut last: Option<anyhow::Error> = None;
     for _ in 0..20 {
         match docker
