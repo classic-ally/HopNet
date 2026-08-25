@@ -906,7 +906,13 @@ impl IrohComms {
         {
             let connections = self.connections.read().await;
             if let Some(conn) = connections.get(&key) {
-                if conn.close_reason().is_none() {
+                // The remote identity must match the peer we were asked
+                // for: the Add Node probe keys every candidate under
+                // node_id -1, so a stale hit here would "verify" a NEW
+                // joiner with TLS that was completed by the PREVIOUS one
+                // (S5 gate-2 finding). A mismatched entry is simply
+                // skipped — the fresh dial below overwrites it.
+                if conn.close_reason().is_none() && conn.remote_id().as_bytes() == &peer.pubkey {
                     return Ok(conn.clone());
                 }
             }
@@ -1858,6 +1864,43 @@ mod tests {
         // The compat ping reaches the wrong-magic node via legacy…
         assert!(a.ping(&peer_wrong).await.is_ok());
         // …the locked ping refuses it.
+        match a.ping_locked(&peer_wrong).await {
+            Err(CommsError::Refused(crate::RefusalError::AlpnRejected)) => {}
+            other => panic!("expected Refused(AlpnRejected), got {other:?}"),
+        }
+    }
+
+    // Impact: regression guard for the S5 gate-2 cache bug — the Add
+    // Node probe keys every candidate under node_id -1, and a cached
+    // connection from the PREVIOUS candidate answered the ping for the
+    // next one, "verifying" a wrong-code node with someone else's TLS.
+    // Should: refuse a locked ping whose peer pubkey differs from the
+    // cached connection's remote identity under the same node_id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_cached_connection_never_answers_for_a_different_peer() {
+        let a = bind_for_test(Some(MAGIC), CODE, 1).await;
+        let b = bind_for_test(Some(MAGIC), CODE, 1).await;
+        let wrong = bind_for_test(Some([0x01, 0x02, 0x03, 0x04]), CODE, 1).await;
+        b.start(ScopeRegistry::new());
+        a.start(ScopeRegistry::new());
+        wrong.start(ScopeRegistry::new());
+
+        // Probe candidate one: dial + cache under -1.
+        a.connect_to_addr(-1, loopback_addr(&b)).await.unwrap();
+        let peer_b = PeerRef {
+            node_id: -1,
+            pubkey: b.local_pubkey(),
+        };
+        assert!(a.ping_locked(&peer_b).await.is_ok());
+
+        // Probe candidate two under the SAME node_id: the hint moves to
+        // the wrong-magic node (the locked pre-dial itself fails), but
+        // the open cached connection to b is still keyed -1.
+        let _ = a.connect_to_addr(-1, loopback_addr(&wrong)).await;
+        let peer_wrong = PeerRef {
+            node_id: -1,
+            pubkey: wrong.local_pubkey(),
+        };
         match a.ping_locked(&peer_wrong).await {
             Err(CommsError::Refused(crate::RefusalError::AlpnRejected)) => {}
             other => panic!("expected Refused(AlpnRejected), got {other:?}"),
