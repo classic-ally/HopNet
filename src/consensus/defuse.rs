@@ -101,7 +101,10 @@ pub(crate) fn defuse_alpn_rejection(app_state: &crate::AppState, peer: hopnet_co
                 );
             }
             DefuseDecision::Probe => {
-                if !app_state.evidence.try_begin_defuse(peer.node_id, cadence, now) {
+                if !app_state
+                    .evidence
+                    .try_begin_defuse(peer.node_id, cadence, now)
+                {
                     return;
                 }
                 let decided = app_state

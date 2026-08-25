@@ -426,17 +426,14 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // this_node without a malachite genesis — fails here too, by
             // design; it cannot run consensus regardless). Parked nodes
             // derive normally from the sealed old-epoch DB and stay
-            // dialable. A fresh node has no anchor yet and binds
-            // pre-enforcement (legacy ALPN only) until S5 gates bind on
-            // join-code entry.
+            // dialable.
             //
-            // KNOWN TRANSIENT GAP (until S5, same PR): with the magic
-            // bound, the coordinator's locked-family "setup" dial
-            // (JoinDeliver, src/nodes/routes.rs) cannot reach a fresh
-            // node, which serves legacy only. S5 closes this — join-code
-            // entry binds the real families BEFORE JoinDeliver arrives —
-            // and the enforcement release ships S1-S6 together, so no
-            // supported deployment runs this intermediate state.
+            // A fresh node binds DEFERRED (empty ALPN list — TLS-dead)
+            // until the operator enters the mesh code, which adopts the
+            // real families BEFORE any JoinDeliver can arrive: a drive-by
+            // delivery cannot complete TLS against a code-less node. (The
+            // S2-era transient gap — locked setup dials unable to reach a
+            // fresh node — is CLOSED by this ceremony.)
             let magic = if startup_state_opt.is_some() {
                 match regenesis::genesis::mesh_magic(&conn, &paths::data_dir()) {
                     Ok(magic) => Some(magic),
@@ -460,6 +457,31 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 hex::encode(comms.local_pubkey())
             );
 
+            // The headless join channel (RFC-025 §Settled Questions #2):
+            // read ONLY in the pre-anchor state — a set-up node never
+            // looks, so a stale env value is inert. A malformed code can
+            // never succeed and fail-stops; a WRONG well-formed code
+            // adopts and then fails visibly (ceremony timeout).
+            let entered_join_code = Arc::new(std::sync::OnceLock::new());
+            if startup_state_opt.is_none()
+                && let Ok(raw) = std::env::var("HOPNET_JOIN_CODE")
+            {
+                let Some(code) = hopnet_comms::alpn::parse_mesh_code(&raw) else {
+                    panic!("HOPNET_JOIN_CODE {raw:?} is not a mesh code (8 hex digits)");
+                };
+                entered_join_code
+                    .set(code)
+                    .expect("join code cell is fresh at boot");
+                comms
+                    .adopt_magic(code)
+                    .await
+                    .expect("adopting the boot join code on a fresh endpoint");
+                tracing::info!(
+                    code = %hopnet_comms::alpn::format_mesh_code(&code),
+                    "mesh code adopted from HOPNET_JOIN_CODE"
+                );
+            }
+
             // Create consensus queue (channel + submit handle)
             let (consensus_queue, consensus_queue_rx) =
                 consensus::queue::ConsensusQueue::new(pool.clone(), 300);
@@ -482,6 +504,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
                 comms,
                 setup_complete,
+                entered_join_code,
                 consensus_barriers: Arc::new(consensus::barriers::new()),
                 session_store: Arc::new(auth::SessionStore::default()),
                 takeout_runtime: Arc::new(hopnet_takeout::TakeoutRuntime::default()),
@@ -986,6 +1009,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))
+                .route("/setup/join-code", post(setup::post_setup_join_code))
                 .route("/login", post(auth::sign_in));
 
             // Photo-ingress enablement plumbing (owner-only, JWT): the

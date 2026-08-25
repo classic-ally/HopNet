@@ -404,18 +404,16 @@ mod tests {
     // transport failure.
     #[test]
     fn transport_error_classification_keeps_refusals_typed() {
-        let refused = hopnet_comms::CommsError::Refused(
-            hopnet_comms::RefusalError::CompatRetired {
+        let refused =
+            hopnet_comms::CommsError::Refused(hopnet_comms::RefusalError::CompatRetired {
                 floor: 2,
                 node_version: 20270101,
-            },
-        );
+            });
         assert!(matches!(
             classify_transport_error(refused),
             FetchError::Refused(hopnet_comms::RefusalError::CompatRetired { floor: 2, .. })
         ));
-        let timeout =
-            hopnet_comms::CommsError::Transport(hopnet_comms::TransportError::Timeout);
+        let timeout = hopnet_comms::CommsError::Transport(hopnet_comms::TransportError::Timeout);
         assert!(matches!(
             classify_transport_error(timeout),
             FetchError::Transport(_)

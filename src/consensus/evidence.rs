@@ -1403,7 +1403,10 @@ mod tests {
     // ahead of our decided height.
     #[test]
     fn classify_pong_kicks_sync_when_a_same_epoch_peer_is_ahead() {
-        assert_eq!(classify_pong(&me(1, 2430), &pong(1, 35740)), PongAction::KickSync);
+        assert_eq!(
+            classify_pong(&me(1, 2430), &pong(1, 35740)),
+            PongAction::KickSync
+        );
         assert_eq!(classify_pong(&me(1, 0), &pong(1, 1)), PongAction::KickSync);
     }
 
@@ -1419,15 +1422,24 @@ mod tests {
     // relative heights — block sync never crosses a boundary.
     #[test]
     fn classify_pong_joins_a_newer_epoch_at_any_height() {
-        assert_eq!(classify_pong(&me(1, 10), &pong(2, 999)), PongAction::EpochJoin);
-        assert_eq!(classify_pong(&me(1, 999), &pong(2, 10)), PongAction::EpochJoin);
+        assert_eq!(
+            classify_pong(&me(1, 10), &pong(2, 999)),
+            PongAction::EpochJoin
+        );
+        assert_eq!(
+            classify_pong(&me(1, 999), &pong(2, 10)),
+            PongAction::EpochJoin
+        );
     }
 
     // Should not: let a height from an OLDER epoch drag us into a sync —
     // heights don't compare across epochs.
     #[test]
     fn classify_pong_never_syncs_toward_a_retired_epoch() {
-        assert_eq!(classify_pong(&me(2, 10), &pong(1, 999)), PongAction::Nothing);
+        assert_eq!(
+            classify_pong(&me(2, 10), &pong(1, 999)),
+            PongAction::Nothing
+        );
     }
 
     // Impact: the SCREAM state (RFC-025) — a same-epoch build mismatch is

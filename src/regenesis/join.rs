@@ -617,7 +617,7 @@ pub async fn epoch_join_bootstrap(
     target_epoch: u64,
     peers: &[PeerRef],
     running_code: u32,
-) -> Result<(), String> {
+) -> Result<(), crate::consensus::malachite::engine::JoinError> {
     let transport = CommsTransport {
         comms: app_state.comms.clone(),
     };
@@ -684,19 +684,38 @@ pub async fn epoch_join_bootstrap_with(
     peers: &[PeerRef],
     running_code: u32,
     transport: &dyn JoinTransport,
-) -> Result<(), String> {
+) -> Result<(), crate::consensus::malachite::engine::JoinError> {
     set_state(format!("joining epoch {target_epoch} from scratch"));
 
     // The whole chain from the first boundary: cheap (records are bytes),
     // and it leaves this node able to serve any straggler afterwards.
     let records = fetch_lineage_chain(transport, peers, 1).await?;
+
+    // Install-time anchor check (RFC-025 S5): the first record's
+    // back-pointer IS the epoch-1 chain id — the same field mesh_magic
+    // later derives the boot magic from, so agreement with the entered
+    // code holds by construction. Defense against a lying coordinator;
+    // gated on a code being present (stragglers never entered one).
+    if let Some(entered) = app_state.entered_join_code.get() {
+        let installed = records[0].record.prev_chain_id;
+        if installed[..4] != entered[..] {
+            return Err(
+                crate::consensus::malachite::engine::JoinError::AnchorMismatch {
+                    installed,
+                    entered: *entered,
+                },
+            );
+        }
+    }
+
     let target = genesis::verify_lineage_chain(&records, ChainAnchor::tofu(&records[0]))?;
     let record = &target.record;
     if record.epoch != target_epoch {
         return Err(format!(
             "mesh offered epoch {} but the coordinator said {target_epoch}",
             record.epoch
-        ));
+        )
+        .into());
     }
     if running_code != record.required_version_code {
         return Err(format!(
@@ -704,7 +723,8 @@ pub async fn epoch_join_bootstrap_with(
             record.epoch,
             crate::version::format_code(record.required_version_code),
             crate::version::format_code(running_code),
-        ));
+        )
+        .into());
     }
 
     // Reuse the straggler's staging for the download: resumable, and
@@ -758,7 +778,8 @@ pub async fn epoch_join_bootstrap_with(
                 return Err(format!(
                     "snapshot import skipped sections {:?} — refusing a partial epoch join",
                     report.skipped
-                ));
+                )
+                .into());
             }
             install_join_genesis(&tx, &block, &cert, &profile, record)?;
             crate::db::shared::commit_timed(tx).map_err(|e| format!("join commit: {e}"))?;
@@ -1530,6 +1551,58 @@ mod tests {
         assert!(!staging_path(&joiner_db).exists(), "staging cleared");
     }
 
+    // Impact: the install-time anchor check (RFC-025 S5) is the defense
+    // against a coordinator that lied in JoinInfo — the FETCHED chain's
+    // epoch-1 identity is compared against the OPERATOR's entered code,
+    // and the same field later derives the boot magic, so agreement
+    // holds by construction.
+    // Should: abort the join with the typed AnchorMismatch when the
+    // fetched back-pointer disagrees with the entered code, installing
+    // nothing.
+    // Should not: fire for a straggler that never entered a code.
+    #[test]
+    fn fresh_join_aborts_on_anchor_mismatch() {
+        let server_dir = tempfile::tempdir().unwrap();
+        let server = transitioned(server_dir.path());
+        let joiner_dir = tempfile::tempdir().unwrap();
+        let joiner_db = joiner_dir
+            .path()
+            .join("database.db")
+            .to_string_lossy()
+            .into_owned();
+        let signing = crate::db::PrivKey(ed25519_dalek::SigningKey::from_bytes(&[44u8; 32]));
+        let verifying = crate::db::PubKey(signing.0.verifying_key());
+        let app_state = crate::consensus::tests::create_test_app_state_file_backed(
+            signing, verifying, &joiner_db,
+        );
+        // The operator entered a code that does NOT match the mesh.
+        app_state
+            .entered_join_code
+            .set([0xde, 0xad, 0xbe, 0xef])
+            .unwrap();
+
+        let transport = LocalTransport::new(vec![(2, server.clone())]);
+        let err = rt()
+            .block_on(epoch_join_bootstrap_with(
+                &app_state,
+                joiner_dir.path(),
+                2,
+                &[peer(2)],
+                TARGET,
+                &transport,
+            ))
+            .expect_err("anchor mismatch must abort");
+        match err {
+            crate::consensus::malachite::engine::JoinError::AnchorMismatch { entered, .. } => {
+                assert_eq!(entered, [0xde, 0xad, 0xbe, 0xef])
+            }
+            other => panic!("expected AnchorMismatch, got {other:?}"),
+        }
+        // Nothing was imported.
+        let conn = app_state.db_pool.get().unwrap();
+        assert_eq!(genesis::current_epoch(&conn), 1);
+    }
+
     // Should: refuse to join an epoch that requires another binary.
     #[test]
     fn fresh_join_refuses_a_version_it_cannot_run() {
@@ -1558,7 +1631,7 @@ mod tests {
                 &transport,
             ))
             .expect_err("version mismatch must refuse");
-        assert!(err.contains("requires version"), "{err}");
+        assert!(err.to_string().contains("requires version"), "{err}");
         // Nothing was imported.
         let conn = app_state.db_pool.get().unwrap();
         assert_eq!(genesis::current_epoch(&conn), 1);

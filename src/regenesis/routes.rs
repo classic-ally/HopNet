@@ -405,10 +405,9 @@ pub async fn get_regenesis_status(
             // The operator-facing mesh code (RFC-025 S5): shown in the
             // Add Node flow, read by the orchestrator, entered on the
             // joining device. None pre-genesis.
-            let mesh_code =
-                crate::regenesis::genesis::mesh_magic(&conn, &crate::paths::data_dir())
-                    .ok()
-                    .map(|m| hopnet_comms::alpn::format_mesh_code(&m));
+            let mesh_code = crate::regenesis::genesis::mesh_magic(&conn, &crate::paths::data_dir())
+                .ok()
+                .map(|m| hopnet_comms::alpn::format_mesh_code(&m));
             // Empty rather than an error when the stamp table is absent
             // (legacy database parked mid-boundary): the view must keep
             // serving while an operator debugs exactly that state.

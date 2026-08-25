@@ -494,6 +494,7 @@ fn create_test_app_state_on_manager(
         orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
         comms,
         setup_complete,
+        entered_join_code: Arc::new(std::sync::OnceLock::new()),
         consensus_barriers: Arc::new(crate::consensus::barriers::new()),
         session_store: Arc::new(crate::auth::SessionStore::default()),
         takeout_runtime: Arc::new(hopnet_takeout::TakeoutRuntime::default()),

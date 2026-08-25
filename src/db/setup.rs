@@ -359,6 +359,22 @@ pub fn initialize_joining_node(
     }
 }
 
+/// Undo `initialize_joining_node` after an install-time anchor abort
+/// (RFC-025 S5): `this_node` is the ONLY persistent write the join made
+/// before the aborted install transaction, so deleting it returns the
+/// node to fresh at the next restart.
+pub fn rollback_joining_node(
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
+) -> Result<(), DatabaseError> {
+    let conn = db_connection.map_err(|_| DatabaseError::LockError)?;
+    conn.execute("DELETE FROM this_node WHERE internal_id = 1", [])
+        .map_err(|e| {
+            tracing::error!("Failed to roll back this_node: {e:?}");
+            DatabaseError::InsertError
+        })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod policy_spec_tests {
     use super::parse_policy_spec;

@@ -479,8 +479,7 @@ pub fn mesh_magic(
     conn: &rusqlite::Connection,
     data_dir: &std::path::Path,
 ) -> Result<[u8; 4], String> {
-    anchor_chain_id(conn, data_dir)
-        .map(|id| id[..4].try_into().expect("4-byte truncation of 32"))
+    anchor_chain_id(conn, data_dir).map(|id| id[..4].try_into().expect("4-byte truncation of 32"))
 }
 
 /// The trust root a lineage chain is verified from.

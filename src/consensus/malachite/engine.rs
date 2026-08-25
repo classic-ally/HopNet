@@ -496,10 +496,47 @@ pub(crate) fn spawn_tip_poll(app_state: AppState) {
 ///    engine-verified against the validator sets genesis established.
 ///
 /// Returns the tip height reached. Activation is the caller's next step.
+/// A join bootstrap failure (RFC-025 S5): the anchor mismatch is typed
+/// so the caller can roll the join back; everything else keeps the
+/// historical string shape.
+#[derive(Debug)]
+pub enum JoinError {
+    /// The FETCHED mesh identity does not match the operator-entered
+    /// code — a lying coordinator. The caller rolls back.
+    AnchorMismatch {
+        installed: [u8; 32],
+        entered: [u8; 4],
+    },
+    Other(String),
+}
+
+impl From<String> for JoinError {
+    fn from(s: String) -> Self {
+        JoinError::Other(s)
+    }
+}
+
+impl From<&str> for JoinError {
+    fn from(s: &str) -> Self {
+        JoinError::Other(s.to_string())
+    }
+}
+
+impl std::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JoinError::AnchorMismatch { .. } => {
+                write!(f, "fetched mesh identity does not match the entered code")
+            }
+            JoinError::Other(s) => write!(f, "{s}"),
+        }
+    }
+}
+
 pub async fn bootstrap_join(
     app_state: &AppState,
     join_info: &crate::types::JoinInfo,
-) -> Result<u64, String> {
+) -> Result<u64, JoinError> {
     let peers: Vec<hopnet_comms::PeerRef> = join_info
         .bootstrap_validators
         .iter()
@@ -534,7 +571,12 @@ pub async fn bootstrap_join(
             crate::version::effective_running_code(),
         )
         .await
-        .map_err(|e| format!("epoch join: {e}"))?;
+        // Preserve the typed anchor abort; everything else keeps the
+        // historical string shape.
+        .map_err(|e| match e {
+            JoinError::AnchorMismatch { .. } => e,
+            JoinError::Other(s) => JoinError::Other(format!("epoch join: {s}")),
+        })?;
     } else if !already_installed {
         let profile = QuorumProfile::parse(&join_info.quorum_profile)
             .ok_or_else(|| format!("unknown quorum profile {:?}", join_info.quorum_profile))?;
@@ -546,6 +588,21 @@ pub async fn bootstrap_join(
         )
         .await
         .map_err(|e| format!("genesis fetch: {e}"))?;
+
+        // Install-time anchor check (RFC-025 S5): the FETCHED genesis
+        // hash — the chain id about to be installed — must match the
+        // entered code. Defense against a lying coordinator, checked
+        // before the install transaction ever opens. Gated on a code
+        // being present: only fresh joins entered one.
+        if let Some(entered) = app_state.entered_join_code.get() {
+            let installed = *block.block_hash.as_bytes();
+            if installed[..4] != entered[..] {
+                return Err(JoinError::AnchorMismatch {
+                    installed,
+                    entered: *entered,
+                });
+            }
+        }
 
         let old_txs = super::app::to_old_transactions(&block.data.transactions)
             .map_err(|e| format!("genesis bridge: {e}"))?;
