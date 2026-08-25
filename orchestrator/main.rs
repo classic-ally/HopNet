@@ -691,8 +691,27 @@ async fn create_mesh(
                     }
                 }
 
-                // Register additional nodes (1, 2, 3...) with node 0
+                // Register additional nodes (1, 2, 3...) with node 0.
+                // RFC-025 S5 ORDERING: the mesh code must be adopted on
+                // each fresh container BEFORE POST /nodes — the
+                // coordinator's ping probe is an iroh dial, and a fresh
+                // endpoint is TLS-dead until adoption. The code exists
+                // only after node 0's genesis, which is why it cannot
+                // ride the container env (all containers are created
+                // before setup_node_0 runs).
                 if containers.len() > 1 {
+                    let mesh_code = match get_mesh_code(docker, mesh_id, runtime).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            println!("Failed to read the mesh code from node 0: {}", e);
+                            if !no_cleanup {
+                                cleanup_mesh_resources(docker, mesh_id, containers, &network_id)
+                                    .await;
+                            }
+                            return Err(anyhow::anyhow!("Mesh creation failed: no mesh code"));
+                        }
+                    };
+                    println!("Mesh code: {}", mesh_code);
                     for (node_index, (container_name, _container_id, _node_ip)) in
                         containers.iter().enumerate().skip(1)
                     {
@@ -702,13 +721,17 @@ async fn create_mesh(
                             node_id, container_name
                         );
 
-                        if let Err(e) = register_node_with_node_0(
-                            docker,
-                            mesh_id,
-                            node_id,
-                            container_name,
-                            runtime,
-                        )
+                        if let Err(e) = async {
+                            submit_join_code(docker, mesh_id, node_id, runtime, &mesh_code).await?;
+                            register_node_with_node_0(
+                                docker,
+                                mesh_id,
+                                node_id,
+                                container_name,
+                                runtime,
+                            )
+                            .await
+                        }
                         .await
                         {
                             println!("Failed to register node {}: {}", node_id, e);
@@ -837,6 +860,13 @@ pub(crate) async fn add_nodes_to_mesh(
     println!("Waiting for containers to be ready...");
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
+    // The mesh code (RFC-025 S5): adopted on each fresh container BEFORE
+    // registration — the coordinator's ping probe cannot complete TLS
+    // against a code-less endpoint. Same HTTP seam as create_mesh (one
+    // code path, deliberately not env).
+    let mesh_code = get_mesh_code(docker, mesh_id, runtime).await?;
+    println!("Mesh code: {}", mesh_code);
+
     // Register new nodes with node 0 (triggers catch-up based bootstrap)
     for (container_name, _container_id, _node_ip) in &new_containers {
         let node_id: u32 = naming::node_id_of(container_name)
@@ -847,6 +877,7 @@ pub(crate) async fn add_nodes_to_mesh(
             node_id, container_name
         );
 
+        submit_join_code(docker, mesh_id, node_id, runtime, &mesh_code).await?;
         if let Err(e) =
             register_node_with_node_0(docker, mesh_id, node_id, container_name, runtime).await
         {
@@ -1360,6 +1391,82 @@ pub async fn get_jwt_token(
         }
 
         tokio::time::sleep(retry_interval).await;
+    }
+}
+
+/// Read the coordinator's mesh code (RFC-025 S5) from the JWT-protected
+/// regenesis-status view. Exists only after node 0's genesis.
+pub(crate) async fn get_mesh_code(
+    docker: &Docker,
+    mesh_id: u32,
+    runtime: sys::ContainerRuntime,
+) -> Result<String> {
+    let token = get_jwt_token(docker, mesh_id, 0, runtime).await?;
+    let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
+    let (host, port) = addresses
+        .iter()
+        .find(|(id, _, _)| *id == 0)
+        .map(|(_, h, p)| (h.clone(), *p))
+        .ok_or_else(|| anyhow::anyhow!("Node 0 not found"))?;
+    let url = format!("https://{}:{}/api/views/regenesis-status", host, port);
+    let client = crate::insecure_client();
+    let body: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&token)
+        .timeout(tokio::time::Duration::from_secs(15))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    body.get("mesh_code")
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("coordinator has no mesh code yet (pre-genesis?)"))
+}
+
+/// Deliver the mesh code to a fresh container (RFC-025 S5): its endpoint
+/// is TLS-dead until the code is adopted, so this MUST land before the
+/// coordinator's POST /nodes ping probe can succeed. Open pre-setup
+/// endpoint; 204 = adopted (idempotent re-POST is fine).
+pub(crate) async fn submit_join_code(
+    docker: &Docker,
+    mesh_id: u32,
+    node_id: u32,
+    runtime: sys::ContainerRuntime,
+    code: &str,
+) -> Result<()> {
+    let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
+    let (host, port) = addresses
+        .iter()
+        .find(|(id, _, _)| *id == node_id)
+        .map(|(_, h, p)| (h.clone(), *p))
+        .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
+    let url = format!("https://{}:{}/api/setup/join-code", host, port);
+    let client = crate::insecure_client();
+    let start = std::time::Instant::now();
+    loop {
+        match client
+            .post(&url)
+            .json(&json!({ "code": code }))
+            .timeout(tokio::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status() == reqwest::StatusCode::NO_CONTENT => return Ok(()),
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow::anyhow!(
+                    "join-code POST to node {node_id} refused: {status} {body}"
+                ));
+            }
+            Err(e) if start.elapsed() < std::time::Duration::from_secs(15) => {
+                tracing::debug!("join-code POST to node {node_id} not ready ({e}); retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(anyhow::anyhow!("join-code POST to node {node_id}: {e}")),
+        }
     }
 }
 
