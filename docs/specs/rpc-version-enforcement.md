@@ -632,9 +632,47 @@ it as an ordinary upgrade regenesis. S-final trails independently
       containers before genesis, so env cannot carry it). S1's
       pre-enforcement legacy mode retires with its producers; real
       legacy stragglers ride the magic-Some generation-0 tier.
-- [ ] S6 — orchestrator gates: the mixed-version mesh, the
+- [x] S6 — orchestrator gates: the mixed-version mesh, the
       boundary crossing with a live straggler, the
-      retired-generation dialer
+      retired-generation dialer. As built: three scenarios —
+      `mixed-version-mesh` (the version seam on one seat: locked
+      refused with the defuser/prober screams as log contracts,
+      compat answering with the pong provably refreshing, the two
+      clocks split, VersionSkew named on BOTH sides' views — and
+      the vote-out ASSERTED rather than raced: a pong-visible
+      skewed validator still loses its seat, then auto-readmission
+      re-seats the restored binary), `retired-dialer` (a raw
+      host-side endpoint offering generation 0 receives the
+      structured `COMPAT_RETIRED` close naming the floor, with a
+      locked-family control dial proving only the retired tier
+      rejects), and `enforcement-crossing` (a mesh born on the
+      pre-enforcement release crosses into this build with a LIVE
+      straggler: parked alive and G0-visible/locked-dark through
+      the window, then activates and rejoins — S7 end to end over
+      enforced ALPNs). Two constructions make the retired tier
+      reachable at head=1: `alpn::effective_compat_head()` — the
+      version seam's twin (`HOPNET_UPGRADE_COMPAT_HEAD_OVERRIDE`,
+      test-mode + `iroh`-feature gated, clamped to never regress
+      below the compiled head; accept/advertise ONLY, dispatch
+      above the compiled head is undefined; every host window
+      reader routes through `evidence::local_window()` so the
+      diagnosed window always matches the enforced one) — and a
+      FRESH code-adopted, never-registered target (the hook names
+      strangers `REJECT_UNKNOWN_NODE` before the tier check by
+      design; pre-setup the directory answers is_known
+      unconditionally, exposing the tier). Gate findings, both
+      fixed in-slice: a restored peer wore the skew banner forever
+      (no probe refreshes a fresh-contact peer's stamp — newer
+      locked contact now supersedes a stale stamp's claim, by ALPN
+      construction), and old-image mesh creation died on the S5
+      join-code channel (get_mesh_code now treats an ABSENT
+      mesh_code field as "pre-enforcement image, register
+      directly"). The mesh relay's :3340 is host-mapped so raw
+      host-side dialers reach mesh members (rootless podman has no
+      host→container route). The enforcement release's runbook
+      entry (RFC-020 S7 ledger) still needs its two lines — the
+      crossing rides compat generation 0, and Add Node requires
+      the mesh code — they belong to that release, not this PR.
 - [!] S-final — crossing-time advisory: `COMPAT_HEAD` in the
       NodeStagedVersion attestation, the `nodes` column, and the
       advisory's below-window report. Blocked on RFC-020 (the

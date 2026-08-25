@@ -181,7 +181,7 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     joins through the pre-split artifact). All slices complete; only
     the live-mesh crossing remains — release choreography in the S7
     ledger entry.
-  - **RFC-025 S1–S5 landed (WIP branch)**
+  - **RFC-025 S1–S6 landed (WIP branch)**
     ([RFC-025](specs/rpc-version-enforcement.md), Draft 2026-08-17):
     RPC version enforcement — locked scopes refuse mixed-version
     peers at the ALPN (mesh magic + exact CalVer), compat scopes
@@ -214,8 +214,13 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     anchor, pre-flighted before any write, with the install-time
     check + rollback against a lying coordinator; the coordinator
     surfaces the code in Add Node and the orchestrator delivers it
-    over the same HTTP seam. Next: S6 (orchestrator gates). One PR
-    (S1–S6), the following release is the enforcement cutover.
+    over the same HTTP seam. S6 (orchestrator gates): the
+    mixed-version-mesh, retired-dialer, and enforcement-crossing
+    scenarios — the version/head override seams, a live straggler
+    riding generation 0 across the real severance boundary, and the
+    vote-out of a pong-visible skewed seat asserted as behaviour.
+    Next: merge — the following release is the enforcement cutover
+    (one PR, S1–S6).
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`
