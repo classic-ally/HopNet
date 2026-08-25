@@ -331,6 +331,14 @@ pub fn seen_age(view: Option<&PeerEvidenceView>, origin: Instant, now: Instant) 
 /// awaiting_upgrade precedent: a predicate over persistent state, never
 /// a stored flag — the next matched pong overwrites the stamp and the
 /// rows vanish). Shared by the evidence route and the resilience view.
+///
+/// A stamp is also superseded by NEWER LOCKED CONTACT: completing a
+/// locked exchange proves the peer runs our exact code by ALPN
+/// construction, so a mismatched pong older than the contact is history,
+/// not evidence. Without this, a restored peer would wear the skew
+/// banner forever — its fresh contact keeps the prober away, so no
+/// matched pong ever arrives to overwrite the stale stamp (found by the
+/// S6 mixed-version gate).
 pub fn version_banner_rows(
     snap: &[(i32, PeerEvidenceView)],
     local_version: u32,
@@ -347,6 +355,9 @@ pub fn version_banner_rows(
         let Some(stamp) = view.last_pong else {
             continue;
         };
+        if view.last_contact > stamp.at {
+            continue;
+        }
         match stamp.window {
             Some((peer_floor, peer_head)) if compat_head < peer_floor => {
                 stranded.push(hopnet_common::views::StrandedPeer {
@@ -1220,17 +1231,22 @@ pub async fn get_evidence(State(app_state): State<crate::AppState>) -> impl Into
                 "last_known_height": view.and_then(|v| v.last_known_height),
                 "pong": view.and_then(|v| v.last_pong).map(|stamp| {
                     let (floor, head) = stamp.window.unzip();
+                    // Locked contact newer than the stamp proves the
+                    // peer's version by ALPN construction — the stale
+                    // claim is superseded (version_banner_rows' rule).
+                    let superseded = view.is_some_and(|v| v.last_contact > stamp.at);
                     serde_json::json!({
                         "age_ms": now.saturating_duration_since(stamp.at).as_millis() as u64,
                         "version": crate::version::format_code(stamp.version_code),
                         "epoch": stamp.epoch,
                         "floor": floor,
                         "head": head,
-                        "skew": stamp.version_code != local_version,
-                        "stranded": match stamp.window {
-                            Some((peer_floor, _)) => local_window().1 < peer_floor,
-                            None => local_window().0 > 0,
-                        },
+                        "skew": stamp.version_code != local_version && !superseded,
+                        "stranded": !superseded
+                            && match stamp.window {
+                                Some((peer_floor, _)) => local_window().1 < peer_floor,
+                                None => local_window().0 > 0,
+                            },
                     })
                 }),
             })
@@ -1398,6 +1414,49 @@ mod tests {
         assert_eq!(stranded_rows.len(), 1);
         assert_eq!(stranded_rows[0].node_id, 3);
         assert_eq!(stranded_rows[0].floor, 2);
+    }
+
+    // Impact: without supersession a restored peer wears the skew banner
+    // FOREVER — its fresh locked contact keeps the prober away, so no
+    // matched pong ever overwrites the stale stamp (found by the S6
+    // mixed-version gate). A locked exchange proves the peer's version
+    // by ALPN construction.
+    // Should: drop a mismatched pong's skew row (and a disjoint window's
+    // stranded row) once locked contact is newer than the stamp.
+    // Should not: let contact recorded BEFORE the stamp supersede it.
+    #[test]
+    fn newer_locked_contact_supersedes_a_stale_stamp() {
+        let now = Instant::now();
+        let stamp_at = now - Duration::from_secs(60);
+        let mismatched = PongStamp {
+            at: stamp_at,
+            epoch: 1,
+            version_code: 20270101,
+            window: Some((0, 1)),
+        };
+        let disjoint = PongStamp {
+            at: stamp_at,
+            epoch: 1,
+            version_code: 20270101,
+            window: Some((2, 3)),
+        };
+
+        // Contact AFTER the stamp: both rows vanish.
+        let mut recovered_skew = view(now - Duration::from_secs(2));
+        recovered_skew.last_pong = Some(mismatched);
+        let mut recovered_stranded = view(now - Duration::from_secs(2));
+        recovered_stranded.last_pong = Some(disjoint);
+        let snap = vec![(1, recovered_skew), (2, recovered_stranded)];
+        let (skew, stranded_rows) = version_banner_rows(&snap, 20260806, 0, 1, now);
+        assert!(skew.is_empty());
+        assert!(stranded_rows.is_empty());
+
+        // Contact BEFORE the stamp: the claims stand.
+        let mut still_skewed = view(now - Duration::from_secs(120));
+        still_skewed.last_pong = Some(mismatched);
+        let snap = vec![(1, still_skewed)];
+        let (skew, _) = version_banner_rows(&snap, 20260806, 0, 1, now);
+        assert_eq!(skew.len(), 1);
     }
 
     // Impact: this row WAS the production rejoin deadlock — a voted-out
