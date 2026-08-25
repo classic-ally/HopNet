@@ -266,7 +266,15 @@ pub struct JoinInfo {
     /// The epoch the joiner is entering (RFC-019 S7). Epoch 1 takes the
     /// trusted height-0 bootstrap; anything later takes the epoch-join
     /// path, which fetches and verifies the lineage chain and imports the
-    /// boundary snapshot. Nothing else is needed as an anchor: the first
-    /// record's back-pointer IS epoch 1's chain id.
+    /// boundary snapshot.
     pub epoch: u64,
+    /// The FULL anchor (epoch-1) chain id (RFC-025 S5). `anchor[..4]` IS
+    /// the mesh magic / join code; the joiner pre-flights it against the
+    /// operator-entered code before writing anything, and the
+    /// install-time check verifies the FETCHED state against the code
+    /// independently (a lying coordinator aborts there). Appended last —
+    /// legal on positional bincode because the setup scope is
+    /// locked-class: both ends run the same release by ALPN
+    /// construction.
+    pub anchor: [u8; 32],
 }

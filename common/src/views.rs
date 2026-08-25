@@ -255,6 +255,10 @@ pub struct RegenesisStatusView {
     /// node already known good and passed to the node being recovered.
     /// Public knowledge — every peer in the mesh signs against it.
     pub chain_id: String,
+    /// The mesh code (RFC-025 S5): the anchor chain id's 4-byte
+    /// truncation as XXXX-XXXX — read off the Add Node dialog, entered
+    /// on the joining device to bind its endpoint. None pre-genesis.
+    pub mesh_code: Option<String>,
     /// The version this binary effectively runs.
     pub running_version: String,
     /// Sealed for a version this binary does not run: the node is parked

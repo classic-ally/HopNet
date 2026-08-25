@@ -440,16 +440,20 @@ pub fn lowest_lineage_epoch(data_dir: &std::path::Path) -> Option<u64> {
 /// lowest lineage record's back-pointer. Fail-stop policy belongs to
 /// the caller: the host panics at boot, because a wrong or absent magic
 /// on a live member is a silent TLS partition.
-pub fn mesh_magic(
+/// The FULL anchor (epoch-1) chain id: consensus_meta's chain id at
+/// epoch 1, the lowest lineage record's back-pointer past a boundary.
+/// [`mesh_magic`] is its 4-byte truncation; JoinInfo carries the whole
+/// thing so a joiner can pre-flight its entered code (RFC-025 S5).
+pub fn anchor_chain_id(
     conn: &rusqlite::Connection,
     data_dir: &std::path::Path,
-) -> Result<[u8; 4], String> {
-    let anchor_id: [u8; 32] = if current_epoch(conn) == 1 {
+) -> Result<[u8; 32], String> {
+    if current_epoch(conn) == 1 {
         store::meta_get(conn, store::META_CHAIN_ID)
             .map_err(|e| format!("chain id: {e}"))?
             .ok_or("no chain id in consensus_meta (epoch 1)")?
             .try_into()
-            .map_err(|_| "malformed chain id".to_string())?
+            .map_err(|_| "malformed chain id".to_string())
     } else {
         // The lowest lineage record is ALWAYS epoch 2: every join
         // fetches the chain from epoch 1 (epoch_join_bootstrap_with)
@@ -465,11 +469,18 @@ pub fn mesh_magic(
                  the epoch-1 chain id is unreachable"
             ));
         }
-        read_lineage(&lineage_path(data_dir, lowest))?
+        Ok(read_lineage(&lineage_path(data_dir, lowest))?
             .record
-            .prev_chain_id
-    };
-    Ok(anchor_id[..4].try_into().expect("4-byte truncation of 32"))
+            .prev_chain_id)
+    }
+}
+
+pub fn mesh_magic(
+    conn: &rusqlite::Connection,
+    data_dir: &std::path::Path,
+) -> Result<[u8; 4], String> {
+    anchor_chain_id(conn, data_dir)
+        .map(|id| id[..4].try_into().expect("4-byte truncation of 32"))
 }
 
 /// The trust root a lineage chain is verified from.

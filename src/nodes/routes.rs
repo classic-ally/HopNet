@@ -192,10 +192,23 @@ pub async fn post_nodes(
 
     // Get current consensus height, quorum profile, and bootstrap validators
     // on a single connection checkout.
-    let (current_height, quorum_profile, bootstrap_validators, epoch) = {
+    let (current_height, quorum_profile, bootstrap_validators, epoch, anchor) = {
         let mut conn = match app_state.db_pool.get() {
             Ok(c) => c,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        // The anchor (epoch-1) chain id rides JoinInfo so the joiner can
+        // pre-flight its entered mesh code before writing anything
+        // (RFC-025 S5).
+        let anchor = match crate::regenesis::genesis::anchor_chain_id(
+            &conn,
+            &crate::paths::data_dir(),
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("anchor chain id for JoinInfo: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
         };
         let profile =
             hopnet_consensus::store::meta_get(&conn, hopnet_consensus::store::META_QUORUM_PROFILE)
@@ -224,7 +237,7 @@ pub async fn post_nodes(
             }
         };
         let epoch = crate::regenesis::genesis::current_epoch(&conn);
-        (height, profile, validators, epoch)
+        (height, profile, validators, epoch, anchor)
     };
 
     // Create JoinInfo structure
@@ -234,6 +247,7 @@ pub async fn post_nodes(
         bootstrap_validators,
         quorum_profile,
         epoch,
+        anchor,
     };
 
     ///////////////
