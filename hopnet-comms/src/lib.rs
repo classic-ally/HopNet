@@ -92,6 +92,10 @@ pub enum ProtocolError {
     PeerError(String),
     MalformedResponse(String),
     MessageTooLarge(usize),
+    /// RFC-025 S5: this endpoint has no mesh identity yet (the join
+    /// code was never entered) — dials are structurally impossible.
+    /// Not a refusal: nothing refused us. Non-retryable.
+    EndpointDeferred,
 }
 
 impl CommsError {
@@ -157,6 +161,12 @@ impl std::fmt::Display for ProtocolError {
             ProtocolError::PeerError(msg) => write!(f, "peer error: {}", msg),
             ProtocolError::MalformedResponse(msg) => write!(f, "malformed response: {}", msg),
             ProtocolError::MessageTooLarge(size) => write!(f, "message too large: {} bytes", size),
+            ProtocolError::EndpointDeferred => {
+                write!(
+                    f,
+                    "endpoint deferred: no mesh magic adopted (join code not entered)"
+                )
+            }
         }
     }
 }

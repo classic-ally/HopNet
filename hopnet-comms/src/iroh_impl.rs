@@ -140,51 +140,60 @@ pub use iroh::EndpointAddr;
 /// impersonate a legacy dialer (generation 0 — RFC-025 §Evolution).
 pub const HOPNET_ALPN: &[u8] = alpn::LEGACY_ALPN;
 
-/// The node's ALPN identity, settled once at bind (RFC-025 §The ALPN
-/// Scheme: every string known at bind, no committed-state reads).
-/// `magic: None` is pre-enforcement mode — legacy ALPN only, every scope
-/// served, speaking the GENERATION-0 vocabulary on compat scopes (it IS
-/// the pre-enforcement world; S2 derives the magic from the anchor; S5
-/// gates bind on join-code entry).
+/// The node's ALPN identity. The code and window are settled at bind
+/// (RFC-025 §The ALPN Scheme: every string known at bind, no
+/// committed-state reads); the magic is settled at bind for set-up
+/// nodes and ADOPTED at join-code entry for fresh ones (S5). Unadopted
+/// = DEFERRED: an empty ALPN serve list (TLS-dead inbound — QUIC's
+/// strict ALPN fatals any offer against an empty list) and every dial
+/// errors. A drive-by JoinDeliver cannot complete TLS before the
+/// operator enters the mesh code.
 pub(crate) struct AlpnIdentity {
-    magic: Option<[u8; 4]>,
+    magic: OnceLock<[u8; 4]>,
     code: u32,
     head: u32,
 }
 
 impl AlpnIdentity {
     fn new(magic: Option<[u8; 4]>) -> Self {
+        let cell = OnceLock::new();
+        if let Some(m) = magic {
+            let _ = cell.set(m);
+        }
         Self {
-            magic,
+            magic: cell,
             code: hopnet_common::version::effective_running_code(),
             head: alpn::COMPAT_HEAD,
         }
     }
 
     fn serve_list(&self) -> Vec<Vec<u8>> {
-        match &self.magic {
+        match self.magic.get() {
             Some(magic) => alpn::serve_list(magic, self.code, self.head),
-            None => vec![alpn::LEGACY_ALPN.to_vec()],
+            None => Vec::new(),
         }
     }
 
-    /// Accept-tier classification of a negotiated ALPN. Pre-enforcement
-    /// mode serves only the legacy string, so anything negotiated is
-    /// generation 0 by construction.
+    /// Accept-tier classification of a negotiated ALPN. Deferred mode
+    /// serves nothing, so no connection can reach this — defensive
+    /// Unknown.
     fn classify(&self, alpn_bytes: &[u8]) -> AcceptTier {
-        match &self.magic {
+        match self.magic.get() {
             Some(magic) => alpn::classify_accept(magic, self.code, self.head, alpn_bytes),
-            None => AcceptTier::ServedCompat(0),
+            None => AcceptTier::Unknown,
         }
     }
 
     /// The generation a DIALED connection's negotiated ALPN commits both
     /// sides to. Compat connections only by contract; a locked ALPN here
     /// is a caller bug — answer head (the locked family always speaks
-    /// head vocabulary) and note it.
+    /// head vocabulary) and note it. Deferred cannot have dialed.
     fn generation_of(&self, alpn_bytes: &[u8]) -> u32 {
-        match &self.magic {
-            None => 0,
+        match self.magic.get() {
+            None => {
+                tracing::debug!("generation_of on a deferred endpoint");
+                self.head
+            }
             Some(magic) => match alpn::parse_alpn(magic, alpn_bytes) {
                 alpn::ParsedAlpn::Compat(g) => g,
                 parsed => {
@@ -197,12 +206,11 @@ impl AlpnIdentity {
 }
 
 /// The class of an ACCEPTED connection, read once from the negotiated
-/// ALPN and threaded through dispatch. Locked and pre-enforcement
-/// connections serve every scope; a compat connection serves only
-/// compat-class scopes plus the transport ping (RFC-025 §Scope Classes).
+/// ALPN and threaded through dispatch. Locked connections serve every
+/// scope; a compat connection serves only compat-class scopes plus the
+/// transport ping (RFC-025 §Scope Classes).
 #[derive(Debug, Clone, Copy)]
 enum ConnClass {
-    PreEnforcement,
     Locked,
     Compat(u32),
 }
@@ -212,7 +220,6 @@ enum ConnClass {
 /// negotiated ALPN, not the key, is the codec authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ConnKey {
-    Legacy,
     Locked,
     Compat,
 }
@@ -226,26 +233,24 @@ enum DialPlan {
 }
 
 impl AlpnIdentity {
-    fn conn_key(&self, class: ScopeClass) -> ConnKey {
-        match (&self.magic, class) {
-            (None, _) => ConnKey::Legacy,
-            (Some(_), ScopeClass::Locked) => ConnKey::Locked,
-            (Some(_), ScopeClass::Compat) => ConnKey::Compat,
-        }
-    }
-
-    fn dial_plan(&self, class: ScopeClass) -> DialPlan {
-        match (&self.magic, class) {
-            (None, _) => DialPlan::Single(alpn::LEGACY_ALPN.to_vec()),
-            (Some(magic), ScopeClass::Locked) => {
-                DialPlan::Single(alpn::locked_alpn(magic, self.code))
-            }
-            (Some(magic), ScopeClass::Compat) => {
+    /// Cache key + dial plan from ONE read of the magic — no torn read
+    /// across a concurrent adoption. Deferred → error: nothing may dial
+    /// before the mesh identity exists.
+    fn dial_identity(&self, class: ScopeClass) -> Result<(ConnKey, DialPlan), CommsError> {
+        let Some(magic) = self.magic.get() else {
+            return Err(CommsError::Protocol(ProtocolError::EndpointDeferred));
+        };
+        Ok(match class {
+            ScopeClass::Locked => (
+                ConnKey::Locked,
+                DialPlan::Single(alpn::locked_alpn(magic, self.code)),
+            ),
+            ScopeClass::Compat => {
                 let mut offer = alpn::compat_offer(magic, self.head);
                 let head = offer.remove(0);
-                DialPlan::Multi { head, rest: offer }
+                (ConnKey::Compat, DialPlan::Multi { head, rest: offer })
             }
-        }
+        })
     }
 }
 
@@ -462,9 +467,10 @@ pub struct BindOptions {
     /// address to it. Reading the env var is host policy, not comms'.
     pub relay_url: Option<String>,
     /// Mesh magic (RFC-025): the 4-byte truncation of the anchor chain
-    /// id. None = pre-enforcement mode — bind and dial the legacy
-    /// `hopnet/1.0` only, all scopes served. S2 derives it from the
-    /// anchor at boot; S5 gates bind on join-code entry.
+    /// id. Set-up nodes derive it at boot and pass Some. None = DEFERRED
+    /// (S5): the endpoint binds with an EMPTY ALPN serve list — TLS-dead
+    /// inbound, dials error — until [`IrohComms::adopt_magic`] installs
+    /// the identity at join-code entry.
     pub magic: Option<[u8; 4]>,
 }
 
@@ -626,6 +632,44 @@ impl IrohComms {
                 }
             }
         });
+    }
+
+    /// Adopt the mesh magic on a deferred endpoint (RFC-025 S5): sets
+    /// the interior-mutable identity, swaps the served ALPN list onto
+    /// the live endpoint (inbound-only — `set_alpns`; outbound dials
+    /// read the identity per dial), and clears the connection cache
+    /// (defensively — deferred dials error and deferred inbound is
+    /// TLS-dead, so nothing can have been cached). Once-only: the first
+    /// adoption wins; repeating the SAME magic is Ok (idempotent
+    /// re-entry); a DIFFERENT magic errors — the identity is settled
+    /// for the process lifetime, restart to re-enter.
+    pub async fn adopt_magic(&self, magic: [u8; 4]) -> Result<(), CommsError> {
+        match self.identity.magic.set(magic) {
+            Ok(()) => {
+                self.endpoint.set_alpns(self.identity.serve_list());
+                let mut connections = self.connections.write().await;
+                if !connections.is_empty() {
+                    tracing::warn!(
+                        "connection cache non-empty at magic adoption ({} entries)",
+                        connections.len()
+                    );
+                }
+                connections.clear();
+                Ok(())
+            }
+            Err(_) => {
+                let settled = self.identity.magic.get().copied();
+                if settled == Some(magic) {
+                    Ok(())
+                } else {
+                    Err(CommsError::Protocol(ProtocolError::ValueMismatch {
+                        field: "mesh_magic",
+                        expected: format!("{:02x?}", settled),
+                        got: format!("{magic:02x?}"),
+                    }))
+                }
+            }
+        }
     }
 
     /// This endpoint's public key bytes.
@@ -821,19 +865,11 @@ impl IrohComms {
         addr: EndpointAddr,
     ) -> Result<(), CommsError> {
         self.addr_hints.write().await.insert(node_id, addr.clone());
-        let class = ScopeClass::Locked;
+        let (key, plan) = self.identity.dial_identity(ScopeClass::Locked)?;
         let conn = self
-            .dial_bounded(
-                addr,
-                self.identity.dial_plan(class),
-                CONNECTION_TIMEOUT,
-                node_id,
-            )
+            .dial_bounded(addr, plan, CONNECTION_TIMEOUT, node_id)
             .await?;
-        self.connections
-            .write()
-            .await
-            .insert((node_id, self.identity.conn_key(class)), conn);
+        self.connections.write().await.insert((node_id, key), conn);
         Ok(())
     }
 
@@ -846,7 +882,8 @@ impl IrohComms {
         connect_budget: Duration,
         class: ScopeClass,
     ) -> Result<Connection, CommsError> {
-        let key = (peer.node_id, self.identity.conn_key(class));
+        let (conn_key, plan) = self.identity.dial_identity(class)?;
+        let key = (peer.node_id, conn_key);
         {
             let connections = self.connections.read().await;
             if let Some(conn) = connections.get(&key) {
@@ -876,12 +913,7 @@ impl IrohComms {
             }
         };
         let conn = self
-            .dial_bounded(
-                dial_addr,
-                self.identity.dial_plan(class),
-                connect_budget,
-                peer.node_id,
-            )
+            .dial_bounded(dial_addr, plan, connect_budget, peer.node_id)
             .await?;
         if matches!(class, ScopeClass::Compat) {
             tracing::debug!(
@@ -1034,21 +1066,20 @@ impl IrohComms {
         // The negotiated ALPN, read once per connection, is the class every
         // stream on it dispatches under (RFC-025 §Scope Classes). The hook
         // already rejected retired/unknown tiers; a disagreement here is a
-        // transport bug — refuse rather than misdispatch.
-        let conn_class = match &self.identity.magic {
-            None => ConnClass::PreEnforcement,
-            Some(_) => match self.identity.classify(conn.alpn()) {
-                AcceptTier::ServedLocked => ConnClass::Locked,
-                AcceptTier::ServedCompat(generation) => ConnClass::Compat(generation),
-                tier => {
-                    tracing::warn!(
-                        "dropping connection from node {} on unserved ALPN tier {:?}",
-                        peer.node_id,
-                        tier
-                    );
-                    return Ok(());
-                }
-            },
+        // transport bug — refuse rather than misdispatch. A deferred
+        // endpoint serves an empty ALPN list, so nothing can negotiate:
+        // classify's deferred arm (Unknown) makes any arrival here drop.
+        let conn_class = match self.identity.classify(conn.alpn()) {
+            AcceptTier::ServedLocked => ConnClass::Locked,
+            AcceptTier::ServedCompat(generation) => ConnClass::Compat(generation),
+            tier => {
+                tracing::warn!(
+                    "dropping connection from node {} on unserved ALPN tier {:?}",
+                    peer.node_id,
+                    tier
+                );
+                return Ok(());
+            }
         };
         tracing::debug!(
             "accepted iroh connection from node {} ({:?})",
@@ -1131,13 +1162,11 @@ impl IrohComms {
                 ScopeKind::Rpc { head, prev } => {
                     // Generation-keyed dispatch (RFC-025 §Evolution): the
                     // negotiated ALPN is the codec authority for every
-                    // stream on the connection. Pre-enforcement mode IS
-                    // the generation-0 world; a matched peer's locked
+                    // stream on the connection; a matched peer's locked
                     // connection speaks head.
                     let handler = if entry.class == ScopeClass::Compat {
                         let generation = match conn_class {
                             ConnClass::Compat(g) => g,
-                            ConnClass::PreEnforcement => 0,
                             ConnClass::Locked => self.identity.head,
                         };
                         if generation == self.identity.head {
@@ -1354,12 +1383,26 @@ mod tests {
         server_directory: Arc<dyn PeerDirectory>,
         scopes: ScopeRegistry,
     ) -> (IrohComms, IrohComms, PeerRef) {
-        let a = IrohComms::bind(rand::random(), Arc::new(AllowAll), BindOptions::default())
-            .await
-            .unwrap();
-        let b = IrohComms::bind(rand::random(), server_directory, BindOptions::default())
-            .await
-            .unwrap();
+        let a = IrohComms::bind(
+            rand::random(),
+            Arc::new(AllowAll),
+            BindOptions {
+                relay_url: None,
+                magic: Some([0x9f, 0x3a, 0x01, 0xcc]),
+            },
+        )
+        .await
+        .unwrap();
+        let b = IrohComms::bind(
+            rand::random(),
+            server_directory,
+            BindOptions {
+                relay_url: None,
+                magic: Some([0x9f, 0x3a, 0x01, 0xcc]),
+            },
+        )
+        .await
+        .unwrap();
         b.start(scopes);
         a.start(ScopeRegistry::new());
         let peer_b = PeerRef {
@@ -1447,12 +1490,26 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
             }),
         );
-        let a = IrohComms::bind(rand::random(), Arc::new(AllowAll), BindOptions::default())
-            .await
-            .unwrap();
-        let b = IrohComms::bind(rand::random(), Arc::new(DenyAll), BindOptions::default())
-            .await
-            .unwrap();
+        let a = IrohComms::bind(
+            rand::random(),
+            Arc::new(AllowAll),
+            BindOptions {
+                relay_url: None,
+                magic: Some([0x9f, 0x3a, 0x01, 0xcc]),
+            },
+        )
+        .await
+        .unwrap();
+        let b = IrohComms::bind(
+            rand::random(),
+            Arc::new(DenyAll),
+            BindOptions {
+                relay_url: None,
+                magic: Some([0x9f, 0x3a, 0x01, 0xcc]),
+            },
+        )
+        .await
+        .unwrap();
         b.start(scopes);
         let peer_b = PeerRef {
             node_id: 2,
@@ -1523,11 +1580,19 @@ mod tests {
     /// Bind with an injected ALPN identity — the only way to vary code or
     /// COMPAT_HEAD in-process (both are compile-time in production).
     async fn bind_for_test(magic: Option<[u8; 4]>, code: u32, head: u32) -> IrohComms {
+        let cell = OnceLock::new();
+        if let Some(m) = magic {
+            let _ = cell.set(m);
+        }
         IrohComms::bind_with_identity(
             rand::random(),
             Arc::new(AllowAll),
             None,
-            AlpnIdentity { magic, code, head },
+            AlpnIdentity {
+                magic: cell,
+                code,
+                head,
+            },
         )
         .await
         .unwrap()
@@ -1651,47 +1716,88 @@ mod tests {
         assert_eq!(prev_calls.load(Ordering::SeqCst), 0);
     }
 
-    // Impact: pins D2 — pre-enforcement mode IS the generation-0 world,
-    // so a real legacy straggler probing a magic-None enforcement binary
-    // receives generation-0 bytes it can decode.
-    // Should: serve compat scopes with the prev handler and locked scopes
-    // with the head handler when both peers run pre-enforcement mode.
+    // Impact: the S5 bind gate — a fresh node with no adopted mesh
+    // identity must be unreachable at TLS (a drive-by JoinDeliver cannot
+    // reach any HopNet code) and structurally unable to dial; adoption
+    // brings both up without a rebind.
+    // Should: refuse every dial INTO a deferred endpoint, error every
+    // dial FROM it with EndpointDeferred (no retry burn), and serve both
+    // families normally after adopt_magic.
     #[tokio::test(flavor = "multi_thread")]
-    async fn pre_enforcement_serves_generation_zero_vocabulary() {
-        let head_calls = Arc::new(AtomicUsize::new(0));
-        let prev_calls = Arc::new(AtomicUsize::new(0));
-        let locked_calls = Arc::new(AtomicUsize::new(0));
-        let mut scopes = compat_echo_windowed(&head_calls, &prev_calls);
-        scopes.rpc(
-            "lk",
-            Arc::new(Echo {
-                calls: locked_calls.clone(),
-            }),
-        );
-        let a = bind_for_test(None, CODE, 1).await;
-        let b = bind_for_test(None, CODE, 1).await;
-        b.start(scopes);
+    async fn deferred_endpoint_is_tls_dead_until_adopted() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let a = bind_for_test(Some(MAGIC), CODE, 1).await;
+        let b = bind_for_test(None, CODE, 1).await; // deferred
+        b.start(compat_echo(&calls));
         a.start(compat_echo(&Arc::new(AtomicUsize::new(0))));
+        let peer_a = PeerRef {
+            node_id: 1,
+            pubkey: a.local_pubkey(),
+        };
+
+        // Inbound to the deferred node: no negotiable protocol.
+        assert!(
+            a.connect_to_addr(2, loopback_addr(&b)).await.is_err(),
+            "an enforcement dialer must not reach a deferred endpoint"
+        );
+
+        // Outbound from the deferred node: structurally impossible.
+        match b.connect_to_addr(1, loopback_addr(&a)).await {
+            Err(CommsError::Protocol(ProtocolError::EndpointDeferred)) => {}
+            other => panic!("expected EndpointDeferred, got {other:?}"),
+        }
+        match b
+            .rpc(&peer_a, "st", b"x".to_vec(), Duration::from_secs(2))
+            .await
+        {
+            Err(CommsError::Protocol(ProtocolError::EndpointDeferred)) => {}
+            other => panic!("expected EndpointDeferred, got {other:?}"),
+        }
+
+        // Adoption: same magic → both directions come up, no rebind.
+        b.adopt_magic(MAGIC).await.unwrap();
         let peer_b = PeerRef {
             node_id: 2,
             pubkey: b.local_pubkey(),
         };
         a.connect_to_addr(2, loopback_addr(&b)).await.unwrap();
+        let reply = a
+            .rpc(&peer_b, "st", b"up".to_vec(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(reply, b"up");
+        b.connect_to_addr(1, loopback_addr(&a)).await.unwrap();
+        b.rpc(&peer_a, "st", b"back".to_vec(), Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
 
-        a.rpc(&peer_b, "st", b"x".to_vec(), Duration::from_secs(5))
-            .await
-            .unwrap();
-        a.rpc(&peer_b, "lk", b"y".to_vec(), Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert_eq!(prev_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(head_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(locked_calls.load(Ordering::SeqCst), 1);
+    // Impact: the identity is settled for the process lifetime — a
+    // conflicting second code must error (restart is the re-entry path),
+    // while the orchestrator's idempotent re-POST must stay Ok.
+    // Should: accept the same magic again and refuse a different one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adopt_magic_is_once_only() {
+        let b = bind_for_test(None, CODE, 1).await;
+        b.adopt_magic(MAGIC).await.unwrap();
+        b.adopt_magic(MAGIC).await.unwrap(); // idempotent
+        match b.adopt_magic([0x01, 0x02, 0x03, 0x04]).await {
+            Err(CommsError::Protocol(ProtocolError::ValueMismatch { field, .. })) => {
+                assert_eq!(field, "mesh_magic");
+            }
+            other => panic!("expected ValueMismatch, got {other:?}"),
+        }
+        // Adoption on an already-Some (set-up) endpoint follows the same
+        // rule: same magic Ok, different errors.
+        let c = bind_for_test(Some(MAGIC), CODE, 1).await;
+        c.adopt_magic(MAGIC).await.unwrap();
+        assert!(c.adopt_magic([0x0a; 4]).await.is_err());
     }
 
     // Should: report the generation the negotiated ALPN commits both
     // sides to — head between matched enforcement peers, zero when the
-    // server (or the dialer itself) is pre-enforcement.
+    // compat dial fell through to the legacy string (mismatched magic:
+    // the gen-0 cutover caveat).
     #[tokio::test(flavor = "multi_thread")]
     async fn rpc_negotiated_reports_the_connection_generation() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1712,8 +1818,9 @@ mod tests {
             .unwrap();
         assert_eq!(generation, 1);
 
-        // Enforcement dialer reaching a pre-enforcement server → 0.
-        let c = bind_for_test(None, CODE, 1).await;
+        // A different-magic server: the compat offer's only mutual
+        // protocol is the magic-less legacy string → generation 0.
+        let c = bind_for_test(Some([0x01, 0x02, 0x03, 0x04]), CODE, 1).await;
         c.start(compat_echo(&calls));
         let peer_c = PeerRef {
             node_id: 3,
@@ -1722,16 +1829,6 @@ mod tests {
         a.connect_to_addr(3, loopback_addr(&c)).await.ok();
         let (_, generation) = a
             .rpc_negotiated(&peer_c, "st", b"x".to_vec(), Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert_eq!(generation, 0);
-
-        // Pre-enforcement dialer → 0 by construction.
-        let d = bind_for_test(None, CODE, 1).await;
-        d.start(ScopeRegistry::new());
-        d.connect_to_addr(2, loopback_addr(&b)).await.unwrap();
-        let (_, generation) = d
-            .rpc_negotiated(&peer_b, "st", b"x".to_vec(), Duration::from_secs(5))
             .await
             .unwrap();
         assert_eq!(generation, 0);
@@ -1935,32 +2032,31 @@ mod tests {
         );
     }
 
-    // Impact: the S1 host-compatibility guarantee — production passes
-    // magic: None until S2, and behavior must be byte-identical to
-    // pre-enforcement.
-    // Should: serve a locked-registered scope over the legacy ALPN when
-    // both peers run pre-enforcement mode.
+    // Impact: cutover service for real pre-enforcement stragglers — an
+    // enforcement node must still answer a RAW legacy dialer (the old
+    // binary's exact ALPN) on the compat class while generation 0 is
+    // in-window.
+    // Should: complete TLS on the bare legacy string against a
+    // magic-Some server.
     #[tokio::test(flavor = "multi_thread")]
-    async fn magic_none_serves_legacy_everything() {
+    async fn raw_legacy_dialer_negotiates_generation_zero() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut scopes = ScopeRegistry::new();
-        scopes.rpc(
-            "lk",
-            Arc::new(Echo {
-                calls: calls.clone(),
-            }),
-        );
-        let (a, _b, peer_b) = pair(Arc::new(AllowAll), scopes).await;
+        let b = bind_for_test(Some(MAGIC), CODE, 1).await;
+        b.start(compat_echo(&calls));
 
-        let reply = a
-            .rpc(&peer_b, "lk", b"asis".to_vec(), Duration::from_secs(5))
+        // A legacy binary impersonated at the transport level: raw iroh
+        // endpoint, the legacy ALPN, no magic knowledge.
+        let legacy = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
             .await
             .unwrap();
-        assert_eq!(reply, b"asis");
-        let conns = a.connections.read().await;
-        let conn = conns
-            .get(&(2, ConnKey::Legacy))
-            .expect("legacy-keyed connection");
+        let conn = tokio::time::timeout(
+            Duration::from_secs(5),
+            legacy.connect(loopback_addr(&b), alpn::LEGACY_ALPN),
+        )
+        .await
+        .expect("legacy dial timed out")
+        .expect("legacy dial refused");
         assert_eq!(conn.alpn(), alpn::LEGACY_ALPN);
     }
 }
