@@ -685,14 +685,33 @@ impl IrohComms {
     /// Liveness ping (comms-internal "ping" scope): random nonce echo.
     /// Returns round-trip time in nanoseconds.
     pub async fn ping(&self, peer: &PeerRef) -> Result<u64, CommsError> {
+        self.ping_on(peer, ScopeClass::Compat).await
+    }
+
+    /// The ping over the LOCKED family (RFC-025 S5): completing TLS on
+    /// the locked ALPN proves the peer speaks OUR mesh's magic at OUR
+    /// exact release — the same-mesh reachability check the Add Node
+    /// probe needs. The compat ping cannot prove this while generation 0
+    /// is in-window: its offer falls through to the magic-less legacy
+    /// string, so a wrong-code (or foreign) node still answers it.
+    pub async fn ping_locked(&self, peer: &PeerRef) -> Result<u64, CommsError> {
+        self.ping_on(peer, ScopeClass::Locked).await
+    }
+
+    /// The ping short-circuit is served on every connection class, so a
+    /// nonce echo works over whichever family `class` dials.
+    async fn ping_on(&self, peer: &PeerRef, class: ScopeClass) -> Result<u64, CommsError> {
         let start = Instant::now();
         let nonce = rand::random::<u64>();
-        let reply = self
-            .rpc_inner(
+        let request_id: u64 = rand::random();
+        let (reply, _) = self
+            .rpc_with_id_on(
                 peer,
                 PING_SCOPE,
                 nonce.to_le_bytes().to_vec(),
                 Duration::from_secs(5),
+                request_id,
+                class,
             )
             .await?;
         if reply == nonce.to_le_bytes() {
@@ -956,8 +975,24 @@ impl IrohComms {
         timeout: Duration,
         request_id: u64,
     ) -> Result<(Vec<u8>, Connection), CommsError> {
-        let span = tracing::debug_span!("rpc_req", id = %format!("{:016x}", request_id), to = peer.node_id);
         let class = self.scope_class(scope);
+        self.rpc_with_id_on(peer, scope, payload, timeout, request_id, class)
+            .await
+    }
+
+    /// `rpc_with_id` with the dial family forced — the locked-family
+    /// ping's seam (the registry's class stays the authority everywhere
+    /// else).
+    async fn rpc_with_id_on(
+        &self,
+        peer: &PeerRef,
+        scope: &'static str,
+        payload: Vec<u8>,
+        timeout: Duration,
+        request_id: u64,
+        class: ScopeClass,
+    ) -> Result<(Vec<u8>, Connection), CommsError> {
+        let span = tracing::debug_span!("rpc_req", id = %format!("{:016x}", request_id), to = peer.node_id);
         async {
             let conn = self
                 .get_connection_with_budget(peer, CONNECTION_TIMEOUT, class)
@@ -1792,6 +1827,41 @@ mod tests {
         let c = bind_for_test(Some(MAGIC), CODE, 1).await;
         c.adopt_magic(MAGIC).await.unwrap();
         assert!(c.adopt_magic([0x0a; 4]).await.is_err());
+    }
+
+    // Impact: the Add Node probe's whole value (RFC-025 S5) — while
+    // generation 0 is in-window, the compat ping falls through to the
+    // magic-less legacy string and cannot distinguish our mesh from a
+    // wrong-code node; only the locked family proves same-mesh.
+    // Should: answer a locked ping between matched peers and refuse one
+    // from a different-magic dialer that the compat ping still answers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn locked_ping_proves_same_mesh_where_compat_cannot() {
+        let a = bind_for_test(Some(MAGIC), CODE, 1).await;
+        let b = bind_for_test(Some(MAGIC), CODE, 1).await;
+        let wrong = bind_for_test(Some([0x01, 0x02, 0x03, 0x04]), CODE, 1).await;
+        b.start(ScopeRegistry::new());
+        a.start(ScopeRegistry::new());
+        wrong.start(ScopeRegistry::new());
+        let peer_b = PeerRef {
+            node_id: 2,
+            pubkey: b.local_pubkey(),
+        };
+        let peer_wrong = PeerRef {
+            node_id: 3,
+            pubkey: wrong.local_pubkey(),
+        };
+        a.connect_to_addr(2, loopback_addr(&b)).await.unwrap();
+        a.connect_to_addr(3, loopback_addr(&wrong)).await.ok();
+
+        assert!(a.ping_locked(&peer_b).await.is_ok());
+        // The compat ping reaches the wrong-magic node via legacy…
+        assert!(a.ping(&peer_wrong).await.is_ok());
+        // …the locked ping refuses it.
+        match a.ping_locked(&peer_wrong).await {
+            Err(CommsError::Refused(crate::RefusalError::AlpnRejected)) => {}
+            other => panic!("expected Refused(AlpnRejected), got {other:?}"),
+        }
     }
 
     // Should: report the generation the negotiated ALPN commits both

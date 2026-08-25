@@ -45,7 +45,15 @@ pub async fn post_nodes(
 
     ///////////////
     // 1. Verify new node is reachable via iroh (replaces HTTP ping check).
-    //    The iroh connection proves reachability AND pubkey ownership via TLS handshake.
+    //    The iroh connection proves reachability AND pubkey ownership via
+    //    TLS handshake — and, over the LOCKED family (RFC-025 S5),
+    //    same-mesh membership: completing TLS on the locked ALPN proves
+    //    the joiner adopted OUR mesh code at OUR exact release. A
+    //    wrong-code or code-less node fails HERE with 504 — the RFC's
+    //    visible timeout — before any node row is committed (a compat
+    //    ping would fall through to the magic-less legacy string while
+    //    generation 0 is in-window and let a zombie registration
+    //    through).
     ///////////////
     let peer_pubkey = payload.pubkey.0.to_bytes();
     let ping_peer = hopnet_comms::PeerRef {
@@ -56,7 +64,7 @@ pub async fn post_nodes(
     // Retry ping with backoff — iroh discovery (pkarr DNS) can take time for new nodes
     let mut ping_ok = false;
     for attempt in 0..6 {
-        match app_state.comms.ping(&ping_peer).await {
+        match app_state.comms.ping_locked(&ping_peer).await {
             Ok(_rtt) => {
                 tracing::info!("Successfully pinged new node via iroh (pubkey verified by TLS)");
                 ping_ok = true;
