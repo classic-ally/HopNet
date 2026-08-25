@@ -70,8 +70,9 @@ async fn evidence_row(observer: &NodeInfo, node_id: i64) -> Result<serde_json::V
 /// consensus paths carry no defuser hook, so the prober is what names
 /// the skew there).
 const PROBE_SCREAM: &str = "version skew: same epoch, different build";
-/// The defuser's scream — the skewed side's receipt (its own sync dials
-/// are locked-refused and the sync driver is defuser-hooked).
+/// The defuser's scream — an opportunistic extra receipt on the skewed
+/// side (a boot-time sync dial racing ahead of the first pong gets
+/// locked-refused through the defuser-hooked sync driver).
 const DEFUSE_SCREAM: &str = "version skew: locked dial refused at the transport";
 
 impl TestScenario for MixedVersionMesh {
@@ -214,10 +215,13 @@ impl TestScenario for MixedVersionMesh {
 
         // 6. BOTH directions: the skewed node names the mesh as skewed
         // from its side — its local_version is the claim, every peer's
-        // pong reads skewed, its banner fills, its own defuser screams.
-        // A second upload advances the tip so the skewed node's prober
-        // kick-syncs, and that sync dial is the locked-refused path its
-        // defuser classifies. Polled: its prober and defuser both need a
+        // pong reads skewed, its banner fills, and a scream lands in its
+        // log. The guaranteed scream is its own PROBER's (VersionSkew
+        // outranks KickSync in classify_pong, so the prober names the
+        // skew instead of kicking a sync); the defuser's appears too
+        // whenever a boot-time sync dial races ahead of the first pong —
+        // either receipt proves the side named it. The tip-advancing
+        // upload keeps the traffic honest; polled, the prober needs a
         // round or two.
         let _ = upload_file(
             &nodes[0],
@@ -247,9 +251,8 @@ impl TestScenario for MixedVersionMesh {
                 .as_array()
                 .map(|rows| !rows.is_empty())
                 .unwrap_or(false);
-            let scream2 = container_logs(&docker, mesh_id, 2)
-                .await?
-                .contains(DEFUSE_SCREAM);
+            let log2 = container_logs(&docker, mesh_id, 2).await?;
+            let scream2 = log2.contains(PROBE_SCREAM) || log2.contains(DEFUSE_SCREAM);
             skewed_detail = format!(
                 "claimed={claimed} peers_skewed={peers_skewed} banner={banner2} scream={scream2}"
             );
