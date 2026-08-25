@@ -141,6 +141,30 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, String)> {
             ),
         ];
     }
+    // RFC-025 S6: same shape as the cutover rehearsal, but born on the
+    // newest PRE-ENFORCEMENT release — the mesh crosses the actual
+    // enforcement severance (load the old image with
+    // `scripts/build-release-image.sh v<ENFORCEMENT_OLD_RELEASE>`).
+    if test_name == "enforcement-crossing" {
+        return vec![
+            (
+                "HOPNET_GENESIS_CONSENSUS_POLICY",
+                "probe_base=2;grace=1;s_full=6;p_prove=6".to_string(),
+            ),
+            (
+                "HOPNET_UPGRADE_STAGED_OVERRIDE",
+                regenesis::enforcement_crossing_target().to_string(),
+            ),
+            (
+                "HOPNET_ORCH_IMAGE",
+                format!(
+                    "hopnet:{}-{}",
+                    crate::naming::checkout_hash(),
+                    regenesis::ENFORCEMENT_OLD_RELEASE
+                ),
+            ),
+        ];
+    }
     let pairs: Vec<(&'static str, &'static str)> = match test_name {
         "consensus-bft-quorum-loss" => vec![
             ("HOPNET_QUORUM_PROFILE", "bft"),
@@ -298,7 +322,8 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         | "regenesis-cutover"
         | "straggler-rejoin"
         | "diverged-node-rebuild"
-        | "regenesis-rollback" => Some(3),
+        | "regenesis-rollback"
+        | "enforcement-crossing" => Some(3),
         _ => None,
     }
 }
@@ -420,6 +445,11 @@ pub async fn run_test_by_name(
         }
         "retired-dialer" => {
             version_enforcement::RetiredDialer
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "enforcement-crossing" => {
+            regenesis::EnforcementCrossing
                 .run(mesh_id, nodes, flags)
                 .await
         }
@@ -658,6 +688,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "mesh-growth",
         "mixed-version-mesh",
         "retired-dialer",
+        "enforcement-crossing",
         "auto-seam",
         "three-timescales",
         "evidence-drives-voteout",
