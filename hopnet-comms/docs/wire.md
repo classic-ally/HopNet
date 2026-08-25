@@ -20,7 +20,10 @@ generation = canonical-decimal-u32, >= 1  ; generation 0 has no string
 ```
 
 - The magic is the 4-byte truncation of the anchor chain id — the
-  mesh's permanent epoch-1 identity.
+  mesh's permanent epoch-1 identity. The operator-facing MESH CODE is
+  the same four bytes displayed `XXXX-XXXX` (uppercase); the wire
+  grammar below is unchanged by it. A fresh node binds with an EMPTY
+  serve list (TLS-dead) until the code is adopted (RFC-025 S5).
 - `code` is the node's effective CalVer code
   (`hopnet_common::version::effective_running_code`).
 - Canonical decimal: no leading zeros, no sign, fits u32. Parsing is

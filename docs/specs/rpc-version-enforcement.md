@@ -602,11 +602,36 @@ it as an ordinary upgrade regenesis. S-final trails independently
       rows on ConsensusPanelView + additive /consensus/evidence
       fields; the resilience reachability counters ride the
       visibility clock (deliberate divergence from `live`).
-- [ ] S5 — setup and join: the join-code entry gating endpoint
+- [x] S5 — setup and join: the join-code entry gating endpoint
       bind (interactive and `HOPNET_JOIN_CODE`, §Settled
       Questions), JoinInfo carrying the anchor, the install-time
       anchor check, the ceremony orchestrator scenario (including
-      the headless wrong-code case)
+      the headless wrong-code case). As built: "binds no endpoint"
+      narrows to "binds no NEGOTIABLE PROTOCOL" — a fresh node
+      binds with an empty ALPN serve list (TLS-dead inbound under
+      QUIC strict ALPN; a drive-by JoinDeliver cannot complete TLS
+      or reach any HopNet code) and `adopt_magic` installs the
+      families at code entry via a live `set_alpns`, keeping
+      AppState untouched. One entry seam (`adopt_join_code`) feeds
+      both channels: the open pre-setup POST /api/setup/join-code
+      (204 idempotent; 409 names the restart-to-re-enter remedy)
+      and `HOPNET_JOIN_CODE` read only pre-anchor (env-only — no
+      config file exists, the env-wins clause is vacuous; a
+      malformed env code fail-stops). Adoption is once-only per
+      process; restart re-enters. JoinInfo's anchor is appended
+      last (legal: setup is locked-class, both ends run the same
+      release by ALPN construction) and pre-flighted before ANY
+      write; the install-time check compares the FETCHED identity
+      (genesis hash at epoch 1, the first lineage record's
+      back-pointer past a boundary — the same field the boot magic
+      derives from) and the typed AnchorMismatch abort rolls back
+      this_node + setup_complete so a restart returns the node to
+      fresh. The coordinator surfaces the code on
+      RegenesisStatusView (Add Node dialog + the orchestrator,
+      which POSTs it over the same HTTP seam — create_mesh makes
+      containers before genesis, so env cannot carry it). S1's
+      pre-enforcement legacy mode retires with its producers; real
+      legacy stragglers ride the magic-Some generation-0 tier.
 - [ ] S6 — orchestrator gates: the mixed-version mesh, the
       boundary crossing with a live straggler, the
       retired-generation dialer
