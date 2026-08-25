@@ -996,6 +996,28 @@ async fn create_relay_container(
 ) -> Result<String> {
     let container_name = naming::relay_container_name(mesh_id);
 
+    // The relay's :3340 is also host-mapped (like the nodes' HTTP port):
+    // rootless podman blocks host->container-IP, and the retired-dialer
+    // gate (RFC-025 S6) runs a raw iroh endpoint ON THE HOST that must
+    // reach mesh members through this relay. Pseudo node id 499 keeps the
+    // relay's port at the top of the mesh's 500-port range.
+    let runtime = sys::detect_runtime(docker).await?;
+    let needs_port_binding = runtime == sys::ContainerRuntime::Podman || cfg!(target_os = "macos");
+    let (port_bindings, relay_host_port) = if needs_port_binding {
+        let port = sys::find_available_port(mesh_id, 499).await?;
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            "3340/tcp".to_string(),
+            Some(vec![bollard::models::PortBinding {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: Some(port.to_string()),
+            }]),
+        );
+        (Some(bindings), port)
+    } else {
+        (None, 3340)
+    };
+
     let mut endpoints_config = HashMap::new();
     endpoints_config.insert(
         network_name.to_string(),
@@ -1008,6 +1030,7 @@ async fn create_relay_container(
     let mut labels = HashMap::new();
     labels.insert("hopnet.mesh_id".to_string(), mesh_id.to_string());
     labels.insert("hopnet.role".to_string(), "relay".to_string());
+    labels.insert("hopnet.host_port".to_string(), relay_host_port.to_string());
     labels.insert(
         naming::CHECKOUT_LABEL.to_string(),
         naming::checkout_hash().to_string(),
@@ -1019,6 +1042,10 @@ async fn create_relay_container(
         labels: Some(labels),
         networking_config: Some(NetworkingConfig {
             endpoints_config: Some(endpoints_config),
+        }),
+        host_config: Some(HostConfig {
+            port_bindings,
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -1423,6 +1450,41 @@ pub(crate) async fn get_mesh_code(
         .and_then(|c| c.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow::anyhow!("coordinator has no mesh code yet (pre-genesis?)"))
+}
+
+/// The relay's HOST-reachable URL. Podman (rootless: no host->container
+/// IP route) and macOS use the host-mapped port; Docker on Linux reaches
+/// the relay's network IP directly.
+pub(crate) async fn relay_host_url(
+    docker: &Docker,
+    mesh_id: u32,
+    runtime: sys::ContainerRuntime,
+) -> Result<String> {
+    let name = naming::relay_container_name(mesh_id);
+    let info = docker
+        .inspect_container(
+            &name,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await?;
+    let use_host_port = runtime == sys::ContainerRuntime::Podman || cfg!(target_os = "macos");
+    if use_host_port {
+        let port = info
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.as_ref())
+            .and_then(|l| l.get("hopnet.host_port"))
+            .ok_or_else(|| anyhow::anyhow!("relay container has no hopnet.host_port label"))?;
+        Ok(format!("http://localhost:{port}"))
+    } else {
+        let ip = info
+            .network_settings
+            .and_then(|ns| ns.networks)
+            .and_then(|n| n.get(&naming::network_name(mesh_id)).cloned())
+            .and_then(|e| e.ip_address)
+            .ok_or_else(|| anyhow::anyhow!("relay container has no network IP"))?;
+        Ok(format!("http://{ip}:3340"))
+    }
 }
 
 /// Deliver the mesh code to a fresh container (RFC-025 S5): its endpoint

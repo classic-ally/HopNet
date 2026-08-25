@@ -160,6 +160,14 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, String)> {
             // AUTO (default): majority below v=7 — the growth stays in the
             // majority region, no forcing.
         ],
+        // Fast probes so the healthy side's prober reaches the skewed
+        // seat within the deliberately tight skew window (the default
+        // cadence would not pong it for most of a minute); the scenario
+        // restores the seat well before the vote-out this policy arms.
+        "mixed-version-mesh" => vec![(
+            "HOPNET_GENESIS_CONSENSUS_POLICY",
+            "probe_base=2;grace=1;s_full=6;p_prove=6",
+        )],
         "vote-out-after-kill" => vec![
             (
                 "HOPNET_GENESIS_CONSENSUS_POLICY",
@@ -410,6 +418,11 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
+        "retired-dialer" => {
+            version_enforcement::RetiredDialer
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "three-timescales" => {
             three_timescales::ThreeTimescales
                 .run(mesh_id, nodes, flags)
@@ -644,6 +657,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "regenesis-cutover",
         "mesh-growth",
         "mixed-version-mesh",
+        "retired-dialer",
         "auto-seam",
         "three-timescales",
         "evidence-drives-voteout",
