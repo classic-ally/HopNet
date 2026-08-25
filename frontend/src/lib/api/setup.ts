@@ -27,6 +27,10 @@ export type LoginResult =
     | { ok: true; token: string }
     | { ok: false; status: number; detail?: string };
 
+export type SubmitJoinCodeResult =
+    | { ok: true }
+    | { ok: false; status: number; detail?: string };
+
 export interface SetupApi {
     /** POST /setup — genesis. Resolves with the passphrase the node minted. */
     createNetwork(username: string, nodeName: string): Promise<CreateNetworkResult>;
@@ -37,6 +41,15 @@ export interface SetupApi {
      * body either way, so both count as success here.
      */
     fetchPubkey(): Promise<PubkeyResult>;
+
+    /**
+     * POST /setup/join-code — the mesh code read off the network's Add
+     * Node dialog (RFC-025 S5). Adopting it is what makes this node
+     * reachable over the mesh transport at all; 204 = adopted (repeats
+     * with the same code are idempotent), 409 = a different code was
+     * already entered (restart the device to re-enter).
+     */
+    submitJoinCode(code: string): Promise<SubmitJoinCodeResult>;
 
     /** POST /login — exchanges credentials for a session token. */
     login(username: string, passphrase: string, rememberMe: boolean): Promise<LoginResult>;
@@ -69,6 +82,26 @@ export const liveSetupApi: SetupApi = {
                 return { ok: false, status: response.status };
             }
             return { ok: true, pubkey: await response.json() };
+        } catch (error) {
+            return { ok: false, status: TRANSPORT_FAILURE, detail: detailOf(error) };
+        }
+    },
+
+    async submitJoinCode(code) {
+        try {
+            const response = await fetch(`${API_BASE_URL}/setup/join-code`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code }),
+            });
+            if (!response.ok) {
+                return {
+                    ok: false,
+                    status: response.status,
+                    detail: await response.text().catch(() => undefined),
+                };
+            }
+            return { ok: true };
         } catch (error) {
             return { ok: false, status: TRANSPORT_FAILURE, detail: detailOf(error) };
         }
