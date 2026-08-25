@@ -242,13 +242,9 @@ pub fn consensus_view(
         });
 
     let local_version_code = crate::version::effective_running_code();
-    let (version_skew, stranded_peers) = version_banner_rows(
-        &snap,
-        local_version_code,
-        hopnet_comms::alpn::compat_floor(hopnet_comms::alpn::COMPAT_HEAD),
-        hopnet_comms::alpn::COMPAT_HEAD,
-        now,
-    );
+    let (local_floor, local_head) = crate::consensus::evidence::local_window();
+    let (version_skew, stranded_peers) =
+        version_banner_rows(&snap, local_version_code, local_floor, local_head, now);
 
     Some(ConsensusPanelView {
         v: v as u32,

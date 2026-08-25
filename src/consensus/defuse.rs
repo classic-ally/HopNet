@@ -112,12 +112,13 @@ pub(crate) fn defuse_alpn_rejection(app_state: &crate::AppState, peer: hopnet_co
                     .get()
                     .map(|e| *e.decided.borrow())
                     .unwrap_or(0);
+                let (compat_floor, compat_head) = crate::consensus::evidence::local_window();
                 let me = SelfView {
                     epoch: my_epoch,
                     decided,
                     version_code: my_version,
-                    compat_floor: hopnet_comms::alpn::compat_floor(hopnet_comms::alpn::COMPAT_HEAD),
-                    compat_head: hopnet_comms::alpn::COMPAT_HEAD,
+                    compat_floor,
+                    compat_head,
                 };
                 match status_probe(&app_state.comms, &peer, decided, my_epoch, policy.grace).await {
                     Ok(pong) => {

@@ -163,7 +163,7 @@ impl AlpnIdentity {
         Self {
             magic: cell,
             code: hopnet_common::version::effective_running_code(),
-            head: alpn::COMPAT_HEAD,
+            head: alpn::effective_compat_head(),
         }
     }
 

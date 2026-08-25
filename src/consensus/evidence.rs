@@ -298,6 +298,16 @@ impl EvidenceMap {
     }
 }
 
+/// The compat window this node advertises and enforces, routed through
+/// the test-mode head seam so Pongs, probe SelfViews, the evidence JSON,
+/// and the banner rows always agree with the ALPN identity the transport
+/// hook enforces (RFC-025 S6) — a split here would make a node reject on
+/// one window while diagnosing with another.
+pub(crate) fn local_window() -> (u32, u32) {
+    let head = hopnet_comms::alpn::effective_compat_head();
+    (hopnet_comms::alpn::compat_floor(head), head)
+}
+
 /// Evidence age: now − last_contact, or now − origin for a node with no
 /// entry (live-until-first-deadline from map creation).
 pub fn contact_age(view: Option<&PeerEvidenceView>, origin: Instant, now: Instant) -> Duration {
@@ -526,13 +536,14 @@ impl hopnet_comms::RpcHandler for StatusScope {
                 .get()
                 .map(|e| *e.decided.borrow())
                 .unwrap_or(0);
+            let (floor, head) = local_window();
             bincode::serde::encode_to_vec(
                 &StatusResponse::Pong {
                     decided_height,
                     epoch: my_epoch,
                     version_code: crate::version::effective_running_code(),
-                    floor: hopnet_comms::alpn::compat_floor(hopnet_comms::alpn::COMPAT_HEAD),
-                    head: hopnet_comms::alpn::COMPAT_HEAD,
+                    floor,
+                    head,
                 },
                 bincode::config::standard(),
             )
@@ -913,14 +924,13 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 let probe_state = app_state.clone();
                 tokio::spawn(async move {
                     if let Ok(pong) = status_probe(&comms, &peer, decided, my_epoch, g).await {
+                        let (compat_floor, compat_head) = local_window();
                         let me = SelfView {
                             epoch: my_epoch,
                             decided,
                             version_code: crate::version::effective_running_code(),
-                            compat_floor: hopnet_comms::alpn::compat_floor(
-                                hopnet_comms::alpn::COMPAT_HEAD,
-                            ),
-                            compat_head: hopnet_comms::alpn::COMPAT_HEAD,
+                            compat_floor,
+                            compat_head,
                         };
                         let h = pong.decided_height;
                         match absorb_pong(&evidence, &me, peer.node_id, &pong, Instant::now()) {
@@ -1218,10 +1228,8 @@ pub async fn get_evidence(State(app_state): State<crate::AppState>) -> impl Into
                         "head": head,
                         "skew": stamp.version_code != local_version,
                         "stranded": match stamp.window {
-                            Some((peer_floor, _)) =>
-                                hopnet_comms::alpn::COMPAT_HEAD < peer_floor,
-                            None => hopnet_comms::alpn::compat_floor(
-                                hopnet_comms::alpn::COMPAT_HEAD) > 0,
+                            Some((peer_floor, _)) => local_window().1 < peer_floor,
+                            None => local_window().0 > 0,
                         },
                     })
                 }),

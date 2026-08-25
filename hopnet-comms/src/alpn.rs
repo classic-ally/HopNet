@@ -3,7 +3,8 @@
 //! Two families replace the frozen `hopnet/1.0` literal: locked
 //! (`hopnet/<magic>/v/<code>`, exact CalVer match) and compat
 //! (`hopnet/<magic>/compat/<G>`, generation-windowed). Everything here is
-//! pure byte/string arithmetic on the zero-dependency face — the
+//! pure byte/string arithmetic on the zero-dependency face — plus the
+//! feature-gated test-mode head seam (`effective_compat_head`) — the
 //! transport (iroh_impl) consults it; the normative grammar and byte
 //! contract live in `hopnet-comms/docs/wire.md` and move in the same PR
 //! as any change here.
@@ -47,6 +48,36 @@ pub const fn generation_served(head: u32, g: u32) -> bool {
 /// derived, never maintained (contract rule 5).
 pub const fn generation_retired(head: u32, g: u32) -> bool {
     g < compat_floor(head)
+}
+
+/// The pure half of the test-mode head seam: an override value clamps to
+/// `>= COMPAT_HEAD` — a head never regresses (the freeze tripwire's
+/// invariant), and anything unparseable falls back to the compiled head.
+pub fn head_with_override(value: Option<&str>) -> u32 {
+    match value.and_then(|v| v.parse::<u32>().ok()) {
+        Some(h) if h >= COMPAT_HEAD => h,
+        _ => COMPAT_HEAD,
+    }
+}
+
+/// Test-mode head seam (RFC-025 S6). The retired tier is unreachable at
+/// head=1 (`compat_floor(1) == 0`, empty retired set), so the
+/// orchestrator's retired-dialer gate raises the head via
+/// `HOPNET_UPGRADE_COMPAT_HEAD_OVERRIDE` (the prefix rides the
+/// orchestrator's existing container-env forwarding). ACCEPT/ADVERTISE
+/// ONLY: compat DISPATCH above the compiled head is undefined —
+/// generation modules exist for `[0, COMPAT_HEAD]` — so this must never
+/// be set on a node expected to complete compat RPCs.
+#[cfg(feature = "iroh")]
+pub fn effective_compat_head() -> u32 {
+    if hopnet_common::version::test_mode() {
+        return head_with_override(
+            std::env::var("HOPNET_UPGRADE_COMPAT_HEAD_OVERRIDE")
+                .ok()
+                .as_deref(),
+        );
+    }
+    COMPAT_HEAD
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -289,6 +320,28 @@ mod tests {
         assert!(!generation_retired(1, 0));
         assert!(generation_retired(3, 1));
         assert!(!generation_served(2, 0));
+    }
+
+    // Impact: the head seam exists to make the retired tier reachable in
+    // orchestrator gates; a clamp failure here would let a test regress
+    // the head below the compiled window — the invariant the freeze
+    // tripwire pins.
+    // Should: accept an override at or above the compiled head.
+    // Should not: honour a below-head, unparseable, or absent override —
+    // all fall back to the compiled head.
+    #[test]
+    fn head_override_clamps_and_falls_back() {
+        assert_eq!(head_with_override(None), COMPAT_HEAD);
+        assert_eq!(head_with_override(Some("2")), 2);
+        assert_eq!(head_with_override(Some("7")), 7);
+        assert_eq!(
+            head_with_override(Some(&COMPAT_HEAD.to_string())),
+            COMPAT_HEAD
+        );
+        assert_eq!(head_with_override(Some("0")), COMPAT_HEAD);
+        assert_eq!(head_with_override(Some("")), COMPAT_HEAD);
+        assert_eq!(head_with_override(Some("banana")), COMPAT_HEAD);
+        assert_eq!(head_with_override(Some("-1")), COMPAT_HEAD);
     }
 
     // Impact: these strings are the wire contract — a drift here severs
