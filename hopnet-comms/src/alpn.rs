@@ -213,6 +213,31 @@ pub fn compat_offer(magic: &[u8; 4], head: u32) -> Vec<Vec<u8>> {
     ]
 }
 
+/// The operator-facing mesh code: the magic as `XXXX-XXXX`, uppercase
+/// hex (the ALPN wire form stays lowercase — the code IS the magic in
+/// display form, RFC-025 §The ALPN Scheme).
+pub fn format_mesh_code(magic: &[u8; 4]) -> String {
+    let hex: String = magic.iter().map(|b| format!("{b:02X}")).collect();
+    format!("{}-{}", &hex[..4], &hex[4..])
+}
+
+/// Tolerant mesh-code parse: case-insensitive, dashes and whitespace
+/// ignored, exactly 8 hex digits required.
+pub fn parse_mesh_code(s: &str) -> Option<[u8; 4]> {
+    let digits: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
+    if digits.len() != 8 || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 4];
+    for (i, chunk) in out.iter_mut().enumerate() {
+        *chunk = u8::from_str_radix(&digits[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
 /// COMPAT_RETIRED reason bytes: `[0x01][floor u32 LE][node_version u32
 /// LE]` — 9 bytes riding the QUIC CONNECTION_CLOSE frame.
 pub fn encode_retired_reason(floor: u32, node_version: u32) -> Vec<u8> {
@@ -390,6 +415,23 @@ mod tests {
             compat_offer(&MAGIC, 3),
             vec![compat_alpn(&MAGIC, 3), compat_alpn(&MAGIC, 2)]
         );
+    }
+
+    // Impact: this string IS what operators read across a room and type
+    // into a joining device — format and parse must roundtrip through
+    // every reasonable human transcription.
+    // Should: format the documented XXXX-XXXX uppercase form and parse
+    // it back tolerantly (case, dashes, whitespace).
+    // Should not: accept anything but exactly 8 hex digits.
+    #[test]
+    fn mesh_code_roundtrip_and_tolerance() {
+        assert_eq!(format_mesh_code(&MAGIC), "9F3A-01CC");
+        assert_eq!(parse_mesh_code("9F3A-01CC"), Some(MAGIC));
+        assert_eq!(parse_mesh_code("9f3a01cc"), Some(MAGIC));
+        assert_eq!(parse_mesh_code("  9f3a - 01CC "), Some(MAGIC));
+        for bad in ["9F3A-01C", "9F3A-01CCD", "9G3A-01CC", "", "XXXX-XXXX"] {
+            assert_eq!(parse_mesh_code(bad), None, "{bad:?}");
+        }
     }
 
     // Should: roundtrip the reason bytes.
