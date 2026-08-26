@@ -110,12 +110,30 @@ seeds the profile (below); across hopnet upgrades the unit file never
 changes, so `nixos-rebuild` and self-upgrade stop competing over
 `ExecStart`.
 
-**Seeding, newest-wins.** The module's `ExecStartPre` compares the
-flake-pinned package's version against `profile/bin/hopnet --version`:
-profile missing → seed it; flake strictly newer → the operator
-deliberately bumped the pin, re-seed; profile newer or equal → a
-self-upgrade happened, leave it. A rebuild can therefore never regress
-a mesh-coordinated upgrade, and a deliberate flake bump still works.
+**Seeding, newest-WITHIN-AGREEMENT (RFC-025).** The module's
+`ExecStartPre` compares the flake-pinned package's version against
+`profile/bin/hopnet --version`: profile missing → seed it
+(availability wins on a wiped profile; the boot-time version-ahead
+gate is the safety net); profile newer or equal → a self-upgrade
+happened, leave it; flake strictly newer → ask `hopnet seed-guard
+--candidate <ver>` whether the MESH permits the advance. The guard
+reads two markers beside the database (bare CalVer strings, a stable
+interface): `agreed-version` — the version the mesh agreed this node
+runs, stamped at genesis/join and re-stamped only when a crossing
+completes — and `awaiting-upgrade`, whose required target raises the
+ceiling for a parked node (the sanctioned manual-upgrade path). Exit
+0 = seed; 3 = held (named in the journal — `nixos-rebuild` can no
+longer move a node past its mesh mid-epoch; the pin is not lost,
+RFC-021 activation flips the profile when the mesh seals); 2 = usage;
+any non-zero means "don't seed", so failures degrade toward holding,
+and a malformed marker HOLDS (the guard is the conservative reader;
+the daemon degrades a corrupt marker to absent for availability). No
+markers = never joined = the old newest-wins, so a fresh install
+keeps loading the latest version. The guard is deliberately
+override-blind — the candidate is explicit and the markers are files.
+The marker is an ADVISORY projection of committed state (epoch
+lineage records); the consensus gates remain the enforcement — never
+"fix" a divergence by trusting the file over the database.
 (Interpolating the package into the seed script also keeps the seed
 generation rooted in the system closure.) `hopnet --version` prints
 the COMPILE-TIME version precisely so these comparisons verify bytes,

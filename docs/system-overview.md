@@ -219,8 +219,14 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     scenarios — the version/head override seams, a live straggler
     riding generation 0 across the real severance boundary, and the
     vote-out of a pong-visible skewed seat asserted as behaviour.
+    S6b (agreed-version clamp, closes #58): a consensus-derived
+    marker stamped at genesis/join and re-stamped only at completed
+    crossings; the NixOS module seeds newest-WITHIN-AGREEMENT via
+    `hopnet seed-guard` (never-joined stays newest-wins), and normal
+    boots park a binary ahead of the agreement — the system never
+    loads past what the mesh agreed, on any pathway.
     Next: merge — the following release is the enforcement cutover
-    (one PR, S1–S6).
+    (one PR, S1–S6 + S6b).
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

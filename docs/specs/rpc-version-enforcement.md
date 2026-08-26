@@ -673,6 +673,32 @@ it as an ordinary upgrade regenesis. S-final trails independently
       entry (RFC-020 S7 ledger) still needs its two lines — the
       crossing rides compat generation 0, and Add Node requires
       the mesh code — they belong to that release, not this PR.
+- [x] S6b — the agreed-version clamp (in-PR addendum, closes #58):
+      the system never LOADS a binary past the mesh agreement, where
+      S1–S6 only contained one at the transport. A bare-CalVer
+      `agreed-version` marker beside the database mirrors the version
+      the mesh agreed this node runs: stamped at genesis and join
+      (epoch 1 commits no version — the joining binary IS the
+      agreement, provably shared by the locked-class delivery), at
+      every completed crossing (`EpochGenesisRecord.
+      required_version_code`), and REWRITTEN by rollback; removed
+      only by the anchor-mismatch unjoin (absent = never-joined =
+      unclamped); backfilled fill-if-absent from committed lineage on
+      epoch>=2 boots (rollout). Staging, `regenesis_start`, the seal,
+      and the parked window never move it — the transition-only
+      property, pinned by fixture and scenario tests. Enforcement is
+      two-sided: the NixOS module's seeding became
+      newest-WITHIN-AGREEMENT via `hopnet seed-guard` (exit 0/3/2;
+      conservative on garbage; never-joined stays newest-wins — a
+      fresh install keeps loading the latest release), and normal
+      boots gained the one-directional version-ahead gate
+      (`ParkReason::VersionAhead`: running > agreed parks alive with
+      both versions named; running < agreed boots — stragglers must
+      stage, RFC-019 S7; no marker = inert). `agreed_version` rides
+      RegenesisStatusView. The marker is an advisory projection of
+      committed state; consensus gates remain the enforcement. The
+      seeding contract's normative text moved to
+      `docs/specs/nix-upgrade-provider.md` §Seeding.
 - [!] S-final — crossing-time advisory: `COMPAT_HEAD` in the
       NodeStagedVersion attestation, the `nodes` column, and the
       advisory's below-window report. Blocked on RFC-020 (the
