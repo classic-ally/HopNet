@@ -325,7 +325,8 @@ func runDaemon() throws {
         cleanupIntervalSecs: intFlag("--cleanup-interval-secs", default: 3600),
         publishNodeUrl: publishing ? nodeUrl : nil,
         publishDeviceToken: publishing ? deviceToken : nil,
-        publishIntervalSecs: intFlag("--publish-interval-secs", default: 60)
+        publishIntervalSecs: intFlag("--publish-interval-secs", default: 60),
+        publishConcurrency: UInt32(intFlag("--publish-concurrency", default: 16))
     )
     if publishing {
         // Device id only — the secret half of the token stays out of logs.

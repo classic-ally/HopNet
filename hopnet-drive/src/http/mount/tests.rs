@@ -18,7 +18,9 @@ use tower::ServiceExt;
 
 use crate::host::DriveState;
 use crate::paths::encrypt_path;
-use hopnet_common::mount::{MountChangesResponse, MountEnumerateResponse, MountItem};
+use hopnet_common::mount::{
+    MountChangesResponse, MountConflictBody, MountConflictCode, MountEnumerateResponse, MountItem,
+};
 use hopnet_common::CustomUUID;
 use hopnet_projection::host::{
     BlobStreamer, BoxFuture, ByteStream, SessionAccess, SessionError, TxGateway, TxSpec,
@@ -883,18 +885,20 @@ async fn transient_rejection_on_rmdir_is_not_reported_as_non_empty() {
     );
 }
 
-// Impact: the positive twin that keeps the fix honest — the transient
-// classification must not be implementable by weakening the 409 mapping,
-// because genuine occupancy is exactly what write-temp-then-rename clients
-// rely on for atomic-save semantics.
-// Should: still answer 409 for a rename onto a genuinely occupied name.
+// Impact: the RENAME_NOREPLACE contract, and the wire default for daemons
+// that predate the replace field — write-temp-then-rename clients depend on
+// replace SUCCEEDING (that is the atomic-save idiom); the 409 is only for
+// callers that explicitly opt out of replacement, and it must stay
+// distinguishable from a bare consensus-rejection 409 via the coded body.
+// Should: answer a 409 carrying code "occupied" when replace is absent.
+// Should not: replace the destination when the request omits the flag.
 #[tokio::test]
-async fn genuine_rename_conflict_still_answers_409() {
+async fn rename_noreplace_still_answers_409() {
     let env = setup_env_apply(vec![]);
     let app = env.app();
 
     let content = b"occupant";
-    send_multipart::<MountMutationResponse>(
+    let (_, taken) = send_multipart::<MountMutationResponse>(
         &app,
         "/create",
         &[(
@@ -904,6 +908,7 @@ async fn genuine_rename_conflict_still_answers_409() {
         )],
     )
     .await;
+    let occupant_id = taken.unwrap().item.unwrap().id.unwrap();
     let (_, file) = send_multipart::<MountMutationResponse>(
         &app,
         "/create",
@@ -916,7 +921,9 @@ async fn genuine_rename_conflict_still_answers_409() {
     .await;
     let mover_id = file.unwrap().item.unwrap().id.unwrap();
 
-    let (status, _) = send_json::<MountMutationResponse>(
+    // No "replace" field: the serde default must behave like NOREPLACE —
+    // this is exactly what a pre-replace daemon sends.
+    let (status, body) = send_json::<MountConflictBody>(
         &app,
         "PATCH",
         "/modify",
@@ -926,8 +933,18 @@ async fn genuine_rename_conflict_still_answers_409() {
     assert_eq!(
         status,
         StatusCode::CONFLICT,
-        "genuine occupancy must keep its 409 -> EEXIST contract"
+        "an occupied destination without replace keeps its 409 -> EEXIST contract"
     );
+    assert_eq!(
+        body.map(|b| b.code),
+        Some(MountConflictCode::Occupied),
+        "the 409 must carry the coded body that distinguishes occupancy \
+         from a consensus rejection"
+    );
+
+    // Nothing was replaced.
+    let (status, _) = get_json::<MountItem>(&app, &format!("/item?id={occupant_id}")).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 /// Take SQLite's write lock from a second, non-pool connection and release
@@ -1560,4 +1577,521 @@ async fn download_unknown_blob_is_404() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// Impact: POSIX rename(2) replaces an existing destination atomically —
+// "If newpath already exists, it will be atomically replaced". Refusing it
+// breaks every write-temp-then-rename client, which is the standard safe-save
+// idiom: rsync resuming over a --partial file, an editor saving an existing
+// file, and git's lockfile protocol (X.lock renamed over X). Measured on a
+// live mount: `git init` leaves a 36-byte config and no HEAD, because every
+// `git config` write after the first is a rename over an existing file.
+// Should: replace an existing destination and carry the source's content.
+// Should: remove the replaced occupant's inode.
+// Should not: answer 409 merely because the destination name is taken.
+#[tokio::test]
+async fn rename_replaces_an_existing_destination() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let occupant = b"occupant-content";
+    let (_, taken) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", occupant.len()),
+            Some("taken.txt"),
+            occupant.as_slice(),
+        )],
+    )
+    .await;
+    let occupant_id = taken.unwrap().item.unwrap().id.unwrap();
+
+    let mover = b"mover-content";
+    let (_, file) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", mover.len()),
+            Some("mover.txt"),
+            mover.as_slice(),
+        )],
+    )
+    .await;
+    let mover_item = file.unwrap().item.unwrap();
+    let mover_id = mover_item.id.clone().unwrap();
+    let mover_blob = mover_item.blob_id.clone().unwrap();
+
+    let (status, _) = send_json::<MountMutationResponse>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": mover_id, "new_name": "taken.txt", "replace": true }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::CONFLICT,
+        "POSIX rename must replace an existing destination, not refuse it: \
+         rsync resume, editor atomic-save and git's lockfile protocol all \
+         depend on rename-over-existing succeeding"
+    );
+    assert!(
+        status.is_success(),
+        "rename over an existing destination should succeed, got {status}"
+    );
+
+    // The destination name now resolves to the mover — same inode, same
+    // blob — i.e. the rename carried the source's content.
+    let (status, found) = get_json::<MountItem>(&app, "/lookup?name=taken.txt").await;
+    assert_eq!(status, StatusCode::OK);
+    let found = found.unwrap();
+    assert_eq!(
+        found.id.as_ref(),
+        Some(&mover_id),
+        "the surviving inode at the destination must be the rename source"
+    );
+    assert_eq!(
+        found.blob_id.as_ref(),
+        Some(&mover_blob),
+        "the destination must carry the source's content, not the occupant's"
+    );
+    assert_eq!(found.size, Some(mover.len() as u64));
+
+    // The occupant is gone: its inode answers 404 and the source name is
+    // vacated.
+    let (status, _) = get_json::<MountItem>(&app, &format!("/item?id={occupant_id}")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the replaced occupant's inode must be removed"
+    );
+    let (status, _) = get_json::<MountItem>(&app, "/lookup?name=mover.txt").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// Should: replace an empty destination folder and keep the source
+// folder's children reachable under the new path.
+#[tokio::test]
+async fn rename_replace_dir_over_empty_dir_succeeds() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let (_, dest) =
+        send_multipart::<MountMutationResponse>(&app, "/create", &[("folder_name", None, b"Dest")])
+            .await;
+    let dest_id = dest.unwrap().item.unwrap().id.unwrap();
+
+    let (_, src) =
+        send_multipart::<MountMutationResponse>(&app, "/create", &[("folder_name", None, b"Src")])
+            .await;
+    let src_id = src.unwrap().item.unwrap().id.unwrap();
+    let content = b"survivor";
+    send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[
+            ("parent_id", None, src_id.to_string().as_bytes()),
+            (
+                &format!("file_{}", content.len()),
+                Some("child.txt"),
+                content.as_slice(),
+            ),
+        ],
+    )
+    .await;
+
+    let (status, _) = send_json::<MountMutationResponse>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": src_id, "new_name": "Dest", "replace": true }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "dir over an EMPTY dir must replace per POSIX, got {status}"
+    );
+
+    let (status, found) = get_json::<MountItem>(&app, "/lookup?name=Dest").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        found.unwrap().id.as_ref(),
+        Some(&src_id),
+        "the surviving folder must be the rename source"
+    );
+    let (status, _) = get_json::<MountItem>(&app, &format!("/item?id={dest_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "the empty occupant is gone");
+    let (status, _) =
+        get_json::<MountItem>(&app, &format!("/lookup?parent_id={src_id}&name=child.txt")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the source folder's children must survive the move"
+    );
+}
+
+// Should: answer 409 with code not_empty for a dir renamed over a
+// non-empty dir (POSIX ENOTEMPTY, never EEXIST).
+// Should not: delete the destination or any of its children.
+#[tokio::test]
+async fn rename_replace_dir_over_nonempty_dir_is_not_empty() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let (_, dest) =
+        send_multipart::<MountMutationResponse>(&app, "/create", &[("folder_name", None, b"Dest")])
+            .await;
+    let dest_id = dest.unwrap().item.unwrap().id.unwrap();
+    let content = b"occupant-child";
+    send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[
+            ("parent_id", None, dest_id.to_string().as_bytes()),
+            (
+                &format!("file_{}", content.len()),
+                Some("keepme.txt"),
+                content.as_slice(),
+            ),
+        ],
+    )
+    .await;
+
+    let (_, src) =
+        send_multipart::<MountMutationResponse>(&app, "/create", &[("folder_name", None, b"Src")])
+            .await;
+    let src_id = src.unwrap().item.unwrap().id.unwrap();
+
+    let (status, body) = send_json::<MountConflictBody>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": src_id, "new_name": "Dest", "replace": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body.map(|b| b.code),
+        Some(MountConflictCode::NotEmpty),
+        "dir-over-non-empty-dir is ENOTEMPTY, and the daemon needs the code \
+         to avoid reporting EEXIST"
+    );
+
+    let (status, _) = get_json::<MountItem>(
+        &app,
+        &format!("/lookup?parent_id={dest_id}&name=keepme.txt"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "nothing may be deleted on refusal");
+}
+
+// Should: answer 409 with code is_directory for a file renamed over a
+// folder (POSIX EISDIR).
+#[tokio::test]
+async fn rename_replace_file_over_dir_is_is_directory() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    send_multipart::<MountMutationResponse>(&app, "/create", &[("folder_name", None, b"Dest")])
+        .await;
+    let content = b"file";
+    let (_, file) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", content.len()),
+            Some("mover.txt"),
+            content.as_slice(),
+        )],
+    )
+    .await;
+    let mover_id = file.unwrap().item.unwrap().id.unwrap();
+
+    let (status, body) = send_json::<MountConflictBody>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": mover_id, "new_name": "Dest", "replace": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body.map(|b| b.code), Some(MountConflictCode::IsDirectory));
+}
+
+// Should: answer 409 with code not_directory for a folder renamed over a
+// file (POSIX ENOTDIR).
+#[tokio::test]
+async fn rename_replace_dir_over_file_is_not_directory() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let content = b"file";
+    send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", content.len()),
+            Some("dest.txt"),
+            content.as_slice(),
+        )],
+    )
+    .await;
+    let (_, folder) =
+        send_multipart::<MountMutationResponse>(&app, "/create", &[("folder_name", None, b"Src")])
+            .await;
+    let src_id = folder.unwrap().item.unwrap().id.unwrap();
+
+    let (status, body) = send_json::<MountConflictBody>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": src_id, "new_name": "dest.txt", "replace": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body.map(|b| b.code), Some(MountConflictCode::NotDirectory));
+}
+
+// Should: replace a destination under a different parent in the same
+// operation (move + replace combined, one consensus transaction).
+#[tokio::test]
+async fn rename_replace_moves_across_parents() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let (_, folder) =
+        send_multipart::<MountMutationResponse>(&app, "/create", &[("folder_name", None, b"Sub")])
+            .await;
+    let folder_id = folder.unwrap().item.unwrap().id.unwrap();
+    let occupant = b"occupant";
+    send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[
+            ("parent_id", None, folder_id.to_string().as_bytes()),
+            (
+                &format!("file_{}", occupant.len()),
+                Some("target.txt"),
+                occupant.as_slice(),
+            ),
+        ],
+    )
+    .await;
+
+    let mover = b"mover-content-x";
+    let (_, file) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", mover.len()),
+            Some("source.txt"),
+            mover.as_slice(),
+        )],
+    )
+    .await;
+    let mover_id = file.unwrap().item.unwrap().id.unwrap();
+
+    let (status, _) = send_json::<MountMutationResponse>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({
+            "id": mover_id,
+            "new_parent_id": folder_id,
+            "new_name": "target.txt",
+            "replace": true,
+        }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "move+replace must succeed, got {status}"
+    );
+
+    let (status, found) = get_json::<MountItem>(
+        &app,
+        &format!("/lookup?parent_id={folder_id}&name=target.txt"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let found = found.unwrap();
+    assert_eq!(found.id.as_ref(), Some(&mover_id));
+    assert_eq!(found.size, Some(mover.len() as u64));
+}
+
+// Impact: the /changes deleted_ids row is the daemons' only invalidation
+// signal for a replaced destination — without it every other mount keeps
+// serving the dead inode from cache until TTL.
+// Should: report the replaced inode's id as deleted in /changes after the
+// rename height.
+#[tokio::test]
+async fn replaced_destination_appears_deleted_in_changes() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let occupant = b"occupant";
+    let (_, taken) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", occupant.len()),
+            Some("taken.txt"),
+            occupant.as_slice(),
+        )],
+    )
+    .await;
+    let occupant_id = taken.unwrap().item.unwrap().id.unwrap();
+
+    let mover = b"mover";
+    let (_, file) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", mover.len()),
+            Some("mover.txt"),
+            mover.as_slice(),
+        )],
+    )
+    .await;
+    let created = file.unwrap();
+    let mover_id = created.item.unwrap().id.unwrap();
+    let pre_replace_height = created.height;
+
+    let (status, _) = send_json::<MountMutationResponse>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": mover_id, "new_name": "taken.txt", "replace": true }),
+    )
+    .await;
+    assert!(status.is_success());
+
+    let (status, changes) = get_json::<MountChangesResponse>(
+        &app,
+        &format!("/changes?since_height={pre_replace_height}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        changes.unwrap().deleted_ids.contains(&occupant_id),
+        "the replaced occupant must surface as deleted in /changes"
+    );
+}
+
+// Impact: settled #62 decision — replace defers blob reclamation to the
+// orphan sweep exactly like an explicit delete, and a blob still
+// referenced by another user's inode must survive even that.
+// Should: leave the replaced file's data_blocks row in place.
+// Should not: touch another user's inode that references the same blob.
+#[tokio::test]
+async fn rename_replace_leaves_blob_to_orphan_sweep() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let occupant = b"shared-bytes";
+    let (_, taken) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", occupant.len()),
+            Some("taken.txt"),
+            occupant.as_slice(),
+        )],
+    )
+    .await;
+    let taken_item = taken.unwrap().item.unwrap();
+    let occupant_blob = taken_item.blob_id.clone().unwrap();
+
+    // A second user's inode referencing the same blob (share-propagation
+    // shape, inserted directly — the reference is what matters).
+    let sharer_inode = CustomUUID::new(None);
+    {
+        let conn = env.state.db_pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, 'shared.txt', 0, ?)",
+            rusqlite::params![sharer_inode, OTHER_USER_ID, occupant_blob],
+        )
+        .unwrap();
+    }
+
+    let mover = b"mover";
+    let (_, file) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", mover.len()),
+            Some("mover.txt"),
+            mover.as_slice(),
+        )],
+    )
+    .await;
+    let mover_id = file.unwrap().item.unwrap().id.unwrap();
+
+    let (status, _) = send_json::<MountMutationResponse>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": mover_id, "new_name": "taken.txt", "replace": true }),
+    )
+    .await;
+    assert!(status.is_success());
+
+    let conn = env.state.db_pool.get().unwrap();
+    let blob_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM data_blocks WHERE id = ?",
+            rusqlite::params![occupant_blob],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blob_rows, 1,
+        "replace must not eagerly free the blob — the orphan sweep owns reclamation"
+    );
+    let sharer_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM inodes WHERE id = ?",
+            rusqlite::params![sharer_inode],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sharer_rows, 1, "another user's reference must be untouched");
+}
+
+// Should: answer 400 for a rename onto the item's own current path,
+// replace or not — the kernel short-circuits same-dentry renames itself,
+// so this pins the HTTP surface's contract only.
+#[tokio::test]
+async fn rename_onto_self_is_400() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let content = b"self";
+    let (_, file) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", content.len()),
+            Some("self.txt"),
+            content.as_slice(),
+        )],
+    )
+    .await;
+    let id = file.unwrap().item.unwrap().id.unwrap();
+
+    for replace in [false, true] {
+        let (status, _) = send_json::<MountMutationResponse>(
+            &app,
+            "PATCH",
+            "/modify",
+            serde_json::json!({ "id": id, "new_name": "self.txt", "replace": replace }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "same-path rename (replace={replace}) keeps its 400 contract"
+        );
+    }
 }

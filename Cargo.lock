@@ -3014,6 +3014,7 @@ dependencies = [
  "clap",
  "fuser",
  "hopnet-common",
+ "libc",
  "reqwest 0.12.23",
  "rustix",
  "secret-service",

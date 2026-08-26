@@ -4,10 +4,13 @@
 //! Serde field order is bincode-frozen; do not reorder. Bincode is
 //! positional — field names are cosmetic; order IS the wire format.
 //!
-//! Evolution convention (matching drive): new function name, never
-//! modify a frozen type. The envelope file lives here rather than in
-//! photos-core so the projection crate owns its wire format as a single
-//! freeze surface.
+//! Evolution convention (matching drive): frozen within a release; an
+//! in-place change is permitted only under the RFC-025 regime — the
+//! carrying release ships after RFC-025 enforcement and activates at a
+//! regenesis boundary (see hopnet-drive/src/envelopes.rs header). Absent
+//! that, it is still: new function name, never modify a frozen type. The
+//! envelope file lives here rather than in photos-core so the projection
+//! crate owns its wire format as a single freeze surface.
 
 use hopnet_common::CustomUUID;
 use serde::{Deserialize, Serialize};

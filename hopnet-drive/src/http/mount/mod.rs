@@ -27,8 +27,8 @@ use crate::paths::{build_encrypted_path, encrypt_part};
 use crate::upload::session_or_status;
 use hopnet_common::db::InodeType;
 use hopnet_common::mount::{
-    MountChangesResponse, MountDeleteRequest, MountEnumerateResponse, MountItem,
-    MountModifyRequest, MountMutationResponse,
+    MountChangesResponse, MountConflictBody, MountConflictCode, MountDeleteRequest,
+    MountEnumerateResponse, MountItem, MountModifyRequest, MountMutationResponse,
 };
 use hopnet_common::CustomUUID;
 use hopnet_projection::DatabaseError;
@@ -511,12 +511,99 @@ fn ensure_vacant(
     ) {
         Ok(_) => {
             // Genuine destination-occupied 409 — distinct from the
-            // consensus-rejection 409 in tx_error_status.
-            tracing::debug!("rename destination is occupied, answering 409");
+            // consensus-rejection 409 in tx_error_status. (create/mkdir
+            // only; rename goes through check_destination.)
+            tracing::debug!("create destination is occupied, answering 409");
             Err(StatusCode::CONFLICT)
         }
         Err(DatabaseError::NotFound) => Ok(()),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// `patch_modify`'s error: either a bare status (every other mount
+/// route's contract) or a coded 409 whose JSON body discriminates the
+/// POSIX rename verdicts for the daemon (EEXIST vs ENOTEMPTY vs
+/// EISDIR/ENOTDIR). A bare 409 from this route remains the consensus
+/// rejection from tx_error_status — the absence of a body is the signal.
+pub enum ModifyError {
+    Status(StatusCode),
+    Coded(MountConflictCode),
+}
+
+impl From<StatusCode> for ModifyError {
+    fn from(status: StatusCode) -> Self {
+        ModifyError::Status(status)
+    }
+}
+
+impl axum::response::IntoResponse for ModifyError {
+    fn into_response(self) -> Response {
+        match self {
+            ModifyError::Status(status) => status.into_response(),
+            ModifyError::Coded(code) => {
+                (StatusCode::CONFLICT, Json(MountConflictBody { code })).into_response()
+            }
+        }
+    }
+}
+
+/// Replace-aware destination check for `patch_modify` (the consensus
+/// validation re-checks authoritatively; this converts the common cases
+/// into clean coded 409s). Answers the POSIX rename matrix: occupied
+/// destination without replace, file<->folder mismatches, and
+/// folder-over-non-empty-folder.
+fn check_destination(
+    state: &DriveState,
+    user_id: i32,
+    source_type: InodeType,
+    dest_encrypted_path: &str,
+    session: &hopnet_projection::host::UserSession,
+    replace: bool,
+) -> Result<(), ModifyError> {
+    let db_lock = state
+        .db_pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let dest = match db::mount::item_by_exact_path(
+        &db_lock,
+        user_id,
+        dest_encrypted_path,
+        &session.siv_key,
+        &session.siv_nonce,
+    ) {
+        Ok(dest) => dest,
+        Err(DatabaseError::NotFound) => return Ok(()),
+        Err(_) => return Err(ModifyError::Status(StatusCode::INTERNAL_SERVER_ERROR)),
+    };
+    if !replace {
+        // Genuine destination-occupied 409 — distinct from the
+        // consensus-rejection 409 in tx_error_status by its body.
+        tracing::debug!("rename destination is occupied, answering coded 409");
+        return Err(ModifyError::Coded(MountConflictCode::Occupied));
+    }
+    match (source_type, dest.item_type) {
+        (InodeType::File, InodeType::Folder) => {
+            Err(ModifyError::Coded(MountConflictCode::IsDirectory))
+        }
+        (InodeType::Folder, InodeType::File) => {
+            Err(ModifyError::Coded(MountConflictCode::NotDirectory))
+        }
+        (InodeType::Folder, InodeType::Folder) => {
+            drop(db_lock);
+            let empty = db::fileprovider::is_folder_empty(
+                state.db_pool.get(),
+                dest_encrypted_path,
+                user_id,
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if empty {
+                Ok(())
+            } else {
+                Err(ModifyError::Coded(MountConflictCode::NotEmpty))
+            }
+        }
+        (InodeType::File, InodeType::File) => Ok(()),
     }
 }
 
@@ -525,27 +612,35 @@ pub async fn patch_modify(
     State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
     Json(request): Json<MountModifyRequest>,
-) -> Result<Json<MountMutationResponse>, StatusCode> {
+) -> Result<Json<MountMutationResponse>, ModifyError> {
     if request.new_parent_id.is_some() && request.new_parent_root {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
     if request.new_parent_id.is_none() && !request.new_parent_root && request.new_name.is_none() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
     if let Some(name) = &request.new_name {
         if name.is_empty() || name.contains('/') {
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(StatusCode::BAD_REQUEST.into());
         }
     }
     let session = session_or_status(&state, user_id).await?;
 
-    let current_path = {
+    let (source_type, current_path) = {
         let db_lock = state
             .db_pool
             .get()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        db::documentprovider::get_path_by_inode_id(&db_lock, &request.id, user_id)
-            .map_err(status_of)?
+        let path = db::documentprovider::get_path_by_inode_id(&db_lock, &request.id, user_id)
+            .map_err(status_of)?;
+        let source_type: InodeType = db_lock
+            .query_row(
+                "SELECT type FROM inodes WHERE id = ? AND owner_id = ?",
+                rusqlite::params![request.id, user_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        (source_type, path)
     };
 
     // Target parent: explicit new parent, root, or unchanged.
@@ -579,9 +674,16 @@ pub async fn patch_modify(
     };
     let new_encrypted_path = build_encrypted_path(&parent_path, &segment);
     if new_encrypted_path == current_path {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
-    ensure_vacant(&state, user_id, &new_encrypted_path, &session)?;
+    check_destination(
+        &state,
+        user_id,
+        source_type,
+        &new_encrypted_path,
+        &session,
+        request.replace,
+    )?;
 
     // Validate-then-rollback (the consensus preflight repeats this
     // authoritatively).
@@ -602,20 +704,22 @@ pub async fn patch_modify(
             user_id,
             request.id.clone(),
             Some(new_encrypted_path.clone()),
+            request.replace,
             None,
             None,
             &state.fragments_dir,
             0, // validation only — rolled back, height never persisted
         )
         .map_err(|e| match e {
-            DatabaseError::NotFound => StatusCode::NOT_FOUND,
+            DatabaseError::NotFound => ModifyError::Status(StatusCode::NOT_FOUND),
             DatabaseError::ConflictError => {
                 // Third 409 source on this route; see tx_error_status.
                 tracing::debug!("rename preflight found the path occupied, answering 409");
-                StatusCode::CONFLICT
+                ModifyError::Coded(MountConflictCode::Occupied)
             }
-            DatabaseError::InvalidPayload => StatusCode::BAD_REQUEST,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+            DatabaseError::NotEmpty => ModifyError::Coded(MountConflictCode::NotEmpty),
+            DatabaseError::InvalidPayload => ModifyError::Status(StatusCode::BAD_REQUEST),
+            _ => ModifyError::Status(StatusCode::INTERNAL_SERVER_ERROR),
         })?;
         db_tx
             .rollback()
@@ -628,6 +732,7 @@ pub async fn patch_modify(
         new_encrypted_path: Some(new_encrypted_path),
         content_update: None,
         incoming_share_updates: None,
+        replace: request.replace,
     };
     let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -698,6 +803,7 @@ pub async fn put_content(
         new_encrypted_path: None,
         content_update: Some(crate::envelopes::DriveContentUpdate { blob_op }),
         incoming_share_updates,
+        replace: false,
     };
     let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

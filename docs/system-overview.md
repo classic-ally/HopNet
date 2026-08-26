@@ -605,7 +605,13 @@ Cross-platform desktop application providing file management and network adminis
       the mesh (2026-08-01). Cache hardening 2026-08-16: descriptors and
       per-blob states are LRU-bounded, so tree-sweeping reads (migration
       verification, grep -r, backups) no longer exhaust RLIMIT_NOFILE
-      and wedge reads into silent EIO. Remaining: S10 desktop
+      and wedge reads into silent EIO. POSIX rename-replace 2026-08-24
+      (issue #62): rename atomically replaces an occupied destination
+      through one consensus transaction — git/atomic-save/rsync-resume
+      unbroken, RENAME_NOREPLACE honoured, dir-over-empty-dir replaces,
+      ENOTEMPTY discriminated via coded 409 bodies; ships behind the
+      RFC-025 release constraint (in-place ModifyItemPayload change,
+      boundary activation only). Remaining: S10 desktop
       polish/packaging)
 - [ ] Client API compatibility — CalVer identity + skew enforcement
       ([RFC-023](specs/client-compat.md), spec 2026-08-16: per-surface

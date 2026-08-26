@@ -1086,7 +1086,7 @@ async fn rename_and_rmdir_semantics() {
     handle.add_file_with_content(ItemId::Root, "a.txt", b"x");
     core.lookup(ROOT_INO, "a.txt").await.unwrap();
 
-    core.rename(ROOT_INO, "a.txt", folder.ino, "b.txt")
+    core.rename(ROOT_INO, "a.txt", folder.ino, "b.txt", true)
         .await
         .unwrap();
     match core.lookup(ROOT_INO, "a.txt").await {
@@ -1703,4 +1703,145 @@ async fn watcher_without_coupling_holds_quietly() {
         wait_until(2000, || changes_calls(&handle).len() > syncs_before).await,
         "watcher must resync once the gate clears"
     );
+}
+
+// ---------- rename-replace (issue #62, POSIX rename(2)) ----------
+
+// Impact: rename-over-existing is the atomic-save idiom (git lockfiles,
+// editors, rsync resume) — the daemon must pass replace through and must
+// not keep serving the clobbered item's attrs.
+// Should: succeed over an occupied name and resolve it to the source.
+// Should: evict the replaced item's cached attrs (getattr = NotFound).
+#[tokio::test]
+async fn rename_replaces_existing_destination() {
+    let (core, handle, _dir) = setup_writable();
+    let (_, src_blob) = handle.add_file_with_content(ItemId::Root, "source.txt", b"mine");
+    handle.add_file_with_content(ItemId::Root, "target.txt", b"theirs");
+
+    let src = core.lookup(ROOT_INO, "source.txt").await.unwrap();
+    let dest = core.lookup(ROOT_INO, "target.txt").await.unwrap();
+
+    core.rename(ROOT_INO, "source.txt", ROOT_INO, "target.txt", true)
+        .await
+        .expect("replace-rename must succeed");
+
+    let now_there = core.lookup(ROOT_INO, "target.txt").await.unwrap();
+    assert_eq!(
+        now_there.item.id, src.item.id,
+        "the destination must resolve to the rename source"
+    );
+    assert_eq!(
+        now_there.item.blob.as_ref(),
+        Some(&src_blob),
+        "the destination must carry the source's content"
+    );
+    match core.getattr(dest.ino).await {
+        Err(CoreError::NotFound) => {}
+        other => panic!("replaced item's attrs must be evicted, not served stale: {other:?}"),
+    }
+}
+
+// Should: surface AlreadyExists (EEXIST) when replace is disallowed and
+// the destination is occupied — the RENAME_NOREPLACE contract.
+#[tokio::test]
+async fn rename_noreplace_maps_conflict_to_already_exists() {
+    let (core, handle, _dir) = setup_writable();
+    handle.add_file_with_content(ItemId::Root, "source.txt", b"mine");
+    handle.add_file_with_content(ItemId::Root, "target.txt", b"theirs");
+    core.lookup(ROOT_INO, "source.txt").await.unwrap();
+
+    match core
+        .rename(ROOT_INO, "source.txt", ROOT_INO, "target.txt", false)
+        .await
+    {
+        Err(CoreError::AlreadyExists) => {}
+        other => panic!("NOREPLACE onto occupied must be EEXIST-shaped, got {other:?}"),
+    }
+}
+
+// Should: surface NotEmpty (ENOTEMPTY) for a dir renamed over a
+// non-empty dir.
+// Should not: report AlreadyExists — POSIX distinguishes the two.
+#[tokio::test]
+async fn rename_replace_nonempty_dir_maps_to_not_empty() {
+    let (core, handle, _dir) = setup_writable();
+    let src = handle.add_folder(ItemId::Root, "Src");
+    let dest = handle.add_folder(ItemId::Root, "Dest");
+    handle.add_file_with_content(dest, "child.txt", b"x");
+    let _ = src;
+    core.lookup(ROOT_INO, "Src").await.unwrap();
+
+    match core.rename(ROOT_INO, "Src", ROOT_INO, "Dest", true).await {
+        Err(CoreError::NotEmpty) => {}
+        other => panic!("dir-over-non-empty-dir must be ENOTEMPTY, got {other:?}"),
+    }
+}
+
+// Impact: POSIX forbids EEXIST on a replace-allowed rename — a bare 409
+// (consensus rejection, or a pre-replace node) must not masquerade as
+// name-taken, or rsync deletes the source and drops the file.
+// Should: map a bare conflict under replace=true to a transport error.
+// Should not: report AlreadyExists.
+#[tokio::test]
+async fn rename_replace_bare_conflict_is_not_eexist() {
+    let (core, handle, _dir) = setup_writable();
+    handle.add_file_with_content(ItemId::Root, "source.txt", b"mine");
+    core.lookup(ROOT_INO, "source.txt").await.unwrap();
+    handle.arm_rename_bare_conflict();
+
+    match core
+        .rename(ROOT_INO, "source.txt", ROOT_INO, "target.txt", true)
+        .await
+    {
+        Err(CoreError::Transport(_)) => {}
+        other => panic!("bare conflict under replace must be EIO-shaped, got {other:?}"),
+    }
+}
+
+// Should: bust the replaced destination's kernel entry and inode when a
+// REMOTE replace-rename lands via the /changes deletion delta.
+#[tokio::test]
+async fn watch_reports_replaced_destination_deleted() {
+    let (transport, handle) = MockTransport::new();
+    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+    handle.add_file(ItemId::Root, "source.txt", 4);
+    handle.add_file(ItemId::Root, "target.txt", 6);
+
+    let src = core.lookup(ROOT_INO, "source.txt").await.unwrap();
+    let dest = core.lookup(ROOT_INO, "target.txt").await.unwrap();
+    let invalidator = spawn_watcher(core.clone(), transport.clone(), &handle).await;
+
+    // Remote daemon replaces target with source (transport-level, the
+    // same journal shape a real node produces: deletion + move).
+    let ItemId::Inode(src_uuid) = src.item.id.clone() else {
+        panic!("file ids are inodes");
+    };
+    transport
+        .rename(
+            src_uuid,
+            Some(ItemId::Root),
+            Some("target.txt".into()),
+            true,
+        )
+        .await
+        .expect("remote replace must succeed");
+    handle.poke();
+
+    assert!(
+        wait_until(2000, || {
+            let seen = invalidator.snapshot();
+            seen.contains(&Invalidation::Inode { ino: dest.ino })
+                && seen.contains(&Invalidation::Entry {
+                    parent_ino: ROOT_INO,
+                    name: "target.txt".to_string(),
+                })
+        })
+        .await,
+        "the replaced destination must be busted via the deletion delta: {:?}",
+        invalidator.snapshot()
+    );
+    match core.getattr(dest.ino).await {
+        Err(CoreError::NotFound) => {}
+        other => panic!("replaced item must be NotFound after the delta, got {other:?}"),
+    }
 }

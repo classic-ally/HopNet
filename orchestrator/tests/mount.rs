@@ -2,8 +2,11 @@
 //! daemon INSIDE node 0's container and prove kernel IO converges across
 //! the mesh — write through the mount, read via the other nodes' APIs;
 //! write via a remote node's API, read through the mount (poke path);
-//! delete remotely, watch it vanish from the mount. The containers get
-//! /dev/fuse + CAP_SYS_ADMIN from the orchestrator for exactly this test.
+//! delete remotely, watch it vanish from the mount; rename over an
+//! occupied name through the kernel (issue #62 POSIX replace) and watch
+//! the replacement — content, vacated source, deleted occupant inode —
+//! converge on every node. The containers get /dev/fuse + CAP_SYS_ADMIN
+//! from the orchestrator for exactly this test.
 
 use anyhow::{Context, Result};
 use bollard::Docker;
@@ -25,6 +28,7 @@ pub struct MountCrossNodeConsistency;
 const MOUNTPOINT: &str = "/hopdrive";
 const MESH_WRITE: &str = "mesh-write.bin";
 const API_WRITE: &str = "api-write.bin";
+const REPLACE_SRC: &str = "replace-src.bin";
 
 fn deterministic_bytes(len: usize, salt: u8) -> Vec<u8> {
     (0..len)
@@ -278,7 +282,7 @@ impl TestScenario for MountCrossNodeConsistency {
     }
 
     fn description(&self) -> &'static str {
-        "Mount the drive via FUSE inside node 0's container; kernel writes appear on all nodes, remote API writes and deletes appear through the mount"
+        "Mount the drive via FUSE inside node 0's container; kernel writes appear on all nodes, remote API writes and deletes appear through the mount, kernel rename-replace converges mesh-wide"
     }
 
     async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
@@ -538,7 +542,194 @@ impl TestScenario for MountCrossNodeConsistency {
             );
         }
 
-        // 8. Soft passthrough probe: report whether CAP_SYS_ADMIN armed the
+        // 8. Kernel rename over an occupied destination (issue #62, POSIX
+        //    rename(2)): `mv` through the mount is the exact syscall shape
+        //    git's lockfile protocol and every atomic-save client use. The
+        //    replacement must converge mesh-wide: destination carries the
+        //    source's bytes on the other nodes, the source name vacates,
+        //    and the replaced occupant's inode is deleted everywhere.
+        let replace_bytes = deterministic_bytes(768 * 1024, 91);
+        let replace_setup = async {
+            // Occupant id BEFORE the replace, from a remote node — the
+            // "gone everywhere" assertion below is id-addressed.
+            let occupant = wait_for_item(
+                &client,
+                &nodes[1],
+                &api_key,
+                MESH_WRITE,
+                Duration::from_secs(30),
+            )
+            .await?;
+            let occupant_id = occupant["id"]
+                .as_str()
+                .context("occupant has no id")?
+                .to_string();
+            // Source file written through the kernel (create/write/release).
+            upload_via_tar(&docker, &node0, MOUNTPOINT, REPLACE_SRC, &replace_bytes).await?;
+            Ok::<_, anyhow::Error>(occupant_id)
+        }
+        .await;
+        match replace_setup {
+            Err(e) => {
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Stage kernel rename-replace (occupant id + source write)"
+                            .to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
+            }
+            Ok(occupant_id) => {
+                // The mv itself: rename(2) over an occupied name. Before
+                // issue #62 this failed with "can't rename: File exists".
+                let mv = exec_capture(
+                    &docker,
+                    &node0,
+                    &format!(
+                        "mv {}/{} {}/{}",
+                        MOUNTPOINT, REPLACE_SRC, MOUNTPOINT, MESH_WRITE
+                    ),
+                )
+                .await;
+                let (mv_ok, mv_detail) = match &mv {
+                    Ok((0, _)) => (true, None),
+                    Ok((code, out)) => (false, Some(format!("exit {code}: {out}"))),
+                    Err(e) => (false, Some(e.to_string())),
+                };
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!(
+                            "Kernel mv {} over occupied {} succeeds",
+                            REPLACE_SRC, MESH_WRITE
+                        ),
+                        passed: mv_ok,
+                        detail: mv_detail,
+                    },
+                );
+
+                if mv_ok {
+                    // Destination content is the SOURCE's bytes on the
+                    // other nodes (covers the async write-back window).
+                    for node in &nodes[1..3] {
+                        let check = wait_for_content(
+                            &client,
+                            node,
+                            &api_key,
+                            MESH_WRITE,
+                            &replace_bytes,
+                            Duration::from_secs(60),
+                        )
+                        .await;
+                        print_and_add_check(
+                            &mut result,
+                            Check {
+                                name: format!(
+                                    "{} carries the replace source's bytes via node {}'s API",
+                                    MESH_WRITE, node.node_id
+                                ),
+                                passed: check.is_ok(),
+                                detail: check.err().map(|e| e.to_string()),
+                            },
+                        );
+                    }
+
+                    // Source name vacated and occupant inode deleted,
+                    // observed from node 1 (id-addressed via /item).
+                    let item_url = format!(
+                        "https://{}:{}/api/integrations/mount/item",
+                        nodes[1].ip_address, nodes[1].port
+                    );
+                    let lookup_url = format!(
+                        "https://{}:{}/api/integrations/mount/lookup",
+                        nodes[1].ip_address, nodes[1].port
+                    );
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    let mut source_vacated = false;
+                    let mut occupant_gone = false;
+                    while Instant::now() < deadline && !(source_vacated && occupant_gone) {
+                        if !source_vacated
+                            && let Ok(resp) = client
+                                .get(&lookup_url)
+                                .bearer_auth(&api_key)
+                                .query(&[("name", REPLACE_SRC)])
+                                .send()
+                                .await
+                            && resp.status() == reqwest::StatusCode::NOT_FOUND
+                        {
+                            source_vacated = true;
+                        }
+                        if !occupant_gone
+                            && let Ok(resp) = client
+                                .get(&item_url)
+                                .bearer_auth(&api_key)
+                                .query(&[("id", occupant_id.as_str())])
+                                .send()
+                                .await
+                            && resp.status() == reqwest::StatusCode::NOT_FOUND
+                        {
+                            occupant_gone = true;
+                        }
+                        if !(source_vacated && occupant_gone) {
+                            sleep(Duration::from_millis(500)).await;
+                        }
+                    }
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!("{} name vacated on node 1", REPLACE_SRC),
+                            passed: source_vacated,
+                            detail: None,
+                        },
+                    );
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: "Replaced occupant inode deleted on node 1".to_string(),
+                            passed: occupant_gone,
+                            detail: None,
+                        },
+                    );
+
+                    // And locally through the mount: destination serves the
+                    // source's bytes, source path is gone.
+                    let local = async {
+                        let bytes = download_via_tar(
+                            &docker,
+                            &node0,
+                            &format!("{}/{}", MOUNTPOINT, MESH_WRITE),
+                        )
+                        .await?;
+                        anyhow::ensure!(
+                            blake3::hash(&bytes) == blake3::hash(&replace_bytes),
+                            "destination content mismatch ({} bytes)",
+                            bytes.len()
+                        );
+                        let (code, _) = exec_capture(
+                            &docker,
+                            &node0,
+                            &format!("test -e {}/{}", MOUNTPOINT, REPLACE_SRC),
+                        )
+                        .await?;
+                        anyhow::ensure!(code != 0, "source path still present on the mount");
+                        Ok::<_, anyhow::Error>(())
+                    }
+                    .await;
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: "Replace observed through the mount itself".to_string(),
+                            passed: local.is_ok(),
+                            detail: local.err().map(|e| e.to_string()),
+                        },
+                    );
+                }
+            }
+        }
+
+        // 9. Soft passthrough probe: report whether CAP_SYS_ADMIN armed the
         //    S9 path in-container. Informational — never fails the test.
         let log = daemon_log.lock().map(|l| l.clone()).unwrap_or_default();
         let passthrough_lines: Vec<&str> = log

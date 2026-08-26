@@ -874,6 +874,7 @@ pub async fn modify_item(
             user_id,
             inode_id.clone(),
             new_encrypted_path.clone(),
+            false, // FileProvider keeps refuse-to-replace semantics
             content_update.clone().map(|u| u.blob_op),
             None, // incoming_share_updates not needed for validation
             &state.fragments_dir,
@@ -915,6 +916,7 @@ pub async fn modify_item(
         new_encrypted_path: new_encrypted_path.clone(),
         content_update,
         incoming_share_updates,
+        replace: false,
     };
 
     // Serialize and submit to consensus
