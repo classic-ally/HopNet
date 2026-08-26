@@ -126,9 +126,21 @@ in
 
     auth = f"-H 'Authorization: Bearer {jwt_for(node0)}'"
 
+    # The join ceremony (RFC-025 S5): a fresh node binds TLS-dead until
+    # the mesh code is adopted, so the code must land on each joiner
+    # BEFORE the coordinator's registration probe can complete.
+    mesh_code = json.loads(
+        node0.succeed(f"curl -ksf {API}/views/regenesis-status {auth}")
+    )["mesh_code"]
+    code_body = json.dumps({"code": mesh_code})
+
     for i, n in enumerate(nodes[1:], start=1):
         pubkey = n.succeed(f"curl -ks {API}/setup").strip().strip('"')
         assert len(pubkey) == 64, f"node{i} pubkey: {pubkey!r}"
+        n.succeed(
+            f"curl -ksf -X POST {API}/setup/join-code "
+            f"-H 'Content-Type: application/json' -d '{code_body}'"
+        )
         body = json.dumps({"name": f"node{i}", "owner": 0, "pubkey": pubkey})
         # 504 = iroh discovery still warming; retry through it.
         node0.wait_until_succeeds(
