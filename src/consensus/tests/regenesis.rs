@@ -326,8 +326,14 @@ fn commit_refused_in_normal() {
 // Should: seal from the moratorium, recording the certified hash and the
 // terminal height; afterwards the window is closed forward-only — no
 // second commit, no abort, no new start.
+// Should not: touch the agreed-version marker — regenesis_start and the
+// seal are agreement-in-progress, not a transition; only a completed
+// crossing moves the marker.
 #[test]
 fn commit_seals_and_closes_the_window() {
+    let env = crate::test_env::lock_env();
+    let tmp = tempfile::tempdir().unwrap();
+    crate::test_env::set(&env, "XDG_DATA_HOME", tmp.path());
     let node = MockNode::new(3);
     register_node(&node);
     seat_with_version(&node, 3, 20260800);
@@ -339,6 +345,11 @@ fn commit_seals_and_closes_the_window() {
         commit_payload([7u8; 32], 9, 20260800),
     )
     .unwrap();
+    assert_eq!(
+        crate::regenesis::boot::read_agreed_version(&crate::db::shared::get_database_path()),
+        None,
+        "staging and sealing must never move the agreement"
+    );
 
     let state = committed_state(&node);
     assert_eq!(state.phase, RegenesisPhase::Sealed);
@@ -869,8 +880,13 @@ fn handshake_carries_epoch_and_refuses_mismatched_fetch() {
 // Should: refuse a JoinInfo whose anchor disagrees with the entered
 // code — and refuse any delivery when no code was entered — with
 // nothing written and the node identity untouched.
+// Should not: leave an agreed-version marker behind — the refused node
+// is still never-joined and must stay newest-wins for the seed guard.
 #[test]
 fn join_preflight_refuses_mismatched_anchor_before_any_write() {
+    let env = crate::test_env::lock_env();
+    let tmp = tempfile::tempdir().unwrap();
+    crate::test_env::set(&env, "XDG_DATA_HOME", tmp.path());
     let node = MockNode::new(8);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -911,6 +927,11 @@ fn join_preflight_refuses_mismatched_anchor_before_any_write() {
         .query_row("SELECT COUNT(*) FROM this_node", [], |r| r.get(0))
         .unwrap();
     assert_eq!(rows, 0, "nothing may be written before the pre-flight");
+    assert_eq!(
+        crate::regenesis::boot::read_agreed_version(&crate::db::shared::get_database_path()),
+        None,
+        "a refused join must not stamp an agreement"
+    );
 }
 
 // Should: adopt the same code idempotently and refuse a different one

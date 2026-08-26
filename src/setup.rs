@@ -218,6 +218,11 @@ pub async fn process_join_info(
                 if let Err(e) = setup::rollback_joining_node(app_state_clone.db_pool.get()) {
                     tracing::error!("join rollback failed: {e:?} — wipe the data dir manually");
                 }
+                // Back to never-joined: the agreement (if any write
+                // raced ahead) leaves with the membership.
+                crate::regenesis::boot::remove_agreed_version(
+                    &crate::db::shared::get_database_path(),
+                );
                 app_state_clone
                     .setup_complete
                     .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -238,6 +243,17 @@ pub async fn process_join_info(
                 return;
             }
         };
+
+        // Joining IS accepting the agreement. An epoch-1 join has no
+        // committed version to cite, so the joiner's binary stamps
+        // (delivery rode the locked class — both ends provably run the
+        // same release); an epoch>=2 join already stamped the record's
+        // required version, and this rewrite is byte-identical (the
+        // join version gate enforces equality).
+        crate::regenesis::boot::write_agreed_version(
+            &crate::db::shared::get_database_path(),
+            crate::version::effective_running_code(),
+        );
 
         // Mesh-initiated seating (RFC-CONSENSUS-002 S5): the joining node
         // never requests a seat — it registers, syncs, answers probes, and
@@ -339,6 +355,14 @@ pub async fn post_setup(
             app_state
                 .setup_complete
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+
+            // Founding a mesh IS the version agreement: epoch 1 records
+            // no version in committed state, so the coordinator's own
+            // binary stamps the agreed-version marker.
+            crate::regenesis::boot::write_agreed_version(
+                &crate::db::shared::get_database_path(),
+                crate::version::effective_running_code(),
+            );
 
             // The genesis node minted the mesh identity THIS instant —
             // adopt it on the live endpoint (RFC-025 S5). Without this

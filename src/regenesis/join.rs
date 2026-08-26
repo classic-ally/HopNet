@@ -842,6 +842,12 @@ pub async fn epoch_join_bootstrap_with(
         genesis::write_lineage_bytes(data_dir, lr.record.epoch, &bytes)?;
     }
     app_state.epoch.store(record.epoch, Ordering::Relaxed);
+    // The joined epoch's consensus-agreed version becomes this node's
+    // agreement (the join version gate already proved we run it).
+    crate::regenesis::boot::write_agreed_version(
+        &crate::db::shared::get_database_path(),
+        record.required_version_code,
+    );
     clear_staging(&staging);
 
     // A re-registered node may already hold fragments from a previous
