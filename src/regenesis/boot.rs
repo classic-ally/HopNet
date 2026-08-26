@@ -216,6 +216,22 @@ pub fn write_rollback_marker(db_path: &str) {
     }
 }
 
+/// Rollout backfill: a node that crossed epochs BEFORE the marker
+/// existed gets one stamped from committed lineage on its next boot.
+/// Fill-if-absent ONLY — never a bump, never a reconcile — and only
+/// from epoch >= 2 (epoch 1 committed no version; those nodes are
+/// stamped at their next crossing).
+pub(crate) fn backfill_agreed_version(db_path: &str, data_dir: &Path, epoch: u64) {
+    if epoch < 2 || read_agreed_version(db_path).is_some() {
+        return;
+    }
+    tracing::info!(
+        epoch,
+        "agreed-version marker absent; backfilling from lineage"
+    );
+    stamp_agreed_from_lineage(db_path, epoch, None);
+}
+
 /// Is there a boundary to abandon? True when a retained previous-epoch
 /// database exists (we crossed and the window is still open) or this
 /// database is sealed (we sealed but never crossed). False means a
@@ -2046,6 +2062,31 @@ pub(crate) mod tests {
         // Unreadable lineage + fallback: the fallback stamps.
         stamp_agreed_from_lineage(&crossed_db, 9, Some(TARGET + 5));
         assert_eq!(read_agreed_version(&crossed_db), Some(TARGET + 5));
+    }
+
+    // Impact: rollout — every mesh that crossed an epoch before this
+    // marker existed must acquire one WITHOUT a new crossing, or the
+    // seed guard stays unclamped exactly where it matters most.
+    // Should: fill an absent marker from committed lineage on an
+    // epoch>=2 database.
+    // Should not: change an existing marker, or invent one for epoch 1.
+    #[test]
+    fn backfill_fills_only_absent_and_only_from_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = crossed(dir.path());
+        remove_agreed_version(&db_path);
+        backfill_agreed_version(&db_path, dir.path(), 2);
+        assert_eq!(read_agreed_version(&db_path), Some(TARGET));
+
+        // Existing marker: untouched, even when lineage disagrees.
+        write_agreed_version(&db_path, TARGET + 7);
+        backfill_agreed_version(&db_path, dir.path(), 2);
+        assert_eq!(read_agreed_version(&db_path), Some(TARGET + 7));
+
+        // Epoch 1: no committed source, no invention.
+        remove_agreed_version(&db_path);
+        backfill_agreed_version(&db_path, dir.path(), 1);
+        assert_eq!(read_agreed_version(&db_path), None);
     }
 
     // Should: park awaiting upgrade on a version mismatch — marker file

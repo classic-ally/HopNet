@@ -528,10 +528,13 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // already points at the post-transition database, so this is
             // the new epoch on a freshly crossed boundary.
             if let Ok(conn) = app_state.db_pool.get() {
-                app_state.epoch.store(
-                    regenesis::genesis::current_epoch(&conn),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                let epoch = regenesis::genesis::current_epoch(&conn);
+                app_state
+                    .epoch
+                    .store(epoch, std::sync::atomic::Ordering::Relaxed);
+                // Rollout: nodes that crossed before the agreed-version
+                // marker existed pick one up from committed lineage.
+                regenesis::boot::backfill_agreed_version(&db_path, &paths::data_dir(), epoch);
             }
             let restart_signal = app_state.restart_signal.clone();
 
