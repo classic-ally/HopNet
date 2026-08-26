@@ -22,12 +22,23 @@ let
   appBundle = "${profile}";
   appBinary = "${appBundle}/Contents/MacOS/HopNet";
 
-  # Newest-wins seeding + exec, folded into one wrapper: launchd has no
-  # ExecStartPre, and the wrapper's stable store path also keeps the agent's
-  # program path valid while the profile moves. `sort -V` orders CalVer;
-  # coreutils supplies `mv -T` (BSD mv cannot atomically replace a symlink).
-  # Interpolating ${cfg.package} roots the seed generation in the system
-  # closure, so the profile target is never garbage-collected.
+  # Newest-WITHIN-AGREEMENT seeding + exec (RFC-025), folded into one
+  # wrapper: launchd has no ExecStartPre, and the wrapper's stable store
+  # path also keeps the agent's program path valid while the profile
+  # moves. `sort -V` orders CalVer; coreutils supplies `mv -T` (BSD mv
+  # cannot atomically replace a symlink). Interpolating ${cfg.package}
+  # roots the seed generation in the system closure, so the profile
+  # target is never garbage-collected.
+  #
+  # The advance arm asks `seed-guard` (the flake package's binary — it
+  # is in the closure and understands the markers) whether the mesh
+  # agreement permits the candidate, exactly like the NixOS module's
+  # seedScript: a pin beyond the agreement is HELD, not seeded. The
+  # launchd EnvironmentVariables below set HOPNET_DATA_DIR before this
+  # wrapper runs, so the guard resolves the same markers as the app.
+  # The bootstrap arm stays unguarded (availability on a wiped
+  # profile); the boot-time version-ahead gate is the shared backstop.
+  flakeBinary = "${cfg.package}/Applications/HopNet.app/Contents/MacOS/HopNet";
   agentWrapper = pkgs.writeShellScript "hopnet-desktop-agent" ''
     set -eu
     export PATH=${lib.makeBinPath [ pkgs.coreutils ]}:/usr/bin:/bin
@@ -46,8 +57,12 @@ let
       flake_ver="${cfg.package.version}"
       newest=$(printf '%s\n%s\n' "$flake_ver" "$current_ver" | sort -V | tail -n1)
       if [ "$newest" = "$flake_ver" ] && [ "$flake_ver" != "$current_ver" ]; then
-        echo "hopnet-desktop: flake pin $flake_ver is newer than profile $current_ver — re-seeding"
-        seed
+        if "${flakeBinary}" seed-guard --candidate "$flake_ver"; then
+          echo "hopnet-desktop: flake pin $flake_ver is newer than profile $current_ver — re-seeding"
+          seed
+        else
+          echo "hopnet-desktop: flake pin $flake_ver held — the mesh agreement pins the runnable version"
+        fi
       fi
     fi
     exec "${appBinary}"

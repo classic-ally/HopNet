@@ -690,7 +690,10 @@ it as an ordinary upgrade regenesis. S-final trails independently
       two-sided: the NixOS module's seeding became
       newest-WITHIN-AGREEMENT via `hopnet seed-guard` (exit 0/3/2;
       conservative on garbage; never-joined stays newest-wins — a
-      fresh install keeps loading the latest release), and normal
+      fresh install keeps loading the latest release; the darwin
+      launchd wrapper, `hopnet-desktop-module.nix`, carries the
+      same guard in its advance arm — `HOPNET_DATA_DIR` in its
+      agent environment resolves the same markers), and normal
       boots gained the one-directional version-ahead gate
       (`ParkReason::VersionAhead`: running > agreed parks alive with
       both versions named; running < agreed boots — stragglers must
