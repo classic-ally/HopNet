@@ -531,9 +531,42 @@ impl TestScenario for RetiredDialer {
             },
         );
 
+        // 6b. The seeding clamp's never-joined arm (RFC-025
+        // agreed-version), against real on-disk state: the fresh target
+        // has NO agreed-version marker (code adoption is not joining),
+        // so seed-guard allows any candidate — install-without-joining
+        // stays newest-wins. Contrast: the joined coordinator holds.
+        let id = super::regenesis::find_container_id(&docker, mesh_id, target_id).await?;
+        // PID 1 IS the hopnet binary (store-path entrypoint, no PATH).
+        const GUARD: &str = "export HOME=/root; \
+             test ! -e /root/.local/share/hopnet/agreed-version && \
+             \"$(readlink /proc/1/exe)\" seed-guard --candidate 2099.1.1; echo rc=$?";
+        let (rc_fresh, out_fresh) = super::regenesis::exec_sh(&docker, &id, GUARD).await?;
+        let fresh_allows = rc_fresh == 0 && out_fresh.contains("rc=0");
+        let joined_id = super::regenesis::find_container_id(&docker, mesh_id, 0).await?;
+        let (_, out_joined) = super::regenesis::exec_sh(
+            &docker,
+            &joined_id,
+            "export HOME=/root; \
+             \"$(readlink /proc/1/exe)\" seed-guard --candidate 2099.1.1; echo rc=$?",
+        )
+        .await?;
+        let joined_holds = out_joined.contains("rc=3");
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Seed guard: never-joined allows, a joined node holds".to_string(),
+                passed: fresh_allows && joined_holds,
+                detail: Some(format!(
+                    "fresh: {:?}, joined: {:?}",
+                    out_fresh.trim(),
+                    out_joined.trim()
+                )),
+            },
+        );
+
         // 7. Cleanup: the unregistered target must not linger into the
         // runner's divergence check.
-        let id = super::regenesis::find_container_id(&docker, mesh_id, target_id).await?;
         let _ = docker
             .stop_container(&id, None::<bollard::query_parameters::StopContainerOptions>)
             .await;

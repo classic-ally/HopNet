@@ -157,6 +157,32 @@ impl TestScenario for MeshGrowth {
         let after1 = rebuild_nodes(&docker, mesh_id).await?;
         let newcomer = after1.last().cloned().unwrap();
 
+        // RFC-025 agreed-version: joining a mesh sets the agreement (the
+        // fresh-join pathway of the seeding clamp). Poll briefly — the
+        // stamp lands when the join bootstrap completes in background.
+        let mut join_stamped = false;
+        let stamp_deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < stamp_deadline {
+            let view = crate::call_node_api(&newcomer, "/api/views/regenesis-status", true)
+                .await?
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_default();
+            if view["agreed_version"].as_str() == Some(env!("CARGO_PKG_VERSION")) {
+                join_stamped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Joining sets the agreed version".to_string(),
+                passed: join_stamped,
+                detail: None,
+            },
+        );
+
         // 3. It syncs and stays UNSEATED well past s_full (the lateral is
         // refused on posture, not span). Watch a window comfortably past
         // s_full=6 + the scan cadence: 25s, asserting it never seats.

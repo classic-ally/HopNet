@@ -743,11 +743,14 @@ impl TestScenario for RegenesisAwaitingUpgrade {
                 is_running(&info.state),
                 v["awaiting_upgrade"].as_bool().unwrap_or(false),
                 v["target_version"].as_str().unwrap_or("?").to_string(),
+                // RFC-025: staging, the seal, and the park never move
+                // the agreement — it still names the founding version.
+                v["agreed_version"].as_str().unwrap_or("?").to_string(),
             ));
         }
-        let all_parked = parked
-            .iter()
-            .all(|(alive, awaiting, target)| *alive && *awaiting && target == TARGET);
+        let all_parked = parked.iter().all(|(alive, awaiting, target, agreed)| {
+            *alive && *awaiting && target == TARGET && agreed == env!("CARGO_PKG_VERSION")
+        });
         let write_refused = matches!(
             upload_file(&nodes[0], "/", "while-parked.txt", b"never".to_vec()).await,
             Err(e) if e.to_string().contains("503")
@@ -828,24 +831,29 @@ impl TestScenario for RegenesisAwaitingUpgrade {
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        let epochs: Vec<String> = {
+        let epochs: Vec<(String, String)> = {
             let mut e = Vec::new();
             for node in &fresh_nodes {
-                e.push(
-                    regenesis_status(node).await?["epoch"]
-                        .as_str()
-                        .unwrap_or("?")
-                        .to_string(),
-                );
+                let v = regenesis_status(node).await?;
+                e.push((
+                    v["epoch"].as_str().unwrap_or("?").to_string(),
+                    v["agreed_version"].as_str().unwrap_or("?").to_string(),
+                ));
             }
             e
         };
+        // RFC-025: the agreement moved to the target exactly at the
+        // crossing — held at the founding version through the whole
+        // staged/sealed/parked window above.
         print_and_add_check(
             &mut result,
             Check {
-                name: "Upgraded quorum completes epoch 2 and decides past H".to_string(),
-                passed: progressed && epochs.iter().all(|e| e == "2"),
-                detail: Some(format!("progressed: {progressed}, epochs: {epochs:?}")),
+                name: "Upgraded quorum completes epoch 2; agreed version bumped at the crossing"
+                    .to_string(),
+                passed: progressed && epochs.iter().all(|(e, a)| e == "2" && a == TARGET),
+                detail: Some(format!(
+                    "progressed: {progressed}, (epoch, agreed): {epochs:?}"
+                )),
             },
         );
 
@@ -1046,15 +1054,19 @@ impl TestScenario for RegenesisCutover {
         )
         .await?;
         let on_latest = wait_for_epoch(&joined, "2", Duration::from_secs(300)).await?;
-        let joined_ordinals = ordinal_map(&regenesis_status(&joined).await?);
+        let joined_view = regenesis_status(&joined).await?;
+        let joined_ordinals = ordinal_map(&joined_view);
+        // RFC-025: an epoch join stamps the record's consensus-agreed
+        // required version — the fresh-join pathway of the clamp.
+        let joined_agreed = joined_view["agreed_version"].as_str() == Some(target);
         print_and_add_check(
             &mut result,
             Check {
                 name: "Fresh node joins THROUGH the pre-split artifact, stamped at head"
                     .to_string(),
-                passed: on_latest && joined_ordinals == expected,
+                passed: on_latest && joined_ordinals == expected && joined_agreed,
                 detail: Some(format!(
-                    "epoch 2: {on_latest}, ordinals: {joined_ordinals:?}"
+                    "epoch 2: {on_latest}, agreed at target: {joined_agreed}, ordinals: {joined_ordinals:?}"
                 )),
             },
         );
@@ -1285,6 +1297,35 @@ impl TestScenario for EnforcementCrossing {
             },
         );
 
+        // 3b. The crossed side's agreement moved to the target AT the
+        // crossing (RFC-025 agreed-version clamp) — and the backfill
+        // covers rollout: delete the marker, restart, it reappears from
+        // committed lineage.
+        let crossed_agreed =
+            regenesis_status(&crossed[0]).await?["agreed_version"].as_str() == Some(target);
+        const DATA_DIR: &str = "/root/.local/share/hopnet";
+        let c0 = find_container_id(&docker, mesh_id, 0).await?;
+        exec_sh(&docker, &c0, &format!("rm -f {DATA_DIR}/agreed-version")).await?;
+        recreate_node_with_env(&docker, mesh_id, 0, Some(&new_image), crossed_env).await?;
+        let refreshed0 = reauth_node(&docker, mesh_id, &crossed[0]).await?;
+        let c0 = find_container_id(&docker, mesh_id, 0).await?;
+        let (_, backfilled) =
+            exec_sh(&docker, &c0, &format!("cat {DATA_DIR}/agreed-version")).await?;
+        let backfill_ok = backfilled.trim() == target;
+        crossed[0] = refreshed0;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Agreement bumped at the crossing; backfill restores it from lineage"
+                    .to_string(),
+                passed: crossed_agreed && backfill_ok,
+                detail: Some(format!(
+                    "crossed_agreed={crossed_agreed} backfilled={:?}",
+                    backfilled.trim()
+                )),
+            },
+        );
+
         // 4. The crossed pair decides past the boundary while the
         // straggler rides generation 0.
         upload_file(
@@ -1322,6 +1363,7 @@ impl TestScenario for EnforcementCrossing {
         let activated = on_epoch2
             && v["phase"].as_str() == Some("normal")
             && v["running_version"].as_str() == Some(target)
+            && v["agreed_version"].as_str() == Some(target)
             && ordinal_map(&v) == expected;
         print_and_add_check(
             &mut result,
@@ -1378,7 +1420,11 @@ pub struct RegenesisNixActivation;
 
 /// Run a script in the container via busybox sh, returning
 /// (exit_code, output) — mount.rs's exec_capture, shared shape.
-async fn exec_sh(docker: &Docker, container: &str, script: &str) -> Result<(i64, String)> {
+pub(crate) async fn exec_sh(
+    docker: &Docker,
+    container: &str,
+    script: &str,
+) -> Result<(i64, String)> {
     use bollard::exec::{CreateExecOptions, StartExecResults};
     use tokio_stream::StreamExt;
     let exec = docker
