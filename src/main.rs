@@ -534,7 +534,11 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     .store(epoch, std::sync::atomic::Ordering::Relaxed);
                 // Rollout: nodes that crossed before the agreed-version
                 // marker existed pick one up from committed lineage.
-                regenesis::boot::backfill_agreed_version(&db_path, &paths::data_dir(), epoch);
+                regenesis::boot::backfill_agreed_version(
+                    &db::shared::get_database_path(),
+                    &paths::data_dir(),
+                    epoch,
+                );
             }
             let restart_signal = app_state.restart_signal.clone();
 

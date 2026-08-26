@@ -86,6 +86,11 @@ pub enum ParkReason {
     /// Gate 2/3 failure: refused to cross, old database untouched;
     /// retried on next boot.
     GateFailed { gate: &'static str, detail: String },
+    /// State A refusal (issue #58): this binary is NEWER than the
+    /// mesh-agreed version. One-directional — an older binary is a
+    /// straggler and boots normally to stage. NOT an awaiting-upgrade
+    /// park: nothing is pending, the operator overran the agreement.
+    VersionAhead { agreed: u32, running: u32 },
 }
 
 /// Last boundary error, for the status surface (latest wins — in
@@ -221,7 +226,7 @@ pub fn write_rollback_marker(db_path: &str) {
 /// Fill-if-absent ONLY — never a bump, never a reconcile — and only
 /// from epoch >= 2 (epoch 1 committed no version; those nodes are
 /// stamped at their next crossing).
-pub(crate) fn backfill_agreed_version(db_path: &str, data_dir: &Path, epoch: u64) {
+pub fn backfill_agreed_version(db_path: &str, data_dir: &Path, epoch: u64) {
     if epoch < 2 || read_agreed_version(db_path).is_some() {
         return;
     }
@@ -407,6 +412,36 @@ pub fn boot_transition_with(
         // never join staging (an in-progress download resumes).
         remove_with_sidecars(&next);
         let _ = std::fs::remove_file(&awaiting);
+        // The agreed-version gate (issue #58, RFC-025): a binary AHEAD
+        // of the mesh agreement must not run mid-epoch — it would start
+        // its engine and fail every locked dial loudly (contained by
+        // ALPN, but burning operator time as a mysteriously idle node).
+        // One-directional by design: a binary BEHIND the agreement is a
+        // straggler and must boot to stage and epoch-join (RFC-019 S7);
+        // no marker (never-joined, pre-rollout epoch 1) leaves the gate
+        // inert.
+        if let Some(agreed) = read_agreed_version(db_path)
+            && running_code > agreed
+        {
+            let detail = format!(
+                "binary {} is ahead of the mesh agreement {} — parked; \
+                 downgrade to the agreed version, or upgrade the mesh first",
+                crate::version::format_code(running_code),
+                crate::version::format_code(agreed),
+            );
+            tracing::error!(
+                agreed = %crate::version::format_code(agreed),
+                running = %crate::version::format_code(running_code),
+                "version ahead of the mesh agreement: refusing to run (RFC-025)"
+            );
+            if let Ok(mut slot) = BOUNDARY_ERROR.lock() {
+                *slot = Some(format!("version-ahead: {detail}"));
+            }
+            return BootOutcome::Parked(ParkReason::VersionAhead {
+                agreed,
+                running: running_code,
+            });
+        }
         return BootOutcome::NoBoundary;
     }
 
@@ -2062,6 +2097,55 @@ pub(crate) mod tests {
         // Unreadable lineage + fallback: the fallback stamps.
         stamp_agreed_from_lineage(&crossed_db, 9, Some(TARGET + 5));
         assert_eq!(read_agreed_version(&crossed_db), Some(TARGET + 5));
+    }
+
+    // Impact: issue #58 — before this gate, a mid-epoch restart into a
+    // newer release joined the mesh silently and failed every locked
+    // dial as a mysteriously idle node; ALPN contained it, nothing
+    // named it at boot. One-directional: ahead parks, behind boots
+    // (stragglers must stage — RFC-019 S7).
+    // Should: park a set-up node whose binary is ahead of the recorded
+    // agreement, naming both versions, database untouched.
+    // Should not: write the awaiting-upgrade marker (nothing is
+    // pending), park a binary AT or BEHIND the agreement, or fire at
+    // all without a marker.
+    #[test]
+    fn version_ahead_of_agreement_parks_and_behind_boots() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = crossed(dir.path());
+        assert_eq!(read_agreed_version(&db_path), Some(TARGET));
+
+        // Ahead: parked, named, nothing written or touched.
+        let outcome = boot_transition(&db_path, TARGET + 1);
+        assert!(
+            matches!(
+                outcome,
+                BootOutcome::Parked(ParkReason::VersionAhead { agreed: TARGET, .. })
+            ),
+            "got {outcome:?}"
+        );
+        assert!(!awaiting_upgrade_path(&db_path).exists());
+        assert_eq!(read_agreed_version(&db_path), Some(TARGET));
+        let conn = open(&db_path);
+        assert_eq!(genesis::current_epoch(&conn), 2);
+        drop(conn);
+
+        // At the agreement: normal boot.
+        assert!(matches!(
+            boot_transition(&db_path, TARGET),
+            BootOutcome::NoBoundary
+        ));
+        // Behind: a straggler boots normally to stage.
+        assert!(matches!(
+            boot_transition(&db_path, TARGET - 1),
+            BootOutcome::NoBoundary
+        ));
+        // No marker: the gate is inert.
+        remove_agreed_version(&db_path);
+        assert!(matches!(
+            boot_transition(&db_path, TARGET + 1),
+            BootOutcome::NoBoundary
+        ));
     }
 
     // Impact: rollout — every mesh that crossed an epoch before this
