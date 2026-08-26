@@ -16,7 +16,13 @@ description = "HopNet inter-node communication: envelope framing + scoped dispat
 # links it. The workspace-root [patch.crates-io] entry for the iroh fork
 # must stay in the root manifest (cargo requirement); containment means
 # this crate's [dependencies] is the only one in the workspace naming iroh.
+#
+# hopnet-common rides the `iroh` feature too (RFC-025): the transport
+# derives its locked-ALPN code from the workspace-unified effective-code
+# seam. It stays OUT of the default face — the vocabulary remains
+# zero-dependency.
 [dependencies]
+hopnet-common = { path = "../common", optional = true }
 iroh = { version = "0.98.2", optional = true }
 rand = { version = "0.10", optional = true }
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "sync", "time", "io-util", "macros"], optional = true }
@@ -24,4 +30,4 @@ tracing = { version = "0.1", optional = true }
 
 [features]
 default = []
-iroh = ["dep:iroh", "dep:rand", "dep:tokio", "dep:tracing"]
+iroh = ["dep:hopnet-common", "dep:iroh", "dep:rand", "dep:tokio", "dep:tracing"]

@@ -14,11 +14,24 @@ let
   profile = "${cfg.dataDir}/profile";
   stageDir = "${cfg.dataDir}/staged";
 
-  # Newest-wins seeding. Atomic on both arms: build the candidate link
-  # beside the profile, rename over. `sort -V` orders CalVer correctly.
-  # Interpolating ${cfg.package} here also roots the seed generation in
-  # the system closure — the profile indirection never leaves the seed
-  # collectable.
+  # Newest-WITHIN-AGREEMENT seeding (RFC-025). Atomic on both arms:
+  # build the candidate link beside the profile, rename over. `sort -V`
+  # orders CalVer correctly. Interpolating ${cfg.package} here also
+  # roots the seed generation in the system closure — the profile
+  # indirection never leaves the seed collectable.
+  #
+  # The advance arm asks `hopnet seed-guard` (the flake binary — it is
+  # in the closure and understands the markers) whether the mesh
+  # agreement permits the candidate: a flake pin beyond what the mesh
+  # agreed is HELD, not seeded — `nixos-rebuild switch` can no longer
+  # move a node past its mesh mid-epoch. A held pin is not lost: when
+  # the mesh agrees and seals, RFC-021 activation flips the profile
+  # through its own doubly-authorized path. The bootstrap arm (no
+  # usable profile) stays unguarded — availability wins on a wiped
+  # profile, and the boot-time version-ahead gate is the safety net.
+  # The guard runs with the unit's Environment (XDG_DATA_HOME), so it
+  # resolves the same data dir as the daemon; any non-zero exit means
+  # "don't seed".
   seedScript = pkgs.writeShellScript "hopnet-seed-profile" ''
     set -eu
     export PATH=${lib.makeBinPath [ pkgs.coreutils ]}
@@ -37,8 +50,12 @@ let
     flake_ver="${cfg.package.version}"
     newest=$(printf '%s\n%s\n' "$flake_ver" "$current_ver" | sort -V | tail -n1)
     if [ "$newest" = "$flake_ver" ] && [ "$flake_ver" != "$current_ver" ]; then
-      echo "hopnet: flake pin $flake_ver is newer than profile $current_ver — re-seeding"
-      seed
+      if ${cfg.package}/bin/hopnet seed-guard --candidate "$flake_ver"; then
+        echo "hopnet: flake pin $flake_ver is newer than profile $current_ver — re-seeding"
+        seed
+      else
+        echo "hopnet: flake pin $flake_ver held — the mesh agreement pins the runnable version"
+      fi
     fi
   '';
 in

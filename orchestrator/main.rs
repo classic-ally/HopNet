@@ -691,8 +691,39 @@ async fn create_mesh(
                     }
                 }
 
-                // Register additional nodes (1, 2, 3...) with node 0
+                // Register additional nodes (1, 2, 3...) with node 0.
+                // RFC-025 S5 ORDERING: the mesh code must be adopted on
+                // each fresh container BEFORE POST /nodes — the
+                // coordinator's ping probe is an iroh dial, and a fresh
+                // endpoint is TLS-dead until adoption. The code exists
+                // only after node 0's genesis, which is why it cannot
+                // ride the container env (all containers are created
+                // before setup_node_0 runs).
                 if containers.len() > 1 {
+                    let mesh_code = match get_mesh_code(docker, mesh_id, runtime).await {
+                        Ok(Some(c)) => {
+                            println!("Mesh code: {}", c);
+                            Some(c)
+                        }
+                        // A mesh born on a pre-enforcement image (the
+                        // RFC-020 cutover rehearsal): no join-code
+                        // channel exists and none is needed — old fresh
+                        // nodes bind legacy immediately.
+                        Ok(None) => {
+                            println!(
+                                "Coordinator predates the join-code channel; registering directly"
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            println!("Failed to read the mesh code from node 0: {}", e);
+                            if !no_cleanup {
+                                cleanup_mesh_resources(docker, mesh_id, containers, &network_id)
+                                    .await;
+                            }
+                            return Err(anyhow::anyhow!("Mesh creation failed: no mesh code"));
+                        }
+                    };
                     for (node_index, (container_name, _container_id, _node_ip)) in
                         containers.iter().enumerate().skip(1)
                     {
@@ -702,13 +733,19 @@ async fn create_mesh(
                             node_id, container_name
                         );
 
-                        if let Err(e) = register_node_with_node_0(
-                            docker,
-                            mesh_id,
-                            node_id,
-                            container_name,
-                            runtime,
-                        )
+                        if let Err(e) = async {
+                            if let Some(code) = &mesh_code {
+                                submit_join_code(docker, mesh_id, node_id, runtime, code).await?;
+                            }
+                            register_node_with_node_0(
+                                docker,
+                                mesh_id,
+                                node_id,
+                                container_name,
+                                runtime,
+                            )
+                            .await
+                        }
                         .await
                         {
                             println!("Failed to register node {}: {}", node_id, e);
@@ -837,6 +874,16 @@ pub(crate) async fn add_nodes_to_mesh(
     println!("Waiting for containers to be ready...");
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
+    // The mesh code (RFC-025 S5): adopted on each fresh container BEFORE
+    // registration — the coordinator's ping probe cannot complete TLS
+    // against a code-less endpoint. Same HTTP seam as create_mesh (one
+    // code path, deliberately not env).
+    let mesh_code = get_mesh_code(docker, mesh_id, runtime).await?;
+    match &mesh_code {
+        Some(code) => println!("Mesh code: {}", code),
+        None => println!("Coordinator predates the join-code channel; registering directly"),
+    }
+
     // Register new nodes with node 0 (triggers catch-up based bootstrap)
     for (container_name, _container_id, _node_ip) in &new_containers {
         let node_id: u32 = naming::node_id_of(container_name)
@@ -847,6 +894,9 @@ pub(crate) async fn add_nodes_to_mesh(
             node_id, container_name
         );
 
+        if let Some(code) = &mesh_code {
+            submit_join_code(docker, mesh_id, node_id, runtime, code).await?;
+        }
         if let Err(e) =
             register_node_with_node_0(docker, mesh_id, node_id, container_name, runtime).await
         {
@@ -965,6 +1015,28 @@ async fn create_relay_container(
 ) -> Result<String> {
     let container_name = naming::relay_container_name(mesh_id);
 
+    // The relay's :3340 is also host-mapped (like the nodes' HTTP port):
+    // rootless podman blocks host->container-IP, and the retired-dialer
+    // gate (RFC-025 S6) runs a raw iroh endpoint ON THE HOST that must
+    // reach mesh members through this relay. Pseudo node id 499 keeps the
+    // relay's port at the top of the mesh's 500-port range.
+    let runtime = sys::detect_runtime(docker).await?;
+    let needs_port_binding = runtime == sys::ContainerRuntime::Podman || cfg!(target_os = "macos");
+    let (port_bindings, relay_host_port) = if needs_port_binding {
+        let port = sys::find_available_port(mesh_id, 499).await?;
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            "3340/tcp".to_string(),
+            Some(vec![bollard::models::PortBinding {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: Some(port.to_string()),
+            }]),
+        );
+        (Some(bindings), port)
+    } else {
+        (None, 3340)
+    };
+
     let mut endpoints_config = HashMap::new();
     endpoints_config.insert(
         network_name.to_string(),
@@ -977,6 +1049,7 @@ async fn create_relay_container(
     let mut labels = HashMap::new();
     labels.insert("hopnet.mesh_id".to_string(), mesh_id.to_string());
     labels.insert("hopnet.role".to_string(), "relay".to_string());
+    labels.insert("hopnet.host_port".to_string(), relay_host_port.to_string());
     labels.insert(
         naming::CHECKOUT_LABEL.to_string(),
         naming::checkout_hash().to_string(),
@@ -988,6 +1061,10 @@ async fn create_relay_container(
         labels: Some(labels),
         networking_config: Some(NetworkingConfig {
             endpoints_config: Some(endpoints_config),
+        }),
+        host_config: Some(HostConfig {
+            port_bindings,
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -1360,6 +1437,125 @@ pub async fn get_jwt_token(
         }
 
         tokio::time::sleep(retry_interval).await;
+    }
+}
+
+/// Read the coordinator's mesh code (RFC-025 S5) from the JWT-protected
+/// regenesis-status view. Exists only after node 0's genesis.
+/// Read the coordinator's mesh code. `Ok(None)` means the status view has
+/// NO `mesh_code` field at all — a pre-enforcement (pre-RFC-025) image,
+/// which has no join-code channel to feed; the caller registers directly
+/// (old fresh nodes bind legacy immediately, no TLS-dead window). A
+/// present-but-null field is transient (pre-genesis) and stays an error.
+pub(crate) async fn get_mesh_code(
+    docker: &Docker,
+    mesh_id: u32,
+    runtime: sys::ContainerRuntime,
+) -> Result<Option<String>> {
+    let token = get_jwt_token(docker, mesh_id, 0, runtime).await?;
+    let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
+    let (host, port) = addresses
+        .iter()
+        .find(|(id, _, _)| *id == 0)
+        .map(|(_, h, p)| (h.clone(), *p))
+        .ok_or_else(|| anyhow::anyhow!("Node 0 not found"))?;
+    let url = format!("https://{}:{}/api/views/regenesis-status", host, port);
+    let client = crate::insecure_client();
+    let body: serde_json::Value = client
+        .get(&url)
+        .bearer_auth(&token)
+        .timeout(tokio::time::Duration::from_secs(15))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    match body.get("mesh_code") {
+        None => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(|s| Some(s.to_string()))
+            .ok_or_else(|| anyhow::anyhow!("coordinator has no mesh code yet (pre-genesis?)")),
+    }
+}
+
+/// The relay's HOST-reachable URL. Podman (rootless: no host->container
+/// IP route) and macOS use the host-mapped port; Docker on Linux reaches
+/// the relay's network IP directly.
+pub(crate) async fn relay_host_url(
+    docker: &Docker,
+    mesh_id: u32,
+    runtime: sys::ContainerRuntime,
+) -> Result<String> {
+    let name = naming::relay_container_name(mesh_id);
+    let info = docker
+        .inspect_container(
+            &name,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await?;
+    let use_host_port = runtime == sys::ContainerRuntime::Podman || cfg!(target_os = "macos");
+    if use_host_port {
+        let port = info
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.as_ref())
+            .and_then(|l| l.get("hopnet.host_port"))
+            .ok_or_else(|| anyhow::anyhow!("relay container has no hopnet.host_port label"))?;
+        Ok(format!("http://localhost:{port}"))
+    } else {
+        let ip = info
+            .network_settings
+            .and_then(|ns| ns.networks)
+            .and_then(|n| n.get(&naming::network_name(mesh_id)).cloned())
+            .and_then(|e| e.ip_address)
+            .ok_or_else(|| anyhow::anyhow!("relay container has no network IP"))?;
+        Ok(format!("http://{ip}:3340"))
+    }
+}
+
+/// Deliver the mesh code to a fresh container (RFC-025 S5): its endpoint
+/// is TLS-dead until the code is adopted, so this MUST land before the
+/// coordinator's POST /nodes ping probe can succeed. Open pre-setup
+/// endpoint; 204 = adopted (idempotent re-POST is fine).
+pub(crate) async fn submit_join_code(
+    docker: &Docker,
+    mesh_id: u32,
+    node_id: u32,
+    runtime: sys::ContainerRuntime,
+    code: &str,
+) -> Result<()> {
+    let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
+    let (host, port) = addresses
+        .iter()
+        .find(|(id, _, _)| *id == node_id)
+        .map(|(_, h, p)| (h.clone(), *p))
+        .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
+    let url = format!("https://{}:{}/api/setup/join-code", host, port);
+    let client = crate::insecure_client();
+    let start = std::time::Instant::now();
+    loop {
+        match client
+            .post(&url)
+            .json(&json!({ "code": code }))
+            .timeout(tokio::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status() == reqwest::StatusCode::NO_CONTENT => return Ok(()),
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow::anyhow!(
+                    "join-code POST to node {node_id} refused: {status} {body}"
+                ));
+            }
+            Err(e) if start.elapsed() < std::time::Duration::from_secs(15) => {
+                tracing::debug!("join-code POST to node {node_id} not ready ({e}); retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(anyhow::anyhow!("join-code POST to node {node_id}: {e}")),
+        }
     }
 }
 

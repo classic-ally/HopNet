@@ -181,14 +181,52 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     joins through the pre-split artifact). All slices complete; only
     the live-mesh crossing remains — release choreography in the S7
     ledger entry.
-  - **RFC-025 drafted**
+  - **RFC-025 S1–S6 landed (WIP branch)**
     ([RFC-025](specs/rpc-version-enforcement.md), Draft 2026-08-17):
     RPC version enforcement — locked scopes refuse mixed-version
     peers at the ALPN (mesh magic + exact CalVer), compat scopes
     (status, regenesis, ping) serve a two-generation window so
     stragglers stage across boundaries; typed refusals replace
-    silent bincode misdecode. Implementation not started; one PR
-    (S1–S6), the following release is the enforcement cutover.
+    silent bincode misdecode. S1 (comms mechanism): both ALPN
+    families, native multi-ALPN compat offer, typed
+    `AlpnRejected`/`CompatRetired`, the retired reject tier, the
+    `hopnet-comms/docs/wire.md` byte contract. S2 (host wiring):
+    set-up nodes derive the mesh magic from the anchor at boot
+    (fail-stop on underivable identity); fresh nodes bind
+    pre-enforcement until S5 closes the transient JoinDeliver gap
+    (in-PR); scope classes registered per the RFC table and pinned
+    by test; the host suite soaks enforced ALPNs via a shared
+    fixture magic. S3 (generation-1 freezes): frozen compat_g
+    vocabulary modules with byte goldens (incl. the LineageRecord
+    closure), the Pong's served-window fields, generation-keyed
+    handler dispatch with the G0 adapter, dialers decoding per the
+    negotiated generation, and the check-compat-freeze.sh
+    release-tag tripwires in CI. S4 (diagnosability): the
+    liveness/visibility evidence split (compat chatter never
+    shields a validator from vote-out; the reachability counters
+    ride visibility), VersionSkew/Stranded classification screaming
+    at error level with a persistent status-view banner, and the
+    AlpnRejected defuser resolving locked-dial refusals against the
+    peer's latest Pong. S5 (setup and join): the mesh code
+    (XXXX-XXXX, the magic in display form) gates the join ceremony —
+    a fresh node binds TLS-dead until code entry (UI step or
+    HOPNET_JOIN_CODE) adopts the ALPN families; JoinInfo carries the
+    anchor, pre-flighted before any write, with the install-time
+    check + rollback against a lying coordinator; the coordinator
+    surfaces the code in Add Node and the orchestrator delivers it
+    over the same HTTP seam. S6 (orchestrator gates): the
+    mixed-version-mesh, retired-dialer, and enforcement-crossing
+    scenarios — the version/head override seams, a live straggler
+    riding generation 0 across the real severance boundary, and the
+    vote-out of a pong-visible skewed seat asserted as behaviour.
+    S6b (agreed-version clamp, closes #58): a consensus-derived
+    marker stamped at genesis/join and re-stamped only at completed
+    crossings; the NixOS module seeds newest-WITHIN-AGREEMENT via
+    `hopnet seed-guard` (never-joined stays newest-wins), and normal
+    boots park a binary ahead of the agreement — the system never
+    loads past what the mesh agreed, on any pathway.
+    Next: merge — the following release is the enforcement cutover
+    (one PR, S1–S6 + S6b).
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

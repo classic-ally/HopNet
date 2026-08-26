@@ -184,7 +184,9 @@ pub fn consensus_view(
     app_state: &crate::AppState,
     conn: &PooledConnection<SqliteConnectionManager>,
 ) -> Option<ConsensusPanelView> {
-    use crate::consensus::evidence::{contact_age, evidence_inputs, live_estimate};
+    use crate::consensus::evidence::{
+        evidence_inputs, live_estimate, seen_age, version_banner_rows,
+    };
 
     let my_id = app_state.get_node_id().ok()?;
     let decided = app_state
@@ -209,8 +211,11 @@ pub fn consensus_view(
 
     let v = inputs.seated.len() as u64;
 
-    // The literal live_estimate predicate, against the same snapshot and the
-    // same resolved band — so the pool split cannot drift from `live` above it.
+    // The pool split rides the VISIBILITY clock (RFC-025): "reachable"
+    // means any authenticated sighting on any class within the deadline —
+    // deliberately broader than `live`, which rides the liveness clock.
+    // A straggler staging over the compat class reads reachable here
+    // while staying dark on `live`; the divergence is the design.
     let deadline = inputs.policy.t_unresponsive(est.band);
     let seated_set: HashSet<i32> = inputs.seated.iter().copied().collect();
     let in_contact = |id: i32| -> bool {
@@ -221,7 +226,7 @@ pub fn consensus_view(
             .binary_search_by_key(&id, |(k, _)| *k)
             .ok()
             .map(|i| snap[i].1);
-        contact_age(view.as_ref(), origin, now) <= deadline
+        seen_age(view.as_ref(), origin, now) <= deadline
     };
 
     let (reachable_unseated, unreachable_unseated) = inputs
@@ -235,6 +240,11 @@ pub fn consensus_view(
                 (ok, bad + 1)
             }
         });
+
+    let local_version_code = crate::version::effective_running_code();
+    let (local_floor, local_head) = crate::consensus::evidence::local_window();
+    let (version_skew, stranded_peers) =
+        version_banner_rows(&snap, local_version_code, local_floor, local_head, now);
 
     Some(ConsensusPanelView {
         v: v as u32,
@@ -256,6 +266,10 @@ pub fn consensus_view(
         total_nodes: inputs.registered.len() as u32,
         reachable_unseated,
         unreachable_unseated,
+
+        version_skew,
+        stranded_peers,
+        local_version: crate::version::format_code(local_version_code),
     })
 }
 
@@ -343,13 +357,15 @@ pub fn statfs_from_parts(parts: &StorageParts) -> (u64, u64) {
     ((total_gb * BYTES_PER_GB) as u64, used as u64)
 }
 
-/// Count members the evidence layer cannot currently reach.
+/// Count members the evidence layer cannot currently SEE (RFC-025: the
+/// visibility clock — a member serving compat traffic counts as
+/// reachable here even while dark on the liveness clock).
 fn unreachable_member_count(
     app_state: &crate::AppState,
     conn: &PooledConnection<SqliteConnectionManager>,
     member_ids: &[i32],
 ) -> u32 {
-    use crate::consensus::evidence::{contact_age, evidence_inputs, live_estimate};
+    use crate::consensus::evidence::{evidence_inputs, live_estimate, seen_age};
 
     let Ok(my_id) = app_state.get_node_id() else {
         return 0;
@@ -383,7 +399,7 @@ fn unreachable_member_count(
                 .binary_search_by_key(&id, |(k, _)| *k)
                 .ok()
                 .map(|i| snap[i].1);
-            contact_age(view.as_ref(), origin, now) > deadline
+            seen_age(view.as_ref(), origin, now) > deadline
         })
         .count() as u32
 }

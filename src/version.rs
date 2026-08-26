@@ -1,16 +1,22 @@
 //! Node version identity (RFC-019 S3).
 //!
 //! The pure CalVer code helpers live in `hopnet_common::version`
-//! (RFC-023 — clients need them too) and are re-exported here so the
-//! node's `crate::version::` call sites read naturally. This module
-//! keeps what is node-only: the compile-time identity readers and the
-//! test-mode override seams.
+//! (RFC-023 — clients need them too), as do the test-mode gate and the
+//! running-version override seam (RFC-025 — comms derives its ALPN
+//! identity there); all are re-exported here so the node's
+//! `crate::version::` call sites read naturally. This module keeps what
+//! is node-only: the compile-time identity readers and the staged-
+//! version override seam. Note the hoisted seam ignores a malformed
+//! HOPNET_UPGRADE_VERSION_OVERRIDE silently (hopnet-common has no
+//! tracing); boot warns once instead (src/main.rs).
 //!
 //! Legacy non-CalVer tags (v0.1.0-rc.*) cannot be encoded and therefore
 //! cannot be attested; they surface only in the upgrade advisory's
 //! available list, as strings.
 
-pub use hopnet_common::version::{code_is_valid, format_code, parse_code};
+pub use hopnet_common::version::{
+    code_is_valid, effective_running_code, format_code, parse_code, test_mode,
+};
 
 /// The node's version string, verbatim from Cargo.toml.
 pub fn running_version_str() -> &'static str {
@@ -34,35 +40,6 @@ pub fn running_version_code() -> u32 {
             running_version_str()
         )
     })
-}
-
-/// Test-mode gate for the override seams, mirroring the AppState
-/// construction (src/main.rs): debug builds and HOPNET_TEST_MODE. The
-/// overrides exist so orchestrator scenarios can make a release-image
-/// node CLAIM a different version (awaiting-upgrade parking, upgrade-
-/// target regenesis) without building a second image; production
-/// release binaries ignore them entirely.
-pub(crate) fn test_mode() -> bool {
-    cfg!(debug_assertions) || std::env::var("HOPNET_TEST_MODE").is_ok()
-}
-
-/// The node's EFFECTIVE running version code: the compile-time identity,
-/// unless test mode is on and `HOPNET_UPGRADE_VERSION_OVERRIDE` holds a
-/// well-formed CalVer token (malformed overrides are ignored, not
-/// errors). All runtime version-identity consumers go through this.
-pub fn effective_running_code() -> u32 {
-    if test_mode()
-        && let Ok(v) = std::env::var("HOPNET_UPGRADE_VERSION_OVERRIDE")
-    {
-        if let Some(code) = parse_code(&v) {
-            return code;
-        }
-        tracing::warn!(
-            override_value = %v,
-            "ignoring malformed HOPNET_UPGRADE_VERSION_OVERRIDE"
-        );
-    }
-    running_version_code()
 }
 
 /// The node's effective STAGED version, if any: test mode may claim one

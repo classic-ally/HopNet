@@ -43,6 +43,15 @@ pub const AWAITING_UPGRADE_FILENAME: &str = "awaiting-upgrade";
 /// boot path, and deleted only once the rollback is complete.
 pub const ROLLBACK_MARKER_FILENAME: &str = "rollback-epoch";
 
+/// Marker (beside the database) holding the version the mesh has agreed
+/// THIS node runs — bare CalVer, no newline, a STABLE interface read by
+/// the nix module's `seed-guard` (via the hopnet binary) and by
+/// operators. Present exactly while the node has joined a mesh; written
+/// only at version transitions (genesis, join, epoch crossing,
+/// rollback); an advisory projection of committed state — the consensus
+/// gates remain the enforcement.
+pub const AGREED_VERSION_FILENAME: &str = "agreed-version";
+
 #[derive(Debug)]
 pub enum BootOutcome {
     /// No boundary pending: normal boot.
@@ -77,6 +86,11 @@ pub enum ParkReason {
     /// Gate 2/3 failure: refused to cross, old database untouched;
     /// retried on next boot.
     GateFailed { gate: &'static str, detail: String },
+    /// State A refusal (issue #58): this binary is NEWER than the
+    /// mesh-agreed version. One-directional — an older binary is a
+    /// straggler and boots normally to stage. NOT an awaiting-upgrade
+    /// park: nothing is pending, the operator overran the agreement.
+    VersionAhead { agreed: u32, running: u32 },
 }
 
 /// Last boundary error, for the status surface (latest wins — in
@@ -112,6 +126,84 @@ pub fn write_awaiting_marker(db_path: &str, required: u32) {
     }
 }
 
+pub fn agreed_version_path(db_path: &str) -> PathBuf {
+    Path::new(db_path)
+        .parent()
+        .map(|p| p.join(AGREED_VERSION_FILENAME))
+        .unwrap_or_else(|| PathBuf::from(AGREED_VERSION_FILENAME))
+}
+
+/// Stamp the mesh-agreed version. Tmp + rename: the file is an
+/// interface (bash and future binaries read it), so a torn write must
+/// never be observable.
+pub fn write_agreed_version(db_path: &str, code: u32) {
+    let path = agreed_version_path(db_path);
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let result = std::fs::write(&tmp, crate::version::format_code(code))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    match result {
+        Ok(()) => tracing::info!(
+            agreed = %crate::version::format_code(code),
+            "agreed-version marker stamped"
+        ),
+        Err(e) => {
+            tracing::error!(path = %path.display(), "agreed-version marker write failed: {e}");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// The stamped agreement, if any. Malformed content reads as absent
+/// here (availability — the daemon side must not brick on a corrupt
+/// file); the seed-guard CLI is the conservative reader that HOLDS on
+/// garbage instead.
+pub fn read_agreed_version(db_path: &str) -> Option<u32> {
+    let path = agreed_version_path(db_path);
+    let content = std::fs::read_to_string(&path).ok()?;
+    match crate::version::parse_code(content.trim()) {
+        Some(code) => Some(code),
+        None => {
+            tracing::warn!(
+                path = %path.display(),
+                content = %content.trim(),
+                "agreed-version marker is malformed; treating as absent"
+            );
+            None
+        }
+    }
+}
+
+/// Remove the agreement — ONLY when the node returns to never-joined
+/// (the anchor-mismatch join rollback). Everywhere else the marker is
+/// rewritten, never deleted: absent means unclamped.
+pub fn remove_agreed_version(db_path: &str) {
+    let _ = std::fs::remove_file(agreed_version_path(db_path));
+}
+
+/// Stamp the agreement from a crossed epoch's lineage record; `fallback`
+/// covers epochs with no record (epoch 1, or an unreadable file — the
+/// rollback path passes the running code, which on a rollback IS the
+/// restored epoch's binary).
+fn stamp_agreed_from_lineage(db_path: &str, epoch: u64, fallback: Option<u32>) {
+    let dir = Path::new(db_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    match genesis::read_lineage(&genesis::lineage_path(&dir, epoch)) {
+        Ok(lineage) => write_agreed_version(db_path, lineage.record.required_version_code),
+        Err(e) => match fallback {
+            Some(code) => {
+                tracing::warn!(
+                    epoch,
+                    "agreed-version from lineage failed ({e}); using fallback"
+                );
+                write_agreed_version(db_path, code);
+            }
+            None => tracing::warn!(epoch, "agreed-version not stamped: lineage unreadable: {e}"),
+        },
+    }
+}
+
 pub fn rollback_marker_path(db_path: &str) -> PathBuf {
     Path::new(db_path)
         .parent()
@@ -127,6 +219,22 @@ pub fn write_rollback_marker(db_path: &str) {
     if let Err(e) = std::fs::write(&path, "abandon the pending epoch boundary\n") {
         tracing::error!(path = %path.display(), "rollback marker write failed: {e}");
     }
+}
+
+/// Rollout backfill: a node that crossed epochs BEFORE the marker
+/// existed gets one stamped from committed lineage on its next boot.
+/// Fill-if-absent ONLY — never a bump, never a reconcile — and only
+/// from epoch >= 2 (epoch 1 committed no version; those nodes are
+/// stamped at their next crossing).
+pub fn backfill_agreed_version(db_path: &str, data_dir: &Path, epoch: u64) {
+    if epoch < 2 || read_agreed_version(db_path).is_some() {
+        return;
+    }
+    tracing::info!(
+        epoch,
+        "agreed-version marker absent; backfilling from lineage"
+    );
+    stamp_agreed_from_lineage(db_path, epoch, None);
 }
 
 /// Is there a boundary to abandon? True when a retained previous-epoch
@@ -230,7 +338,7 @@ pub fn boot_transition_with(
     // would otherwise be fatal; and before the staged-join branch,
     // because a leftover staging would otherwise drag this node forward
     // again immediately.
-    if let Some(outcome) = rollback_transition(db_path) {
+    if let Some(outcome) = rollback_transition(db_path, running_code) {
         return outcome;
     }
 
@@ -253,6 +361,9 @@ pub fn boot_transition_with(
                 Ok(e) => e,
                 Err(e) => return BootOutcome::Fatal(format!("post-swap epoch read: {e}")),
             };
+            // The lineage record was written before the first rename, so
+            // it is present whenever this state is reachable.
+            stamp_agreed_from_lineage(db_path, epoch, None);
             tracing::info!(epoch, "completed interrupted epoch swap");
             return BootOutcome::Transitioned { epoch };
         }
@@ -301,6 +412,36 @@ pub fn boot_transition_with(
         // never join staging (an in-progress download resumes).
         remove_with_sidecars(&next);
         let _ = std::fs::remove_file(&awaiting);
+        // The agreed-version gate (issue #58, RFC-025): a binary AHEAD
+        // of the mesh agreement must not run mid-epoch — it would start
+        // its engine and fail every locked dial loudly (contained by
+        // ALPN, but burning operator time as a mysteriously idle node).
+        // One-directional by design: a binary BEHIND the agreement is a
+        // straggler and must boot to stage and epoch-join (RFC-019 S7);
+        // no marker (never-joined, pre-rollout epoch 1) leaves the gate
+        // inert.
+        if let Some(agreed) = read_agreed_version(db_path)
+            && running_code > agreed
+        {
+            let detail = format!(
+                "binary {} is ahead of the mesh agreement {} — parked; \
+                 downgrade to the agreed version, or upgrade the mesh first",
+                crate::version::format_code(running_code),
+                crate::version::format_code(agreed),
+            );
+            tracing::error!(
+                agreed = %crate::version::format_code(agreed),
+                running = %crate::version::format_code(running_code),
+                "version ahead of the mesh agreement: refusing to run (RFC-025)"
+            );
+            if let Ok(mut slot) = BOUNDARY_ERROR.lock() {
+                *slot = Some(format!("version-ahead: {detail}"));
+            }
+            return BootOutcome::Parked(ParkReason::VersionAhead {
+                agreed,
+                running: running_code,
+            });
+        }
         return BootOutcome::NoBoundary;
     }
 
@@ -417,6 +558,10 @@ pub fn boot_transition_with(
     }
 
     let epoch = epoch_genesis.record.epoch;
+    // The agreement moves HERE and nowhere earlier: staging and
+    // regenesis_start leave it untouched; only the completed crossing
+    // re-stamps it.
+    write_agreed_version(db_path, epoch_genesis.record.required_version_code);
     tracing::info!(
         epoch,
         seal_height = epoch_genesis.record.seal_height,
@@ -454,7 +599,7 @@ pub fn boot_transition_with(
 /// identically, and the row is divergence-only, so it never enters the
 /// exported state hash. Recovery from a rollback is another regenesis,
 /// FORWARD; the abandoned boundary is never retried.
-fn rollback_transition(db_path: &str) -> Option<BootOutcome> {
+fn rollback_transition(db_path: &str, running_code: u32) -> Option<BootOutcome> {
     let marker = rollback_marker_path(db_path);
     if !marker.exists() {
         return None;
@@ -515,6 +660,12 @@ fn rollback_transition(db_path: &str) -> Option<BootOutcome> {
     let _ = std::fs::remove_file(awaiting_upgrade_path(db_path));
 
     let epoch = read_epoch_of(db_path).unwrap_or(1);
+    // A rollback is a version transition BACKWARDS: rewrite the
+    // agreement to the restored epoch's version (never delete — absent
+    // means never-joined). Epoch 1 has no lineage record; the binary
+    // performing an operator rollback is the restored epoch's, so its
+    // running code is the fallback.
+    stamp_agreed_from_lineage(db_path, epoch, Some(running_code));
     // LAST: until this is gone the rollback is still in progress.
     let _ = std::fs::remove_file(&marker);
     tracing::warn!(epoch, "rollback complete: the epoch boundary was abandoned");
@@ -794,6 +945,7 @@ fn staged_join_transition(
 
     join::clear_staging(&staging);
     let epoch = epoch_genesis.record.epoch;
+    write_agreed_version(db_path, epoch_genesis.record.required_version_code);
     tracing::info!(
         epoch,
         seal_height = epoch_genesis.record.seal_height,
@@ -1326,6 +1478,8 @@ pub(crate) mod tests {
             "lineage kept"
         );
         assert!(!fx.staging.exists(), "staging cleared after the crossing");
+        // The staged crossing stamps the joined epoch's agreement.
+        assert_eq!(read_agreed_version(&fx.db_path), Some(TARGET));
     }
 
     // Impact: an upgrade-boundary straggler running the old binary must
@@ -1578,6 +1732,10 @@ pub(crate) mod tests {
         );
         assert!(!rollback_marker_path(&db_path).exists());
         assert!(!awaiting_upgrade_path(&db_path).exists());
+        // Should: the rollback REWRITES the agreement (never deletes —
+        // absent means never-joined); epoch 1 has no lineage record, so
+        // the fallback is the running code performing the rollback.
+        assert_eq!(read_agreed_version(&db_path), Some(TARGET));
     }
 
     // Impact: THIS is the bug that made a first-class mechanism
@@ -1882,20 +2040,151 @@ pub(crate) mod tests {
             assert_eq!(stamps.get(chain.module), Some(&chain.head()));
         }
         drop(conn);
+        // The crossing stamped the agreement, exact bytes (bare CalVer,
+        // no newline — bash reads this file).
+        assert_eq!(
+            std::fs::read_to_string(agreed_version_path(&db_path)).unwrap(),
+            crate::version::format_code(TARGET)
+        );
 
         // Next boot: state A — normal, and the retained file is kept.
         let again = boot_transition(&db_path, TARGET);
         assert!(matches!(again, BootOutcome::NoBoundary), "got {again:?}");
         assert!(sealed_path(&db_path).exists());
+        // Should not: the state-A cleanup sweep touches the agreement.
+        assert_eq!(read_agreed_version(&db_path), Some(TARGET));
+    }
+
+    // Impact: the agreed-version file is a STABLE interface — the nix
+    // module's seed-guard and operators read it raw, so the format
+    // (bare CalVer, no newline) and the malformed-reads-as-absent
+    // daemon semantics are contracts, not conveniences.
+    // Should: roundtrip a stamped agreement byte-exactly; read a
+    // malformed marker as absent; stamp from a crossed epoch's lineage
+    // record when one exists.
+    #[test]
+    fn agreed_version_primitives_roundtrip_and_degrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("database.db");
+        let db_path = db_path.to_str().unwrap();
+
+        assert_eq!(read_agreed_version(db_path), None);
+        write_agreed_version(db_path, TARGET);
+        assert_eq!(
+            std::fs::read_to_string(agreed_version_path(db_path)).unwrap(),
+            crate::version::format_code(TARGET)
+        );
+        assert_eq!(read_agreed_version(db_path), Some(TARGET));
+
+        std::fs::write(agreed_version_path(db_path), "not-a-version").unwrap();
+        assert_eq!(read_agreed_version(db_path), None);
+
+        remove_agreed_version(db_path);
+        assert!(!agreed_version_path(db_path).exists());
+
+        // The lineage arm: a crossed database's record re-stamps the
+        // exact agreed version (the backfill and State C both lean on
+        // this).
+        let crossed_dir = tempfile::tempdir().unwrap();
+        let crossed_db = crossed(crossed_dir.path());
+        remove_agreed_version(&crossed_db);
+        stamp_agreed_from_lineage(&crossed_db, 2, None);
+        assert_eq!(read_agreed_version(&crossed_db), Some(TARGET));
+        // Unreadable lineage + no fallback: no marker appears.
+        remove_agreed_version(&crossed_db);
+        stamp_agreed_from_lineage(&crossed_db, 9, None);
+        assert_eq!(read_agreed_version(&crossed_db), None);
+        // Unreadable lineage + fallback: the fallback stamps.
+        stamp_agreed_from_lineage(&crossed_db, 9, Some(TARGET + 5));
+        assert_eq!(read_agreed_version(&crossed_db), Some(TARGET + 5));
+    }
+
+    // Impact: issue #58 — before this gate, a mid-epoch restart into a
+    // newer release joined the mesh silently and failed every locked
+    // dial as a mysteriously idle node; ALPN contained it, nothing
+    // named it at boot. One-directional: ahead parks, behind boots
+    // (stragglers must stage — RFC-019 S7).
+    // Should: park a set-up node whose binary is ahead of the recorded
+    // agreement, naming both versions, database untouched.
+    // Should not: write the awaiting-upgrade marker (nothing is
+    // pending), park a binary AT or BEHIND the agreement, or fire at
+    // all without a marker.
+    #[test]
+    fn version_ahead_of_agreement_parks_and_behind_boots() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = crossed(dir.path());
+        assert_eq!(read_agreed_version(&db_path), Some(TARGET));
+
+        // Ahead: parked, named, nothing written or touched.
+        let outcome = boot_transition(&db_path, TARGET + 1);
+        assert!(
+            matches!(
+                outcome,
+                BootOutcome::Parked(ParkReason::VersionAhead { agreed: TARGET, .. })
+            ),
+            "got {outcome:?}"
+        );
+        assert!(!awaiting_upgrade_path(&db_path).exists());
+        assert_eq!(read_agreed_version(&db_path), Some(TARGET));
+        let conn = open(&db_path);
+        assert_eq!(genesis::current_epoch(&conn), 2);
+        drop(conn);
+
+        // At the agreement: normal boot.
+        assert!(matches!(
+            boot_transition(&db_path, TARGET),
+            BootOutcome::NoBoundary
+        ));
+        // Behind: a straggler boots normally to stage.
+        assert!(matches!(
+            boot_transition(&db_path, TARGET - 1),
+            BootOutcome::NoBoundary
+        ));
+        // No marker: the gate is inert.
+        remove_agreed_version(&db_path);
+        assert!(matches!(
+            boot_transition(&db_path, TARGET + 1),
+            BootOutcome::NoBoundary
+        ));
+    }
+
+    // Impact: rollout — every mesh that crossed an epoch before this
+    // marker existed must acquire one WITHOUT a new crossing, or the
+    // seed guard stays unclamped exactly where it matters most.
+    // Should: fill an absent marker from committed lineage on an
+    // epoch>=2 database.
+    // Should not: change an existing marker, or invent one for epoch 1.
+    #[test]
+    fn backfill_fills_only_absent_and_only_from_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = crossed(dir.path());
+        remove_agreed_version(&db_path);
+        backfill_agreed_version(&db_path, dir.path(), 2);
+        assert_eq!(read_agreed_version(&db_path), Some(TARGET));
+
+        // Existing marker: untouched, even when lineage disagrees.
+        write_agreed_version(&db_path, TARGET + 7);
+        backfill_agreed_version(&db_path, dir.path(), 2);
+        assert_eq!(read_agreed_version(&db_path), Some(TARGET + 7));
+
+        // Epoch 1: no committed source, no invention.
+        remove_agreed_version(&db_path);
+        backfill_agreed_version(&db_path, dir.path(), 1);
+        assert_eq!(read_agreed_version(&db_path), None);
     }
 
     // Should: park awaiting upgrade on a version mismatch — marker file
     // written with the required version, database untouched — and cross
     // normally once the running version matches (marker cleaned).
+    // Should: hold the agreed-version at its OLD value through the
+    // Sealed phase and the park — the agreement moves only at the
+    // completed crossing, never at staging or sealing.
     #[test]
     fn version_mismatch_parks_then_upgrade_crosses() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = sealed_db(dir.path());
+        // The pre-boundary agreement (the old epoch's version).
+        write_agreed_version(&db_path, TARGET - 100);
 
         let outcome = boot_transition(&db_path, TARGET + 1);
         assert!(
@@ -1919,11 +2208,16 @@ pub(crate) mod tests {
         assert_eq!(genesis::current_epoch(&conn), 1);
         drop(conn);
         assert!(!next_path(&db_path).exists());
+        // Sealed + parked, but NOT transitioned: the agreement is
+        // untouched.
+        assert_eq!(read_agreed_version(&db_path), Some(TARGET - 100));
 
         // The "binary swap": the matching version crosses and cleans up.
         let outcome = boot_transition(&db_path, TARGET);
         assert!(matches!(outcome, BootOutcome::Transitioned { epoch: 2 }));
         assert!(!marker.exists());
+        // ...and the agreement moves exactly here.
+        assert_eq!(read_agreed_version(&db_path), Some(TARGET));
     }
 
     // Impact: RFC-021's unattended crossing — the one step that used to

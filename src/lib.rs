@@ -33,6 +33,7 @@ pub mod photos_host;
 pub mod projections;
 pub mod reference_providers;
 pub mod regenesis;
+pub mod seed_guard;
 pub mod setup;
 pub mod shares;
 pub mod storage_host;
@@ -71,6 +72,12 @@ pub struct AppState {
     /// Shared with the comms peer directory — when false, all incoming
     /// connections are allowed (the brief pre-init window).
     pub setup_complete: Arc<std::sync::atomic::AtomicBool>,
+    /// The operator-entered mesh code (RFC-025 S5) — transient, never
+    /// persisted (the installed anchor is the truth after join; a
+    /// restart clears it). Set once via HOPNET_JOIN_CODE at boot or the
+    /// pre-setup join-code endpoint; the join pre-flight and the
+    /// install-time anchor check compare against it.
+    pub entered_join_code: Arc<std::sync::OnceLock<[u8; 4]>>,
     pub consensus_barriers: Arc<barriers::Barriers>,
     pub session_store: Arc<auth::SessionStore>,
     /// Module-owned takeout/import runtime state (resume registry +

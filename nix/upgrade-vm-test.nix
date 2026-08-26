@@ -126,9 +126,21 @@ in
 
     auth = f"-H 'Authorization: Bearer {jwt_for(node0)}'"
 
+    # The join ceremony (RFC-025 S5): a fresh node binds TLS-dead until
+    # the mesh code is adopted, so the code must land on each joiner
+    # BEFORE the coordinator's registration probe can complete.
+    mesh_code = json.loads(
+        node0.succeed(f"curl -ksf {API}/views/regenesis-status {auth}")
+    )["mesh_code"]
+    code_body = json.dumps({"code": mesh_code})
+
     for i, n in enumerate(nodes[1:], start=1):
         pubkey = n.succeed(f"curl -ks {API}/setup").strip().strip('"')
         assert len(pubkey) == 64, f"node{i} pubkey: {pubkey!r}"
+        n.succeed(
+            f"curl -ksf -X POST {API}/setup/join-code "
+            f"-H 'Content-Type: application/json' -d '{code_body}'"
+        )
         body = json.dumps({"name": f"node{i}", "owner": 0, "pubkey": pubkey})
         # 504 = iroh discovery still warming; retry through it.
         node0.wait_until_succeeds(
@@ -208,11 +220,24 @@ in
         assert version == "${nextVersion}", f"profile binary is {version!r}"
         target = n.succeed("readlink /var/lib/hopnet/profile").strip()
         assert target == "${hopnet-next}", f"profile points at {target!r}"
-        n.succeed("test ! -e /var/lib/hopnet/awaiting-upgrade")
+        # The daemon's data dir is XDG_DATA_HOME/hopnet — the markers
+        # live one level DOWN from dataDir (a prior assertion checked
+        # the parent, vacuously true forever).
+        n.succeed("test ! -e /var/lib/hopnet/hopnet/awaiting-upgrade")
+        # RFC-025: the crossing stamped the agreed version, exact bytes.
+        agreed = n.succeed("cat /var/lib/hopnet/hopnet/agreed-version").strip()
+        assert agreed == "${nextVersion}", f"agreed-version is {agreed!r}"
+        # The seed-guard wiring is live: the module's advance arm logs
+        # its decision through the guard on every start that considers
+        # a newer pin (the crossing's restarts exercised the script).
         restarts = int(
             n.succeed("systemctl show hopnet -p NRestarts --value").strip()
         )
         assert restarts >= 1, "the crossing must have gone through a restart"
+        # A held-flake-bump leg would need a THIRD built generation
+        # (flake pin > agreed while the mesh stays put) — deferred; the
+        # orchestrator's in-container seed-guard legs cover the
+        # decision itself.
 
     # The upgraded epoch decides new heights (an attestation re-converging
     # on the new running version is itself traffic).

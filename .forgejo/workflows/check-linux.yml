@@ -30,6 +30,9 @@ jobs:
       - name: chain tripwires (RFC-020)
         run: bash scripts/check-chains.sh
 
+      - name: compat freeze tripwires (RFC-025)
+        run: bash scripts/check-compat-freeze.sh
+
       - name: macOS version stamp check
         # RFC-026 S1: catches a CalVer bump that forgot the daemon plist
         # before a v* tag ever exists (grep-based, platform-independent).

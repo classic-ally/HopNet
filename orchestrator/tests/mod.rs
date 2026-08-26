@@ -56,6 +56,7 @@ mod three_timescales;
 mod tier_membership;
 mod tls_pinning;
 mod upload_and_confirm_placement;
+mod version_enforcement;
 mod vote_out;
 
 /// Represents the result of a test scenario execution
@@ -140,6 +141,30 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, String)> {
             ),
         ];
     }
+    // RFC-025 S6: same shape as the cutover rehearsal, but born on the
+    // newest PRE-ENFORCEMENT release — the mesh crosses the actual
+    // enforcement severance (load the old image with
+    // `scripts/build-release-image.sh v<ENFORCEMENT_OLD_RELEASE>`).
+    if test_name == "enforcement-crossing" {
+        return vec![
+            (
+                "HOPNET_GENESIS_CONSENSUS_POLICY",
+                "probe_base=2;grace=1;s_full=6;p_prove=6".to_string(),
+            ),
+            (
+                "HOPNET_UPGRADE_STAGED_OVERRIDE",
+                regenesis::enforcement_crossing_target().to_string(),
+            ),
+            (
+                "HOPNET_ORCH_IMAGE",
+                format!(
+                    "hopnet:{}-{}",
+                    crate::naming::checkout_hash(),
+                    regenesis::ENFORCEMENT_OLD_RELEASE
+                ),
+            ),
+        ];
+    }
     let pairs: Vec<(&'static str, &'static str)> = match test_name {
         "consensus-bft-quorum-loss" => vec![
             ("HOPNET_QUORUM_PROFILE", "bft"),
@@ -159,6 +184,14 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, String)> {
             // AUTO (default): majority below v=7 — the growth stays in the
             // majority region, no forcing.
         ],
+        // Fast probes so the healthy side's prober reaches the skewed
+        // seat within the deliberately tight skew window (the default
+        // cadence would not pong it for most of a minute); the scenario
+        // restores the seat well before the vote-out this policy arms.
+        "mixed-version-mesh" => vec![(
+            "HOPNET_GENESIS_CONSENSUS_POLICY",
+            "probe_base=2;grace=1;s_full=6;p_prove=6",
+        )],
         "vote-out-after-kill" => vec![
             (
                 "HOPNET_GENESIS_CONSENSUS_POLICY",
@@ -279,6 +312,9 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         // 6 nodes: forms in the majority region (seats 5 + pooled spare, or
         // 6); the test adds the 7th itself to watch the seam get crossed.
         "auto-seam" => Some(6),
+        // The mixed-version gate holds one of three seats out of the
+        // locked class; majority (AUTO at v=3) keeps the pair deciding.
+        "mixed-version-mesh" => Some(3),
         // Boundary scenarios are written against a 3-node mesh.
         "regenesis-restart"
         | "regenesis-awaiting-upgrade"
@@ -286,7 +322,8 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         | "regenesis-cutover"
         | "straggler-rejoin"
         | "diverged-node-rebuild"
-        | "regenesis-rollback" => Some(3),
+        | "regenesis-rollback"
+        | "enforcement-crossing" => Some(3),
         _ => None,
     }
 }
@@ -401,6 +438,21 @@ pub async fn run_test_by_name(
         }
         "auto-seam" => auto_seam::AutoSeam.run(mesh_id, nodes, flags).await,
         "mesh-growth" => mesh_growth::MeshGrowth.run(mesh_id, nodes, flags).await,
+        "mixed-version-mesh" => {
+            version_enforcement::MixedVersionMesh
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "retired-dialer" => {
+            version_enforcement::RetiredDialer
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "enforcement-crossing" => {
+            regenesis::EnforcementCrossing
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "three-timescales" => {
             three_timescales::ThreeTimescales
                 .run(mesh_id, nodes, flags)
@@ -634,6 +686,9 @@ pub fn list_test_names() -> Vec<&'static str> {
         "regenesis-rollback",
         "regenesis-cutover",
         "mesh-growth",
+        "mixed-version-mesh",
+        "retired-dialer",
+        "enforcement-crossing",
         "auto-seam",
         "three-timescales",
         "evidence-drives-voteout",

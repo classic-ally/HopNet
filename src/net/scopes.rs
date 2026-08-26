@@ -71,18 +71,26 @@ pub fn build_registry(app_state: &AppState) -> ScopeRegistry {
             app_state: app_state.clone(),
         }),
     );
-    scopes.rpc(
-        "status",
+    // The compat class (RFC-025 §Scope Classes) — an allowlist, not a
+    // default: each admission has a named cross-version consumer. status:
+    // diagnosing any mismatched peer (the Pong is the policy readout);
+    // regenesis: RFC-019 S7 stragglers staging on the old binary. The
+    // class-pin test below is the table's enforcement. Generation 0 is
+    // served by the same handler as the head while the vocabularies are
+    // byte-identical (the compat_g0 equality goldens are the license).
+    let status: Arc<dyn hopnet_comms::RpcHandler> =
         Arc::new(crate::consensus::evidence::StatusScope {
             app_state: app_state.clone(),
-        }),
-    );
-    scopes.rpc(
-        "regenesis",
+        });
+    let status_g0 = Arc::new(crate::consensus::evidence::StatusCompatG0 {
+        inner: status.clone(),
+    });
+    scopes.rpc_compat("status", status, status_g0);
+    let regenesis: Arc<dyn hopnet_comms::RpcHandler> =
         Arc::new(crate::regenesis::rpc::RegenesisScope {
             app_state: app_state.clone(),
-        }),
-    );
+        });
+    scopes.rpc_compat("regenesis", regenesis.clone(), regenesis);
     scopes
 }
 
@@ -448,5 +456,57 @@ impl RpcHandler for SetupScope {
                 .await
                 .expect("setup task panicked")
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Impact: the §Scope Classes table (RFC-025) is enacted HERE and
+    // nowhere else — a scope registered under the wrong class either
+    // freezes a vocabulary nobody consumes or strands stragglers at a
+    // boundary. The full-list equality makes every future scope
+    // addition, removal, or reclassification a deliberate act.
+    // Should: register exactly the RFC's table — locked: consensus,
+    // metrics, setup, storage, txforward; compat: regenesis, status.
+    // Should not: pass if any scope is added, removed, or reclassified
+    // without this list changing.
+    // Impact: the cross-crate tie (RFC-025 §Placement) — the frozen
+    // modules' generation labels must match the window comms serves, or
+    // a COMPAT_HEAD bump without new head modules ships a mislabeled
+    // vocabulary.
+    // Should: pin every frozen module's GENERATION const to the served
+    // window's head.
+    #[test]
+    fn frozen_module_labels_match_the_served_window() {
+        use hopnet_comms::alpn::{COMPAT_HEAD, compat_floor};
+        assert_eq!(crate::consensus::status_compat_g1::GENERATION, COMPAT_HEAD);
+        assert_eq!(crate::regenesis::compat_g1::GENERATION, COMPAT_HEAD);
+        assert_eq!(
+            crate::consensus::status_compat_g0::GENERATION,
+            compat_floor(COMPAT_HEAD)
+        );
+    }
+
+    #[test]
+    fn registry_matches_the_scope_class_table() {
+        use hopnet_comms::ScopeClass::{Compat, Locked};
+        let app_state = crate::consensus::tests::create_test_app_state();
+        let registry = build_registry(&app_state);
+        let mut scopes: Vec<(&str, hopnet_comms::ScopeClass)> = registry.scopes().collect();
+        scopes.sort_by_key(|(name, _)| *name);
+        assert_eq!(
+            scopes,
+            vec![
+                ("consensus", Locked),
+                ("metrics", Locked),
+                ("regenesis", Compat),
+                ("setup", Locked),
+                ("status", Compat),
+                ("storage", Locked),
+                ("txforward", Locked),
+            ]
+        );
     }
 }

@@ -45,7 +45,15 @@ pub async fn post_nodes(
 
     ///////////////
     // 1. Verify new node is reachable via iroh (replaces HTTP ping check).
-    //    The iroh connection proves reachability AND pubkey ownership via TLS handshake.
+    //    The iroh connection proves reachability AND pubkey ownership via
+    //    TLS handshake — and, over the LOCKED family (RFC-025 S5),
+    //    same-mesh membership: completing TLS on the locked ALPN proves
+    //    the joiner adopted OUR mesh code at OUR exact release. A
+    //    wrong-code or code-less node fails HERE with 504 — the RFC's
+    //    visible timeout — before any node row is committed (a compat
+    //    ping would fall through to the magic-less legacy string while
+    //    generation 0 is in-window and let a zombie registration
+    //    through).
     ///////////////
     let peer_pubkey = payload.pubkey.0.to_bytes();
     let ping_peer = hopnet_comms::PeerRef {
@@ -56,7 +64,7 @@ pub async fn post_nodes(
     // Retry ping with backoff — iroh discovery (pkarr DNS) can take time for new nodes
     let mut ping_ok = false;
     for attempt in 0..6 {
-        match app_state.comms.ping(&ping_peer).await {
+        match app_state.comms.ping_locked(&ping_peer).await {
             Ok(_rtt) => {
                 tracing::info!("Successfully pinged new node via iroh (pubkey verified by TLS)");
                 ping_ok = true;
@@ -192,11 +200,22 @@ pub async fn post_nodes(
 
     // Get current consensus height, quorum profile, and bootstrap validators
     // on a single connection checkout.
-    let (current_height, quorum_profile, bootstrap_validators, epoch) = {
+    let (current_height, quorum_profile, bootstrap_validators, epoch, anchor) = {
         let mut conn = match app_state.db_pool.get() {
             Ok(c) => c,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
         };
+        // The anchor (epoch-1) chain id rides JoinInfo so the joiner can
+        // pre-flight its entered mesh code before writing anything
+        // (RFC-025 S5).
+        let anchor =
+            match crate::regenesis::genesis::anchor_chain_id(&conn, &crate::paths::data_dir()) {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::error!("anchor chain id for JoinInfo: {e}");
+                    return StatusCode::INTERNAL_SERVER_ERROR;
+                }
+            };
         let profile =
             hopnet_consensus::store::meta_get(&conn, hopnet_consensus::store::META_QUORUM_PROFILE)
                 .ok()
@@ -224,7 +243,7 @@ pub async fn post_nodes(
             }
         };
         let epoch = crate::regenesis::genesis::current_epoch(&conn);
-        (height, profile, validators, epoch)
+        (height, profile, validators, epoch, anchor)
     };
 
     // Create JoinInfo structure
@@ -234,6 +253,7 @@ pub async fn post_nodes(
         bootstrap_validators,
         quorum_profile,
         epoch,
+        anchor,
     };
 
     ///////////////

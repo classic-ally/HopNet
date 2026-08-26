@@ -11,6 +11,15 @@ mod signatures;
 mod transient_restage;
 mod upgrade;
 
+/// RFC-025: one synthetic mesh identity shared by every in-process
+/// fixture bind. Fixtures bind before any genesis exists, so the real
+/// anchor derivation is impossible — and mixed magics would fail TLS
+/// between loopback peers, so this is deliberately a single constant,
+/// never per-test. (Fixture binds also read effective_running_code();
+/// the pre-existing env-override race now fails loud as AlpnRejected
+/// on the locked family instead of silently.)
+pub(crate) const TEST_MESH_MAGIC: [u8; 4] = *b"t3st";
+
 #[derive(Clone)]
 pub struct MockNode {
     pub node_id: i32,
@@ -461,7 +470,10 @@ fn create_test_app_state_on_manager(
         .block_on(hopnet_comms::IrohComms::bind(
             signing_key.0.to_bytes(),
             directory,
-            None,
+            hopnet_comms::BindOptions {
+                relay_url: None,
+                magic: Some(TEST_MESH_MAGIC),
+            },
         ))
         .expect("test iroh comms");
 
@@ -482,6 +494,7 @@ fn create_test_app_state_on_manager(
         orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
         comms,
         setup_complete,
+        entered_join_code: Arc::new(std::sync::OnceLock::new()),
         consensus_barriers: Arc::new(crate::consensus::barriers::new()),
         session_store: Arc::new(crate::auth::SessionStore::default()),
         takeout_runtime: Arc::new(hopnet_takeout::TakeoutRuntime::default()),

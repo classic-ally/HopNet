@@ -35,13 +35,40 @@ use hopnet_consensus::membership::{Band, ConsensusPolicy, band};
 /// dark(X); `bright_since` anchors the S5 bright span;
 /// `probes_since_contact` carries the S4 attestation floor (>= 2 probe
 /// attempts since last contact).
+///
+/// Two clocks (RFC-025 §Rejection & Diagnosability): `last_contact` is
+/// LIVENESS — refreshed only by locked-class exchanges and
+/// version-matched Pongs, and it alone drives vote-out, bands, and
+/// bright spans. `last_seen` is VISIBILITY — any authenticated sighting
+/// on any class (compat chatter included). Contact implies seen; a peer
+/// chatty on the compat class while unable to vote is visible, never
+/// live.
 #[derive(Debug, Clone, Copy)]
 pub struct PeerEvidence {
     pub last_contact: Instant,
+    pub last_seen: Option<Instant>,
     pub last_probe_at: Option<Instant>,
     pub probes_since_contact: u32,
     pub bright_since: Option<Instant>,
     pub last_known_height: Option<u64>,
+    /// The latest Pong's identity claims (RFC-025): the defuser's cache
+    /// and the skew/stranded banner's source. Overwritten by every pong
+    /// — a matched pong self-heals the banner.
+    pub last_pong: Option<PongStamp>,
+    /// Defuser cooldown anchor (RFC-025): one resolution probe per peer
+    /// per cooldown, however many locked dials are failing.
+    pub last_defuse_at: Option<Instant>,
+}
+
+/// What the latest Pong claimed about a peer's identity.
+#[derive(Debug, Clone, Copy)]
+pub struct PongStamp {
+    pub at: Instant,
+    pub epoch: u64,
+    pub version_code: u32,
+    /// The served compat window (floor, head); None ⇔ a generation-0
+    /// peer answered (pre-enforcement binaries have no window fields).
+    pub window: Option<(u32, u32)>,
 }
 
 /// Copy-out view — snapshots never alias the live map.
@@ -116,6 +143,77 @@ impl EvidenceMap {
         self.record_probe_sent_at(node_id, Instant::now());
     }
 
+    /// Visibility evidence (RFC-025): an authenticated compat-class
+    /// sighting. Makes the peer VISIBLE (last-seen, the status view),
+    /// never LIVE — the vote-out clock is untouched.
+    pub fn record_seen(&self, node_id: i32) {
+        self.record_seen_at(node_id, None, Instant::now());
+    }
+
+    /// Visibility that also proved a decided height (an inbound status
+    /// ping carries the prober's height).
+    pub fn record_seen_with_height(&self, node_id: i32, height: u64) {
+        self.record_seen_at(node_id, Some(height), Instant::now());
+    }
+
+    /// Record what a Pong proved (RFC-025 §Rejection): the stamp always;
+    /// LIVENESS only when the peer's version matched ours — a mismatched
+    /// pong makes the peer visible, never live.
+    pub fn record_pong(&self, node_id: i32, height: u64, stamp: PongStamp, version_matched: bool) {
+        let reset_gap = Duration::from_millis(self.reset_gap_ms.load(Ordering::Relaxed));
+        let origin = self.origin;
+        let now = stamp.at;
+        let mut map = self.inner.lock();
+        let entry = map.entry(node_id).or_insert(PeerEvidence {
+            last_contact: if version_matched { now } else { origin },
+            last_seen: None,
+            last_probe_at: None,
+            probes_since_contact: 0,
+            bright_since: version_matched.then_some(now),
+            last_known_height: None,
+            last_pong: None,
+            last_defuse_at: None,
+        });
+        if version_matched {
+            Self::touch_contact(entry, now, reset_gap);
+        } else {
+            entry.last_seen = Some(now);
+        }
+        entry.last_known_height = Some(height);
+        entry.last_pong = Some(stamp);
+    }
+
+    /// The peer's latest Pong identity, for the defuser's cache lookup —
+    /// a point read, cheaper than snapshot().
+    pub fn last_pong(&self, node_id: i32) -> Option<PongStamp> {
+        self.inner.lock().get(&node_id).and_then(|v| v.last_pong)
+    }
+
+    /// Defuser cooldown gate (RFC-025): true iff no defuse ran for this
+    /// peer within `cooldown` — and claims the slot atomically under the
+    /// map lock, so concurrent failing dials elect one resolver.
+    pub fn try_begin_defuse(&self, node_id: i32, cooldown: Duration, now: Instant) -> bool {
+        let origin = self.origin;
+        let mut map = self.inner.lock();
+        let entry = map.entry(node_id).or_insert(PeerEvidence {
+            last_contact: origin,
+            last_seen: None,
+            last_probe_at: None,
+            probes_since_contact: 0,
+            bright_since: None,
+            last_known_height: None,
+            last_pong: None,
+            last_defuse_at: None,
+        });
+        match entry.last_defuse_at {
+            Some(at) if now.saturating_duration_since(at) < cooldown => false,
+            _ => {
+                entry.last_defuse_at = Some(now);
+                true
+            }
+        }
+    }
+
     /// Snapshot for classification and the debug route; sorted by node_id.
     pub fn snapshot(&self) -> Vec<(i32, PeerEvidenceView)> {
         let map = self.inner.lock();
@@ -129,23 +227,55 @@ impl EvidenceMap {
         let mut map = self.inner.lock();
         let entry = map.entry(node_id).or_insert(PeerEvidence {
             last_contact: now,
+            last_seen: Some(now),
             last_probe_at: None,
             probes_since_contact: 0,
             bright_since: Some(now),
             last_known_height: None,
+            last_pong: None,
+            last_defuse_at: None,
         });
-        // Reset rule: a gap no band would tolerate restarts the bright
-        // span; sub-gap silences are the hysteresis grace for blips.
+        Self::touch_contact(entry, now, reset_gap);
+        if height.is_some() {
+            entry.last_known_height = height;
+        }
+    }
+
+    pub(crate) fn record_seen_at(&self, node_id: i32, height: Option<u64>, now: Instant) {
+        let origin = self.origin;
+        let mut map = self.inner.lock();
+        let entry = map.entry(node_id).or_insert(PeerEvidence {
+            // A never-contacted node keeps aging on the vote-out clock
+            // from origin — visibility is not liveness.
+            last_contact: origin,
+            last_seen: None,
+            last_probe_at: None,
+            probes_since_contact: 0,
+            bright_since: None,
+            last_known_height: None,
+            last_pong: None,
+            last_defuse_at: None,
+        });
+        entry.last_seen = Some(now);
+        if height.is_some() {
+            entry.last_known_height = height;
+        }
+    }
+
+    /// The liveness mutation: contact implies seen, resets the probe
+    /// counter, and applies the bright-span reset rule — a gap no band
+    /// would tolerate restarts the span; sub-gap silences are the
+    /// hysteresis grace for blips. One home so every liveness writer
+    /// shares the rule.
+    fn touch_contact(entry: &mut PeerEvidence, now: Instant, reset_gap: Duration) {
         if entry.bright_since.is_none()
             || now.saturating_duration_since(entry.last_contact) > reset_gap
         {
             entry.bright_since = Some(now);
         }
         entry.last_contact = now;
+        entry.last_seen = Some(now);
         entry.probes_since_contact = 0;
-        if height.is_some() {
-            entry.last_known_height = height;
-        }
     }
 
     pub(crate) fn record_probe_sent_at(&self, node_id: i32, now: Instant) {
@@ -153,16 +283,29 @@ impl EvidenceMap {
         let mut map = self.inner.lock();
         let entry = map.entry(node_id).or_insert(PeerEvidence {
             // Never-contacted nodes keep aging from origin (the probe
-            // attempt is not contact).
+            // attempt is not contact — and not a sighting either).
             last_contact: origin,
+            last_seen: None,
             last_probe_at: None,
             probes_since_contact: 0,
             bright_since: None,
             last_known_height: None,
+            last_pong: None,
+            last_defuse_at: None,
         });
         entry.last_probe_at = Some(now);
         entry.probes_since_contact = entry.probes_since_contact.saturating_add(1);
     }
+}
+
+/// The compat window this node advertises and enforces, routed through
+/// the test-mode head seam so Pongs, probe SelfViews, the evidence JSON,
+/// and the banner rows always agree with the ALPN identity the transport
+/// hook enforces (RFC-025 S6) — a split here would make a node reject on
+/// one window while diagnosing with another.
+pub(crate) fn local_window() -> (u32, u32) {
+    let head = hopnet_comms::alpn::effective_compat_head();
+    (hopnet_comms::alpn::compat_floor(head), head)
 }
 
 /// Evidence age: now − last_contact, or now − origin for a node with no
@@ -172,6 +315,76 @@ pub fn contact_age(view: Option<&PeerEvidenceView>, origin: Instant, now: Instan
         Some(v) => now.saturating_duration_since(v.last_contact),
         None => now.saturating_duration_since(origin),
     }
+}
+
+/// Visibility age (RFC-025): now − last sighting on ANY class, falling
+/// back to the liveness clock (contact implies seen; a probe-created
+/// entry has neither and ages from origin via last_contact).
+pub fn seen_age(view: Option<&PeerEvidenceView>, origin: Instant, now: Instant) -> Duration {
+    match view {
+        Some(v) => now.saturating_duration_since(v.last_seen.unwrap_or(v.last_contact)),
+        None => now.saturating_duration_since(origin),
+    }
+}
+
+/// The RFC-025 banner rows, derived per request from the snapshot (the
+/// awaiting_upgrade precedent: a predicate over persistent state, never
+/// a stored flag — the next matched pong overwrites the stamp and the
+/// rows vanish). Shared by the evidence route and the resilience view.
+///
+/// A stamp is also superseded by NEWER LOCKED CONTACT: completing a
+/// locked exchange proves the peer runs our exact code by ALPN
+/// construction, so a mismatched pong older than the contact is history,
+/// not evidence. Without this, a restored peer would wear the skew
+/// banner forever — its fresh contact keeps the prober away, so no
+/// matched pong ever arrives to overwrite the stale stamp (found by the
+/// S6 mixed-version gate).
+pub fn version_banner_rows(
+    snap: &[(i32, PeerEvidenceView)],
+    local_version: u32,
+    compat_floor: u32,
+    compat_head: u32,
+    now: Instant,
+) -> (
+    Vec<hopnet_common::views::VersionSkewPeer>,
+    Vec<hopnet_common::views::StrandedPeer>,
+) {
+    let mut skew = Vec::new();
+    let mut stranded = Vec::new();
+    for (node_id, view) in snap {
+        let Some(stamp) = view.last_pong else {
+            continue;
+        };
+        if view.last_contact > stamp.at {
+            continue;
+        }
+        match stamp.window {
+            Some((peer_floor, peer_head)) if compat_head < peer_floor => {
+                stranded.push(hopnet_common::views::StrandedPeer {
+                    node_id: *node_id,
+                    floor: peer_floor,
+                    head: peer_head,
+                });
+            }
+            None if compat_floor > 0 => {
+                stranded.push(hopnet_common::views::StrandedPeer {
+                    node_id: *node_id,
+                    floor: 0,
+                    head: 0,
+                });
+            }
+            _ => {
+                if stamp.version_code != local_version {
+                    skew.push(hopnet_common::views::VersionSkewPeer {
+                        node_id: *node_id,
+                        version: crate::version::format_code(stamp.version_code),
+                        pong_age_ms: now.saturating_duration_since(stamp.at).as_millis() as u64,
+                    });
+                }
+            }
+        }
+    }
+    (skew, stranded)
 }
 
 /// Observed bright span: now − bright_since, but only while the node is in
@@ -259,39 +472,9 @@ pub fn live_estimate(
 // catch-up gate (last_known_height).
 // ============================================================================
 
-#[derive(serde::Serialize, serde::Deserialize)]
-pub enum StatusRequest {
-    /// Carries the PROBER's decided height: a probe teaches both sides —
-    /// the responder learns the prober's height here, the prober learns
-    /// the responder's from the Pong. Without this, steady-state probe
-    /// circularity (each side's probes keeping the other's view fresh)
-    /// leaves exactly one probe direction per pair and the responder
-    /// heightless.
-    ///
-    /// Also the hello of the (epoch, version) handshake (RFC-019 S6):
-    /// both sides learn each other's identity and log a structured
-    /// refusal on mismatch — turning the silent signature-domain failure
-    /// (chain_id is mixed into every vote) into a diagnosable one. The
-    /// responder still answers and records contact: reachability is a
-    /// transport fact, orthogonal to epoch membership.
-    Ping {
-        decided_height: u64,
-        epoch: u64,
-        version_code: u32,
-    },
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub enum StatusResponse {
-    /// Current decided height (0 pre-genesis/pre-engine — reachability is
-    /// a transport property; a zero height just fails catch-up gates),
-    /// plus the responder's (epoch, version) — see Ping.
-    Pong {
-        decided_height: u64,
-        epoch: u64,
-        version_code: u32,
-    },
-}
+// The wire vocabulary is generation-1 frozen inventory (RFC-025); the
+// scope below speaks the head types via these re-exports.
+pub use super::status_compat_g1::{StatusRequest, StatusResponse};
 
 /// Inbound status scope: mesh plane, inline on the net runtime — one
 /// watch borrow + one mutex write, no DB, no spawn.
@@ -322,9 +505,12 @@ impl hopnet_comms::RpcHandler for StatusScope {
                     },
                     _,
                 )) => {
+                    // Compat chatter (RFC-025): an inbound ping makes the
+                    // prober VISIBLE, never live — liveness rides locked
+                    // exchanges and version-matched Pongs only.
                     app_state
                         .evidence
-                        .record_contact_with_height(peer.node_id, decided_height);
+                        .record_seen_with_height(peer.node_id, decided_height);
                     if epoch != my_epoch {
                         tracing::warn!(
                             peer = peer.node_id,
@@ -351,18 +537,24 @@ impl hopnet_comms::RpcHandler for StatusScope {
                         }
                     }
                 }
-                Err(_) => app_state.evidence.record_contact(peer.node_id),
+                // The undecodable-request hole (RFC-025 §Rejection)
+                // closes here: a malformed request is a sighting, never
+                // contact — it no longer touches the vote-out clock.
+                Err(_) => app_state.evidence.record_seen(peer.node_id),
             }
             let decided_height = app_state
                 .malachite
                 .get()
                 .map(|e| *e.decided.borrow())
                 .unwrap_or(0);
+            let (floor, head) = local_window();
             bincode::serde::encode_to_vec(
                 &StatusResponse::Pong {
                     decided_height,
                     epoch: my_epoch,
                     version_code: crate::version::effective_running_code(),
+                    floor,
+                    head,
                 },
                 bincode::config::standard(),
             )
@@ -371,15 +563,80 @@ impl hopnet_comms::RpcHandler for StatusScope {
     }
 }
 
+/// The generation-0 status adapter (RFC-025 §Evolution): a pure codec
+/// shim serving pre-enforcement dialers through the head handler.
+/// Request bytes pass through untouched — the G0 and G1 Pings are
+/// byte-identical (the equality golden in `status_compat_g0` is the
+/// license), which also preserves the undecodable-request semantics
+/// exactly. The head Pong is then narrowed to the G0 shape by dropping
+/// the window fields.
+pub struct StatusCompatG0 {
+    pub inner: std::sync::Arc<dyn hopnet_comms::RpcHandler>,
+}
+
+impl hopnet_comms::RpcHandler for StatusCompatG0 {
+    fn handle(
+        &self,
+        peer: hopnet_comms::PeerRef,
+        payload: Vec<u8>,
+    ) -> hopnet_comms::BoxFuture<'_, Vec<u8>> {
+        Box::pin(async move {
+            let head_response = self.inner.handle(peer, payload).await;
+            match bincode::serde::decode_from_slice::<StatusResponse, _>(
+                &head_response,
+                bincode::config::standard(),
+            ) {
+                Ok((
+                    StatusResponse::Pong {
+                        decided_height,
+                        epoch,
+                        version_code,
+                        ..
+                    },
+                    _,
+                )) => bincode::serde::encode_to_vec(
+                    &super::status_compat_g0::StatusResponse::Pong {
+                        decided_height,
+                        epoch,
+                        version_code,
+                    },
+                    bincode::config::standard(),
+                )
+                .unwrap_or_default(),
+                // The head handler always encodes a well-formed Pong;
+                // refuse to relay anything else to an old decoder.
+                Err(_) => Vec::new(),
+            }
+        })
+    }
+}
+
+/// Everything a Pong teaches the prober; classify_pong consumes every
+/// field.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PongInfo {
+    pub decided_height: u64,
+    pub epoch: u64,
+    pub version_code: u32,
+    /// The peer's served compat window (floor, head); None when a
+    /// generation-0 peer answered (pre-enforcement binaries have none).
+    pub window: Option<(u32, u32)>,
+}
+
 /// Fire one status probe; `timeout` = the policy grace g (one source of
 /// truth — the comms transport default is only the floor).
+///
+/// The Pong is decoded under the generation the connection's negotiated
+/// ALPN commits both sides to (RFC-025: no dialer ever guesses what a
+/// peer speaks) — the G1/G0 Pings are byte-identical, so only the
+/// response side is generation-dependent.
 pub async fn status_probe(
     comms: &hopnet_comms::IrohComms,
     peer: &hopnet_comms::PeerRef,
     my_decided_height: u64,
     my_epoch: u64,
     timeout: Duration,
-) -> Result<(u64, u64), String> {
+) -> Result<PongInfo, String> {
     let payload = bincode::serde::encode_to_vec(
         &StatusRequest::Ping {
             decided_height: my_decided_height,
@@ -389,23 +646,52 @@ pub async fn status_probe(
         bincode::config::standard(),
     )
     .map_err(|e| format!("encode: {e}"))?;
-    let raw = comms
-        .rpc(peer, "status", payload, timeout)
+    let (raw, generation) = comms
+        .rpc_negotiated(peer, "status", payload, timeout)
         .await
         .map_err(|e| format!("rpc: {e:?}"))?;
-    let (resp, _) =
-        bincode::serde::decode_from_slice::<StatusResponse, _>(&raw, bincode::config::standard())
-            .map_err(|e| format!("decode: {e}"))?;
-    let StatusResponse::Pong {
-        decided_height,
-        epoch,
-        version_code,
-    } = resp;
-    if epoch != my_epoch {
+    let info = if generation == 0 {
+        let (resp, _) = bincode::serde::decode_from_slice::<
+            super::status_compat_g0::StatusResponse,
+            _,
+        >(&raw, bincode::config::standard())
+        .map_err(|e| format!("decode (g0): {e}"))?;
+        let super::status_compat_g0::StatusResponse::Pong {
+            decided_height,
+            epoch,
+            version_code,
+        } = resp;
+        PongInfo {
+            decided_height,
+            epoch,
+            version_code,
+            window: None,
+        }
+    } else {
+        let (resp, _) = bincode::serde::decode_from_slice::<StatusResponse, _>(
+            &raw,
+            bincode::config::standard(),
+        )
+        .map_err(|e| format!("decode: {e}"))?;
+        let StatusResponse::Pong {
+            decided_height,
+            epoch,
+            version_code,
+            floor,
+            head,
+        } = resp;
+        PongInfo {
+            decided_height,
+            epoch,
+            version_code,
+            window: Some((floor, head)),
+        }
+    };
+    if info.epoch != my_epoch {
         tracing::warn!(
             peer = peer.node_id,
-            peer_epoch = epoch,
-            peer_version = %crate::version::format_code(version_code),
+            peer_epoch = info.epoch,
+            peer_version = %crate::version::format_code(info.version_code),
             local_epoch = my_epoch,
             "handshake: peer answered from a different epoch"
         );
@@ -414,7 +700,7 @@ pub async fn status_probe(
     // slept through a boundary while the mesh stayed quiet has nothing
     // else to learn from — no sync to fail, no gossip to arrive. The
     // pong is its only signal that it must rejoin.
-    Ok((decided_height, epoch))
+    Ok(info)
 }
 
 /// What a pong obliges the PROBER to do about its own state.
@@ -423,6 +709,14 @@ pub(crate) enum PongAction {
     /// The responder is in a NEWER epoch: no amount of block sync crosses
     /// a boundary — rejoin via the epoch-join path (RFC-019 S7).
     EpochJoin,
+    /// The responder's served window excludes every generation we speak
+    /// (RFC-025): self-staging is over; the remedy is a fresh join with a
+    /// current release. Named operator error.
+    Stranded { peer_floor: u32 },
+    /// Same epoch, different build (RFC-025): an unsupported state that
+    /// must SCREAM — the scheduler logs at error level and the status
+    /// view carries the persistent banner.
+    VersionSkew { peer_version: u32 },
     /// Same epoch, responder decided past us: kick decided-value sync.
     KickSync,
     /// The responder is level, behind, or in an OLDER epoch: nothing to
@@ -430,8 +724,21 @@ pub(crate) enum PongAction {
     Nothing,
 }
 
-/// Classify a pong against the prober's own (epoch, decided). Epoch
-/// comparison dominates height — heights from another epoch don't compare.
+/// The prober's own identity, passed in so classification stays pure.
+/// `compat_floor`/`compat_head` come from `hopnet_comms::alpn` at the
+/// call site.
+pub(crate) struct SelfView {
+    pub epoch: u64,
+    pub decided: u64,
+    pub version_code: u32,
+    pub compat_floor: u32,
+    pub compat_head: u32,
+}
+
+/// Classify a pong against the prober's own identity. Epoch comparison
+/// dominates everything — a version mismatch at a boundary is the epoch
+/// join's business, not an operator's (RFC-025 §Rejection); then the
+/// window (Stranded), then the build (VersionSkew), then height.
 ///
 /// The KickSync arm is the prober's only SELF-lag signal that still works
 /// once the mesh has unseated it: gossip is valset-only, a
@@ -441,19 +748,54 @@ pub(crate) enum PongAction {
 /// Observed in production: a validator that stalled at height h and was
 /// voted out effective h+1 sat for days rebroadcasting a stale Prevote
 /// with zero sync attempts, every other trigger structurally dead.
-pub(crate) fn classify_pong(
-    my_epoch: u64,
-    peer_epoch: u64,
-    my_decided: u64,
-    pong_height: u64,
-) -> PongAction {
-    if peer_epoch > my_epoch {
+pub(crate) fn classify_pong(me: &SelfView, pong: &PongInfo) -> PongAction {
+    if pong.epoch > me.epoch {
         return PongAction::EpochJoin;
     }
-    if peer_epoch == my_epoch && pong_height > my_decided {
+    // Stranded: the peer's window excludes every generation we speak. A
+    // gen-0 peer (no window on the wire) speaks exactly {0}, which
+    // strands us only once our own floor has moved past 0.
+    match pong.window {
+        Some((peer_floor, _)) if me.compat_head < peer_floor => {
+            return PongAction::Stranded { peer_floor };
+        }
+        None if me.compat_floor > 0 => {
+            return PongAction::Stranded { peer_floor: 0 };
+        }
+        _ => {}
+    }
+    if pong.epoch == me.epoch && pong.version_code != me.version_code {
+        return PongAction::VersionSkew {
+            peer_version: pong.version_code,
+        };
+    }
+    if pong.epoch == me.epoch && pong.decided_height > me.decided {
         return PongAction::KickSync;
     }
     PongAction::Nothing
+}
+
+/// Record what a pong proves and classify it (RFC-025 §Rejection):
+/// liveness only when version-matched — an EpochJoin pong from a
+/// mismatched build is still visibility-only. Extracted from the
+/// scheduler so the clock semantics are testable without it; the
+/// scheduler owns only the side effects.
+pub(crate) fn absorb_pong(
+    evidence: &EvidenceMap,
+    me: &SelfView,
+    peer_id: i32,
+    pong: &PongInfo,
+    now: Instant,
+) -> PongAction {
+    let stamp = PongStamp {
+        at: now,
+        epoch: pong.epoch,
+        version_code: pong.version_code,
+        window: pong.window,
+    };
+    let version_matched = pong.version_code == me.version_code;
+    evidence.record_pong(peer_id, pong.decided_height, stamp, version_matched);
+    classify_pong(me, pong)
 }
 
 // ============================================================================
@@ -592,11 +934,17 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 let g = policy.grace;
                 let probe_state = app_state.clone();
                 tokio::spawn(async move {
-                    if let Ok((h, peer_epoch)) =
-                        status_probe(&comms, &peer, decided, my_epoch, g).await
-                    {
-                        evidence.record_contact_with_height(peer.node_id, h);
-                        match classify_pong(my_epoch, peer_epoch, decided, h) {
+                    if let Ok(pong) = status_probe(&comms, &peer, decided, my_epoch, g).await {
+                        let (compat_floor, compat_head) = local_window();
+                        let me = SelfView {
+                            epoch: my_epoch,
+                            decided,
+                            version_code: crate::version::effective_running_code(),
+                            compat_floor,
+                            compat_head,
+                        };
+                        let h = pong.decided_height;
+                        match absorb_pong(&evidence, &me, peer.node_id, &pong, Instant::now()) {
                             // The offline-through-regenesis case (RFC-019
                             // S7): this node woke in a sealed epoch with a
                             // quiet mesh around it. Nothing will sync and
@@ -607,6 +955,33 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                                     &probe_state,
                                     crate::regenesis::join::JoinAnchor::OwnDb,
                                     vec![peer],
+                                );
+                            }
+                            // RFC-025: an unsupported state that must
+                            // SCREAM — error level, both codes named,
+                            // never a warn that scrolls away. (Also the
+                            // tell if a leaked version override suppresses
+                            // KickSync in tests.)
+                            PongAction::VersionSkew { peer_version } => {
+                                tracing::error!(
+                                    peer = peer.node_id,
+                                    peer_version = %crate::version::format_code(peer_version),
+                                    local_version = %crate::version::format_code(me.version_code),
+                                    epoch = my_epoch,
+                                    "version skew: same epoch, different build — \
+                                     unsupported state (RFC-025)"
+                                );
+                            }
+                            // RFC-025: the peer serves no generation we
+                            // speak — self-staging is over; the remedy is
+                            // a fresh join with a current release.
+                            PongAction::Stranded { peer_floor } => {
+                                tracing::error!(
+                                    peer = peer.node_id,
+                                    peer_floor,
+                                    local_head = me.compat_head,
+                                    "stranded: peer's compat window excludes every \
+                                     generation we speak — fresh join required (RFC-025)"
                                 );
                             }
                             // Same-epoch lag discovery (see classify_pong):
@@ -840,11 +1215,13 @@ pub async fn get_evidence(State(app_state): State<crate::AppState>) -> impl Into
                 .map(|i| snap[i].1);
             let age = contact_age(view.as_ref(), origin, now);
             let span = bright_span(view.as_ref(), origin, &policy, est.band, now);
+            let local_version = crate::version::effective_running_code();
             serde_json::json!({
                 "node_id": id,
                 "seated": seated.contains(id),
                 "self": *id == my_id,
                 "age_ms": age.as_millis() as u64,
+                "seen_age_ms": seen_age(view.as_ref(), origin, now).as_millis() as u64,
                 "synthetic_age": view.is_none(),
                 "probes_since_contact": view.map(|v| v.probes_since_contact).unwrap_or(0),
                 "last_probe_age_ms": view
@@ -852,6 +1229,26 @@ pub async fn get_evidence(State(app_state): State<crate::AppState>) -> impl Into
                     .map(|p| now.saturating_duration_since(p).as_millis() as u64),
                 "bright_span_ms": span.as_millis() as u64,
                 "last_known_height": view.and_then(|v| v.last_known_height),
+                "pong": view.and_then(|v| v.last_pong).map(|stamp| {
+                    let (floor, head) = stamp.window.unzip();
+                    // Locked contact newer than the stamp proves the
+                    // peer's version by ALPN construction — the stale
+                    // claim is superseded (version_banner_rows' rule).
+                    let superseded = view.is_some_and(|v| v.last_contact > stamp.at);
+                    serde_json::json!({
+                        "age_ms": now.saturating_duration_since(stamp.at).as_millis() as u64,
+                        "version": crate::version::format_code(stamp.version_code),
+                        "epoch": stamp.epoch,
+                        "floor": floor,
+                        "head": head,
+                        "skew": stamp.version_code != local_version && !superseded,
+                        "stranded": !superseded
+                            && match stamp.window {
+                                Some((peer_floor, _)) => local_window().1 < peer_floor,
+                                None => local_window().0 > 0,
+                            },
+                    })
+                }),
             })
         })
         .collect();
@@ -868,6 +1265,8 @@ pub async fn get_evidence(State(app_state): State<crate::AppState>) -> impl Into
             "t_probe_ms": policy.t_probe(est.band).as_millis() as u64,
             "t_unresponsive_ms": policy.t_unresponsive(est.band).as_millis() as u64,
             "t_out_ms": policy.t_out(est.band).as_millis() as u64,
+            "local_version":
+                crate::version::format_code(crate::version::effective_running_code()),
         },
         "nodes": nodes,
     }))
@@ -885,11 +1284,179 @@ mod tests {
     fn view(last_contact: Instant) -> PeerEvidenceView {
         PeerEvidence {
             last_contact,
+            last_seen: Some(last_contact),
             last_probe_at: None,
             probes_since_contact: 0,
             bright_since: Some(last_contact),
             last_known_height: None,
+            last_pong: None,
+            last_defuse_at: None,
         }
+    }
+
+    // Impact: this pin IS the vote-out shield — compat chatter
+    // refreshing the liveness clock would shield a lagging validator
+    // from the vote-out it deserves (RFC-025 §Rejection).
+    // Should: record_seen move only the visibility timestamp, leaving
+    // last_contact, the probe counter, and the bright span untouched.
+    // Should not: create a liveness-bearing entry for a never-contacted
+    // node (it keeps aging from origin on the vote-out clock).
+    #[test]
+    fn seen_moves_only_the_visibility_clock() {
+        let map = EvidenceMap::new();
+        map.record_probe_sent_at(7, map.origin() + Duration::from_secs(1));
+        map.record_seen_at(7, Some(42), map.origin() + Duration::from_secs(2));
+
+        let snap = map.snapshot();
+        let (_, v) = snap.iter().find(|(id, _)| *id == 7).unwrap();
+        assert_eq!(v.last_contact, map.origin());
+        assert_eq!(v.last_seen, Some(map.origin() + Duration::from_secs(2)));
+        assert_eq!(v.probes_since_contact, 1);
+        assert_eq!(v.bright_since, None);
+        assert_eq!(v.last_known_height, Some(42));
+
+        // A brand-new entry created by record_seen alone: liveness ages
+        // from origin.
+        map.record_seen_at(8, None, map.origin() + Duration::from_secs(3));
+        let snap = map.snapshot();
+        let (_, v) = snap.iter().find(|(id, _)| *id == 8).unwrap();
+        assert_eq!(v.last_contact, map.origin());
+    }
+
+    // Should: contact imply seen — one authenticated locked exchange
+    // refreshes both clocks (visibility never reads older than liveness).
+    #[test]
+    fn contact_implies_seen() {
+        let map = EvidenceMap::new();
+        let t = map.origin() + Duration::from_secs(5);
+        map.record_at(9, None, t);
+        let snap = map.snapshot();
+        let (_, v) = snap.iter().find(|(id, _)| *id == 9).unwrap();
+        assert_eq!(v.last_contact, t);
+        assert_eq!(v.last_seen, Some(t));
+    }
+
+    // Should: seen_age fall back to the liveness clock when no sighting
+    // is recorded (probe-created entries age from origin on both).
+    #[test]
+    fn seen_age_falls_back_to_contact() {
+        let origin = Instant::now();
+        let now = origin + Duration::from_secs(10);
+        let mut v = view(origin + Duration::from_secs(4));
+        v.last_seen = None;
+        assert_eq!(seen_age(Some(&v), origin, now), Duration::from_secs(6));
+        v.last_seen = Some(origin + Duration::from_secs(8));
+        assert_eq!(seen_age(Some(&v), origin, now), Duration::from_secs(2));
+        assert_eq!(seen_age(None, origin, now), Duration::from_secs(10));
+    }
+
+    /// A matched-identity SelfView: same version and window as `pong()`
+    /// produces, so height/epoch cases exercise only their own axis.
+    fn me(epoch: u64, decided: u64) -> SelfView {
+        SelfView {
+            epoch,
+            decided,
+            version_code: 20260806,
+            compat_floor: 0,
+            compat_head: 1,
+        }
+    }
+
+    fn pong(epoch: u64, decided_height: u64) -> PongInfo {
+        PongInfo {
+            decided_height,
+            epoch,
+            version_code: 20260806,
+            window: Some((0, 1)),
+        }
+    }
+
+    // Impact: the banner is derived, never stored — the next matched
+    // pong overwrites the stamp and the rows vanish (self-healing, the
+    // awaiting_upgrade precedent).
+    // Should: emit a skew row for a same-window build mismatch and a
+    // stranded row for a disjoint window; peers with no pong stay off
+    // the banner.
+    // Should not: put a stranded peer on the skew list too — stranded
+    // outranks.
+    #[test]
+    fn banner_rows_derive_from_stamps() {
+        let now = Instant::now();
+        let fresh = now - Duration::from_secs(3);
+        let mut matched = view(fresh);
+        matched.last_pong = Some(PongStamp {
+            at: fresh,
+            epoch: 1,
+            version_code: 20260806,
+            window: Some((0, 1)),
+        });
+        let mut skewed = view(fresh);
+        skewed.last_pong = Some(PongStamp {
+            at: fresh,
+            epoch: 1,
+            version_code: 20270101,
+            window: Some((0, 1)),
+        });
+        let mut stranded = view(fresh);
+        stranded.last_pong = Some(PongStamp {
+            at: fresh,
+            epoch: 1,
+            version_code: 20270101,
+            window: Some((2, 3)),
+        });
+        let silent = view(fresh);
+        let snap = vec![(1, matched), (2, skewed), (3, stranded), (4, silent)];
+
+        let (skew, stranded_rows) = version_banner_rows(&snap, 20260806, 0, 1, now);
+        assert_eq!(skew.len(), 1);
+        assert_eq!(skew[0].node_id, 2);
+        assert_eq!(skew[0].version, "2027.1.1");
+        assert_eq!(stranded_rows.len(), 1);
+        assert_eq!(stranded_rows[0].node_id, 3);
+        assert_eq!(stranded_rows[0].floor, 2);
+    }
+
+    // Impact: without supersession a restored peer wears the skew banner
+    // FOREVER — its fresh locked contact keeps the prober away, so no
+    // matched pong ever overwrites the stale stamp (found by the S6
+    // mixed-version gate). A locked exchange proves the peer's version
+    // by ALPN construction.
+    // Should: drop a mismatched pong's skew row (and a disjoint window's
+    // stranded row) once locked contact is newer than the stamp.
+    // Should not: let contact recorded BEFORE the stamp supersede it.
+    #[test]
+    fn newer_locked_contact_supersedes_a_stale_stamp() {
+        let now = Instant::now();
+        let stamp_at = now - Duration::from_secs(60);
+        let mismatched = PongStamp {
+            at: stamp_at,
+            epoch: 1,
+            version_code: 20270101,
+            window: Some((0, 1)),
+        };
+        let disjoint = PongStamp {
+            at: stamp_at,
+            epoch: 1,
+            version_code: 20270101,
+            window: Some((2, 3)),
+        };
+
+        // Contact AFTER the stamp: both rows vanish.
+        let mut recovered_skew = view(now - Duration::from_secs(2));
+        recovered_skew.last_pong = Some(mismatched);
+        let mut recovered_stranded = view(now - Duration::from_secs(2));
+        recovered_stranded.last_pong = Some(disjoint);
+        let snap = vec![(1, recovered_skew), (2, recovered_stranded)];
+        let (skew, stranded_rows) = version_banner_rows(&snap, 20260806, 0, 1, now);
+        assert!(skew.is_empty());
+        assert!(stranded_rows.is_empty());
+
+        // Contact BEFORE the stamp: the claims stand.
+        let mut still_skewed = view(now - Duration::from_secs(120));
+        still_skewed.last_pong = Some(mismatched);
+        let snap = vec![(1, still_skewed)];
+        let (skew, _) = version_banner_rows(&snap, 20260806, 0, 1, now);
+        assert_eq!(skew.len(), 1);
     }
 
     // Impact: this row WAS the production rejoin deadlock — a voted-out
@@ -903,31 +1470,152 @@ mod tests {
     // ahead of our decided height.
     #[test]
     fn classify_pong_kicks_sync_when_a_same_epoch_peer_is_ahead() {
-        assert_eq!(classify_pong(1, 1, 2430, 35740), PongAction::KickSync);
-        assert_eq!(classify_pong(1, 1, 0, 1), PongAction::KickSync);
+        assert_eq!(
+            classify_pong(&me(1, 2430), &pong(1, 35740)),
+            PongAction::KickSync
+        );
+        assert_eq!(classify_pong(&me(1, 0), &pong(1, 1)), PongAction::KickSync);
     }
 
     // Should: do nothing when a same-epoch peer is level with us or
     // behind us — the pong carries nothing we lack.
     #[test]
     fn classify_pong_ignores_a_level_or_lagging_peer() {
-        assert_eq!(classify_pong(1, 1, 10, 10), PongAction::Nothing);
-        assert_eq!(classify_pong(1, 1, 10, 3), PongAction::Nothing);
+        assert_eq!(classify_pong(&me(1, 10), &pong(1, 10)), PongAction::Nothing);
+        assert_eq!(classify_pong(&me(1, 10), &pong(1, 3)), PongAction::Nothing);
     }
 
     // Should: route a newer-epoch pong to epoch join regardless of the
     // relative heights — block sync never crosses a boundary.
     #[test]
     fn classify_pong_joins_a_newer_epoch_at_any_height() {
-        assert_eq!(classify_pong(1, 2, 10, 999), PongAction::EpochJoin);
-        assert_eq!(classify_pong(1, 2, 999, 10), PongAction::EpochJoin);
+        assert_eq!(
+            classify_pong(&me(1, 10), &pong(2, 999)),
+            PongAction::EpochJoin
+        );
+        assert_eq!(
+            classify_pong(&me(1, 999), &pong(2, 10)),
+            PongAction::EpochJoin
+        );
     }
 
     // Should not: let a height from an OLDER epoch drag us into a sync —
     // heights don't compare across epochs.
     #[test]
     fn classify_pong_never_syncs_toward_a_retired_epoch() {
-        assert_eq!(classify_pong(2, 1, 10, 999), PongAction::Nothing);
+        assert_eq!(
+            classify_pong(&me(2, 10), &pong(1, 999)),
+            PongAction::Nothing
+        );
+    }
+
+    // Impact: the SCREAM state (RFC-025) — a same-epoch build mismatch is
+    // unsupported and must surface, but only same-epoch: at a boundary
+    // the version difference is the epoch join's business.
+    // Should: classify same-epoch different-build as VersionSkew naming
+    // the peer's code.
+    // Should not: fire for a cross-epoch mismatch (EpochJoin outranks),
+    // or for a matched build.
+    #[test]
+    fn classify_pong_screams_on_same_epoch_skew_only() {
+        let mut skewed = pong(1, 10);
+        skewed.version_code = 20270101;
+        assert_eq!(
+            classify_pong(&me(1, 10), &skewed),
+            PongAction::VersionSkew {
+                peer_version: 20270101
+            }
+        );
+        // Height is irrelevant once skewed — skew outranks KickSync.
+        let mut skewed_ahead = pong(1, 999);
+        skewed_ahead.version_code = 20270101;
+        assert_eq!(
+            classify_pong(&me(1, 10), &skewed_ahead),
+            PongAction::VersionSkew {
+                peer_version: 20270101
+            }
+        );
+        // A newer epoch wins even with a skewed build.
+        let mut boundary = pong(2, 999);
+        boundary.version_code = 20270101;
+        assert_eq!(classify_pong(&me(1, 10), &boundary), PongAction::EpochJoin);
+    }
+
+    // Impact: the fresh-join remedy state (RFC-025) — a peer serving no
+    // generation we speak means self-staging is structurally over.
+    // Should: classify a disjoint window as Stranded naming the peer's
+    // floor; treat a gen-0 peer (no window) as stranded only once our
+    // own floor has moved past 0.
+    // Should not: strand on overlapping windows, and EpochJoin outranks.
+    #[test]
+    fn classify_pong_names_stranded_when_windows_disjoint() {
+        // Peer window [2,3], our head 1: disjoint.
+        let mut ahead = pong(1, 10);
+        ahead.window = Some((2, 3));
+        assert_eq!(
+            classify_pong(&me(1, 10), &ahead),
+            PongAction::Stranded { peer_floor: 2 }
+        );
+        // Overlap ([1,2] vs our [0,1]) is fine.
+        let mut overlap = pong(1, 10);
+        overlap.window = Some((1, 2));
+        assert_eq!(classify_pong(&me(1, 10), &overlap), PongAction::Nothing);
+        // Gen-0 peer vs our floor 0: intersects at {0}.
+        let mut legacy = pong(1, 10);
+        legacy.window = None;
+        assert_eq!(classify_pong(&me(1, 10), &legacy), PongAction::Nothing);
+        // Gen-0 peer once our floor moved past 0: stranded.
+        let mut me_advanced = me(1, 10);
+        me_advanced.compat_floor = 1;
+        me_advanced.compat_head = 2;
+        assert_eq!(
+            classify_pong(&me_advanced, &legacy),
+            PongAction::Stranded { peer_floor: 0 }
+        );
+        // EpochJoin outranks Stranded.
+        let mut boundary = pong(2, 10);
+        boundary.window = Some((5, 6));
+        assert_eq!(classify_pong(&me(1, 10), &boundary), PongAction::EpochJoin);
+    }
+
+    // Impact: the version-matched-Pongs-only liveness rule (RFC-025) — a
+    // mismatched peer's pong must not shield it from vote-out, while
+    // still making it visible and caching its identity for the defuser
+    // and the banner.
+    // Should: refresh liveness for a matched pong; record only
+    // visibility, height, and the stamp for a mismatched one.
+    #[test]
+    fn absorb_pong_gates_liveness_on_version_match() {
+        let map = EvidenceMap::new();
+        let now = map.origin() + Duration::from_secs(5);
+
+        // Mismatched: visibility + stamp, liveness untouched.
+        let mut skewed = pong(1, 42);
+        skewed.version_code = 20270101;
+        let action = absorb_pong(&map, &me(1, 10), 7, &skewed, now);
+        assert_eq!(
+            action,
+            PongAction::VersionSkew {
+                peer_version: 20270101
+            }
+        );
+        let snap = map.snapshot();
+        let (_, v) = snap.iter().find(|(id, _)| *id == 7).unwrap();
+        assert_eq!(v.last_contact, map.origin());
+        assert_eq!(v.last_seen, Some(now));
+        assert_eq!(v.last_known_height, Some(42));
+        let stamp = v.last_pong.unwrap();
+        assert_eq!(stamp.version_code, 20270101);
+        assert_eq!(stamp.window, Some((0, 1)));
+
+        // Matched: full liveness.
+        let later = now + Duration::from_secs(1);
+        let action = absorb_pong(&map, &me(1, 10), 7, &pong(1, 43), later);
+        assert_eq!(action, PongAction::KickSync);
+        let snap = map.snapshot();
+        let (_, v) = snap.iter().find(|(id, _)| *id == 7).unwrap();
+        assert_eq!(v.last_contact, later);
+        assert_eq!(v.last_pong.unwrap().version_code, 20260806);
     }
 
     // Should: classification be a pure function of the snapshot — same

@@ -60,6 +60,9 @@ export function mockSetupApi(options: MockSetupOptions = {}): SetupApi {
         async fetchPubkey() {
             return (await gate()) ?? { ok: true, pubkey };
         },
+        async submitJoinCode() {
+            return (await gate()) ?? { ok: true };
+        },
         async login() {
             return (await gate()) ?? { ok: true, token: MOCK_TOKEN };
         },

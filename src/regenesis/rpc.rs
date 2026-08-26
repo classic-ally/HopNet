@@ -7,72 +7,17 @@
 //! REQUESTER against committed hashes (lineage certificates, the
 //! record's snapshot_hash) — the server is never trusted.
 
-use serde::{Deserialize, Serialize};
-
 use hopnet_comms::{BoxFuture, PeerRef, RpcHandler};
 
 use crate::AppState;
 use crate::net::{decode_payload, encode_payload};
 use crate::regenesis::{boot, genesis, seal};
 
-/// Lineage records per LineageFetch response. Each is small (one record,
-/// one final block, one certificate), so the cap is about bounding a
-/// single frame, not about pagination in practice.
-pub const LINEAGE_FETCH_MAX: u64 = 32;
-
-/// Snapshot chunk ceiling — the fragment precedent's size, comfortably
-/// under the transport's 8MB receiver-enforced frame cap.
-pub const SNAPSHOT_CHUNK_MAX: u64 = 4 * 1024 * 1024;
-
-#[derive(Serialize, Deserialize, Debug)]
-pub enum RegenesisNetRequest {
-    /// Epoch identity probe: what epoch is this node on, what can it serve.
-    EpochInfo,
-    /// Lineage records for epochs `from_epoch..`, ascending and contiguous,
-    /// capped at LINEAGE_FETCH_MAX per response.
-    LineageFetch { from_epoch: u64 },
-    /// Artifact identity for the server's CURRENT epoch (v1 serves the
-    /// latest snapshot only). Also the PREPARE step: a server that must
-    /// recompute materializes the artifact file here, so subsequent chunk
-    /// reads are plain file reads.
-    SnapshotInfo { epoch: u64 },
-    /// One artifact byte range. `len` is clamped to SNAPSHOT_CHUNK_MAX;
-    /// a read at or past EOF returns empty data.
-    SnapshotChunk { epoch: u64, offset: u64, len: u64 },
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub enum RegenesisNetResponse {
-    EpochInfo {
-        epoch: u64,
-        decided_height: u64,
-        /// H for a database born from a boundary; None on epoch 1.
-        epoch_genesis_height: Option<u64>,
-        /// Lowest lineage record on disk (normally 2); None = none.
-        lineage_from: Option<u64>,
-    },
-    /// Encoded LineageRecord bytes (the exact on-disk encoding), ascending.
-    Lineage {
-        records: Vec<Vec<u8>>,
-    },
-    SnapshotInfo {
-        epoch: u64,
-        total_len: u64,
-        snapshot_hash: [u8; 32],
-    },
-    SnapshotChunk {
-        data: Vec<u8>,
-    },
-    /// Honest refusal: the requested epoch is not served, or the artifact
-    /// is unrecoverable here (lost file, state advanced past H, rollback
-    /// window closed). The requester rotates peers.
-    NotAvailable {
-        reason: String,
-    },
-    Error {
-        message: String,
-    },
-}
+// The wire vocabulary is generation-1 frozen inventory (RFC-025); the
+// handler below speaks the head types via these re-exports.
+pub use super::compat_g1::{
+    LINEAGE_FETCH_MAX, RegenesisNetRequest, RegenesisNetResponse, SNAPSHOT_CHUNK_MAX,
+};
 
 pub struct RegenesisScope {
     pub(crate) app_state: AppState,
@@ -88,9 +33,11 @@ impl RegenesisScope {
                 };
             }
         };
-        // Reachability evidence: an authenticated, well-formed exchange —
-        // a straggler asking for lineage is very much reachable.
-        self.app_state.evidence.record_contact(peer.node_id);
+        // Visibility evidence (RFC-025): a straggler fetching lineage is
+        // very much REACHABLE — the status view says so — without
+        // brightening its seat; it is chatty on the compat class exactly
+        // while it cannot vote.
+        self.app_state.evidence.record_seen(peer.node_id);
         // Consensus-support plane: file + DB reads on the QUEUE runtime,
         // never the net runtime, never gated on an engine handle.
         let db_path = crate::db::shared::get_database_path();
@@ -138,7 +85,7 @@ pub(crate) fn serve_request(db_path: &str, request: RegenesisNetRequest) -> Rege
                 epoch: genesis::current_epoch(&conn),
                 decided_height,
                 epoch_genesis_height: genesis::epoch_genesis_height(&conn),
-                lineage_from: lowest_lineage_epoch(&data_dir),
+                lineage_from: genesis::lowest_lineage_epoch(&data_dir),
             }
         }
         RegenesisNetRequest::LineageFetch { from_epoch } => {
@@ -211,18 +158,6 @@ fn open_read_only(db_path: &str) -> Result<rusqlite::Connection, String> {
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| format!("busy_timeout: {e}"))?;
     Ok(conn)
-}
-
-fn lowest_lineage_epoch(data_dir: &std::path::Path) -> Option<u64> {
-    let dir = std::fs::read_dir(data_dir.join(genesis::LINEAGE_DIR)).ok()?;
-    dir.filter_map(|entry| {
-        let name = entry.ok()?.file_name().into_string().ok()?;
-        name.strip_prefix("epoch-")?
-            .strip_suffix(".bin")?
-            .parse::<u64>()
-            .ok()
-    })
-    .min()
 }
 
 /// The snapshot identity this node serves for `epoch`, or the honest
@@ -360,6 +295,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(updated, 1);
+    }
+
+    // Impact: the cross-generation parity gate for the rejoin path — a
+    // reshape that breaks generation-0 dialers fails here at mint time.
+    // Should: serve generation-0-encoded requests through the head
+    // handler (the identity registration) and produce responses the
+    // frozen generation-0 decoder reads back exactly.
+    #[test]
+    fn regenesis_g0_roundtrip() {
+        use crate::regenesis::compat_g0 as g0;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = transitioned_db(dir.path());
+
+        let raw = crate::net::encode_payload(&g0::RegenesisNetRequest::EpochInfo);
+        let request: RegenesisNetRequest = crate::net::decode_payload(&raw).unwrap();
+        let response = serve_request(&db_path, request);
+        let bytes = crate::net::encode_payload(&response);
+        match crate::net::decode_payload::<g0::RegenesisNetResponse>(&bytes).unwrap() {
+            g0::RegenesisNetResponse::EpochInfo {
+                epoch,
+                lineage_from,
+                ..
+            } => {
+                assert_eq!(epoch, 2);
+                assert_eq!(lineage_from, Some(2));
+            }
+            _ => panic!("expected EpochInfo"),
+        }
+
+        let raw =
+            crate::net::encode_payload(&g0::RegenesisNetRequest::LineageFetch { from_epoch: 2 });
+        let request: RegenesisNetRequest = crate::net::decode_payload(&raw).unwrap();
+        let response = serve_request(&db_path, request);
+        let bytes = crate::net::encode_payload(&response);
+        match crate::net::decode_payload::<g0::RegenesisNetResponse>(&bytes).unwrap() {
+            g0::RegenesisNetResponse::Lineage { records } => {
+                assert_eq!(records.len(), 1);
+                // The blob is the straggler-parsed encoding — it must
+                // decode under the same codec the old binary uses.
+                genesis::decode_lineage(&records[0]).unwrap();
+            }
+            _ => panic!("expected Lineage"),
+        }
     }
 
     // Should: report the epoch, decided height, genesis height, and the

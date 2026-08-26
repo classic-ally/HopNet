@@ -106,6 +106,19 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     // tracing
     tracing_subscriber::fmt::init();
 
+    // The hoisted effective-code seam (hopnet_common::version) ignores a
+    // malformed override silently; validate once here so the operator
+    // still hears about it.
+    if version::test_mode()
+        && let Ok(v) = std::env::var("HOPNET_UPGRADE_VERSION_OVERRIDE")
+        && version::parse_code(&v).is_none()
+    {
+        tracing::warn!(
+            override_value = %v,
+            "ignoring malformed HOPNET_UPGRADE_VERSION_OVERRIDE"
+        );
+    }
+
     // RFC-015 boot tripwire: fail-stop immediately if the linker dropped a
     // projection's cross-crate inventory registrations.
     assert_projection_registrations();
@@ -404,10 +417,38 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 pool.clone(),
                 setup_complete.clone(),
             ));
+            // RFC-025: the mesh magic — the anchor (epoch-1) chain id
+            // truncation, settled before bind so every ALPN is known
+            // without committed-state reads later. A set-up node that
+            // cannot derive its own mesh identity must not bind: a wrong
+            // or absent magic on a live member is a silent TLS partition,
+            // so derivation failure fail-stops (a half-set-up node —
+            // this_node without a malachite genesis — fails here too, by
+            // design; it cannot run consensus regardless). Parked nodes
+            // derive normally from the sealed old-epoch DB and stay
+            // dialable.
+            //
+            // A fresh node binds DEFERRED (empty ALPN list — TLS-dead)
+            // until the operator enters the mesh code, which adopts the
+            // real families BEFORE any JoinDeliver can arrive: a drive-by
+            // delivery cannot complete TLS against a code-less node. (The
+            // S2-era transient gap — locked setup dials unable to reach a
+            // fresh node — is CLOSED by this ceremony.)
+            let magic = if startup_state_opt.is_some() {
+                match regenesis::genesis::mesh_magic(&conn, &paths::data_dir()) {
+                    Ok(magic) => Some(magic),
+                    Err(detail) => panic!("mesh magic derivation: {detail}"),
+                }
+            } else {
+                None
+            };
             let comms = hopnet_comms::IrohComms::bind(
                 privatekey.to_bytes(),
                 directory,
-                std::env::var("HOPNET_RELAY_URL").ok(),
+                hopnet_comms::BindOptions {
+                    relay_url: std::env::var("HOPNET_RELAY_URL").ok(),
+                    magic,
+                },
             )
             .await
             .expect("Failed to create iroh comms");
@@ -415,6 +456,31 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 "iroh endpoint ready, node_id: {}",
                 hex::encode(comms.local_pubkey())
             );
+
+            // The headless join channel (RFC-025 §Settled Questions #2):
+            // read ONLY in the pre-anchor state — a set-up node never
+            // looks, so a stale env value is inert. A malformed code can
+            // never succeed and fail-stops; a WRONG well-formed code
+            // adopts and then fails visibly (ceremony timeout).
+            let entered_join_code = Arc::new(std::sync::OnceLock::new());
+            if startup_state_opt.is_none()
+                && let Ok(raw) = std::env::var("HOPNET_JOIN_CODE")
+            {
+                let Some(code) = hopnet_comms::alpn::parse_mesh_code(&raw) else {
+                    panic!("HOPNET_JOIN_CODE {raw:?} is not a mesh code (8 hex digits)");
+                };
+                entered_join_code
+                    .set(code)
+                    .expect("join code cell is fresh at boot");
+                comms
+                    .adopt_magic(code)
+                    .await
+                    .expect("adopting the boot join code on a fresh endpoint");
+                tracing::info!(
+                    code = %hopnet_comms::alpn::format_mesh_code(&code),
+                    "mesh code adopted from HOPNET_JOIN_CODE"
+                );
+            }
 
             // Create consensus queue (channel + submit handle)
             let (consensus_queue, consensus_queue_rx) =
@@ -438,6 +504,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
                 comms,
                 setup_complete,
+                entered_join_code,
                 consensus_barriers: Arc::new(consensus::barriers::new()),
                 session_store: Arc::new(auth::SessionStore::default()),
                 takeout_runtime: Arc::new(hopnet_takeout::TakeoutRuntime::default()),
@@ -461,9 +528,16 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // already points at the post-transition database, so this is
             // the new epoch on a freshly crossed boundary.
             if let Ok(conn) = app_state.db_pool.get() {
-                app_state.epoch.store(
-                    regenesis::genesis::current_epoch(&conn),
-                    std::sync::atomic::Ordering::Relaxed,
+                let epoch = regenesis::genesis::current_epoch(&conn);
+                app_state
+                    .epoch
+                    .store(epoch, std::sync::atomic::Ordering::Relaxed);
+                // Rollout: nodes that crossed before the agreed-version
+                // marker existed pick one up from committed lineage.
+                regenesis::boot::backfill_agreed_version(
+                    &db::shared::get_database_path(),
+                    &paths::data_dir(),
+                    epoch,
                 );
             }
             let restart_signal = app_state.restart_signal.clone();
@@ -942,6 +1016,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))
+                .route("/setup/join-code", post(setup::post_setup_join_code))
                 .route("/login", post(auth::sign_in));
 
             // Photo-ingress enablement plumbing (owner-only, JWT): the
@@ -1175,6 +1250,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         println!("{}", hopnet::version::running_version_str());
         return Ok(());
+    }
+
+    // `hopnet seed-guard --candidate <ver>`: the NixOS module's seeding
+    // clamp (RFC-025) — may the profile advance to <ver>? Read-only,
+    // exits before the instance lock (ExecStartPre runs with the daemon
+    // down, but a concurrent daemon is harmless to a file read).
+    if std::env::args().nth(1).as_deref() == Some("seed-guard") {
+        let candidate = match (std::env::args().nth(2).as_deref(), std::env::args().nth(3)) {
+            (Some("--candidate"), Some(v)) => v,
+            _ => {
+                eprintln!("usage: hopnet seed-guard --candidate <CalVer>");
+                std::process::exit(2);
+            }
+        };
+        std::process::exit(hopnet::seed_guard::run(&candidate));
     }
 
     // Single-instance guard: a second node on the same data dir shares the

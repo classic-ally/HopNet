@@ -388,12 +388,15 @@ mod tests {
     fn view_at(last_contact: Instant, probes: u32, bright_since: Option<Instant>) -> PeerEvidence {
         PeerEvidence {
             last_contact,
+            last_seen: Some(last_contact),
             last_probe_at: None,
             probes_since_contact: probes,
             bright_since,
             // Fresh height so the catch-up gate passes; tests overriding
             // catch-up set this explicitly.
             last_known_height: Some(200),
+            last_pong: None,
+            last_defuse_at: None,
         }
     }
 

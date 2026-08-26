@@ -2940,6 +2940,7 @@ dependencies = [
 name = "hopnet-comms"
 version = "2026.8.6"
 dependencies = [
+ "hopnet-common",
  "iroh",
  "rand 0.10.1",
  "tokio",

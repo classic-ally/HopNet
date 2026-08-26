@@ -92,16 +92,96 @@ impl TestScenario for MeshGrowth {
             },
         );
 
-        // 2. Add one node — it is a lateral candidate.
-        crate::add_nodes_to_mesh(
+        // 2. The join ceremony, wrong code first (RFC-025 S5): create
+        // the container by hand, feed it a nibble-flipped mesh code, and
+        // assert the registration fails VISIBLY (the coordinator's ping
+        // probe cannot complete TLS against the wrong magic — the 504
+        // window runs out). Recovery is the documented one: restart the
+        // container (the adopted code is transient in-memory state),
+        // enter the right code, register.
+        let runtime = crate::sys::detect_runtime(&docker).await?;
+        let new_id: u32 = 3;
+        let container_name = crate::naming::container_name(mesh_id, new_id);
+        let network_name = crate::naming::network_name(mesh_id);
+        crate::create_hopnet_container(
             &docker,
             mesh_id,
-            1,
-            crate::sys::detect_runtime(&docker).await?,
+            new_id,
+            &container_name,
+            &network_name,
+            runtime,
         )
         .await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let mesh_code = crate::get_mesh_code(&docker, mesh_id, runtime)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("mesh has no join-code channel (pre-RFC-025 image?)"))?;
+        let wrong_code: String = {
+            // Flip the first nibble, keeping the shape valid.
+            let mut chars: Vec<char> = mesh_code.chars().collect();
+            chars[0] = if chars[0] == 'F' { '0' } else { 'F' };
+            chars.into_iter().collect()
+        };
+        crate::submit_join_code(&docker, mesh_id, new_id, runtime, &wrong_code).await?;
+        let wrong_refused =
+            crate::register_node_with_node_0(&docker, mesh_id, new_id, &container_name, runtime)
+                .await
+                .is_err();
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Wrong mesh code: registration times out visibly".to_string(),
+                passed: wrong_refused,
+                detail: Some(format!("wrong code {wrong_code} vs {mesh_code}")),
+            },
+        );
+
+        // Restart clears the adopted code; enter the right one.
+        crate::tests::persistence::stop_node(&docker, mesh_id, new_id).await?;
+        crate::tests::persistence::start_node(&docker, mesh_id, new_id).await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        crate::submit_join_code(&docker, mesh_id, new_id, runtime, &mesh_code).await?;
+        let joined =
+            crate::register_node_with_node_0(&docker, mesh_id, new_id, &container_name, runtime)
+                .await;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Correct code after restart: node joins".to_string(),
+                passed: joined.is_ok(),
+                detail: joined.err().map(|e| e.to_string()),
+            },
+        );
+
         let after1 = rebuild_nodes(&docker, mesh_id).await?;
         let newcomer = after1.last().cloned().unwrap();
+
+        // RFC-025 agreed-version: joining a mesh sets the agreement (the
+        // fresh-join pathway of the seeding clamp). Poll briefly — the
+        // stamp lands when the join bootstrap completes in background.
+        let mut join_stamped = false;
+        let stamp_deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < stamp_deadline {
+            let view = crate::call_node_api(&newcomer, "/api/views/regenesis-status", true)
+                .await?
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_default();
+            if view["agreed_version"].as_str() == Some(env!("CARGO_PKG_VERSION")) {
+                join_stamped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Joining sets the agreed version".to_string(),
+                passed: join_stamped,
+                detail: None,
+            },
+        );
 
         // 3. It syncs and stays UNSEATED well past s_full (the lateral is
         // refused on posture, not span). Watch a window comfortably past

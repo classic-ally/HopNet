@@ -23,6 +23,22 @@
     let publicKey = $state('');
     let isAdding = $state(false);
     let addError = $state('');
+    // The mesh code (RFC-025 S5): read on modal open, shown so the
+    // operator can enter it on the joining device — a fresh device is
+    // unreachable until it adopts this code.
+    let meshCode = $state<string | null>(null);
+
+    $effect(() => {
+        if (!isOpen) return;
+        authenticatedFetch(`${API_BASE_URL}/views/regenesis-status`)
+            .then((r) => (r.ok ? r.json() : null))
+            .then((view) => {
+                meshCode = view?.mesh_code ?? null;
+            })
+            .catch(() => {
+                meshCode = null;
+            });
+    });
 
     function validateInputs(): boolean {
         if (!name.trim()) return false;
@@ -104,6 +120,21 @@
 {#if isOpen}
 <Modal title="Add a Node" onClose={handleClose} size="md">
     {#snippet content()}
+        <!-- Mesh code: the joining device needs this FIRST — it is
+             unreachable until the code is entered there. -->
+        {#if meshCode}
+            <div class="space-y-1">
+                <div class="block text-sm font-medium text-subtitle">
+                    Mesh code
+                </div>
+                <div class="font-mono text-2xl tracking-widest text-primary">{meshCode}</div>
+                <p class="text-muted text-sm">
+                    Enter this code on the joining device's Join Network screen
+                    before adding it here.
+                </p>
+            </div>
+        {/if}
+
         <!-- Name Input -->
         <div class="space-y-2">
             <div class="block text-sm font-medium text-subtitle">

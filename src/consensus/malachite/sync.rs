@@ -44,11 +44,22 @@ pub enum SyncError {
 }
 
 /// A single fetch's failure, classified: transport/malformed strikes count
-/// against the peer; an epoch-ahead refusal is a signpost, not a strike.
+/// against the peer; an epoch-ahead refusal is a signpost, not a strike;
+/// a structural refusal (RFC-025) is a strike whose CAUSE gets named.
 #[derive(Debug)]
 enum FetchError {
     Transport(String),
     EpochMismatch { peer_epoch: u64 },
+    Refused(hopnet_comms::RefusalError),
+}
+
+/// Split from fetch_chunk so the refusal/transport classification is
+/// testable without a mesh.
+fn classify_transport_error(e: hopnet_comms::CommsError) -> FetchError {
+    match e {
+        hopnet_comms::CommsError::Refused(r) => FetchError::Refused(r),
+        other => FetchError::Transport(other.to_string()),
+    }
 }
 
 impl std::fmt::Display for FetchError {
@@ -58,6 +69,7 @@ impl std::fmt::Display for FetchError {
             FetchError::EpochMismatch { peer_epoch } => {
                 write!(f, "epoch mismatch: peer is on epoch {peer_epoch}")
             }
+            FetchError::Refused(r) => write!(f, "refused: {r}"),
         }
     }
 }
@@ -77,19 +89,10 @@ pub async fn sync_to_target(
     decided: &mut watch::Receiver<u64>,
     target: u64,
     hint_peer: Option<i32>,
-    evidence: Option<std::sync::Arc<crate::consensus::evidence::EvidenceMap>>,
+    host: Option<&crate::AppState>,
 ) -> Result<(), SyncError> {
     let peers = peer_list(db_pool, my_node_id, hint_peer);
-    sync_loop(
-        comms,
-        epoch,
-        input_tx,
-        decided,
-        Some(target),
-        &peers,
-        evidence,
-    )
-    .await?;
+    sync_loop(comms, epoch, input_tx, decided, Some(target), &peers, host).await?;
     Ok(())
 }
 
@@ -103,9 +106,9 @@ pub async fn sync_to_tip(
     input_tx: &mpsc::Sender<HostInput>,
     decided: &mut watch::Receiver<u64>,
     peers: &[PeerRef],
-    evidence: Option<std::sync::Arc<crate::consensus::evidence::EvidenceMap>>,
+    host: Option<&crate::AppState>,
 ) -> Result<u64, SyncError> {
-    sync_loop(comms, epoch, input_tx, decided, None, peers, evidence).await
+    sync_loop(comms, epoch, input_tx, decided, None, peers, host).await
 }
 
 /// Shared fetch/feed/apply loop. With `target = Some(h)`: sync until decided
@@ -119,7 +122,10 @@ async fn sync_loop(
     decided: &mut watch::Receiver<u64>,
     target: Option<u64>,
     peers: &[PeerRef],
-    evidence: Option<std::sync::Arc<crate::consensus::evidence::EvidenceMap>>,
+    // Evidence recording + refusal defusing (RFC-025). None during the
+    // join bootstrap: the nodes table is still filling and evidence
+    // starts post-join.
+    host: Option<&crate::AppState>,
 ) -> Result<u64, SyncError> {
     let mut cursor = 0usize;
     // Peers that failed (transport error, malformed data, chunk didn't apply).
@@ -163,9 +169,9 @@ async fn sync_loop(
         match fetch_chunk(comms, epoch, &peer, from, to).await {
             Ok(pairs) if !pairs.is_empty() => {
                 // Reachability evidence (RFC-CONSENSUS-002): the peer served
-                // us an authenticated chunk.
-                if let Some(ref ev) = evidence {
-                    ev.record_contact(peer.node_id);
+                // us an authenticated chunk (locked class — liveness).
+                if let Some(h) = host {
+                    h.evidence.record_contact(peer.node_id);
                 }
                 let mut last_fed = *decided.borrow();
                 // Heights must arrive contiguous from `from` — a gap means
@@ -238,6 +244,31 @@ async fn sync_loop(
                     peer: peer.node_id,
                     peer_epoch,
                 });
+            }
+            // A structural refusal (RFC-025): still a strike — the peer
+            // is unusable for THIS sync — but the cause gets named
+            // rather than dissolving into a transport string.
+            Err(FetchError::Refused(hopnet_comms::RefusalError::AlpnRejected)) => {
+                if let Some(h) = host {
+                    crate::consensus::defuse::defuse_alpn_rejection(h, peer);
+                }
+                tracing::debug!("sync: node {} refused our locked ALPN", peer.node_id);
+                failures += 1;
+            }
+            Err(FetchError::Refused(hopnet_comms::RefusalError::CompatRetired {
+                floor,
+                node_version,
+            })) => {
+                // Already typed — no probe needed. WE are below the
+                // peer's window: self-staging is over; fresh join is the
+                // remedy (RFC-025 §Rejection).
+                tracing::error!(
+                    peer = peer.node_id,
+                    peer_floor = floor,
+                    peer_version = %crate::version::format_code(node_version),
+                    "compat generation retired by peer — fresh join required (RFC-025)"
+                );
+                failures += 1;
             }
             // A peer BEHIND us (it is the straggler) counts like any
             // other unusable answer.
@@ -329,7 +360,7 @@ async fn fetch_chunk(
     let reply = comms
         .rpc(peer, "consensus", payload, FETCH_TIMEOUT)
         .await
-        .map_err(|e| FetchError::Transport(e.to_string()))?;
+        .map_err(classify_transport_error)?;
     parse_fetch_reply(&reply)
 }
 
@@ -365,6 +396,29 @@ fn parse_fetch_reply(reply: &[u8]) -> Result<Vec<(Block, WireCommitCertificate)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Impact: a structural refusal must keep its name through the fetch
+    // path (RFC-025) — dissolved into a transport string, the defuser
+    // and the retired SCREAM never fire.
+    // Should: classify Refused as Refused and everything else as a
+    // transport failure.
+    #[test]
+    fn transport_error_classification_keeps_refusals_typed() {
+        let refused =
+            hopnet_comms::CommsError::Refused(hopnet_comms::RefusalError::CompatRetired {
+                floor: 2,
+                node_version: 20270101,
+            });
+        assert!(matches!(
+            classify_transport_error(refused),
+            FetchError::Refused(hopnet_comms::RefusalError::CompatRetired { floor: 2, .. })
+        ));
+        let timeout = hopnet_comms::CommsError::Transport(hopnet_comms::TransportError::Timeout);
+        assert!(matches!(
+            classify_transport_error(timeout),
+            FetchError::Transport(_)
+        ));
+    }
 
     // Impact: the classification is the whole point of the structured
     // refusal — an epoch-ahead peer must read as "pivot to epoch join",

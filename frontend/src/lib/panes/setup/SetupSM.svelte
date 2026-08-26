@@ -3,18 +3,21 @@
      * The steps of the setup flow. Two branches lead off `initial`:
      *
      *   create: create-network → confirm → passphrase-display → passphrase-verify
-     *   join:   join-qr
+     *   join:   join-code → join-qr
      *
-     * The join branch is a single step and has no terminal state of its own —
-     * join-qr waits for a peer on the other side to accept the pairing. It used
-     * to be preceded by a device-naming step, but this node has no say in its
-     * own name: whoever adds it supplies one, and `POST /api/nodes` takes the
-     * name from that request. The step collected a value nothing read.
+     * The join branch starts with the mesh code (RFC-025 S5): entering it
+     * is what makes this node reachable over the mesh transport at all,
+     * so it must precede the QR step — the other side's Add Node cannot
+     * even ping a code-less device. join-qr then waits for a peer on the
+     * other side to accept the pairing; it has no terminal state of its
+     * own. (A page reload re-shows code entry; re-submitting the same
+     * code is idempotent.)
      */
     export type SetupStep =
         | 'initial'
         | 'create-network'
         | 'confirm'
+        | 'join-code'
         | 'join-qr'
         | 'passphrase-display'
         | 'passphrase-verify';
@@ -25,6 +28,7 @@
     import ConfirmPane from "./ConfirmPane.svelte";
     import CreateNetwork from "./CreateNetwork.svelte";
     import InitialSetup from "./InitialSetup.svelte";
+    import JoinCodeEntry from "./JoinCodeEntry.svelte";
     import JoinQr from "./JoinQR.svelte";
     import PassphraseDisplay from "./PassphraseDisplay.svelte";
     import PassphraseVerify from "./PassphraseVerify.svelte";
@@ -86,7 +90,15 @@
       <div in:fade={ANIM_PANE}>
         <InitialSetup
           onCreateNetwork={() => { step = 'create-network'; }}
-          onJoinNetwork={() => { step = 'join-qr'; }}
+          onJoinNetwork={() => { step = 'join-code'; }}
+        />
+      </div>
+    {:else if step === 'join-code'}
+      <div in:fade={ANIM_PANE}>
+        <JoinCodeEntry
+          {api}
+          onBackButton={() => { step = 'initial'; }}
+          onCodeAccepted={() => { step = 'join-qr'; }}
         />
       </div>
     {:else if step === 'create-network'}
@@ -102,7 +114,7 @@
       <div in:fade={ANIM_PANE}>
         <JoinQr
           {api}
-          onBackButton={() => { step = 'initial'; }}
+          onBackButton={() => { step = 'join-code'; }}
         />
       </div>
     {:else if step === 'confirm'}

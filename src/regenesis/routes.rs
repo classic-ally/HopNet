@@ -382,7 +382,7 @@ pub async fn get_regenesis_status(
 
     // One blocking hop for everything that touches the DB or the
     // filesystem (rollback-window file check).
-    let (state, rollback_retained, chain_id, schema_ordinals) = {
+    let (state, rollback_retained, chain_id, mesh_code, schema_ordinals, agreed_version) = {
         let app_state = app_state.clone();
         tokio::task::spawn_blocking(move || {
             let conn = app_state
@@ -402,6 +402,12 @@ pub async fn get_regenesis_status(
                     .flatten()
                     .map(hex_lower)
                     .unwrap_or_default();
+            // The operator-facing mesh code (RFC-025 S5): shown in the
+            // Add Node flow, read by the orchestrator, entered on the
+            // joining device. None pre-genesis.
+            let mesh_code = crate::regenesis::genesis::mesh_magic(&conn, &crate::paths::data_dir())
+                .ok()
+                .map(|m| hopnet_comms::alpn::format_mesh_code(&m));
             // Empty rather than an error when the stamp table is absent
             // (legacy database parked mid-boundary): the view must keep
             // serving while an operator debugs exactly that state.
@@ -412,7 +418,21 @@ pub async fn get_regenesis_status(
                     |(module, ordinal)| hopnet_common::views::SchemaOrdinalView { module, ordinal },
                 )
                 .collect::<Vec<_>>();
-            Ok::<_, StatusCode>((state, retained, chain_id, schema_ordinals))
+            // The mesh-agreed version this node runs (RFC-025): the
+            // marker the seed guard clamps on, surfaced for operators
+            // and the orchestrator gates. None = never joined.
+            let agreed_version = crate::regenesis::boot::read_agreed_version(
+                &crate::db::shared::get_database_path(),
+            )
+            .map(crate::version::format_code);
+            Ok::<_, StatusCode>((
+                state,
+                retained,
+                chain_id,
+                mesh_code,
+                schema_ordinals,
+                agreed_version,
+            ))
         })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??
@@ -432,7 +452,9 @@ pub async fn get_regenesis_status(
             .load(std::sync::atomic::Ordering::Relaxed)
             .to_string(),
         chain_id,
+        mesh_code,
         running_version: crate::version::format_code(running_code),
+        agreed_version,
         awaiting_upgrade,
         boundary_error: crate::regenesis::boot::boundary_error(),
         rollback_retained,

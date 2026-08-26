@@ -54,11 +54,44 @@ pub struct ConsensusPanelView {
     pub t_out_ms: u64,
 
     /// Every registered node, split three ways for the Validator Pool bar.
-    /// The reachability test is the literal `live_estimate` predicate, so these
-    /// cannot drift from `live` above.
+    /// Reachability is the VISIBILITY clock (RFC-025): any authenticated
+    /// sighting on any class — deliberately broader than `live`, which
+    /// rides the liveness clock (locked exchanges + version-matched
+    /// Pongs). A straggler staging over the compat class reads reachable
+    /// here while dark on `live`.
     pub total_nodes: u32,
     pub reachable_unseated: u32,
     pub unreachable_unseated: u32,
+
+    /// RFC-025 S4: peers whose latest Pong disagrees with our build —
+    /// the persistent skew banner's rows. Empty means no banner;
+    /// self-healing (the next matched pong overwrites the stamp).
+    pub version_skew: Vec<VersionSkewPeer>,
+    /// Peers whose served compat window excludes every generation we
+    /// speak — fresh join is the remedy.
+    pub stranded_peers: Vec<StrandedPeer>,
+    /// Our own CalVer, formatted, so the banner names both sides.
+    pub local_version: String,
+}
+
+/// One row of the RFC-025 version-skew banner.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct VersionSkewPeer {
+    pub node_id: i32,
+    /// The peer's CalVer, formatted.
+    pub version: String,
+    #[typeshare(serialized_as = "number")]
+    pub pong_age_ms: u64,
+}
+
+/// One row of the RFC-025 stranded-peer state (the peer's served window).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct StrandedPeer {
+    pub node_id: i32,
+    pub floor: u32,
+    pub head: u32,
 }
 
 /// Data Replication panel.
@@ -222,8 +255,16 @@ pub struct RegenesisStatusView {
     /// node already known good and passed to the node being recovered.
     /// Public knowledge — every peer in the mesh signs against it.
     pub chain_id: String,
+    /// The mesh code (RFC-025 S5): the anchor chain id's 4-byte
+    /// truncation as XXXX-XXXX — read off the Add Node dialog, entered
+    /// on the joining device to bind its endpoint. None pre-genesis.
+    pub mesh_code: Option<String>,
     /// The version this binary effectively runs.
     pub running_version: String,
+    /// The mesh-agreed version this node runs (RFC-025): stamped at
+    /// genesis/join and re-stamped only at version transitions; the
+    /// seed guard clamps profile advances to it. None = never joined.
+    pub agreed_version: Option<String>,
     /// Sealed for a version this binary does not run: the node is parked
     /// until its operator swaps the binary (RFC-019 S6 boot gate 1).
     pub awaiting_upgrade: bool,

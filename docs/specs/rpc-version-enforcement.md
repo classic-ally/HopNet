@@ -543,45 +543,204 @@ design, so there is no incremental landing, and the mesh crosses
 it as an ordinary upgrade regenesis. S-final trails independently
 (blocked on RFC-020).
 
-- [ ] S1 — comms mechanism: the two ALPN families, magic
+- [x] S1 — comms mechanism: the two ALPN families, magic
       injection, `COMPAT_HEAD` + window/retired arithmetic,
       generation-keyed dispatch and connection cache, typed
       `AlpnRejected`/`CompatRetired`, the retired reject tier, the
       effective-code seam hoisted to hopnet-common, the
-      multi-generation ALPN offer (fork change, or two-attempt
-      fallback), comms unit gates + envelope golden, and the
-      `hopnet-comms/docs/` wire document
-- [ ] S2 — host wiring: class-explicit registration
+      multi-generation ALPN offer (native,
+      `ConnectOptions::with_additional_alpns` — §Settled
+      Questions), comms unit gates + envelope golden, and the
+      `hopnet-comms/docs/` wire document. As built:
+      `hopnet-comms/docs/wire.md` is the normative byte authority.
+- [x] S2 — host wiring: class-explicit registration
       (`rpc`/`rpc_compat`), the §Scope Classes table enacted, the
-      magic derived from the anchor at boot, the class pin test
-- [ ] S3 — generation 1 freezes: the frozen inventory (status +
+      magic derived from the anchor at boot, the class pin test.
+      As built: `mesh_magic` in `src/regenesis/genesis.rs` (the
+      anchor is consensus_meta's chain id at epoch 1, the lowest
+      lineage record's back-pointer past a boundary — which must
+      be epoch 2, else refuse); derivation failure fail-stops at
+      boot for set-up nodes; fresh nodes bind pre-enforcement
+      until S5 closes the JoinDeliver gap (documented at the bind
+      site); the class table is pinned by full-list equality in
+      `src/net/scopes.rs` tests, and the in-process fixtures bind
+      a shared synthetic magic so the host suite soaks the
+      enforced families.
+- [x] S3 — generation 1 freezes: the frozen inventory (status +
       regenesis vocabulary, LineageRecord), the Pong's window
       fields, per-type goldens, the cross-generation roundtrip
       harness, the release-tag CI tripwires, generation 0 served
-      for cutover (§Evolution)
-- [ ] S4 — diagnosability: the defuser, `classify_pong`'s
+      for cutover (§Evolution). As built: vocabulary-only frozen
+      modules (`*compat_g<N>.rs`, glob-derived by the freeze
+      script) with re-exports at the old paths; adapters live
+      beside handlers, never in frozen files (the next mint edits
+      them); `rpc_compat`'s mandatory prev handler makes the
+      window invariant a compile error; pre-enforcement
+      (magic-None) nodes serve generation-0 vocabulary on compat
+      scopes; regenesis serves generation 0 with the head handler
+      under the byte-equality license; dialers decode per the
+      negotiated generation (`rpc_negotiated`/`PongInfo`);
+      retirement's deletion escape is a `RETIRES: compat_g<N>`
+      commit trailer (`scripts/check-compat-freeze.sh`).
+- [x] S4 — diagnosability: the defuser, `classify_pong`'s
       VersionSkew/Stranded arms, the liveness/visibility split,
-      status-view surfacing
-- [ ] S5 — setup and join: the join-code entry gating endpoint
-      bind, JoinInfo carrying the anchor, the install-time anchor
-      check, the ceremony orchestrator scenario
-- [ ] S6 — orchestrator gates: the mixed-version mesh, the
+      status-view surfacing. As built: two clocks on the evidence
+      record (contact ⊆ seen; `record_seen*` never touches the
+      vote-out clock — the three compat writers flipped, closing the
+      undecodable-StatusRequest hole); `absorb_pong` gates liveness
+      on version match and caches the PongStamp (the defuser's cache
+      and the banner's source, self-healing); classify_pong takes
+      SelfView vs PongInfo with arm order EpochJoin → Stranded →
+      VersionSkew → KickSync; both new states SCREAM at error level.
+      The defuser (`src/consensus/defuse.rs`) resolves AlpnRejected
+      against the stamp (freshness = the Lazy probe cadence, per-peer
+      cooldown electing one resolver) and hooks the sync driver
+      (FetchError::Refused — a named strike; CompatRetired SCREAMS
+      directly) and the txforward error arm; storage classify and the
+      metrics grid defer with in-code notes; gossip has no error path
+      by design — the prober is the idle backstop. Surfacing: banner
+      rows on ConsensusPanelView + additive /consensus/evidence
+      fields; the resilience reachability counters ride the
+      visibility clock (deliberate divergence from `live`).
+- [x] S5 — setup and join: the join-code entry gating endpoint
+      bind (interactive and `HOPNET_JOIN_CODE`, §Settled
+      Questions), JoinInfo carrying the anchor, the install-time
+      anchor check, the ceremony orchestrator scenario (including
+      the headless wrong-code case). As built: "binds no endpoint"
+      narrows to "binds no NEGOTIABLE PROTOCOL" — a fresh node
+      binds with an empty ALPN serve list (TLS-dead inbound under
+      QUIC strict ALPN; a drive-by JoinDeliver cannot complete TLS
+      or reach any HopNet code) and `adopt_magic` installs the
+      families at code entry via a live `set_alpns`, keeping
+      AppState untouched. One entry seam (`adopt_join_code`) feeds
+      both channels: the open pre-setup POST /api/setup/join-code
+      (204 idempotent; 409 names the restart-to-re-enter remedy)
+      and `HOPNET_JOIN_CODE` read only pre-anchor (env-only — no
+      config file exists, the env-wins clause is vacuous; a
+      malformed env code fail-stops). Adoption is once-only per
+      process; restart re-enters. JoinInfo's anchor is appended
+      last (legal: setup is locked-class, both ends run the same
+      release by ALPN construction) and pre-flighted before ANY
+      write; the install-time check compares the FETCHED identity
+      (genesis hash at epoch 1, the first lineage record's
+      back-pointer past a boundary — the same field the boot magic
+      derives from) and the typed AnchorMismatch abort rolls back
+      this_node + setup_complete so a restart returns the node to
+      fresh. The coordinator surfaces the code on
+      RegenesisStatusView (Add Node dialog + the orchestrator,
+      which POSTs it over the same HTTP seam — create_mesh makes
+      containers before genesis, so env cannot carry it). S1's
+      pre-enforcement legacy mode retires with its producers; real
+      legacy stragglers ride the magic-Some generation-0 tier.
+- [x] S6 — orchestrator gates: the mixed-version mesh, the
       boundary crossing with a live straggler, the
-      retired-generation dialer
+      retired-generation dialer. As built: three scenarios —
+      `mixed-version-mesh` (the version seam on one seat: locked
+      refused with the defuser/prober screams as log contracts,
+      compat answering with the pong provably refreshing, the two
+      clocks split, VersionSkew named on BOTH sides' views — and
+      the vote-out ASSERTED rather than raced: a pong-visible
+      skewed validator still loses its seat, then auto-readmission
+      re-seats the restored binary), `retired-dialer` (a raw
+      host-side endpoint offering generation 0 receives the
+      structured `COMPAT_RETIRED` close naming the floor, with a
+      locked-family control dial proving only the retired tier
+      rejects), and `enforcement-crossing` (a mesh born on the
+      pre-enforcement release crosses into this build with a LIVE
+      straggler: parked alive and G0-visible/locked-dark through
+      the window, then activates and rejoins — S7 end to end over
+      enforced ALPNs). Two constructions make the retired tier
+      reachable at head=1: `alpn::effective_compat_head()` — the
+      version seam's twin (`HOPNET_UPGRADE_COMPAT_HEAD_OVERRIDE`,
+      test-mode + `iroh`-feature gated, clamped to never regress
+      below the compiled head; accept/advertise ONLY, dispatch
+      above the compiled head is undefined; every host window
+      reader routes through `evidence::local_window()` so the
+      diagnosed window always matches the enforced one) — and a
+      FRESH code-adopted, never-registered target (the hook names
+      strangers `REJECT_UNKNOWN_NODE` before the tier check by
+      design; pre-setup the directory answers is_known
+      unconditionally, exposing the tier). Gate findings, both
+      fixed in-slice: a restored peer wore the skew banner forever
+      (no probe refreshes a fresh-contact peer's stamp — newer
+      locked contact now supersedes a stale stamp's claim, by ALPN
+      construction), and old-image mesh creation died on the S5
+      join-code channel (get_mesh_code now treats an ABSENT
+      mesh_code field as "pre-enforcement image, register
+      directly"). The mesh relay's :3340 is host-mapped so raw
+      host-side dialers reach mesh members (rootless podman has no
+      host→container route). The enforcement release's runbook
+      entry (RFC-020 S7 ledger) still needs its two lines — the
+      crossing rides compat generation 0, and Add Node requires
+      the mesh code — they belong to that release, not this PR.
+- [x] S6b — the agreed-version clamp (in-PR addendum, closes #58):
+      the system never LOADS a binary past the mesh agreement, where
+      S1–S6 only contained one at the transport. A bare-CalVer
+      `agreed-version` marker beside the database mirrors the version
+      the mesh agreed this node runs: stamped at genesis and join
+      (epoch 1 commits no version — the joining binary IS the
+      agreement, provably shared by the locked-class delivery), at
+      every completed crossing (`EpochGenesisRecord.
+      required_version_code`), and REWRITTEN by rollback; removed
+      only by the anchor-mismatch unjoin (absent = never-joined =
+      unclamped); backfilled fill-if-absent from committed lineage on
+      epoch>=2 boots (rollout). Staging, `regenesis_start`, the seal,
+      and the parked window never move it — the transition-only
+      property, pinned by fixture and scenario tests. Enforcement is
+      two-sided: the NixOS module's seeding became
+      newest-WITHIN-AGREEMENT via `hopnet seed-guard` (exit 0/3/2;
+      conservative on garbage; never-joined stays newest-wins — a
+      fresh install keeps loading the latest release; the darwin
+      launchd wrapper, `hopnet-desktop-module.nix`, carries the
+      same guard in its advance arm — `HOPNET_DATA_DIR` in its
+      agent environment resolves the same markers), and normal
+      boots gained the one-directional version-ahead gate
+      (`ParkReason::VersionAhead`: running > agreed parks alive with
+      both versions named; running < agreed boots — stragglers must
+      stage, RFC-019 S7; no marker = inert). `agreed_version` rides
+      RegenesisStatusView. The marker is an advisory projection of
+      committed state; consensus gates remain the enforcement. The
+      seeding contract's normative text moved to
+      `docs/specs/nix-upgrade-provider.md` §Seeding.
 - [!] S-final — crossing-time advisory: `COMPAT_HEAD` in the
       NodeStagedVersion attestation, the `nodes` column, and the
       advisory's below-window report. Blocked on RFC-020 (the
       replicated schema change; see §Evolution).
 
-## Open Questions
+## Settled Questions
 
-1. **The dial-side generation offer**: native multi-ALPN offering
-   needs a small iroh fork change (`connect` takes a single ALPN
-   today); the two-attempt fallback dial needs none. Decide at S1
-   — the wire behaviour is identical, only handshake count
-   differs.
-2. **The join code without a human**: the Join Network flow assumes
-   an operator typing the code; orchestrator containers and nix
-   deployments join headless. An env/config channel for the code
-   is probably enough — but it must not become a second,
-   drift-prone identity source. Decide at S5.
+Both settled 2026-08-24, ahead of S1:
+
+1. **The dial-side generation offer: native multi-ALPN.**
+   Re-settled same day, superseding the two-attempt fallback: that
+   choice rested on a false premise — the pinned fork already
+   carries upstream's `ConnectOptions::with_additional_alpns`
+   (`Endpoint::connect_with_opts`), so the native offer needs NO
+   fork change either; the fallback's decisive criterion (patch
+   surface stays at exactly the registration hook) is satisfied
+   by both, and the fallback's costs (a second handshake per
+   mid-transition dial and across the whole generation-0 cutover,
+   plus disambiguating ALPN-reject from other dial failures
+   before redialing) buy nothing. Compat dials offer
+   `[head, head-1]` in one handshake; fork-pinned semantics
+   (`connect_multiple_alpn_negotiated`): accept-side list order
+   is preference order, dial-side order is irrelevant, the
+   highest mutual generation is selected — contract rule 2
+   holds literally. The negotiated generation is read from the
+   connection. Locked dials stay single-ALPN (one code per
+   node).
+2. **The join code without a human: an env/config bootstrap
+   channel into the same entry seam.** `HOPNET_JOIN_CODE` (env
+   wins over the config-file key — the `HOPNET_DB_*` precedence)
+   feeds the same code-entry seam as Join Network, read only in
+   the pre-anchor state. The install-time anchor check runs
+   unchanged, and after install the magic derives from the
+   installed anchor only — a stale value left behind in config is
+   inert, never a second identity source. A wrong code fails
+   headless the way it fails interactively: ceremony timeout,
+   error-level log, failed health. The orchestrator reads the
+   code from the coordinator — the Add Node surface exposes it
+   for humans anyway — and forwards it like `HOPNET_DB_*`. The
+   code is deliberately not a secret (it rides every ALPN
+   string), so plain config is fine; it IS the setup window's
+   brute-force barrier, so keep it out of public repos.

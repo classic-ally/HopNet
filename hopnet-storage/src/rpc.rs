@@ -122,6 +122,13 @@ pub struct RpcTransport<R> {
     pub rpc: R,
 }
 
+// RFC-025 S4 note: a CommsError::Refused currently falls into the
+// catch-all below and reads as a retryable transport fault (the engine
+// rotates candidates, which is behaviorally fine). This crate deps the
+// zero-dependency comms face and stays host-agnostic, so the future
+// shape is a Refused classification variant here with the host-side
+// defuser at the substrate boundary; until then the status prober is
+// the named-diagnosis backstop.
 fn classify(e: hopnet_comms::CommsError) -> TransportError {
     match e {
         hopnet_comms::CommsError::Protocol(hopnet_comms::ProtocolError::PeerError(msg)) => {

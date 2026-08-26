@@ -15,6 +15,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+pub mod alpn;
+
 #[cfg(feature = "iroh")]
 mod iroh_impl;
 /// The raw iroh crate, for test harnesses that must impersonate a foreign
@@ -25,7 +27,7 @@ mod iroh_impl;
 pub use iroh;
 #[cfg(feature = "iroh")]
 pub use iroh_impl::{
-    net_rt, Call, CallOptions, EndpointAddr, IrohComms, ScopeRegistry, HOPNET_ALPN,
+    net_rt, BindOptions, Call, CallOptions, EndpointAddr, IrohComms, ScopeRegistry, HOPNET_ALPN,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -51,6 +53,24 @@ pub enum CommsError {
     Transport(TransportError),
     /// Non-retryable protocol failures (validation, peer errors).
     Protocol(ProtocolError),
+    /// Structural refusals (RFC-025): the peer is alive and reachable
+    /// and said no. Never retryable — a redial gets the same answer.
+    Refused(RefusalError),
+}
+
+/// The typed refusals of RFC-025 §Rejection & Diagnosability.
+#[derive(Debug)]
+pub enum RefusalError {
+    /// TLS completed but the peer refused every offered protocol
+    /// (`no_application_protocol`): version-mismatched on the locked
+    /// family, or a different mesh entirely — the host's defuser
+    /// resolves which against the peer's Pong.
+    AlpnRejected,
+    /// The registration hook's COMPAT_RETIRED reject: we are below the
+    /// peer's served window. floor/node_version are 0 ("unknown") when
+    /// the reason bytes were unparseable — the QUIC error code alone is
+    /// authoritative for the refusal class.
+    CompatRetired { floor: u32, node_version: u32 },
 }
 
 /// Transport-layer errors - generally retryable.
@@ -72,10 +92,16 @@ pub enum ProtocolError {
     PeerError(String),
     MalformedResponse(String),
     MessageTooLarge(usize),
+    /// RFC-025 S5: this endpoint has no mesh identity yet (the join
+    /// code was never entered) — dials are structurally impossible.
+    /// Not a refusal: nothing refused us. Non-retryable.
+    EndpointDeferred,
 }
 
 impl CommsError {
-    /// Whether this error should trigger a retry.
+    /// Whether this error should trigger a retry. Refusals are
+    /// structurally non-retryable: the transport proved the peer's
+    /// answer, and a redial gets the same one.
     pub fn is_retryable(&self) -> bool {
         matches!(self, CommsError::Transport(_))
     }
@@ -86,6 +112,28 @@ impl std::fmt::Display for CommsError {
         match self {
             CommsError::Transport(e) => write!(f, "transport error: {}", e),
             CommsError::Protocol(e) => write!(f, "protocol error: {}", e),
+            CommsError::Refused(e) => write!(f, "refused: {}", e),
+        }
+    }
+}
+
+impl std::fmt::Display for RefusalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefusalError::AlpnRejected => {
+                write!(
+                    f,
+                    "every offered ALPN rejected (version skew or foreign mesh)"
+                )
+            }
+            RefusalError::CompatRetired {
+                floor,
+                node_version,
+            } => write!(
+                f,
+                "compat generation retired: peer floor {}, peer version {}",
+                floor, node_version
+            ),
         }
     }
 }
@@ -113,6 +161,12 @@ impl std::fmt::Display for ProtocolError {
             ProtocolError::PeerError(msg) => write!(f, "peer error: {}", msg),
             ProtocolError::MalformedResponse(msg) => write!(f, "malformed response: {}", msg),
             ProtocolError::MessageTooLarge(size) => write!(f, "message too large: {} bytes", size),
+            ProtocolError::EndpointDeferred => {
+                write!(
+                    f,
+                    "endpoint deferred: no mesh magic adopted (join code not entered)"
+                )
+            }
         }
     }
 }
@@ -172,6 +226,17 @@ pub trait PeerDirectory: Send + Sync {
 // Scope handlers (server side)
 // ============================================================================
 
+/// A scope's ALPN class (RFC-025 §Scope Classes). Locked scopes ride the
+/// exact-version family and may permute state; compat scopes ride the
+/// generation-windowed family and carry the only wire compatibility
+/// burden. Registration declares it; dial-side family selection and
+/// server-side admissibility both consult it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeClass {
+    Locked,
+    Compat,
+}
+
 /// Single-response scope handler. The transport deduplicates retried
 /// requests by request id (response-byte cache) for rpc scopes.
 pub trait RpcHandler: Send + Sync {
@@ -201,3 +266,24 @@ pub const PING_SCOPE: &str = "ping";
 // transport to dispatch it is meaningless, and only the host — which
 // links the transport — registers scopes. The handler TRAITS above stay
 // in the vocabulary so scope owners can define handlers anywhere.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Impact: the transport's retry-once arm keys on is_retryable — a
+    // retryable refusal would burn a second dial for a structurally
+    // identical answer.
+    // Should not: classify either refusal as retryable.
+    #[test]
+    fn refused_is_not_retryable() {
+        assert!(!CommsError::Refused(RefusalError::AlpnRejected).is_retryable());
+        assert!(!CommsError::Refused(RefusalError::CompatRetired {
+            floor: 2,
+            node_version: 20260806,
+        })
+        .is_retryable());
+        // The existing identity stays: transport faults retry.
+        assert!(CommsError::Transport(TransportError::Timeout).is_retryable());
+    }
+}

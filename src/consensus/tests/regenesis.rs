@@ -326,8 +326,14 @@ fn commit_refused_in_normal() {
 // Should: seal from the moratorium, recording the certified hash and the
 // terminal height; afterwards the window is closed forward-only — no
 // second commit, no abort, no new start.
+// Should not: touch the agreed-version marker — regenesis_start and the
+// seal are agreement-in-progress, not a transition; only a completed
+// crossing moves the marker.
 #[test]
 fn commit_seals_and_closes_the_window() {
+    let env = crate::test_env::lock_env();
+    let tmp = tempfile::tempdir().unwrap();
+    crate::test_env::set(&env, "XDG_DATA_HOME", tmp.path());
     let node = MockNode::new(3);
     register_node(&node);
     seat_with_version(&node, 3, 20260800);
@@ -339,6 +345,11 @@ fn commit_seals_and_closes_the_window() {
         commit_payload([7u8; 32], 9, 20260800),
     )
     .unwrap();
+    assert_eq!(
+        crate::regenesis::boot::read_agreed_version(&crate::db::shared::get_database_path()),
+        None,
+        "staging and sealing must never move the agreement"
+    );
 
     let state = committed_state(&node);
     assert_eq!(state.phase, RegenesisPhase::Sealed);
@@ -845,10 +856,255 @@ fn handshake_carries_epoch_and_refuses_mismatched_fetch() {
         StatusResponse::Pong {
             epoch,
             version_code,
+            floor,
+            head,
             ..
         },
         _,
     ) = bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
+    assert_eq!(epoch, 1);
+    assert_eq!(version_code, crate::version::effective_running_code());
+    // The Pong is the policy readout (RFC-025): the served window rides
+    // every answer.
+    assert_eq!(
+        floor,
+        hopnet_comms::alpn::compat_floor(hopnet_comms::alpn::COMPAT_HEAD)
+    );
+    assert_eq!(head, hopnet_comms::alpn::COMPAT_HEAD);
+}
+
+// Impact: the pre-flight (RFC-025 S5) is the cheap, structured refusal
+// while NO state exists — by ALPN construction the coordinator already
+// proved magic agreement, so a mismatch here means a lying or buggy
+// coordinator, and the node must stay fresh and re-joinable.
+// Should: refuse a JoinInfo whose anchor disagrees with the entered
+// code — and refuse any delivery when no code was entered — with
+// nothing written and the node identity untouched.
+// Should not: leave an agreed-version marker behind — the refused node
+// is still never-joined and must stay newest-wins for the seed guard.
+#[test]
+fn join_preflight_refuses_mismatched_anchor_before_any_write() {
+    let env = crate::test_env::lock_env();
+    let tmp = tempfile::tempdir().unwrap();
+    crate::test_env::set(&env, "XDG_DATA_HOME", tmp.path());
+    let node = MockNode::new(8);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let join_info = crate::types::JoinInfo {
+        node_id: 8,
+        user_id: 1,
+        bootstrap_validators: vec![],
+        quorum_profile: "majority".to_string(),
+        epoch: 1,
+        anchor: [0xAA; 32],
+    };
+
+    // No code entered: defensive refusal (a deferred endpoint makes
+    // this unreachable in production).
+    let err = rt
+        .block_on(crate::setup::process_join_info(
+            &node.app_state,
+            join_info.clone(),
+        ))
+        .expect_err("no entered code must refuse");
+    assert!(err.contains("no mesh code entered"), "{err}");
+
+    // Wrong code entered: named refusal, nothing written.
+    node.app_state
+        .entered_join_code
+        .set([0xde, 0xad, 0xbe, 0xef])
+        .unwrap();
+    let err = rt
+        .block_on(crate::setup::process_join_info(&node.app_state, join_info))
+        .expect_err("mismatched anchor must refuse");
+    assert!(err.contains("does not match"), "{err}");
+    assert!(node.app_state.node_id.get().is_none());
+    assert!(node.app_state.user_id.get().is_none());
+    let conn = node.app_state.db_pool.get().unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM this_node", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "nothing may be written before the pre-flight");
+    assert_eq!(
+        crate::regenesis::boot::read_agreed_version(&crate::db::shared::get_database_path()),
+        None,
+        "a refused join must not stamp an agreement"
+    );
+}
+
+// Should: adopt the same code idempotently and refuse a different one
+// (restart is the re-entry path); a set-up node never takes this path.
+#[test]
+fn adopt_join_code_is_once_only_and_fresh_only() {
+    let node = MockNode::new(9);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // Fixtures read as set up — the seam refuses.
+    assert!(matches!(
+        rt.block_on(crate::setup::adopt_join_code(&node.app_state, *b"t3st")),
+        Err(crate::setup::JoinCodeError::AlreadySetUp)
+    ));
+
+    // Fresh-flavored: the fixture's comms already carry TEST_MESH_MAGIC,
+    // so adopting the same code is the idempotent path and a different
+    // one conflicts.
+    node.app_state
+        .setup_complete
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    rt.block_on(crate::setup::adopt_join_code(
+        &node.app_state,
+        crate::consensus::tests::TEST_MESH_MAGIC,
+    ))
+    .unwrap();
+    rt.block_on(crate::setup::adopt_join_code(
+        &node.app_state,
+        crate::consensus::tests::TEST_MESH_MAGIC,
+    ))
+    .unwrap();
+    assert!(matches!(
+        rt.block_on(crate::setup::adopt_join_code(&node.app_state, [0x01; 4])),
+        Err(crate::setup::JoinCodeError::Conflict)
+    ));
+}
+
+// Should: delete the this_node row so a restart returns the node to
+// fresh after an install-time anchor abort.
+#[test]
+fn rollback_joining_node_returns_to_fresh() {
+    let node = MockNode::new(10);
+    {
+        let conn = node.app_state.db_pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO this_node (internal_id, node_id, privkey) VALUES (1, 10, ?)",
+            rusqlite::params![&node.signing_key],
+        )
+        .unwrap();
+    }
+    crate::db::setup::rollback_joining_node(node.app_state.db_pool.get()).unwrap();
+    let conn = node.app_state.db_pool.get().unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM this_node", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+// Impact: this pin is the vote-out shield (RFC-025 §Rejection) — a
+// lagging validator chatty on the compat class must stay dark on the
+// liveness clock, or its chatter shields it from the vote-out it
+// deserves. Both directions of the undecodable-request hole close here.
+// Should: record only VISIBILITY (last_seen + height) for a decoded
+// inbound status ping, and visibility alone for an undecodable one.
+// Should not: move last_contact from either path.
+#[test]
+fn inbound_status_is_visibility_never_liveness() {
+    let _env = crate::test_env::lock_env();
+    use crate::consensus::evidence::StatusRequest;
+
+    let node = MockNode::new(7);
+    register_node(&node);
+    let peer = hopnet_comms::PeerRef {
+        node_id: 44,
+        pubkey: [0u8; 32],
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let status = crate::consensus::evidence::StatusScope {
+        app_state: node.app_state.clone(),
+    };
+    let evidence = &node.app_state.evidence;
+    let origin = evidence.origin();
+
+    // Decoded ping: visibility + height, liveness untouched.
+    let ping = bincode::serde::encode_to_vec(
+        &StatusRequest::Ping {
+            decided_height: 11,
+            epoch: 1,
+            version_code: crate::version::effective_running_code(),
+        },
+        bincode::config::standard(),
+    )
+    .unwrap();
+    rt.block_on(hopnet_comms::RpcHandler::handle(&status, peer, ping));
+    let snap = evidence.snapshot();
+    let (_, v) = snap.iter().find(|(id, _)| *id == 44).unwrap();
+    assert_eq!(
+        v.last_contact, origin,
+        "decoded ping must not touch liveness"
+    );
+    assert!(v.last_seen.is_some());
+    assert_eq!(v.last_known_height, Some(11));
+
+    // Undecodable request: the RFC's hole — sighting only.
+    let garbage_peer = hopnet_comms::PeerRef {
+        node_id: 45,
+        pubkey: [0u8; 32],
+    };
+    rt.block_on(hopnet_comms::RpcHandler::handle(
+        &status,
+        garbage_peer,
+        vec![0xFF, 0xFF, 0xFF],
+    ));
+    let snap = evidence.snapshot();
+    let (_, v) = snap.iter().find(|(id, _)| *id == 45).unwrap();
+    assert_eq!(v.last_contact, origin, "garbage must not touch liveness");
+    assert!(v.last_seen.is_some());
+}
+
+// Impact: the schema-evolution parity gate transposed to the wire — a
+// generation-1 reshape that strands generation-0 peers fails here at
+// mint time, not in the field.
+// Should: serve a generation-0-encoded Ping through the head handler
+// via the G0 adapter and produce a response the frozen generation-0
+// decoder reads back exactly (three fields, correct epoch and version).
+#[test]
+fn status_g0_roundtrip_through_the_head_adapter() {
+    // Reads `effective_running_code()` for the pong.
+    let _env = crate::test_env::lock_env();
+    use crate::consensus::status_compat_g0 as g0;
+
+    let node = MockNode::new(6);
+    register_node(&node);
+    let peer = hopnet_comms::PeerRef {
+        node_id: 43,
+        pubkey: [0u8; 32],
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let adapter = crate::consensus::evidence::StatusCompatG0 {
+        inner: std::sync::Arc::new(crate::consensus::evidence::StatusScope {
+            app_state: node.app_state.clone(),
+        }),
+    };
+    let g0_ping = bincode::serde::encode_to_vec(
+        &g0::StatusRequest::Ping {
+            decided_height: 3,
+            epoch: 1,
+            version_code: 20990100,
+        },
+        bincode::config::standard(),
+    )
+    .unwrap();
+    let raw = rt.block_on(hopnet_comms::RpcHandler::handle(&adapter, peer, g0_ping));
+    let (
+        g0::StatusResponse::Pong {
+            decided_height,
+            epoch,
+            version_code,
+        },
+        consumed,
+    ) = bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
+    assert_eq!(consumed, raw.len(), "no trailing bytes for the old decoder");
+    assert_eq!(decided_height, 0);
     assert_eq!(epoch, 1);
     assert_eq!(version_code, crate::version::effective_running_code());
 }

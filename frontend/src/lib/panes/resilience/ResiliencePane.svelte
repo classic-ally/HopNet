@@ -81,7 +81,10 @@
         tOutMs: view.consensus.t_out_ms,
         totalNodes: view.consensus.total_nodes,
         reachableUnseated: view.consensus.reachable_unseated,
-        unreachableUnseated: view.consensus.unreachable_unseated
+        unreachableUnseated: view.consensus.unreachable_unseated,
+        versionSkew: view.consensus.version_skew,
+        strandedPeers: view.consensus.stranded_peers,
+        localVersion: view.consensus.local_version
     };
 
     $: storageProps = view && {

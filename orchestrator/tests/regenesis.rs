@@ -100,7 +100,11 @@ async fn decided_height(node: &NodeInfo) -> Result<u64> {
 /// its whole deadline on a container that will never exit — reporting a
 /// node that restarted in seconds as "did not restart". Volumes were
 /// already filtered this way in `main.rs`; the container lookups were not.
-async fn find_container_id(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<String> {
+pub(crate) async fn find_container_id(
+    docker: &Docker,
+    mesh_id: u32,
+    node_id: u32,
+) -> Result<String> {
     let mut last: Option<anyhow::Error> = None;
     for _ in 0..20 {
         match docker
@@ -739,11 +743,14 @@ impl TestScenario for RegenesisAwaitingUpgrade {
                 is_running(&info.state),
                 v["awaiting_upgrade"].as_bool().unwrap_or(false),
                 v["target_version"].as_str().unwrap_or("?").to_string(),
+                // RFC-025: staging, the seal, and the park never move
+                // the agreement — it still names the founding version.
+                v["agreed_version"].as_str().unwrap_or("?").to_string(),
             ));
         }
-        let all_parked = parked
-            .iter()
-            .all(|(alive, awaiting, target)| *alive && *awaiting && target == TARGET);
+        let all_parked = parked.iter().all(|(alive, awaiting, target, agreed)| {
+            *alive && *awaiting && target == TARGET && agreed == env!("CARGO_PKG_VERSION")
+        });
         let write_refused = matches!(
             upload_file(&nodes[0], "/", "while-parked.txt", b"never".to_vec()).await,
             Err(e) if e.to_string().contains("503")
@@ -824,24 +831,29 @@ impl TestScenario for RegenesisAwaitingUpgrade {
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        let epochs: Vec<String> = {
+        let epochs: Vec<(String, String)> = {
             let mut e = Vec::new();
             for node in &fresh_nodes {
-                e.push(
-                    regenesis_status(node).await?["epoch"]
-                        .as_str()
-                        .unwrap_or("?")
-                        .to_string(),
-                );
+                let v = regenesis_status(node).await?;
+                e.push((
+                    v["epoch"].as_str().unwrap_or("?").to_string(),
+                    v["agreed_version"].as_str().unwrap_or("?").to_string(),
+                ));
             }
             e
         };
+        // RFC-025: the agreement moved to the target exactly at the
+        // crossing — held at the founding version through the whole
+        // staged/sealed/parked window above.
         print_and_add_check(
             &mut result,
             Check {
-                name: "Upgraded quorum completes epoch 2 and decides past H".to_string(),
-                passed: progressed && epochs.iter().all(|e| e == "2"),
-                detail: Some(format!("progressed: {progressed}, epochs: {epochs:?}")),
+                name: "Upgraded quorum completes epoch 2; agreed version bumped at the crossing"
+                    .to_string(),
+                passed: progressed && epochs.iter().all(|(e, a)| e == "2" && a == TARGET),
+                detail: Some(format!(
+                    "progressed: {progressed}, (epoch, agreed): {epochs:?}"
+                )),
             },
         );
 
@@ -1042,15 +1054,19 @@ impl TestScenario for RegenesisCutover {
         )
         .await?;
         let on_latest = wait_for_epoch(&joined, "2", Duration::from_secs(300)).await?;
-        let joined_ordinals = ordinal_map(&regenesis_status(&joined).await?);
+        let joined_view = regenesis_status(&joined).await?;
+        let joined_ordinals = ordinal_map(&joined_view);
+        // RFC-025: an epoch join stamps the record's consensus-agreed
+        // required version — the fresh-join pathway of the clamp.
+        let joined_agreed = joined_view["agreed_version"].as_str() == Some(target);
         print_and_add_check(
             &mut result,
             Check {
                 name: "Fresh node joins THROUGH the pre-split artifact, stamped at head"
                     .to_string(),
-                passed: on_latest && joined_ordinals == expected,
+                passed: on_latest && joined_ordinals == expected && joined_agreed,
                 detail: Some(format!(
-                    "epoch 2: {on_latest}, ordinals: {joined_ordinals:?}"
+                    "epoch 2: {on_latest}, agreed at target: {joined_agreed}, ordinals: {joined_ordinals:?}"
                 )),
             },
         );
@@ -1075,6 +1091,322 @@ impl TestScenario for RegenesisCutover {
     }
 }
 
+/// RFC-025 S6: the enforcement crossing with a LIVE straggler. The mesh
+/// is born on the PRE-ENFORCEMENT release (2026.8.6 — the newest tag
+/// speaking only `hopnet/1.0`), stages this build, and crosses the
+/// upgrade boundary — but one node stays on the old binary through the
+/// crossing: parked alive, visible to the crossed pair ONLY over the
+/// compat generation-0 tier (its legacy dials, their compat fallthrough),
+/// dark on the locked class. The gate proves the cutover caveat end to
+/// end: the straggler stages and parks over what the enforcement build
+/// serves as generation 0, the crossed side's evidence names it
+/// visible-not-live with the G0 pong (version named, no window), and
+/// recreating it onto this build activates and rejoins it — RFC-019/020
+/// S7 machinery working over enforced ALPNs.
+///
+/// Before running, load the old image:
+/// `scripts/build-release-image.sh v<ENFORCEMENT_OLD_RELEASE>`, plus the
+/// usual `orchestrator load-image` for the current one.
+pub struct EnforcementCrossing;
+
+/// The release the enforcement crossing starts FROM — the newest
+/// pre-enforcement tag (RFC-020-complete, speaks only the legacy ALPN).
+pub(crate) const ENFORCEMENT_OLD_RELEASE: &str = "2026.8.6";
+
+/// The version the crossing targets. The real enforcement release will
+/// carry a version ABOVE the pre-enforcement tag, but this branch still
+/// compiles as the released number — a same-version "upgrade" is not a
+/// boundary at all. Until the release bump lands, the crossed nodes
+/// claim a synthetic next version over the standard override seam; the
+/// ALPN severance being tested is real either way (the old binary
+/// serves no enforced family regardless of code strings). Once the
+/// workspace version moves past the tag this collapses to the binary's
+/// real identity.
+pub(crate) fn enforcement_crossing_target() -> &'static str {
+    if env!("CARGO_PKG_VERSION") == ENFORCEMENT_OLD_RELEASE {
+        "2026.8.99"
+    } else {
+        env!("CARGO_PKG_VERSION")
+    }
+}
+
+impl TestScenario for EnforcementCrossing {
+    fn name(&self) -> &'static str {
+        "enforcement-crossing"
+    }
+
+    fn description(&self) -> &'static str {
+        "Pre-enforcement mesh crosses into enforcement with a live straggler riding generation 0"
+    }
+
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
+        let mut result = TestResult::new();
+        anyhow::ensure!(
+            nodes.len() == 3,
+            "enforcement-crossing expects a 3-node mesh"
+        );
+        let docker = crate::sys::connect()?;
+        let target: &str = enforcement_crossing_target();
+        let crossed_env: &[(&str, &str)] = &[("HOPNET_UPGRADE_VERSION_OVERRIDE", target)];
+        let new_image = format!("hopnet:{}", crate::naming::checkout_hash());
+
+        println!("\nRunning enforcement-crossing checks:");
+
+        // 0. Born pre-enforcement — a misloaded image would self-cross.
+        let born_on = regenesis_status(&nodes[0]).await?["running_version"]
+            .as_str()
+            .unwrap_or("?")
+            .to_string();
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: format!(
+                    "Mesh born on the pre-enforcement release ({ENFORCEMENT_OLD_RELEASE})"
+                ),
+                passed: born_on == ENFORCEMENT_OLD_RELEASE,
+                detail: Some(born_on.clone()),
+            },
+        );
+        if born_on != ENFORCEMENT_OLD_RELEASE {
+            return Ok(result);
+        }
+
+        // 1. Epoch-1 data, then the freeze toward this build — ALL THREE
+        // stage (the consensus precondition covers every seated
+        // validator), including the one that will straggle.
+        upload_file(
+            &nodes[0],
+            "/",
+            "pre-enforcement.txt",
+            b"written by the legacy-only release".to_vec(),
+        )
+        .await?;
+        if attest_and_freeze(&mut result, nodes, Some(target))
+            .await?
+            .is_none()
+        {
+            return Ok(result);
+        }
+        let seal_height = wait_sealed_everywhere(nodes).await?.unwrap_or(0);
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Boundary seals with the straggler staged".to_string(),
+                passed: seal_height > 0,
+                detail: Some(format!("seal_height {seal_height}")),
+            },
+        );
+        if seal_height == 0 {
+            return Ok(result);
+        }
+
+        // 2. Nodes 0 and 1 cross onto the enforcement build; node 2 stays
+        // the old binary — the live straggler.
+        let expected: std::collections::BTreeMap<String, u64> = hopnet::db::chains::chains()
+            .iter()
+            .map(|c| (c.module.to_string(), u64::from(c.head())))
+            .collect();
+        let mut crossed = Vec::new();
+        let mut crossings = Vec::new();
+        for node in &nodes[..2] {
+            recreate_node_with_env(
+                &docker,
+                mesh_id,
+                node.node_id,
+                Some(&new_image),
+                crossed_env,
+            )
+            .await?;
+            let fresh = reauth_node(&docker, mesh_id, node).await?;
+            let v = regenesis_status(&fresh).await?;
+            crossings.push((
+                node.node_id,
+                v["phase"].as_str() == Some("normal"),
+                v["epoch"].as_str() == Some("2"),
+                v["running_version"].as_str() == Some(target),
+                ordinal_map(&v) == expected,
+            ));
+            crossed.push(fresh);
+        }
+        let pair_crossed = crossings.iter().all(|(_, p, e, r, o)| *p && *e && *r && *o);
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "The crossed pair: epoch 2, enforcement build, chains at head".to_string(),
+                passed: pair_crossed,
+                detail: Some(format!("{crossings:?}")),
+            },
+        );
+        if !pair_crossed {
+            return Ok(result);
+        }
+
+        // 3. The straggler window (kept tight — the fast probe policy
+        // arms vote-out against a contact-dark seat). The straggler is
+        // parked ALIVE on the old binary; the crossed side sees it over
+        // the compat generation-0 tier only: a fresh G0 pong naming its
+        // version with NO window fields, sightings fresh while contact
+        // starves — visible-not-live over enforced ALPNs, the cutover
+        // caveat working as designed.
+        let mut parked = false;
+        let mut g0_named = false;
+        let mut clocks_split = false;
+        let mut banner_named = false;
+        let mut window_detail = String::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let straggler_view = regenesis_status(&nodes[2]).await?;
+            parked = straggler_view["awaiting_upgrade"].as_bool() == Some(true)
+                && straggler_view["running_version"].as_str() == Some(ENFORCEMENT_OLD_RELEASE);
+            let ev = get_json(&crossed[0], "/api/consensus/evidence").await?;
+            let row = ev["nodes"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["node_id"] == 2).cloned())
+                .unwrap_or(serde_json::Value::Null);
+            let pong = &row["pong"];
+            if pong["skew"] == true {
+                g0_named = pong["version"] == ENFORCEMENT_OLD_RELEASE
+                    && pong["floor"].is_null()
+                    && pong["head"].is_null()
+                    && pong["stranded"] == false;
+                let seen = row["seen_age_ms"].as_u64().unwrap_or(u64::MAX);
+                let contact = row["age_ms"].as_u64().unwrap_or(0);
+                clocks_split = seen < 10_000 && contact > seen;
+                let view = get_json(&crossed[0], "/api/views/network-resilience").await?;
+                banner_named = view["consensus"]["version_skew"]
+                    .as_array()
+                    .map(|rows| rows.iter().any(|r| r["node_id"] == 2))
+                    .unwrap_or(false)
+                    && view["consensus"]["stranded_peers"] == serde_json::json!([]);
+                window_detail = format!(
+                    "parked={parked} g0_named={g0_named} clocks_split={clocks_split} banner={banner_named}"
+                );
+                if parked && g0_named && clocks_split && banner_named {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Straggler window: parked alive, G0-visible, locked-dark, banner named"
+                    .to_string(),
+                passed: parked && g0_named && clocks_split && banner_named,
+                detail: Some(window_detail),
+            },
+        );
+
+        // 3b. The crossed side's agreement moved to the target AT the
+        // crossing (RFC-025 agreed-version clamp) — and the backfill
+        // covers rollout: delete the marker, restart, it reappears from
+        // committed lineage.
+        let crossed_agreed =
+            regenesis_status(&crossed[0]).await?["agreed_version"].as_str() == Some(target);
+        const DATA_DIR: &str = "/root/.local/share/hopnet";
+        let c0 = find_container_id(&docker, mesh_id, 0).await?;
+        exec_sh(&docker, &c0, &format!("rm -f {DATA_DIR}/agreed-version")).await?;
+        recreate_node_with_env(&docker, mesh_id, 0, Some(&new_image), crossed_env).await?;
+        let refreshed0 = reauth_node(&docker, mesh_id, &crossed[0]).await?;
+        let c0 = find_container_id(&docker, mesh_id, 0).await?;
+        let (_, backfilled) =
+            exec_sh(&docker, &c0, &format!("cat {DATA_DIR}/agreed-version")).await?;
+        let backfill_ok = backfilled.trim() == target;
+        crossed[0] = refreshed0;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Agreement bumped at the crossing; backfill restores it from lineage"
+                    .to_string(),
+                passed: crossed_agreed && backfill_ok,
+                detail: Some(format!(
+                    "crossed_agreed={crossed_agreed} backfilled={:?}",
+                    backfilled.trim()
+                )),
+            },
+        );
+
+        // 4. The crossed pair decides past the boundary while the
+        // straggler rides generation 0.
+        upload_file(
+            &crossed[1],
+            "/",
+            "post-enforcement.txt",
+            b"decided by the enforcement release".to_vec(),
+        )
+        .await?;
+        let mut progressed = false;
+        for _ in 0..60 {
+            if decided_height(&crossed[0]).await.unwrap_or(0) > seal_height
+                && decided_height(&crossed[1]).await.unwrap_or(0) > seal_height
+            {
+                progressed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Crossed pair decides past the boundary".to_string(),
+                passed: progressed,
+                detail: Some(format!("H={seal_height}")),
+            },
+        );
+
+        // 5. ACTIVATE: the straggler recreated onto the enforcement build
+        // crosses from its own local seal and rejoins.
+        recreate_node_with_env(&docker, mesh_id, 2, Some(&new_image), crossed_env).await?;
+        let rejoined = reauth_node(&docker, mesh_id, &nodes[2]).await?;
+        let on_epoch2 = wait_for_epoch(&rejoined, "2", Duration::from_secs(300)).await?;
+        let v = regenesis_status(&rejoined).await?;
+        let activated = on_epoch2
+            && v["phase"].as_str() == Some("normal")
+            && v["running_version"].as_str() == Some(target)
+            && v["agreed_version"].as_str() == Some(target)
+            && ordinal_map(&v) == expected;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Straggler activates: epoch 2, enforcement build, chains at head".to_string(),
+                passed: activated,
+                detail: Some(format!("epoch2={on_epoch2}")),
+            },
+        );
+
+        // 6. Whole-mesh convergence and coherence: rejoined ≡ crossed,
+        // and the skew banner clears.
+        let mut all_nodes = crossed.clone();
+        all_nodes.push(rejoined);
+        let tip = decided_height(&crossed[0]).await.unwrap_or(seal_height);
+        let (converged, heights) = wait_for_convergence(&all_nodes, tip, 180).await;
+        let snapshots = fetch_state_snapshots(&all_nodes).await?;
+        let (coherent, detail) = coherence(&snapshots);
+        let mut skew_cleared = false;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            let view = get_json(&crossed[0], "/api/views/network-resilience").await?;
+            if view["consensus"]["version_skew"] == serde_json::json!([]) {
+                skew_cleared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Rejoined mesh converges, coherent, skew banner clear".to_string(),
+                passed: converged && coherent && skew_cleared,
+                detail: Some(format!(
+                    "heights: {heights:?}, {detail}, skew_cleared={skew_cleared}"
+                )),
+            },
+        );
+
+        Ok(result)
+    }
+}
+
 /// RFC-021 nix activation: with the nix deployment contract declared and
 /// a verified staged generation planted in each node's volume, the sealed
 /// upgrade boundary does NOT park — every node flips its profile symlink
@@ -1088,7 +1420,11 @@ pub struct RegenesisNixActivation;
 
 /// Run a script in the container via busybox sh, returning
 /// (exit_code, output) — mount.rs's exec_capture, shared shape.
-async fn exec_sh(docker: &Docker, container: &str, script: &str) -> Result<(i64, String)> {
+pub(crate) async fn exec_sh(
+    docker: &Docker,
+    container: &str,
+    script: &str,
+) -> Result<(i64, String)> {
     use bollard::exec::{CreateExecOptions, StartExecResults};
     use tokio_stream::StreamExt;
     let exec = docker

@@ -419,6 +419,69 @@ pub fn decode_lineage(bytes: &[u8]) -> Result<LineageRecord, String> {
         .map_err(|e| format!("lineage decode: {e}"))
 }
 
+/// The lowest lineage epoch on disk, if any records exist.
+pub fn lowest_lineage_epoch(data_dir: &std::path::Path) -> Option<u64> {
+    let dir = std::fs::read_dir(data_dir.join(LINEAGE_DIR)).ok()?;
+    dir.filter_map(|entry| {
+        let name = entry.ok()?.file_name().into_string().ok()?;
+        name.strip_prefix("epoch-")?
+            .strip_suffix(".bin")?
+            .parse::<u64>()
+            .ok()
+    })
+    .min()
+}
+
+/// The mesh magic (RFC-025 §The ALPN Scheme): the first 4 bytes of the
+/// ANCHOR chain id — the mesh's permanent epoch-1 identity, deliberately
+/// NOT the per-epoch chain id, which would lock stragglers out of the
+/// compat class at exactly the boundary it exists for. At epoch 1 the
+/// anchor IS consensus_meta's chain id; past a boundary it is the
+/// lowest lineage record's back-pointer. Fail-stop policy belongs to
+/// the caller: the host panics at boot, because a wrong or absent magic
+/// on a live member is a silent TLS partition.
+/// The FULL anchor (epoch-1) chain id: consensus_meta's chain id at
+/// epoch 1, the lowest lineage record's back-pointer past a boundary.
+/// [`mesh_magic`] is its 4-byte truncation; JoinInfo carries the whole
+/// thing so a joiner can pre-flight its entered code (RFC-025 S5).
+pub fn anchor_chain_id(
+    conn: &rusqlite::Connection,
+    data_dir: &std::path::Path,
+) -> Result<[u8; 32], String> {
+    if current_epoch(conn) == 1 {
+        store::meta_get(conn, store::META_CHAIN_ID)
+            .map_err(|e| format!("chain id: {e}"))?
+            .ok_or("no chain id in consensus_meta (epoch 1)")?
+            .try_into()
+            .map_err(|_| "malformed chain id".to_string())
+    } else {
+        // The lowest lineage record is ALWAYS epoch 2: every join
+        // fetches the chain from epoch 1 (epoch_join_bootstrap_with)
+        // and records are kept forever, so the first record's
+        // back-pointer IS the epoch-1 chain id. Anything else on disk
+        // would make prev_chain_id a mid-chain identity — refuse
+        // rather than derive a wrong mesh magic.
+        let lowest = lowest_lineage_epoch(data_dir)
+            .ok_or("no lineage records on a post-boundary database")?;
+        if lowest != 2 {
+            return Err(format!(
+                "lowest lineage record is epoch {lowest}, expected 2 — \
+                 the epoch-1 chain id is unreachable"
+            ));
+        }
+        Ok(read_lineage(&lineage_path(data_dir, lowest))?
+            .record
+            .prev_chain_id)
+    }
+}
+
+pub fn mesh_magic(
+    conn: &rusqlite::Connection,
+    data_dir: &std::path::Path,
+) -> Result<[u8; 4], String> {
+    anchor_chain_id(conn, data_dir).map(|id| id[..4].try_into().expect("4-byte truncation of 32"))
+}
+
 /// The trust root a lineage chain is verified from.
 ///
 /// A straggler anchors at its own database (`from_db`): the chain id it
@@ -856,6 +919,98 @@ pub(crate) mod tests {
             "canonical genesis encoding changed — if intentional, bump \
              format_version and re-pin"
         );
+    }
+
+    // Impact: this is the identity every production node binds its ALPNs
+    // with (RFC-025) — a wrong truncation partitions the mesh at TLS at
+    // the enforcement release.
+    // Should: derive the magic from consensus_meta's chain id at epoch 1,
+    // and from the lowest lineage record's back-pointer past a boundary —
+    // the SAME magic from both paths (the identity is epoch-stable).
+    #[test]
+    fn mesh_magic_is_the_epoch_one_identity_on_both_paths() {
+        let pool = sealed_pool(false);
+        let conn = pool.get().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Epoch 1: META_CHAIN_ID is the anchor directly.
+        assert_eq!(mesh_magic(&conn, dir.path()).unwrap(), PREV_CHAIN[..4]);
+
+        // Past the boundary: epoch 2, anchor recovered from the lineage
+        // back-pointer. write_lineage produces the real epoch-2 record.
+        let g = build_epoch_genesis(&conn).unwrap();
+        write_lineage(dir.path(), &g).unwrap();
+        hopnet_consensus::store::meta_put(&conn, META_EPOCH, &2u64.to_be_bytes()).unwrap();
+        assert_eq!(mesh_magic(&conn, dir.path()).unwrap(), PREV_CHAIN[..4]);
+    }
+
+    // Should: refuse to derive — naming what is missing — rather than
+    // ever produce a wrong or default identity: absent chain id at epoch
+    // 1, absent lineage past a boundary, a lowest record above epoch 2
+    // (whose back-pointer is a mid-chain id, not the anchor), and a
+    // corrupt record file.
+    #[test]
+    fn mesh_magic_refuses_underivable_states() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Epoch 1, schema installed, no chain id (the half-set-up state).
+        let manager = crate::db::SqliteConnectionManager::memory();
+        let fresh = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        crate::db::chains::install(&fresh.get().unwrap()).unwrap();
+        let fresh_conn = fresh.get().unwrap();
+        assert!(
+            mesh_magic(&fresh_conn, dir.path())
+                .unwrap_err()
+                .contains("no chain id")
+        );
+
+        // Post-boundary states, on a sealed pool flipped to epoch 2.
+        let pool = sealed_pool(false);
+        let conn = pool.get().unwrap();
+        let g = build_epoch_genesis(&conn).unwrap();
+        hopnet_consensus::store::meta_put(&conn, META_EPOCH, &2u64.to_be_bytes()).unwrap();
+
+        // No lineage records at all.
+        assert!(
+            mesh_magic(&conn, dir.path())
+                .unwrap_err()
+                .contains("no lineage")
+        );
+
+        // Lowest record above 2: refuse, never trust its back-pointer.
+        let gap_dir = tempfile::tempdir().unwrap();
+        let valid = {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::read(write_lineage(tmp.path(), &g).unwrap()).unwrap()
+        };
+        write_lineage_bytes(gap_dir.path(), 3, &valid).unwrap();
+        assert!(
+            mesh_magic(&conn, gap_dir.path())
+                .unwrap_err()
+                .contains("expected 2")
+        );
+
+        // Corrupt epoch-2 file: the decode error propagates.
+        let corrupt_dir = tempfile::tempdir().unwrap();
+        write_lineage_bytes(corrupt_dir.path(), 2, &[0u8; 3]).unwrap();
+        assert!(
+            mesh_magic(&conn, corrupt_dir.path())
+                .unwrap_err()
+                .contains("lineage decode")
+        );
+    }
+
+    // Should: report the lowest epoch present, and nothing for an absent
+    // or empty lineage directory. (Previously untested; now backs the
+    // boot-critical magic derivation.)
+    #[test]
+    fn lowest_lineage_epoch_scans_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(lowest_lineage_epoch(dir.path()), None);
+        write_lineage_bytes(dir.path(), 4, b"x").unwrap();
+        write_lineage_bytes(dir.path(), 2, b"x").unwrap();
+        write_lineage_bytes(dir.path(), 3, b"x").unwrap();
+        assert_eq!(lowest_lineage_epoch(dir.path()), Some(2));
     }
 
     // Should: round-trip the lineage record through disk and verify the
