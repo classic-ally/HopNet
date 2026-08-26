@@ -261,6 +261,10 @@ pub struct RegenesisStatusView {
     pub mesh_code: Option<String>,
     /// The version this binary effectively runs.
     pub running_version: String,
+    /// The mesh-agreed version this node runs (RFC-025): stamped at
+    /// genesis/join and re-stamped only at version transitions; the
+    /// seed guard clamps profile advances to it. None = never joined.
+    pub agreed_version: Option<String>,
     /// Sealed for a version this binary does not run: the node is parked
     /// until its operator swaps the binary (RFC-019 S6 boot gate 1).
     pub awaiting_upgrade: bool,
