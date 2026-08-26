@@ -1252,6 +1252,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // `hopnet seed-guard --candidate <ver>`: the NixOS module's seeding
+    // clamp (RFC-025) — may the profile advance to <ver>? Read-only,
+    // exits before the instance lock (ExecStartPre runs with the daemon
+    // down, but a concurrent daemon is harmless to a file read).
+    if std::env::args().nth(1).as_deref() == Some("seed-guard") {
+        let candidate = match (std::env::args().nth(2).as_deref(), std::env::args().nth(3)) {
+            (Some("--candidate"), Some(v)) => v,
+            _ => {
+                eprintln!("usage: hopnet seed-guard --candidate <CalVer>");
+                std::process::exit(2);
+            }
+        };
+        std::process::exit(hopnet::seed_guard::run(&candidate));
+    }
+
     // Single-instance guard: a second node on the same data dir shares the
     // WAL database and silently loses the network bind. The loser exits 0
     // on purpose — a supervised launchd agent losing this race to a

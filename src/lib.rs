@@ -33,6 +33,7 @@ pub mod photos_host;
 pub mod projections;
 pub mod reference_providers;
 pub mod regenesis;
+pub mod seed_guard;
 pub mod setup;
 pub mod shares;
 pub mod storage_host;
