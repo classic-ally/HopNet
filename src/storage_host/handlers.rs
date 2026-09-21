@@ -14,7 +14,100 @@ pub const TX_FUNCTIONS: &[&str] = &[
     "update_placement_heights",
     "delete_orphaned_data_blocks",
     "self_check_fragments",
+    hopnet_storage::lifecycle::DECLARE_TX_FN,
+    hopnet_storage::lifecycle::CONFIRM_TX_FN,
 ];
+
+/// Storage apply errors → handler errors: SQLite contention stays
+/// transient (validation must surface it as Undetermined, never a
+/// verdict); anything else is a processing failure.
+fn storage_err(what: &'static str) -> impl Fn(hopnet_storage::StorageError) -> DatabaseError {
+    move |e| match e {
+        hopnet_storage::StorageError::Transient(code) => DatabaseError::Transient(code),
+        other => {
+            tracing::error!("{what} failed: {other}");
+            DatabaseError::ProcessingError
+        }
+    }
+}
+
+/// RFC-STORAGE-003 DeclarePlacementTarget: move blobs' goals forward.
+/// Per-entry validation lives in the substrate (`lifecycle::apply_declare`);
+/// invalid entries are skipped, never fail the block — only an undecodable
+/// payload errors.
+pub struct DeclarePlacementTargetHandler;
+
+impl TransactionHandler for DeclarePlacementTargetHandler {
+    fn name(&self) -> &'static str {
+        hopnet_storage::lifecycle::DECLARE_TX_FN
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<
+            hopnet_storage::DeclarePlacementTarget,
+            _,
+        >(tx.payload, bincode::config::standard())
+        .map_err(|_| DatabaseError::InvalidPayload)?;
+        let outcome = hopnet_storage::lifecycle::apply_declare(db_tx, &payload, ctx.height)
+            .map_err(storage_err("apply_declare"))?;
+        tracing::debug!(
+            height = ctx.height,
+            applied = outcome.applied,
+            skipped = outcome.skipped,
+            "declare_placement_target applied"
+        );
+        Ok(())
+    }
+}
+
+inventory::submit! {
+    &DeclarePlacementTargetHandler as &dyn TransactionHandler
+}
+
+/// RFC-STORAGE-003 ConfirmPlacement: stamp placement_height once the
+/// attested evidence for the declared goal is complete. Same skip
+/// semantics as declare.
+pub struct ConfirmPlacementHandler;
+
+impl TransactionHandler for ConfirmPlacementHandler {
+    fn name(&self) -> &'static str {
+        hopnet_storage::lifecycle::CONFIRM_TX_FN
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) =
+            bincode::serde::decode_from_slice::<hopnet_storage::ConfirmPlacement, _>(
+                tx.payload,
+                bincode::config::standard(),
+            )
+            .map_err(|_| DatabaseError::InvalidPayload)?;
+        let outcome = hopnet_storage::lifecycle::apply_confirm(db_tx, &payload)
+            .map_err(storage_err("apply_confirm"))?;
+        tracing::debug!(
+            height = ctx.height,
+            applied = outcome.applied,
+            skipped = outcome.skipped,
+            "confirm_placement applied"
+        );
+        Ok(())
+    }
+}
+
+inventory::submit! {
+    &ConfirmPlacementHandler as &dyn TransactionHandler
+}
 
 pub struct UpdatePlacementHeightsHandler;
 

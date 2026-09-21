@@ -18,6 +18,7 @@ pub mod engine;
 pub mod error;
 pub mod eviction;
 pub mod fragstore;
+pub mod lifecycle;
 pub mod maintenance;
 pub mod membership;
 pub mod pins;
@@ -35,6 +36,11 @@ pub use hopnet_common::CustomUUID;
 pub use types::{
     BlobAccess, BlobId, DeleteOrphanedDataBlocksPayload, MeshKeyGrant, PlacementUpdate,
     SelfCheckFragments,
+};
+// RFC-STORAGE-003 lifecycle tx payloads (storage-owned; the host registers
+// the handlers, projections never see them).
+pub use lifecycle::{
+    ConfirmPlacement, DeclarePlacementTarget, PlacementConfirmation, PlacementTarget,
 };
 
 // Public crypto seam — consumers (photos-core, future projections) wrap

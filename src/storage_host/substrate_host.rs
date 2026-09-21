@@ -267,10 +267,36 @@ impl LocalStateSink for SubstrateHost {
 /// views — can reach the same derivation. This feeds `select_nodes_for_blob`,
 /// so it is a behaviour-preserving move and nothing more.
 pub fn storage_view_with_conn(conn: &rusqlite::Connection) -> Result<StorageView, StorageError> {
-    use hopnet_storage::membership;
-
     let height = crate::db::consensus::get_current_consensus_height(conn)
         .map_err(|e| StorageError::Host(format!("current height: {e:?}")))?;
+    storage_view_at(conn, height)
+}
+
+/// Record the storage-view transition for a block (RFC-STORAGE-003 S1).
+/// Runs inside the block's apply transaction, after its transactions, on
+/// every node: the view at the deciding height is derived from replicated
+/// rows by a pure function, so the appended row is identical everywhere
+/// and the record is replicated state. Both the validation dry-run and
+/// the execute pass call this, so validation-time reads see the same
+/// record the apply will write.
+pub fn record_view_transition(
+    db_tx: &rusqlite::Transaction<'_>,
+    height: u64,
+) -> Result<bool, StorageError> {
+    let view = storage_view_at(db_tx, height)?;
+    let snapshot = hopnet_storage::lifecycle::ViewSnapshot::from(&view);
+    hopnet_storage::lifecycle::record_transition(db_tx, height, &snapshot)
+}
+
+/// The storage view as of `height`: every input is read at-or-below that
+/// height (metrics rows, availability anchor), so the derivation is a
+/// function of replicated state at a height — the same on every node.
+pub fn storage_view_at(
+    conn: &rusqlite::Connection,
+    height: u64,
+) -> Result<StorageView, StorageError> {
+    use hopnet_storage::membership;
+
     // Active quorum profile (consensus_meta) — sizes the watermark fault
     // budget so a majority-profile mesh buffers the burst consensus
     // actually survives. Defaults to AUTO, matching the mesh default.

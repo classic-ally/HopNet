@@ -216,13 +216,12 @@ pub fn insert_files(
     block_height: u64,
 ) -> Result<(), DatabaseError> {
     // Substrate half first: blobs must exist before inodes reference them.
+    let apply = hopnet_storage::store::ApplyCtx {
+        fragments_dir,
+        height: block_height,
+    };
     for op in blob_ops {
-        hopnet_storage::store::apply_blob_insert(
-            db_tx,
-            op,
-            &hopnet_storage::store::ApplyCtx { fragments_dir },
-        )
-        .map_err(|e| {
+        hopnet_storage::store::apply_blob_insert(db_tx, op, &apply).map_err(|e| {
             tracing::error!("apply_blob_insert failed: id={} error={e}", op.blob_id);
             match e {
                 hopnet_storage::StorageError::Transient(code) => DatabaseError::Transient(code),
@@ -642,7 +641,10 @@ pub fn modify_item(
             hopnet_storage::store::apply_blob_insert(
                 db_tx,
                 op,
-                &hopnet_storage::store::ApplyCtx { fragments_dir },
+                &hopnet_storage::store::ApplyCtx {
+                    fragments_dir,
+                    height: block_height,
+                },
             )
             .map_err(|e| {
                 tracing::error!(

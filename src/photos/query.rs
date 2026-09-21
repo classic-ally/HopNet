@@ -746,7 +746,15 @@ mod tests {
         {
             let conn = pool.get().unwrap();
             let tx = conn.unchecked_transaction().unwrap();
-            hopnet_photos::db::photos::insert_photo_entry(&tx, &entry, &fragments_dir).unwrap();
+            hopnet_photos::db::photos::insert_photo_entry(
+                &tx,
+                &entry,
+                &hopnet_storage::store::ApplyCtx {
+                    fragments_dir: &fragments_dir,
+                    height: 1,
+                },
+            )
+            .unwrap();
             crate::db::shared::commit_timed(tx).unwrap();
         }
 

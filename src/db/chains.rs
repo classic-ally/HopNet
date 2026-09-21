@@ -632,9 +632,14 @@ mod tests {
 
         adopt_legacy(&conn).unwrap();
         let applied = fast_forward(&mut conn).unwrap();
-        // identity's stamp step was applied during adopt; nothing else
-        // has a gap yet.
-        assert_eq!(applied, 0);
+        // identity's stamp step was applied during adopt; fast-forward
+        // owes every other module's steps above its baseline.
+        let owed: u32 = chains()
+            .iter()
+            .filter(|c| c.module != IDENTITY_CHAIN.module)
+            .map(|c| c.head() - c.baseline())
+            .sum();
+        assert_eq!(applied, owed);
 
         let stamps = read_stamps(&conn).unwrap();
         for chain in chains() {
@@ -851,13 +856,18 @@ mod tests {
     /// hand-written raw-SQL fixtures): replay everything to the
     /// pre-step state, apply the fixture rows against that shape, apply
     /// the step, hash-pin the full canonical dump.
+    /// Other modules sit at their released BASELINES, not their heads:
+    /// the dump hashes the whole database, and a pinned step hash must
+    /// not move when an unrelated module appends a step. A step whose
+    /// fixture needs an upstream module above its baseline extends this
+    /// helper with an explicit upstream ordinal when that day comes.
     fn run_step_fixture(module: &str, ordinal: u32, fixture_sql: &str) -> String {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         for chain in chains() {
             let to = if chain.module == module {
                 ordinal - 1
             } else {
-                chain.head()
+                chain.baseline()
             };
             hopnet_common::chain::replay(&conn, chain, to).unwrap();
         }
@@ -896,6 +906,75 @@ mod tests {
     const STEP_FIXTURE_IDENTITY_0001_HASH: &str =
         "bf26241642c4ec3c060d50fd8552d3cf53fedd2d48a7db1dd01610b121cf693a";
 
+    // Impact: the RFC-STORAGE-003 cutover rides this step — its backfill
+    // enrolls every existing blob into the lifecycle, so the output over
+    // the two blob shapes (placed, never placed) is pinned.
+    // Should: backfill desired_placement_height = placement_height for a
+    // placed blob and the sentinel 0 for a never-placed one, creating the
+    // empty transition record beside them.
+    #[test]
+    fn step_fixture_storage_0002_block_lifecycle() {
+        let hash = run_step_fixture(
+            "storage",
+            2,
+            "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height, file_size)
+             VALUES ('01890a5d-ac96-774b-b9aa-9f8b24f0c9a1', NULL, X'01', 3, 0, 7, 10);
+             INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height, file_size)
+             VALUES ('01890a5d-ac96-774b-b9aa-9f8b24f0c9a2', NULL, X'02', 3, 0, NULL, 20);",
+        );
+        assert_eq!(
+            hash, STEP_FIXTURE_STORAGE_0002_HASH,
+            "storage/0002 output moved — a released step may never change \
+             (contract rules 1-2); if this is an intentional pre-release \
+             redefinition, re-pin in the same commit"
+        );
+    }
+
+    const STEP_FIXTURE_STORAGE_0002_HASH: &str =
+        "46f6def7429d041e4597f5193dca03a78f33e9c7f4501fa87b425f32b5a15940";
+
+    // Should: land the documented backfill values, not just a stable hash.
+    #[test]
+    fn storage_0002_backfill_values() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for chain in chains() {
+            let to = if chain.module == "storage" {
+                1
+            } else {
+                chain.baseline()
+            };
+            hopnet_common::chain::replay(&conn, chain, to).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height, file_size)
+             VALUES ('placed', NULL, X'01', 3, 0, 7, 10);
+             INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height, file_size)
+             VALUES ('stranded', NULL, X'02', 3, 0, NULL, 20);",
+        )
+        .unwrap();
+        let storage = chains()
+            .into_iter()
+            .find(|c| c.module == "storage")
+            .unwrap();
+        hopnet_common::chain::advance(&conn, storage, 1, 2).unwrap();
+        let desired = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT desired_placement_height FROM data_blocks WHERE id = ?",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(desired("placed"), 7);
+        assert_eq!(desired("stranded"), 0);
+        let transitions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM storage_view_transitions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(transitions, 0);
+    }
+
     /// A pre-split (cutover-era) artifact over the fixture rows: the
     /// old-shape database is the all-baselines shape, serialized with
     /// the frozen pre-split specs in the old section order.
@@ -906,7 +985,9 @@ mod tests {
         let specs: Vec<&'static hopnet_common::SectionSpec> = vec![
             &crate::db::snapshot::PRE_SPLIT_HOST_SECTION,
             &crate::db::snapshot::PRE_SPLIT_CONSENSUS_SECTION,
-            &hopnet_storage::store::SNAPSHOT_SECTION,
+            // storage@1: the cutover-era shape predates the lifecycle
+            // table (its frozen spec is the import mapping for it).
+            &hopnet_storage::store::PRE_LIFECYCLE_SNAPSHOT_SECTION,
             &hopnet_drive::db::SNAPSHOT_SECTION,
             &hopnet_photos::db::SNAPSHOT_SECTION,
             &hopnet_takeout::db::SNAPSHOT_SECTION,
@@ -933,6 +1014,10 @@ mod tests {
         assert!(plan.pre_split);
         assert_eq!(plan.targets.get("identity"), Some(&0));
         assert_eq!(plan.targets.get("consensus"), Some(&2));
+        // storage@1 maps to its frozen spec and materializes at 1, so
+        // the fast-forward below crosses step 0002 with artifact rows
+        // in place (the real RFC-STORAGE-003 cutover shape).
+        assert_eq!(plan.targets.get("storage"), Some(&1));
 
         // Scratch: build + verify at the artifact's shape, then head.
         let scratch_dir = tempfile::tempdir().unwrap();

@@ -192,6 +192,20 @@ pub struct HandlerCtx<'a> {
     pub work: &'a dyn WorkScheduler,
 }
 
+/// The substrate's apply-time context, derived from the handler context:
+/// projections hand `(&ctx).into()` to `hopnet_storage::store::apply_*`
+/// and never assemble storage internals themselves — what a blob apply
+/// needs (today the fragment root and the block height) is the
+/// substrate's decision.
+impl<'a> From<&'a HandlerCtx<'a>> for hopnet_storage::store::ApplyCtx<'a> {
+    fn from(ctx: &'a HandlerCtx<'a>) -> Self {
+        hopnet_storage::store::ApplyCtx {
+            fragments_dir: ctx.fragments_dir,
+            height: ctx.height,
+        }
+    }
+}
+
 /// A consensus transaction handler. Implementations register themselves via
 /// `inventory::submit!` in their own crate; the host builds its dispatch
 /// table from the collected registry.

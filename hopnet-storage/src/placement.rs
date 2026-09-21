@@ -20,9 +20,19 @@ pub trait PlacementNode {
     fn node_id(&self) -> i32;
 }
 
+/// A bare node id is placeable (the lifecycle's view snapshots carry ids
+/// only — pubkeys move no bytes at assignment time).
+impl PlacementNode for i32 {
+    fn node_id(&self) -> i32 {
+        *self
+    }
+}
+
 /// Node quality metrics at a consensus height — the substrate-owned mirror of
-/// the host's replicated metrics row (score fields only).
-#[derive(Debug, Clone)]
+/// the host's replicated metrics row (score fields only). Serialized only
+/// inside the lifecycle's canonical view snapshots (replicated rows, so the
+/// float bytes agree on every node).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MetricsRow {
     pub node_id: i32,
     pub trust_factor: f64,

@@ -49,10 +49,15 @@ pub struct BlobInsertOp {
     pub access: Vec<BlobAccess>,
 }
 
-/// Apply-time context supplied by the host.
+/// Apply-time context supplied by the host. Projections obtain one from
+/// the handler context (`From<&HandlerCtx>` in hopnet-projection) rather
+/// than assembling it — the substrate decides what an apply needs.
 pub struct ApplyCtx<'a> {
     /// Local fragment store root — used for the stored_locally probe.
     pub fragments_dir: &'a str,
+    /// The block height this apply runs under (RFC-STORAGE-003: a newborn
+    /// blob's goal is stamped with its inserting block).
+    pub height: u64,
 }
 
 pub(crate) fn db_err(what: &'static str) -> impl Fn(rusqlite::Error) -> StorageError {
@@ -74,6 +79,40 @@ pub(crate) fn db_err(what: &'static str) -> impl Fn(rusqlite::Error) -> StorageE
 /// are covered. stored_locally and self_verified_height are node-local
 /// columns of otherwise-replicated tables, excluded from canonical bytes.
 pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionSpec {
+    name: "storage",
+    // v2 (RFC-STORAGE-003 S1): data_blocks.desired_placement_height and
+    // the storage_view_transitions record — both replicated (derived at
+    // apply from replicated inputs on every node).
+    format_version: 2,
+    tables: &[
+        hopnet_common::TableSpec::exported("data_blocks"),
+        hopnet_common::TableSpec::exported("storage_view_transitions"),
+        hopnet_common::TableSpec::exported("blob_access"),
+        hopnet_common::TableSpec::exported("mesh_key"),
+        hopnet_common::TableSpec::exported("mesh_key_access"),
+        hopnet_common::TableSpec {
+            name: "fragment_hashes",
+            role: hopnet_common::TableRole::Exported,
+            excluded_columns: &["stored_locally"],
+        },
+        hopnet_common::TableSpec {
+            name: "fragment_inventory",
+            role: hopnet_common::TableRole::Exported,
+            excluded_columns: &["self_verified_height"],
+        },
+        hopnet_common::TableSpec::exported("hopnet_storage_policy"),
+    ],
+};
+
+/// The storage section as sealed by pre-lifecycle binaries (ordinal 1):
+/// the covered set without `storage_view_transitions`. FROZEN — the
+/// import mapping for storage@1 artifacts (every mesh crossing into the
+/// RFC-STORAGE-003 release): the joiner materializes storage at ordinal
+/// 1, imports and verifies with THIS spec, then fast-forwards. Adding a
+/// table to a released section is a covered-set change, which RFC-020
+/// handles by a frozen spec per historical shape (the pre-split
+/// consensus precedent), never by editing the live spec's history.
+pub const PRE_LIFECYCLE_SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionSpec {
     name: "storage",
     format_version: 1,
     tables: &[
@@ -103,11 +142,18 @@ pub const NODE_LOCAL_TABLES: &[&str] = &["hopnet_storage_pins"];
 /// registry tests.
 pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
     module: "storage",
-    steps: &[hopnet_common::Step::sql(
-        1,
-        "init",
-        include_str!("../migrations/storage/0001_init.sql"),
-    )],
+    steps: &[
+        hopnet_common::Step::sql(
+            1,
+            "init",
+            include_str!("../migrations/storage/0001_init.sql"),
+        ),
+        hopnet_common::Step::sql(
+            2,
+            "block_lifecycle",
+            include_str!("../migrations/storage/0002_block_lifecycle.sql"),
+        ),
+    ],
 };
 
 /// Seed/overwrite mesh policy rows (genesis apply; later a settings tx).
@@ -135,7 +181,10 @@ pub fn read_policy(
 }
 
 /// Register a blob: data_blocks row + fragment_hashes rows (stored_locally
-/// probed against THIS node's disk) + blob_access wraps.
+/// probed against THIS node's disk) + blob_access wraps. Birth is a
+/// declaration (RFC-STORAGE-003): the goal is stamped with the inserting
+/// block's height, so a newborn blob is already in flight toward the
+/// current view; placement_height starts NULL (never confirmed).
 pub fn apply_blob_insert(
     db_tx: &rusqlite::Transaction,
     op: &BlobInsertOp,
@@ -143,13 +192,14 @@ pub fn apply_blob_insert(
 ) -> Result<(), StorageError> {
     db_tx
         .execute(
-            "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height, file_size) VALUES (?, NULL, ?, ?, ?, NULL, ?)",
+            "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height, file_size, desired_placement_height) VALUES (?, NULL, ?, ?, ?, NULL, ?, ?)",
             params![
                 op.blob_id,
                 op.integrity_hash,
                 op.fragments.len() as i32,
                 op.added_bytes,
-                op.file_size as i64
+                op.file_size as i64,
+                height_to_db(ctx.height)
             ],
         )
         .map_err(db_err("insert data_block"))?;
@@ -805,7 +855,8 @@ mod tests {
             "CREATE TABLE data_blocks (
                 id TEXT PRIMARY KEY, modified_at TEXT, file_hash BLOB,
                 fragment_count INTEGER, added_bytes INTEGER,
-                placement_height INTEGER, file_size INTEGER
+                placement_height INTEGER, file_size INTEGER,
+                desired_placement_height INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE fragment_hashes (
                 data_block_id TEXT, chunk_number INTEGER, local_index INTEGER,
@@ -909,19 +960,23 @@ mod tests {
             &op,
             &ApplyCtx {
                 fragments_dir: &dir_s,
+                height: 42,
             },
         )
         .unwrap();
 
-        let (count, placement): (i32, Option<i32>) = tx
+        // Should: stamp the goal with the inserting height (birth is a
+        // declaration) while the confirmed epoch starts NULL.
+        let (count, placement, desired): (i32, Option<i32>, i64) = tx
             .query_row(
-                "SELECT fragment_count, placement_height FROM data_blocks WHERE id = ?",
+                "SELECT fragment_count, placement_height, desired_placement_height FROM data_blocks WHERE id = ?",
                 params![blob_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
         assert_eq!(count, 2);
         assert_eq!(placement, None);
+        assert_eq!(desired, 42);
 
         // stored_locally probed: on-disk fragment true, missing false;
         // recovery flag round-trips as the legacy 0/1 encoding.

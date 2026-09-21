@@ -178,6 +178,18 @@ pub fn resolve_import_plan(headers: &[(String, u32)]) -> Result<ImportPlan, Stri
                 plan.expected.insert(name.clone(), *fv);
                 plan.targets.insert("consensus", 2);
             }
+            "storage"
+                if *fv == hopnet_storage::store::PRE_LIFECYCLE_SNAPSHOT_SECTION.format_version =>
+            {
+                // Covered-set bump (RFC-STORAGE-003 S1 added
+                // storage_view_transitions): a storage@1 artifact is
+                // imported and verified with the frozen v1 spec at
+                // ordinal 1, then fast-forwarded through step 0002.
+                plan.specs
+                    .push(&hopnet_storage::store::PRE_LIFECYCLE_SNAPSHOT_SECTION);
+                plan.expected.insert(name.clone(), *fv);
+                plan.targets.insert("storage", *fv);
+            }
             _ => {
                 let spec = sections()
                     .into_iter()
@@ -302,7 +314,8 @@ pub(crate) mod tests {
              INSERT INTO hopnet_consensus_policy VALUES ('ck', 'cv');
              INSERT INTO decided_blocks VALUES (1, X'01', 0, X'B0');
              INSERT INTO decided_blocks VALUES (2, X'02', 0, X'B1');
-             INSERT INTO data_blocks VALUES ('blob1', '2026-01-01T00:00:00Z', X'99', 30, 1, 5, 1000);
+             INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height, file_size)
+                 VALUES ('blob1', '2026-01-01T00:00:00Z', X'99', 30, 1, 5, 1000);
              INSERT INTO blob_access VALUES ('blob1', X'BB02', X'E1', X'77');
              INSERT INTO mesh_key VALUES (1, X'AB', 1);
              INSERT INTO mesh_key_access VALUES (X'BB02', X'E2', X'78');
@@ -339,6 +352,21 @@ pub(crate) mod tests {
              INSERT INTO photo_ingress_responsibility VALUES (1, 'lib1', 'dt1', 'op2');",
         )
         .unwrap();
+        // Head-shape only: the pre-split artifact fixture seeds the
+        // all-baselines shape, where storage@1 has no transition record
+        // yet (its frozen spec is the import mapping for that shape).
+        let has_transitions: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                                WHERE type = 'table' AND name = 'storage_view_transitions')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if has_transitions {
+            conn.execute_batch("INSERT INTO storage_view_transitions VALUES (3, X'A1');")
+                .unwrap();
+        }
     }
 
     // Should: cover exactly the full schema — covered tables plus
@@ -453,7 +481,7 @@ pub(crate) mod tests {
         assert_eq!(report.manifest.top_hash.to_hex(), EMPTY_TOP_HASH);
     }
 
-    const EMPTY_TOP_HASH: &str = "975747a4e1c8931bfda722c9c3a2ae85831afc7da75454f6238e0e290f417c1b";
+    const EMPTY_TOP_HASH: &str = "3e1c0296d37d197ad5e5d9a4f9ba5e2e2ecdc41413d787dfe2fe782e77e13aff";
     const EMPTY_SECTION_HASHES: &[(&str, &str)] = &[
         (
             "identity",
@@ -468,8 +496,10 @@ pub(crate) mod tests {
             "62d94827859d6760294d88f1e23528e2f7118808336bcb26a6ca458e6a50541b",
         ),
         (
+            // v2 (RFC-STORAGE-003 S1): storage_view_transitions joined
+            // the covered set and data_blocks gained a column.
             "storage",
-            "8a3c2e0b2d1a34c26fc6c2794543e42da783bd22ec9790d6fdc465ffc6f8ac35",
+            "1018b217b7687d066244b86a15b253d9d81dbb18683f9af0bad8cda7a19be8f3",
         ),
         (
             "drive",
@@ -505,14 +535,16 @@ pub(crate) mod tests {
     }
 
     const SEEDED_TOP_HASH: &str =
-        "74522360a2649b453f28d94091043f0e769336f7b044f88935dbae33d824d67e";
+        "0439b790d9083e789011e68e61dcc0481896829fa298d7483b75abe75b92e3f2";
     const SEEDED_ARTIFACT_HASH: &str =
-        "5e60c9ccb76178709b0b76dac430c963051931af336aa05e7632c7b5741d0fa8";
+        "e2fc12903fcbf6b11ba130fae3a5ac96ba127dcf66ef07044513521e11aed691";
     // 5159 pre-split + 25: the "host" section header (16 bytes) became
     // identity (20) + telemetry (21) headers. Row bytes unchanged — the
     // delta being exactly the header arithmetic is the cheap proof the
-    // RFC-020 S1 split moved no table content.
-    const SEEDED_ARTIFACT_LEN: usize = 5184;
+    // RFC-020 S1 split moved no table content. 5184 + 118 at
+    // RFC-STORAGE-003 S1: the desired_placement_height column on blob1
+    // and the one-row storage_view_transitions table (see the seed).
+    const SEEDED_ARTIFACT_LEN: usize = 5302;
 
     // Should: report identical manifests from the hash-only walk and the
     // full export, and byte-identical artifacts from two independently

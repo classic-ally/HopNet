@@ -473,3 +473,108 @@ fn drain_limit_is_bounded_and_rejects_non_positive() {
     assert!(resolve_drain_limit(-1).is_err());
     assert!(resolve_drain_limit(i32::MIN).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// RFC-STORAGE-003 S1 lifecycle handlers: skip semantics at the block seam.
+
+mod lifecycle_handlers {
+    use crate::handlers::{HandlerCtx, NullNotifier, NullScheduler, TransactionHandler, TxMeta};
+    use crate::storage_host::handlers::{ConfirmPlacementHandler, DeclarePlacementTargetHandler};
+    use hopnet_storage::lifecycle::{CONFIRM_TX_FN, DECLARE_TX_FN};
+    use hopnet_storage::{
+        BlobId, ConfirmPlacement, DeclarePlacementTarget, PlacementConfirmation, PlacementTarget,
+    };
+    use std::str::FromStr;
+
+    fn run(
+        handler: &dyn TransactionHandler,
+        function: &str,
+        payload: &[u8],
+        height: u64,
+    ) -> crate::handlers::HandlerResult {
+        let pool = super::setup_test_db();
+        let meta = TxMeta {
+            function,
+            payload,
+            submitter_node: 1,
+            user_id: None,
+        };
+        let notifier = NullNotifier;
+        let scheduler = NullScheduler;
+        let ctx = HandlerCtx {
+            fragments_dir: "",
+            node_id: Some(1),
+            height,
+            notifier: &notifier,
+            work: &scheduler,
+        };
+        let mut conn = pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        handler.process(&meta, false, &ctx, &db_tx)
+    }
+
+    fn encode<T: serde::Serialize>(v: &T) -> Vec<u8> {
+        bincode::serde::encode_to_vec(v, bincode::config::standard()).unwrap()
+    }
+
+    // Impact: the host aborts the WHOLE block on any handler error, so
+    // a proposer including one stale or bogus entry must never be able
+    // to wedge or reject a block — need is recorded, never refused.
+    // Should: return Ok for a declare batch whose every entry is invalid
+    // (unknown blob, height 0 preflight).
+    // Should not: fail the block on an invalid entry.
+    #[test]
+    fn declare_with_invalid_entries_never_fails_the_block() {
+        let payload = encode(&DeclarePlacementTarget {
+            targets: vec![PlacementTarget {
+                blob_id: BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap(),
+                from: 0,
+                to: 3,
+            }],
+        });
+        assert!(run(&DeclarePlacementTargetHandler, DECLARE_TX_FN, &payload, 10).is_ok());
+        // Mempool preflight runs at height 0: everything fails closed, still Ok.
+        assert!(run(&DeclarePlacementTargetHandler, DECLARE_TX_FN, &payload, 0).is_ok());
+    }
+
+    // Should: return Ok for a confirm batch whose every entry is invalid.
+    // Should not: fail the block on an invalid entry.
+    #[test]
+    fn confirm_with_invalid_entries_never_fails_the_block() {
+        let payload = encode(&ConfirmPlacement {
+            confirmations: vec![PlacementConfirmation {
+                blob_id: BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap(),
+                height: 3,
+            }],
+        });
+        assert!(run(&ConfirmPlacementHandler, CONFIRM_TX_FN, &payload, 10).is_ok());
+    }
+
+    // Should: reject an undecodable payload as InvalidPayload — the one
+    // error the lifecycle handlers may surface.
+    #[test]
+    fn undecodable_payloads_are_invalid() {
+        let junk = [0xFFu8; 7];
+        assert!(matches!(
+            run(&DeclarePlacementTargetHandler, DECLARE_TX_FN, &junk, 10),
+            Err(crate::db::DatabaseError::InvalidPayload)
+        ));
+        assert!(matches!(
+            run(&ConfirmPlacementHandler, CONFIRM_TX_FN, &junk, 10),
+            Err(crate::db::DatabaseError::InvalidPayload)
+        ));
+    }
+
+    // Should: register both lifecycle functions in the dispatch table
+    // and the boot tripwire's list, so a dropped registration is loud.
+    #[test]
+    fn lifecycle_functions_are_registered() {
+        for f in [DECLARE_TX_FN, CONFIRM_TX_FN] {
+            assert!(crate::storage_host::handlers::TX_FUNCTIONS.contains(&f));
+            assert!(
+                crate::DISPATCH_TABLE.contains_key(f),
+                "{f} missing from dispatch"
+            );
+        }
+    }
+}

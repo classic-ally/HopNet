@@ -214,7 +214,7 @@ CREATE TABLE data_blocks (
             added_bytes      INTEGER NOT NULL,
             placement_height INTEGER,  -- Consensus height when fragment placement was determined
             file_size        INTEGER NOT NULL  -- Total size of the file in bytes (i64, max ~9.2 EB)
-        );
+        , desired_placement_height INTEGER NOT NULL DEFAULT 0);
 
 CREATE TABLE blob_access (
             blob_id          TEXT NOT NULL,
@@ -281,6 +281,15 @@ CREATE TABLE hopnet_storage_pins (
         );
 
 CREATE INDEX idx_hopnet_storage_pins_blob ON hopnet_storage_pins(blob_id);
+
+CREATE INDEX idx_data_blocks_desired ON data_blocks(desired_placement_height);
+
+CREATE INDEX idx_data_blocks_inflight ON data_blocks(placement_height, desired_placement_height);
+
+CREATE TABLE storage_view_transitions (
+    height   INTEGER PRIMARY KEY,
+    snapshot BLOB NOT NULL
+);
 
 CREATE TABLE inodes (
             -- stable identifier for FileProvider (UUIDv7 encodes creation time)

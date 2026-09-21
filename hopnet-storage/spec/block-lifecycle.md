@@ -566,10 +566,21 @@ state to converged, with obligations never dropped in between.
     scheduling backpressure, never refusal of recorded need.
   - The transition record — heights where the derived storage view
     actually changed, each with a memoized view snapshot — is
-    node-local, derived incrementally at apply of view-input txs,
-    prunable below `min(desired)`, rebuildable by replay. Only
-    confirm validation reads historical snapshots; the sweep needs
-    just the latest. Transitions are designed-rare: the decay gate
+    derived incrementally at apply (every block, after its txs) and
+    prunable below `min(desired)`. Only confirm validation reads
+    historical snapshots; the sweep needs just the latest.
+    - S1 decision (2026-09-21): the record is REPLICATED state
+      (`storage_view_transitions`, exported and divergence-checked),
+      not node-local as first drafted. Apply validation must be
+      identical on every node, and a node-local record a joiner
+      lacked would make it skip declare/confirm entries other nodes
+      applied — diverging `data_blocks`. Every node derives the
+      same rows from the same replicated inputs, so writing them
+      into an exported table costs nothing and removes the rebuild
+      path entirely; the artifact carries the record across epochs.
+    - The snapshot is exactly the placement inputs (members,
+      weights, selection metrics), canonically ordered; the view
+      in force at height h is the latest row at or below h. Transitions are designed-rare: the decay gate
     and quantized tiers exist so metric noise does not move the
     view — days-to-weeks cadence in a steady mesh, and sustained
     churn is visible as a drain that never completes.
@@ -771,13 +782,20 @@ optimization and carries no proof obligation.
     eviction guards.
 - **The cutover is also the recovery event.**
   - The migration backfills `desired_placement_height =
-    COALESCE(placement_height, current_height)` (riding RFC-020's
-    schema evolution, together with the provenance column and the
-    suspect state). Placed blobs emerge quiescent; every
-    historically stranded blob emerges already in-flight toward
-    the current view — the entire stranded class is enrolled into
-    the new lifecycle by the schema migration itself, with no
+    COALESCE(placement_height, 0)` (riding RFC-020's schema
+    evolution; the provenance column and the suspect state ride
+    S5's step). Placed blobs emerge quiescent; every historically
+    stranded blob carries the sentinel 0, which sorts below every
+    recorded transition, so the first staleness pass declares the
+    whole stranded class forward — enrolled into the new lifecycle
+    by the schema migration plus one batched declare, with no
     operator action.
+    - S1 decision (2026-09-21): the draft said `current_height`. A
+      chain step must be deterministic on every node (RFC-020
+      contract rule 2) and the epoch crossing prunes
+      `consensus_meta` before fast-forward runs, so no height is
+      readable there. The sentinel makes every stranded blob enter
+      through declare, the one path the model checks.
   - The first propose-hook check then declares every blob placed
     against a pre-transition view — the population the starved
     migration rung never reached. One mesh-wide catch-up drain
@@ -816,12 +834,30 @@ optimization and carries no proof obligation.
     real copy. Falsification method
     institutionalized as `calmProbeStep`; the fast half of the
     suite runs in CI (`check-linux.yml`, job `spec`).
-- **S1 — Schema and txs.** The two columns (NOT NULL, backfill),
+- [x] **S1 — Schema and txs.** The two columns (NOT NULL, backfill),
   DeclarePlacementTarget and ConfirmPlacement handlers with full
   apply validation, the transition record memo. Rides RFC-020
   schema evolution. Gate: snapshotter parity on all touched DB
   functions; apply-side validation exercised by handler tests.
-- **S2 — The protection predicate.** One pure function consuming the
+  - Done 2026-09-21. Storage chain step 0002 (column + indexes +
+    `storage_view_transitions`), `hopnet_storage::lifecycle` (payloads,
+    canonical `ViewSnapshot`, record reads, `apply_declare` /
+    `apply_confirm` with per-entry skip semantics — an invalid entry
+    never fails the block, because the host's dispatch aborts the
+    whole block on a handler error), thin host shims registered as
+    `declare_placement_target` / `confirm_placement`, and the
+    transition memo derived after every block's txs in both the
+    validation dry-run and the execute pass. Birth stamps the goal:
+    `ApplyCtx` carries the block height and projections obtain it
+    from the handler context (`From<&HandlerCtx>`), so the columns
+    never reach a projection. Two recorded deviations: the backfill
+    sentinel (Cutover) and the replicated record (Handoff Protocol).
+    storage@1 artifacts import through a frozen v1 spec — the first
+    covered-set addition to a released section under RFC-020, by the
+    pre-split consensus precedent. Not yet: the recency window on
+    declare's `to` (S4 sizes it with the passes), attestation recency
+    at confirm (S5).
+- [ ] **S2 — The protection predicate.** One pure function consuming the
   transition record's memoized snapshots (confirmed epoch plus every
   in-flight epoch); evictor and reconciler both consume it; the
   unconfirmed-blob clause; a parity test pinning it to the model's
@@ -830,7 +866,7 @@ optimization and carries no proof obligation.
   the acrobatics. Also lands the ITF trace-conformance seam: the
   predicate evaluated against exported model-witness traces, the
   first rung of replaying Quint executions against real code.
-- **S3 — Pull machinery.** Pull duties derived at declare-apply;
+- [ ] **S3 — Pull machinery.** Pull duties derived at declare-apply;
   fetch-with-recovery; awaited-send marks (backpressure); the
   serial worker's deficit-first duty ladder. The push pipeline,
   threshold, and blind placement batcher retire in the same stage —
@@ -840,23 +876,23 @@ optimization and carries no proof obligation.
   asserting state agreement after every step — upgrading "the code
   resembles the model" to "the code refuses to diverge from it on
   every checked execution".
-- **S4 — The two passes.** Propose hook + grace rung (staleness);
+- [ ] **S4 — The two passes.** Propose hook + grace rung (staleness);
   fulfillment sampling fused with the tick (confirm discovery).
   The missing-class scan and the LIMIT-1 rebalance rung retire.
   Gate: orchestrator suite — distribution, departure re-encode,
   rebalance — green on the new machinery only.
-- **S5 — Disk-truth attestation.** Existence sweep both directions
+- [ ] **S5 — Disk-truth attestation.** Existence sweep both directions
   plus orphan-file fold-in; honest `self_verified_height` with
   provenance; suspect state; prompt attestation on pull
   completion.
-- **S6 — Lifecycle closure.** Data-block cleanup registered on
+- [ ] **S6 — Lifecycle closure.** Data-block cleanup registered on
   schedule; availability-class branch deleted; departed-node row
   pruning at confirm-apply plus one-time backfill.
-- **S7 — Observability.** The pane series (in-flight ages,
+- [ ] **S7 — Observability.** The pane series (in-flight ages,
   staleness backlog, converged predicate, verification freshness);
   transfer-timing histograms; per-tier ETA last, on top of
   measured throughput.
-- **Cutover.** One release: migration backfill enrolls the stranded
+- [ ] **Cutover.** One release: migration backfill enrolls the stranded
   class, the first propose hook starts the catch-up drain.
   Validation on the live mesh: watch the drain complete, then the
   converged predicate hold. The 518-block incident class is the

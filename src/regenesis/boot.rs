@@ -2416,12 +2416,21 @@ pub(crate) mod tests {
     fn legacy_sealed_database_adopts_and_crosses() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = sealed_db(dir.path());
-        // Simulate the pre-chain sealed shape: today head differs from
-        // baseline ONLY by schema_ordinals (identity 0001), so dropping
-        // it reproduces the baseline shape exactly.
+        // Simulate the pre-chain sealed shape by reverting every
+        // post-baseline step: identity 0001 (schema_ordinals) and
+        // storage 0002 (RFC-STORAGE-003: the goal column, its indexes,
+        // the transition record). Fingerprints compare DDL text, so the
+        // reverts must restore the baseline statements byte for byte.
         {
             let conn = open(&db_path);
-            conn.execute_batch("DROP TABLE schema_ordinals;").unwrap();
+            conn.execute_batch(
+                "DROP TABLE schema_ordinals;
+                 DROP INDEX idx_data_blocks_desired;
+                 DROP INDEX idx_data_blocks_inflight;
+                 DROP TABLE storage_view_transitions;
+                 ALTER TABLE data_blocks DROP COLUMN desired_placement_height;",
+            )
+            .unwrap();
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                 .unwrap();
         }

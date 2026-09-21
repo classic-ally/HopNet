@@ -16,6 +16,7 @@ mod files;
 mod fragments;
 mod helpers;
 mod inventory;
+mod lifecycle;
 mod metrics;
 mod nodes;
 mod resilience;
@@ -57,6 +58,7 @@ pub fn capture_all(
     resilience::capture(pool, &mut results);
     files::capture(pool, ctx, &mut results);
     inventory::capture(pool, ctx, &mut results);
+    lifecycle::capture(pool, &mut results);
     fileprovider::capture(pool, ctx, &mut results);
     documentprovider::capture(pool, ctx, &mut results);
     nodes::capture(pool, &mut results);
