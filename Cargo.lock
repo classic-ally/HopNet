@@ -3107,6 +3107,7 @@ dependencies = [
  "reed-solomon-simd",
  "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",

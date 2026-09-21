@@ -220,6 +220,93 @@ pub fn snapshot_at(
     bytes.map(|b| ViewSnapshot::decode(&b)).transpose()
 }
 
+/// The epochs protecting one blob's copies (RFC-STORAGE-003 S2): the
+/// confirmed epoch's assignment and every declared-but-unconfirmed epoch's
+/// — the distinct views on record in `(placement_height, desired]` plus the
+/// view in force at `desired` (the current target, always in flight while
+/// the pair differs). `Ok(None)` when the record cannot answer: a confirmed
+/// height below the record's first row, or a target no row reaches. The
+/// caller treats that as protected — never evict on an unanswerable
+/// question.
+pub fn epochs_for_blob(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+    placement_height: Option<u64>,
+    desired: u64,
+) -> Result<Option<crate::protection::ProtectionEpochs>, StorageError> {
+    let Some(confirmed_height) = placement_height else {
+        // Never confirmed: the predicate protects everything; no reads.
+        return Ok(Some(crate::protection::ProtectionEpochs::default()));
+    };
+    let Some(confirmed) = snapshot_at(conn, confirmed_height)? else {
+        return Ok(None);
+    };
+    let mut in_flight = Vec::new();
+    if desired != confirmed_height {
+        let Some(target) = snapshot_at(conn, desired)? else {
+            return Ok(None);
+        };
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT DISTINCT snapshot FROM storage_view_transitions
+                 WHERE height > ? AND height <= ? ORDER BY height",
+            )
+            .map_err(db_err("prepare in-flight snapshots"))?;
+        let rows = stmt
+            .query_map(
+                params![height_to_db(confirmed_height), height_to_db(desired)],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(db_err("read in-flight snapshots"))?;
+        let mut seen: Vec<ViewSnapshot> = Vec::new();
+        for row in rows {
+            let snapshot = ViewSnapshot::decode(&row.map_err(db_err("read in-flight row"))?)?;
+            if !seen.contains(&snapshot) {
+                seen.push(snapshot);
+            }
+        }
+        if !seen.contains(&target) {
+            seen.push(target);
+        }
+        in_flight = seen.iter().map(|s| s.assignment(blob_id)).collect();
+    }
+    Ok(Some(crate::protection::ProtectionEpochs {
+        confirmed: Some(confirmed.assignment(blob_id)),
+        in_flight,
+    }))
+}
+
+/// `(placement_height, desired_placement_height)` for a batch of blobs;
+/// unknown ids are absent from the map.
+pub fn placement_pairs(
+    conn: &rusqlite::Connection,
+    blob_ids: &[BlobId],
+) -> Result<HashMap<BlobId, (Option<u64>, u64)>, StorageError> {
+    let mut out = HashMap::new();
+    for chunk in blob_ids.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let query = format!(
+            "SELECT id, placement_height, desired_placement_height
+             FROM data_blocks WHERE id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&query).map_err(db_err("prepare pairs"))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, BlobId>(0)?,
+                    row.get::<_, Option<i64>>(1)?.map(height_from_db),
+                    height_from_db(row.get::<_, i64>(2)?),
+                ))
+            })
+            .map_err(db_err("read pairs"))?;
+        for row in rows {
+            let (id, placed, desired) = row.map_err(db_err("read pair row"))?;
+            out.insert(id, (placed, desired));
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // DeclarePlacementTarget apply
 
@@ -675,6 +762,44 @@ mod tests {
 
         // Re-confirming the confirmed goal is a no-op.
         assert_eq!(apply_confirm(&tx, &confirm(&b, 6)).unwrap().skipped, 1);
+    }
+
+    // Should: resolve a blob's protection epochs from the record — the
+    // confirmed view, every distinct in-flight view in (confirmed, desired]
+    // and the view at desired — and answer None when the record cannot.
+    // Should not: read anything for a never-confirmed blob (protected
+    // outright) or list in-flight epochs for a quiescent one.
+    #[test]
+    fn epochs_for_blob_reads_confirmed_and_in_flight_views() {
+        let mut conn = test_conn();
+        let tx = conn.transaction().unwrap();
+        let b = blob(1);
+        record_transition(&tx, 5, &view(&[1, 2])).unwrap();
+        record_transition(&tx, 8, &view(&[1, 2, 3])).unwrap();
+        record_transition(&tx, 12, &view(&[1, 3])).unwrap();
+
+        // Never confirmed: everything protected, no epochs listed.
+        let birth = epochs_for_blob(&tx, &b, None, 20).unwrap().unwrap();
+        assert_eq!(birth, crate::protection::ProtectionEpochs::default());
+
+        // Quiescent at 6: the view in force is the row at 5.
+        let quiet = epochs_for_blob(&tx, &b, Some(6), 6).unwrap().unwrap();
+        assert_eq!(quiet.confirmed, Some(view(&[1, 2]).assignment(&b)));
+        assert!(quiet.in_flight.is_empty());
+
+        // In flight 6 → 15: rows 8 and 12 are in range; the target view at
+        // 15 is row 12 (deduplicated).
+        let moving = epochs_for_blob(&tx, &b, Some(6), 15).unwrap().unwrap();
+        assert_eq!(
+            moving.in_flight,
+            vec![
+                view(&[1, 2, 3]).assignment(&b),
+                view(&[1, 3]).assignment(&b)
+            ]
+        );
+
+        // Confirmed below the record's first row: unanswerable.
+        assert_eq!(epochs_for_blob(&tx, &b, Some(3), 15).unwrap(), None);
     }
 
     // Should: reuse the engine's placement recipe — the class map from a

@@ -128,6 +128,23 @@ CI (`.forgejo/workflows/check-linux.yml`, job `spec`) runs the fast
 half — typecheck + the per-config witness suites — on every push/PR.
 The Apalache matrix stays a local ritual.
 
+## Trace conformance (RFC-STORAGE-003 S2)
+
+`spec/traces/*.itf.json` are ITF exports of the `scaled_bal` lifecycle
+witnesses. `tests/model_conformance.rs` (`cargo test -p hopnet-storage
+--test model_conformance`) replays every state of every trace against
+the Rust protection predicate and eviction planner, driven by the
+model's own `mix` placement scoring: the memo must equal the model's
+`protectedBy`, `protects` must equal `protected`, and the planner's
+verdict must equal `evictable`. Regenerate after a model change (the
+`#meta` block differs per run and is ignored):
+
+```bash
+npx @informalsystems/quint test spec/storage_policy.qnt --main scaled_bal \
+  --match 'prematureEvictionSafeTest|supersedeMidFlightTest|originHeldRegionTraceTest|originSurplusLapsesTest|evictLaunderAccountingTest|calmTightnessTest|dropMarkHealsTest' \
+  --out-itf 'spec/traces/{test}_{seq}.itf.json'
+```
+
 ## Regenerating the verify table
 
 If the placement functions in module `placement` change, the literal

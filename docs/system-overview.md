@@ -506,7 +506,7 @@ apply functions inside consensus handlers.
       repair scan, migration pull, eviction, weekly rolling scrub).
       Orchestrator: tier-membership, eviction-under-pressure,
       re-encode-after-departure (kill → decay → regenerate → download)
-- [~] Block lifecycle convergence — S0 + S1 of 7 + cutover
+- [~] Block lifecycle convergence — S0–S2 of 7 + cutover
       ([RFC-STORAGE-003](../hopnet-storage/spec/block-lifecycle.md),
       branch `rfc-block-lifecycle`, PR #72): the upload-to-placement
       pipeline joins the proven model. S0 (2026-08-22): the Quint model
@@ -517,10 +517,13 @@ apply functions inside consensus handlers.
       NOT NULL stamped at insert, the replicated `storage_view_transitions`
       record memoized after every block — plus `declare_placement_target`
       / `confirm_placement` consensus txs with per-entry apply validation
-      (`hopnet_storage::lifecycle`). Push distribution still runs
-      unchanged; S2–S4 (protection predicate, pull machinery, the two
-      passes) retire it, S5–S7 add disk-truth attestation, lifecycle
-      closure, observability.
+      (`hopnet_storage::lifecycle`). S2 (2026-09-21): the protection
+      predicate (`hopnet_storage::protection`) — confirmed epoch plus every
+      in-flight epoch, never-confirmed clause, pins — is the evictor's
+      single guard, and `tests/model_conformance.rs` replays exported Quint
+      witness traces (`spec/traces/`) against it. Push distribution still
+      runs unchanged; S3–S4 (pull machinery, the two passes) retire it,
+      S5–S7 add disk-truth attestation, lifecycle closure, observability.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage

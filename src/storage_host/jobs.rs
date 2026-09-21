@@ -634,7 +634,8 @@ pub async fn run_watermark_eviction(
         view.members.iter().map(|p| p.node_id).collect();
     let hashes: Vec<crate::types::Blake3Hash> = disk.iter().map(|(h, _)| *h).collect();
 
-    let (info, holder_counts, pinned) = {
+    let (info, holder_counts, pinned, protection) = {
+        use std::str::FromStr;
         let conn = app_state
             .db_pool
             .get()
@@ -646,35 +647,53 @@ pub async fn run_watermark_eviction(
                 .map_err(|e| Error::Failed(Arc::new(format!("holder counts: {e:?}").into())))?;
         let pinned = hopnet_storage::pins::pinned_blob_ids(&conn)
             .map_err(|e| Error::Failed(Arc::new(format!("pins: {e}").into())))?;
-        (info, holder_counts, pinned)
+
+        // The protection predicate per blob (RFC-STORAGE-003 S2): the
+        // confirmed epoch plus every in-flight epoch, from agreed state
+        // only — never the current view. An unanswerable record protects.
+        let blob_ids: Vec<hopnet_storage::BlobId> = {
+            let mut ids: Vec<String> = info.values().map(|f| f.blob_id.clone()).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids.iter()
+                .filter_map(|s| hopnet_storage::BlobId::from_str(s).ok())
+                .collect()
+        };
+        let pairs = hopnet_storage::lifecycle::placement_pairs(&conn, &blob_ids)
+            .map_err(|e| Error::Failed(Arc::new(format!("placement pairs: {e}").into())))?;
+        let mut protection: std::collections::HashMap<
+            String,
+            hopnet_storage::protection::Protection,
+        > = Default::default();
+        for blob_id in &blob_ids {
+            let verdict =
+                match pairs.get(blob_id) {
+                    Some((placed, desired)) => hopnet_storage::lifecycle::epochs_for_blob(
+                        &conn, blob_id, *placed, *desired,
+                    )
+                    .map_err(|e| Error::Failed(Arc::new(format!("protection epochs: {e}").into())))?
+                    .map(|epochs| hopnet_storage::protection::Protection::from_epochs(&epochs))
+                    .unwrap_or_else(hopnet_storage::protection::Protection::unknown),
+                    None => hopnet_storage::protection::Protection::unknown(),
+                };
+            protection.insert(blob_id.to_string(), verdict);
+        }
+        (info, holder_counts, pinned, protection)
     };
 
-    // Per-blob class assignment under the current view — responsibility is
-    // computed, never stored.
-    let mut assignments: std::collections::HashMap<String, Vec<i32>> = Default::default();
     let mut candidates = Vec::new();
     for (hash, size) in &disk {
         // Not in fragment_hashes = orphan; the orphan GC flow owns it.
         let Some(frag) = info.get(hash) else { continue };
-        let assignment = assignments.entry(frag.blob_id.clone()).or_insert_with(|| {
-            use std::str::FromStr;
-            let seed = hopnet_storage::BlobId::from_str(&frag.blob_id)
-                .map(|id| hopnet_storage::placement::placement_seed(&id))
-                .unwrap_or([0u8; 32]);
-            hopnet_storage::engine::assign_for_blob(
-                &seed,
-                view.members.clone(),
-                view.metrics.clone(),
-                &view.weights,
-            )
-            .1
-        });
+        let protected = protection
+            .get(&frag.blob_id)
+            .map(|p| p.protects(frag.local_index, my_node_id, pinned.contains(&frag.blob_id)))
+            .unwrap_or(true);
         candidates.push(EvictionCandidate {
             fragment_hash: *hash,
             blob_id: frag.blob_id.clone(),
             size_bytes: *size,
-            responsible: assignment.get(frag.local_index as usize).copied() == Some(my_node_id),
-            pinned: pinned.contains(&frag.blob_id),
+            protected,
             other_member_holders: holder_counts.get(hash).copied().unwrap_or(0),
         });
     }

@@ -38,3 +38,5 @@ engine = ["dep:tokio", "dep:tokio-stream", "dep:async-stream", "dep:bytes"]
 tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
 tokio-stream = "0.1.17"
 tempfile = "3"
+# ITF trace reader for the model-conformance test (spec/traces).
+serde_json = "1"

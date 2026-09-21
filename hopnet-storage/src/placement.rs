@@ -277,6 +277,17 @@ pub fn assign_fragment_classes(
     })
 }
 
+/// The model's deterministic integer hash stand-in, ported verbatim from
+/// spec/storage_policy.qnt `mix` (staged mod-multiply). Model-parity use
+/// only — the table-guard test and the trace-conformance test drive
+/// `assign_classes_by_score` with it to reproduce the model's literal
+/// placement; production scoring is blake3 (`assign_fragment_classes`).
+pub fn qnt_mix(n: i64, f: i64) -> i64 {
+    let a = (n * 1103515245 + 12345) % 2147483647;
+    let b = (a * 31 + f * 1103515245 + 54321) % 2147483647;
+    (b * 65539 + a * (f + 7)) % 2147483647
+}
+
 /// Single responsible node for one class (None on an empty member set).
 pub fn responsible_node(
     seed: &[u8; 32],
@@ -490,14 +501,6 @@ mod tests {
         let c = assign_fragment_classes(&seed(9), &shuffled, &weights, 30);
         assert_eq!(a, b);
         assert_eq!(a, c);
-    }
-
-    /// The model's deterministic integer hash stand-in, ported verbatim
-    /// from spec/storage_policy.qnt `mix` (staged mod-multiply).
-    fn qnt_mix(n: i64, f: i64) -> i64 {
-        let a = (n * 1103515245 + 12345) % 2147483647;
-        let b = (a * 31 + f * 1103515245 + 54321) % 2147483647;
-        (b * 65539 + a * (f + 7)) % 2147483647
     }
 
     // Should: reproduce the literal BAL_TABLE from the verified model

@@ -23,6 +23,7 @@ pub mod maintenance;
 pub mod membership;
 pub mod pins;
 pub mod placement;
+pub mod protection;
 pub mod rpc;
 pub mod rs;
 pub mod serve;

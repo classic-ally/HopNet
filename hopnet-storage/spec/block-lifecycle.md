@@ -857,7 +857,7 @@ optimization and carries no proof obligation.
     pre-split consensus precedent. Not yet: the recency window on
     declare's `to` (S4 sizes it with the passes), attestation recency
     at confirm (S5).
-- [ ] **S2 — The protection predicate.** One pure function consuming the
+- [x] **S2 — The protection predicate.** One pure function consuming the
   transition record's memoized snapshots (confirmed epoch plus every
   in-flight epoch); evictor and reconciler both consume it; the
   unconfirmed-blob clause; a parity test pinning it to the model's
@@ -866,6 +866,21 @@ optimization and carries no proof obligation.
   the acrobatics. Also lands the ITF trace-conformance seam: the
   predicate evaluated against exported model-witness traces, the
   first rung of replaying Quint executions against real code.
+  - Done 2026-09-21. `hopnet_storage::protection` holds the memo
+    (`Protection::from_epochs`) and the guard (`protects(class,
+    node, pinned)`), pure over assignments; `lifecycle::epochs_for_blob`
+    resolves a blob's confirmed and in-flight epochs from the record
+    (distinct views in `(placement_height, desired]` plus the view at
+    `desired`). The evictor (`run_watermark_eviction`) now asks the
+    predicate instead of the current view; an unanswerable record
+    (confirmed height below the first row) protects — never evict on
+    an unanswerable question. `spec/traces/` carries seven exported
+    witness traces and `tests/model_conformance.rs` replays them:
+    the Rust memo equals the model's `protectedBy` on every state,
+    `protects` equals `protected`, and the planner's verdict equals
+    `evictable` — the supersede counterexample finally has a fast
+    guard. The reconciler half is S3's: it must call `protects`,
+    never a current-view responsibility.
 - [ ] **S3 — Pull machinery.** Pull duties derived at declare-apply;
   fetch-with-recovery; awaited-send marks (backpressure); the
   serial worker's deficit-first duty ladder. The push pipeline,
