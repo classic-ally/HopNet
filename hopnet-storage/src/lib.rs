@@ -24,6 +24,7 @@ pub mod membership;
 pub mod pins;
 pub mod placement;
 pub mod protection;
+pub mod reconcile;
 pub mod rpc;
 pub mod rs;
 pub mod serve;

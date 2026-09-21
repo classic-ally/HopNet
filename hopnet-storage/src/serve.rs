@@ -44,8 +44,9 @@ pub enum StoreOutcome {
 }
 
 /// Store a fragment pushed by a peer: enforce the size cap and content
-/// addressing, persist atomically, and queue the stored_locally settlement.
-pub fn serve_fragment_store<L: LocalStateSink + ?Sized>(
+/// addressing, persist atomically, and settle stored_locally (awaited —
+/// the wire arm survives for compatibility; the engine no longer pushes).
+pub async fn serve_fragment_store<L: LocalStateSink + ?Sized>(
     fragments_dir: &str,
     sink: &L,
     fragment_hash: &Blake3Hash,
@@ -75,6 +76,6 @@ pub fn serve_fragment_store<L: LocalStateSink + ?Sized>(
         return StoreOutcome::Io(e);
     }
 
-    sink.mark_local(*fragment_hash);
+    sink.mark_local(*fragment_hash).await;
     StoreOutcome::Stored
 }

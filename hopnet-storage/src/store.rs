@@ -663,185 +663,15 @@ pub fn row_to_blob_access(row: &rusqlite::Row<'_>) -> Result<BlobAccess, rusqlit
     })
 }
 
-/// A blob this node should distribute: its full local fragment set, ordered
-/// by (chunk_number, local_index).
-#[derive(Debug, Clone)]
-pub struct DistributableBlob {
-    pub blob_id: BlobId,
-    /// (local_index, fragment_hash) per fragment.
-    pub fragments: Vec<(u32, Blake3Hash)>,
-}
-
-/// Origin filter for the distribution engine: return the blob's fragments
-/// IFF it is unplaced (`placement_height IS NULL`) and EVERY fragment is
-/// stored locally — i.e. this node holds the complete set (the origin).
-/// `None` is the cheap common case on non-origin nodes.
-pub fn get_distributable_blob(
-    conn: &rusqlite::Connection,
-    blob_id: &BlobId,
-) -> Result<Option<DistributableBlob>, StorageError> {
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT fh.local_index, fh.fragment_hash
-             FROM data_blocks db
-             JOIN fragment_hashes fh ON db.id = fh.data_block_id
-             WHERE db.id = ?
-               AND db.placement_height IS NULL
-               AND fh.stored_locally = TRUE
-               AND (SELECT COUNT(*) FROM fragment_hashes
-                    WHERE data_block_id = db.id AND stored_locally = TRUE)
-                   = db.fragment_count
-             ORDER BY fh.chunk_number, fh.local_index",
-        )
-        .map_err(db_err("prepare distributable blob query"))?;
-    let fragments: Vec<(u32, Blake3Hash)> = stmt
-        .query_map(params![blob_id], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(db_err("query distributable blob"))?
-        .collect::<Result<_, _>>()
-        .map_err(db_err("read distributable blob row"))?;
-    if fragments.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(DistributableBlob {
-            blob_id: blob_id.clone(),
-            fragments,
-        }))
-    }
-}
-
-/// Blob ids stuck at `placement_height IS NULL` — distribution either never
-/// ran or failed, and nothing retries them: the distribution worker drops a
-/// failed blob (no requeue), and tier-1 repair bails on unplaced blobs by
-/// design (`repair_one` diffs placement against a prior height it does not
-/// have). This is the selection half of the operator drain that recovers
-/// them; `notify_blob_committed` is the other half.
-///
-/// Ordered by `id`, which is a UUIDv7 — its leading 48 bits are a
-/// millisecond timestamp, so lexicographic order IS creation order. Oldest
-/// stranded blobs drain first.
-///
-/// `count_unplaced_blobs` is the unbounded companion: the caller reports
-/// how many remain beyond `limit` so an operator knows how many more passes
-/// are needed.
-pub fn get_unplaced_blob_ids(
-    conn: &rusqlite::Connection,
-    limit: i32,
-) -> Result<Vec<BlobId>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT id FROM data_blocks
-         WHERE placement_height IS NULL
-         ORDER BY id ASC
-         LIMIT ?",
-    )?;
-    // Bound to a local: the MappedRows temporary borrows `stmt`, so
-    // returning the collect() directly outlives the statement.
-    let ids: Result<Vec<BlobId>, _> = stmt.query_map(params![limit], |row| row.get(0))?.collect();
-    ids
-}
-
-/// Total blobs stuck unplaced, ignoring any drain limit. Paired with
-/// [`get_unplaced_blob_ids`] so a drain response can report the remaining
-/// backlog rather than just what it enqueued this pass.
+/// Blobs never confirmed (`placement_height IS NULL`), ignoring any drain
+/// limit — the operator drain's backlog figure and the pane's unplaced
+/// count.
 pub fn count_unplaced_blobs(conn: &rusqlite::Connection) -> Result<i64, rusqlite::Error> {
     conn.query_row(
         "SELECT COUNT(*) FROM data_blocks WHERE placement_height IS NULL",
         [],
         |row| row.get(0),
     )
-}
-
-/// A rebalance candidate: one placed blob with its full fragment layout.
-#[derive(Debug, Clone)]
-pub struct DataBlockRebalanceInfo {
-    pub data_block_id: BlobId,
-    pub placement_height: u64,
-    pub fragments: Vec<FragmentInfo>,
-}
-
-/// One fragment of a rebalance candidate: hash + decoded chunk-type label.
-#[derive(Debug, Clone)]
-pub struct FragmentInfo {
-    pub fragment_hash: Blake3Hash,
-    pub chunk_type: String,
-}
-
-/// Get data blocks that need rebalancing (distributed before a certain
-/// height). Returns data blocks with their fragments, ordered by
-/// placement_height (oldest first); blobs with an incomplete fragment set
-/// are skipped.
-pub fn get_data_blocks_for_rebalancing(
-    conn: &rusqlite::Connection,
-    max_placement_height: u64,
-    limit: i32,
-) -> Result<Vec<DataBlockRebalanceInfo>, rusqlite::Error> {
-    // Get data blocks that were placed before the specified height
-    let query = "SELECT DISTINCT db.id, db.placement_height, db.fragment_count
-         FROM data_blocks db
-         WHERE db.placement_height IS NOT NULL
-           AND db.placement_height < ?
-         ORDER BY db.placement_height ASC
-         LIMIT ?";
-    let mut stmt = conn.prepare(query)?;
-    let data_blocks: Vec<(BlobId, u64, i32)> = stmt
-        .query_map(params![height_to_db(max_placement_height), limit], |row| {
-            Ok((row.get(0)?, row.get(1).map(height_from_db)?, row.get(2)?))
-        })?
-        .collect::<Result<_, _>>()?;
-
-    // For each data block, get all its fragments
-    let fragment_query = "SELECT fragment_hash, chunk_type
-             FROM fragment_hashes
-             WHERE data_block_id = ?
-             ORDER BY chunk_number";
-    let mut fragment_stmt = conn.prepare(fragment_query)?;
-
-    let mut result = Vec::new();
-    for (data_block_id, placement_height, total_fragments) in data_blocks {
-        let fragments: Vec<FragmentInfo> = fragment_stmt
-            .query_map(params![&data_block_id], |row| {
-                let fragment_hash: Blake3Hash = row.get(0)?;
-                // fragment_hashes.chunk_type is the storage schema's 0/1
-                // encoding (see install_schema) — decoded to its label here.
-                let chunk_type = match row.get::<_, i32>(1)? {
-                    0 => "original".to_string(),
-                    1 => "recovery".to_string(),
-                    other => {
-                        return Err(rusqlite::Error::FromSqlConversionFailure(
-                            1,
-                            rusqlite::types::Type::Integer,
-                            format!("invalid chunk_type {other}").into(),
-                        ));
-                    }
-                };
-                Ok(FragmentInfo {
-                    fragment_hash,
-                    chunk_type,
-                })
-            })?
-            .collect::<Result<_, _>>()?;
-
-        // Only include data blocks where we have all fragments
-        if fragments.len() == total_fragments as usize {
-            result.push(DataBlockRebalanceInfo {
-                data_block_id,
-                placement_height,
-                fragments,
-            });
-        } else {
-            tracing::warn!(
-                "Data block {} has {} fragments but expected {}, skipping",
-                data_block_id,
-                fragments.len(),
-                total_fragments
-            );
-        }
-    }
-
-    tracing::info!(
-        "Found {} complete data blocks for rebalancing",
-        result.len()
-    );
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -1084,74 +914,18 @@ mod tests {
 
     /// Insert a bare data_blocks row with the given placement height.
     fn seed_block(conn: &rusqlite::Connection, id: &str, placement: Option<i64>) {
-        seed_block_with_fragments(conn, id, placement, 30);
-    }
-
-    /// As `seed_block`, but pinning `fragment_count` — the distributable
-    /// query compares it against the locally-stored fragment rows.
-    fn seed_block_with_fragments(
-        conn: &rusqlite::Connection,
-        id: &str,
-        placement: Option<i64>,
-        fragment_count: i32,
-    ) {
         conn.execute(
             "INSERT INTO data_blocks
                  (id, modified_at, file_hash, fragment_count, added_bytes,
                   placement_height, file_size)
-             VALUES (?, '', X'00', ?, 0, ?, 0)",
-            params![BlobId::from_str(id).unwrap(), fragment_count, placement],
+             VALUES (?, '', X'00', 30, 0, ?, 0)",
+            params![BlobId::from_str(id).unwrap(), placement],
         )
         .unwrap();
     }
-
-    // Impact: the drain endpoint's selection half. Picking up a placed blob
-    // would re-run distribution for data already committed mesh-wide; missing
-    // an unplaced one leaves it stranded single-copy forever, since nothing
-    // else retries a failed distribution.
-    // Should: return only rows whose placement_height IS NULL.
-    // Should: order oldest-first, so the longest-stranded blobs drain first.
-    // Should: respect the caller's limit.
-    // Should not: include blobs that already carry a placement height.
+    // Should: count every never-confirmed blob, and none once confirmed.
     #[test]
-    fn unplaced_selection_takes_only_null_placement_oldest_first() {
-        let conn = test_conn();
-        // UUIDv7: the leading 48 bits are a ms timestamp, so these are in
-        // creation order. Interleave placed rows to prove the filter bites.
-        seed_block(&conn, "01890a5d-0001-7000-8000-000000000001", None);
-        seed_block(&conn, "01890a5d-0002-7000-8000-000000000002", Some(42));
-        seed_block(&conn, "01890a5d-0003-7000-8000-000000000003", None);
-        seed_block(&conn, "01890a5d-0004-7000-8000-000000000004", Some(7));
-        seed_block(&conn, "01890a5d-0005-7000-8000-000000000005", None);
-
-        let all = get_unplaced_blob_ids(&conn, 100).unwrap();
-        assert_eq!(
-            all,
-            vec![
-                BlobId::from_str("01890a5d-0001-7000-8000-000000000001").unwrap(),
-                BlobId::from_str("01890a5d-0003-7000-8000-000000000003").unwrap(),
-                BlobId::from_str("01890a5d-0005-7000-8000-000000000005").unwrap(),
-            ],
-            "only unplaced blobs, in creation order"
-        );
-
-        let limited = get_unplaced_blob_ids(&conn, 2).unwrap();
-        assert_eq!(
-            limited,
-            all[..2],
-            "limit takes the oldest, not an arbitrary 2"
-        );
-
-        assert_eq!(count_unplaced_blobs(&conn).unwrap(), 3);
-    }
-
-    // Impact: the drain response reports remaining backlog from this count,
-    // so an operator knows whether another pass is needed. If it tracked the
-    // limit it would read as "done" while blobs were still stranded.
-    // Should: count every unplaced blob regardless of any drain limit.
-    // Should: report zero once every blob carries a placement height.
-    #[test]
-    fn unplaced_count_ignores_the_drain_limit() {
+    fn unplaced_count_tracks_never_confirmed_blobs() {
         let conn = test_conn();
         for i in 1..=5 {
             seed_block(
@@ -1160,63 +934,10 @@ mod tests {
                 None,
             );
         }
-        assert_eq!(get_unplaced_blob_ids(&conn, 2).unwrap().len(), 2);
-        assert_eq!(
-            count_unplaced_blobs(&conn).unwrap(),
-            5,
-            "count is the backlog, not the page"
-        );
+        assert_eq!(count_unplaced_blobs(&conn).unwrap(), 5);
 
         conn.execute("UPDATE data_blocks SET placement_height = 1", [])
             .unwrap();
         assert_eq!(count_unplaced_blobs(&conn).unwrap(), 0);
-        assert!(get_unplaced_blob_ids(&conn, 100).unwrap().is_empty());
-    }
-
-    // Impact: this is what makes the operator drain repeatable. The drain
-    // enqueues blob ids fire-and-forget, so the same blob can be kicked while
-    // an earlier kick is still in flight, or after it has since been placed.
-    // The worker's only guard against re-distributing committed data is this
-    // query returning None — if it ever stopped filtering on placement, a
-    // second drain pass would re-push fragments for blobs already committed
-    // mesh-wide.
-    // Should: offer an unplaced blob whose fragments are all held locally.
-    // Should not: offer that same blob once a placement height is committed.
-    #[test]
-    fn distributable_blob_stops_offering_a_blob_once_it_is_placed() {
-        let conn = test_conn();
-        let id = "01890a5d-0001-7000-8000-000000000001";
-        let blob_id = BlobId::from_str(id).unwrap();
-        seed_block_with_fragments(&conn, id, None, 2);
-        for idx in 0..2u32 {
-            conn.execute(
-                "INSERT INTO fragment_hashes
-                     (data_block_id, chunk_number, local_index, fragment_id,
-                      fragment_hash, chunk_type, stored_locally)
-                 VALUES (?, 0, ?, '', ?, 0, TRUE)",
-                params![blob_id, idx, Blake3Hash::from_bytes([idx as u8; 32])],
-            )
-            .unwrap();
-        }
-
-        let offered = get_distributable_blob(&conn, &blob_id).unwrap();
-        assert!(
-            offered.is_some(),
-            "unplaced blob with a complete local fragment set is distributable"
-        );
-
-        // A placement commit lands (either from the first kick, or from a
-        // concurrent one) — the blob must drop out of the distributable set.
-        conn.execute(
-            "UPDATE data_blocks SET placement_height = 99 WHERE id = ?",
-            params![blob_id],
-        )
-        .unwrap();
-        assert!(
-            get_distributable_blob(&conn, &blob_id).unwrap().is_none(),
-            "a placed blob must never be re-distributed by a repeat drain"
-        );
-        // And it is no longer a drain candidate at all.
-        assert!(get_unplaced_blob_ids(&conn, 100).unwrap().is_empty());
     }
 }

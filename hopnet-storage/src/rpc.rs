@@ -67,7 +67,7 @@ fn encode<T: Serialize>(msg: &T) -> Vec<u8> {
 /// per-arm serve shells and the [`StoreOutcome`] → wire mapping the host
 /// used to own. No auth needed — mesh connections are already authenticated
 /// by the peer directory's before-registration hook.
-pub fn serve<L: LocalStateSink + ?Sized>(
+pub async fn serve<L: LocalStateSink + ?Sized>(
     fragments_dir: &str,
     sink: &L,
     req: FragmentRequest,
@@ -91,7 +91,7 @@ pub fn serve<L: LocalStateSink + ?Sized>(
         FragmentRequest::Store {
             fragment_hash,
             data,
-        } => match serve::serve_fragment_store(fragments_dir, sink, &fragment_hash, data) {
+        } => match serve::serve_fragment_store(fragments_dir, sink, &fragment_hash, data).await {
             StoreOutcome::Stored => FragmentResponse::Store {
                 success: true,
                 already_existed: false,

@@ -16,7 +16,6 @@ use hopnet_storage::BlobId;
 use hopnet_storage::StorageError;
 use hopnet_storage::engine::{EngineConfig, EngineHandle, Seams};
 use hopnet_storage::rpc::RpcTransport;
-use hopnet_storage::store::DistributableBlob;
 use hopnet_storage::traits::{
     LocalStateSink, PeerRef, PlacementInputs, StateReader, StorageView, SubmitError, TxSubmitter,
 };
@@ -32,10 +31,9 @@ impl SubstrateHost {
     }
 }
 
-/// Spawn the storage distribution engine behind the host seams and install
-/// its handle in AppState (idempotent; mirrors the malachite OnceCell).
-/// Data-plane workers land on the CALLER's runtime (main — fragment sends);
-/// the placement batcher lands on the consensus queue runtime.
+/// Spawn the storage reconciler behind the host seams and install its
+/// handle in AppState (idempotent; mirrors the malachite OnceCell). The
+/// serial worker lands on the CALLER's runtime (main — fragment fetches).
 pub fn spawn_storage_engine(app_state: &AppState) {
     if app_state.storage.get().is_some() {
         return;
@@ -54,7 +52,6 @@ pub fn spawn_storage_engine(app_state: &AppState) {
             fragments_dir: app_state.fragments_dir.clone(),
         },
         tokio::runtime::Handle::current(),
-        crate::consensus::queue::queue_rt().handle().clone(),
     );
     // Lost race = another spawner won; their engine is equivalent.
     let _ = app_state.storage.set(handle);
@@ -187,16 +184,34 @@ impl StateReader for SubstrateHost {
             .collect())
     }
 
-    fn distributable_blob(
+    fn pull_target(
         &self,
         blob_id: &BlobId,
-    ) -> Result<Option<DistributableBlob>, StorageError> {
+    ) -> Result<Option<hopnet_storage::traits::PullTarget>, StorageError> {
         let conn = self
             .app_state
             .db_pool
             .get()
             .map_err(|e| StorageError::Host(format!("pool checkout: {e}")))?;
-        hopnet_storage::store::get_distributable_blob(&conn, blob_id)
+        hopnet_storage::lifecycle::pull_target(&conn, blob_id)
+    }
+
+    fn self_check_report(&self) -> Result<hopnet_storage::SelfCheckFragments, StorageError> {
+        let node_id = self
+            .app_state
+            .get_node_id()
+            .map_err(|_| StorageError::Host("node id not set".to_string()))?;
+        crate::db::inventory::compute_inventory_differential(self.app_state.db_pool.get(), node_id)
+            .map_err(|e| StorageError::Host(format!("inventory differential: {e:?}")))
+    }
+
+    fn confirm_ready(&self, blob_id: &BlobId) -> Result<Option<u64>, StorageError> {
+        let conn = self
+            .app_state
+            .db_pool
+            .get()
+            .map_err(|e| StorageError::Host(format!("pool checkout: {e}")))?;
+        hopnet_storage::lifecycle::confirm_ready(&conn, blob_id)
     }
 
     fn blob_manifest(
@@ -234,29 +249,50 @@ impl TxSubmitter for SubstrateHost {
     }
 }
 
+/// Awaited settlement (RFC-STORAGE-003 S3): the send waits for queue room
+/// (a full queue slows the writer instead of dropping its mark) and the
+/// drain acknowledges once the flag is written, so a caller that goes on
+/// to attest sees its own marks. A closed queue (shutdown) resolves
+/// immediately — the disk-truth sweep (S5) is the backstop for anything
+/// unrecorded.
 impl LocalStateSink for SubstrateHost {
-    fn mark_local(&self, fragment_hash: Blake3Hash) {
-        if let Err(e) = self
+    async fn mark_local(&self, fragment_hash: Blake3Hash) {
+        let (done, ack) = tokio::sync::oneshot::channel();
+        if self
             .app_state
             .local_state_tx
-            .try_send(LocalStateUpdate::MarkLocal { fragment_hash })
+            .send(LocalStateUpdate::MarkLocal {
+                fragment_hash,
+                done: Some(done),
+            })
+            .await
+            .is_err()
         {
             tracing::warn!(
-                "Local state queue full, dropping mark-local for {}: {}",
-                fragment_hash.to_hex(),
-                e
+                "local state queue closed: mark-local for {} unrecorded",
+                fragment_hash.to_hex()
             );
+            return;
         }
+        let _ = ack.await;
     }
 
-    fn mark_remote_batch(&self, fragment_hashes: Vec<Blake3Hash>) {
-        if let Err(e) = self
+    async fn mark_remote_batch(&self, fragment_hashes: Vec<Blake3Hash>) {
+        let (done, ack) = tokio::sync::oneshot::channel();
+        if self
             .app_state
             .local_state_tx
-            .try_send(LocalStateUpdate::MarkRemoteBatch { fragment_hashes })
+            .send(LocalStateUpdate::MarkRemoteBatch {
+                fragment_hashes,
+                done: Some(done),
+            })
+            .await
+            .is_err()
         {
-            tracing::warn!("Local state queue full, dropping mark-remote batch: {}", e);
+            tracing::warn!("local state queue closed: mark-remote batch unrecorded");
+            return;
         }
+        let _ = ack.await;
     }
 }
 

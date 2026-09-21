@@ -195,22 +195,19 @@ async fn cleanup_orphaned_data_blocks(
     Ok(total_cleaned)
 }
 
-/// Network rebalancing job (tier-1 repair, RFC-014): for blobs whose
-/// placement commit has aged past min_age_heights, ask the storage engine
-/// to recompute placement at the current height and pull/re-commit if the
-/// selection moved.
+/// The level-triggered obligation check (RFC-STORAGE-003 S3): re-kick up
+/// to `max_data_blocks` in-flight blobs — goal not yet confirmed, oldest
+/// goal first — through this node's reconciler, which pulls what it owes
+/// under each goal, attests, and proposes confirmation when the evidence
+/// is complete. Every kick is idempotent; the in-flight set is the
+/// work-list and a blob leaves it at confirm, so no cursor exists to
+/// starve. `min_age_heights` is accepted for the route's compatibility
+/// and ignored: need is need.
 pub async fn run_network_rebalancing(
     app_state: &AppState,
     max_data_blocks: i32,
-    min_age_heights: u64,
+    _min_age_heights: u64,
 ) -> Result<NetworkRebalancingResult, Error> {
-    tracing::info!(
-        "Starting network rebalancing (max {} data blocks, min age {} heights)",
-        max_data_blocks,
-        min_age_heights
-    );
-
-    // Get current consensus height
     let consensus_height = match app_state
         .db_pool
         .get()
@@ -226,71 +223,84 @@ pub async fn run_network_rebalancing(
         }
     };
 
-    let max_placement_height = consensus_height.saturating_sub(min_age_heights);
-    tracing::info!(
-        "Rebalancing at height {}, looking for data blocks placed before height {}",
-        consensus_height,
-        max_placement_height
-    );
-
-    // Get data blocks that need rebalancing — scoped checkout, dropped
-    // before the engine's data plane runs.
-    let data_blocks_to_rebalance = {
+    // Scoped checkout, dropped before the engine's data plane runs.
+    let in_flight = {
         let conn = app_state.db_pool.get().map_err(|e| {
-            tracing::error!("Failed to get database connection for rebalancing: {:?}", e);
             Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
                 "Failed to get database connection: {:?}",
                 e
             )))))
         })?;
-        hopnet_storage::store::get_data_blocks_for_rebalancing(
-            &conn,
-            max_placement_height,
-            max_data_blocks,
-        )
-        .map_err(|e| {
-            tracing::error!("Failed to get data blocks for rebalancing: {:?}", e);
-            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
-                "Failed to get data blocks: {:?}",
-                e
-            )))))
-        })?
+        hopnet_storage::lifecycle::in_flight_blobs(&conn, max_data_blocks.max(0) as usize).map_err(
+            |e| {
+                Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+                    "Failed to select in-flight blobs: {e}"
+                )))))
+            },
+        )?
     };
 
-    tracing::info!(
-        "Found {} data blocks to check for repair",
-        data_blocks_to_rebalance.len()
-    );
-
-    // Tier-1 repair (RFC-014): the storage engine recomputes the seeded
-    // placement at the current height (blob_id seed — computable again since
-    // Stage B killed the file_hash seed) and pulls what this node should now
-    // hold; the new primary re-commits placement. Serial on the engine's
-    // repair worker.
     let Some(storage) = app_state.storage.get() else {
         return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
             "storage engine not running",
         )))));
     };
 
-    let stats = storage
-        .repair_blobs(
-            data_blocks_to_rebalance
-                .into_iter()
-                .map(|block| block.data_block_id),
-        )
-        .await;
-
+    let stats = storage.pull_blobs(in_flight).await;
     let result = NetworkRebalancingResult {
         consensus_height,
         data_blocks_checked: stats.checked,
-        data_blocks_rebalanced: stats.repaired,
+        data_blocks_rebalanced: stats.confirms_proposed,
         data_blocks_failed: stats.failed,
-        total_fragments_migrated: stats.fragments_pulled,
+        total_fragments_migrated: stats.pulled + stats.rebuilt,
     };
-
-    tracing::info!("Network rebalancing completed: {:?}", result);
+    if stats.checked > 0 {
+        tracing::info!("In-flight pull check completed: {:?}", result);
+    }
     Ok(result)
+}
+
+/// The fulfillment floor (RFC-STORAGE-003 S3): one batched
+/// ConfirmPlacement for the in-flight blobs whose evidence is complete
+/// right now. Apply validation re-checks on every node, so a stale read
+/// here costs a skipped entry, never a wrong confirmation. Returns how
+/// many confirmations were proposed.
+pub async fn propose_ready_confirmations(
+    app_state: &AppState,
+    limit: usize,
+) -> Result<usize, Error> {
+    let ready: Vec<hopnet_storage::PlacementConfirmation> = {
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
+        let mut out = Vec::new();
+        for blob_id in hopnet_storage::lifecycle::in_flight_blobs(&conn, limit)
+            .map_err(|e| Error::Failed(Arc::new(format!("in-flight read: {e}").into())))?
+        {
+            if let Some(height) = hopnet_storage::lifecycle::confirm_ready(&conn, &blob_id)
+                .map_err(|e| Error::Failed(Arc::new(format!("confirm read: {e}").into())))?
+            {
+                out.push(hopnet_storage::PlacementConfirmation { blob_id, height });
+            }
+        }
+        out
+    };
+    if ready.is_empty() {
+        return Ok(0);
+    }
+    let count = ready.len();
+    let payload = hopnet_storage::ConfirmPlacement {
+        confirmations: ready,
+    };
+    let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        .map_err(|e| Error::Failed(Arc::new(format!("confirm encode: {e}").into())))?;
+    SubstrateHost::new(app_state.clone())
+        .submit(hopnet_storage::lifecycle::CONFIRM_TX_FN, encoded)
+        .await
+        .map_err(|e| Error::Failed(Arc::new(format!("confirm submit: {e:?}").into())))?;
+    tracing::info!("fulfillment: proposed {count} confirmations");
+    Ok(count)
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -302,27 +312,21 @@ pub struct NetworkRebalancingResult {
     pub total_fragments_migrated: usize,
 }
 
-/// Operator drain for blobs stranded at `placement_height IS NULL`: re-kick
-/// them onto the distribution pipeline the same way a decided blob is kicked.
+/// Operator re-kick (RFC-STORAGE-003 S3): wake this node's reconciler for
+/// up to `limit` in-flight blobs, oldest goal first — the same check the
+/// policy tick runs, on demand. Survives as a manual re-kick during the
+/// cutover drain and retires once the reconciler owns the full lifecycle
+/// (S4); its selection query IS the reconciler's own.
 ///
-/// Exists because nothing else retries them. A failed `distribute_one` is
-/// logged and dropped with no requeue, and tier-1 repair skips unplaced blobs
-/// by construction (it diffs placement against a prior height that does not
-/// exist). A transient peer outage therefore strands every blob written
-/// during it, permanently and silently.
-///
-/// FIRE-AND-FORGET. `notify_blob_committed` is a non-blocking send onto the
-/// distribution channel, so this returns once the ids are enqueued — NOT once
-/// they are placed. Confirm by re-reading `unplaced_total` on a later call.
-///
-/// Re-running is safe: `distribute_one` guards on `get_distributable_blob`,
-/// which requires `placement_height IS NULL` and a complete local fragment
-/// set, so an already-placed or non-origin blob is a no-op in the worker.
+/// FIRE-AND-FORGET. `notify_blob_committed` is a non-blocking send, so
+/// this returns once the ids are enqueued — NOT once they are pulled or
+/// confirmed. Confirm by re-reading `unplaced_total` on a later call.
+/// Re-running is safe: every kick is idempotent.
 pub async fn run_unplaced_drain(
     app_state: &AppState,
     limit: i32,
 ) -> Result<UnplacedDrainResult, Error> {
-    tracing::info!("Starting unplaced-block drain (limit {})", limit);
+    tracing::info!("Starting in-flight re-kick (limit {})", limit);
 
     // Scoped checkout, dropped before the engine is touched — the data plane
     // must never run while this task holds a pool connection.
@@ -339,12 +343,13 @@ pub async fn run_unplaced_drain(
                 "Failed to count unplaced blobs: {e:?}"
             )))))
         })?;
-        let ids = hopnet_storage::store::get_unplaced_blob_ids(&conn, limit).map_err(|e| {
-            tracing::error!("Failed to select unplaced blobs: {e:?}");
-            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
-                "Failed to select unplaced blobs: {e:?}"
-            )))))
-        })?;
+        let ids = hopnet_storage::lifecycle::in_flight_blobs(&conn, limit.max(0) as usize)
+            .map_err(|e| {
+                tracing::error!("Failed to select in-flight blobs: {e}");
+                Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+                    "Failed to select in-flight blobs: {e}"
+                )))))
+            })?;
         (ids, total)
     };
 
@@ -713,7 +718,7 @@ pub async fn run_watermark_eviction(
     }
     if !deleted.is_empty() {
         let host = SubstrateHost::new(app_state.clone());
-        host.mark_remote_batch(deleted.clone());
+        host.mark_remote_batch(deleted.clone()).await;
     }
 
     tracing::info!(
@@ -836,12 +841,28 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json:
         }
     }
 
-    // (3) One migration pull per tick (per-class placement diff no-ops on
-    // unmoved blobs).
-    let migration_repaired = run_network_rebalancing(app_state, 1, 0)
-        .await
-        .map(|r| r.data_blocks_rebalanced)
-        .unwrap_or(0);
+    // (3) The obligation check (RFC-STORAGE-003 S3): re-kick a bounded page
+    // of in-flight blobs through the reconciler — pulls owed under each
+    // goal, prompt attestation, confirm proposals where the evidence is
+    // complete. Level-triggered: any blob a kick missed is found here.
+    let migration_repaired = run_network_rebalancing(
+        app_state,
+        hopnet_storage::engine::policy::PULL_KICKS_PER_TICK as i32,
+        0,
+    )
+    .await
+    .map(|r| r.data_blocks_rebalanced)
+    .unwrap_or(0);
+
+    // (3b) Fulfillment floor: propose confirmation for in-flight blobs
+    // whose evidence is already complete (other nodes' pulls finished
+    // after our own check). One batched ConfirmPlacement per tick.
+    let confirms_proposed = propose_ready_confirmations(
+        app_state,
+        hopnet_storage::engine::policy::CONFIRM_CHECKS_PER_TICK,
+    )
+    .await
+    .unwrap_or(0);
 
     // (4) Eviction check (statvfs no-op below the high watermark).
     let eviction = run_watermark_eviction(app_state, None, None).await?;
@@ -874,7 +895,9 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json:
                 let _ = hopnet_storage::fragstore::delete_fragment(&fragments_dir, hash);
             }
             use hopnet_storage::traits::LocalStateSink;
-            SubstrateHost::new(app_state.clone()).mark_remote_batch(corrupted.clone());
+            SubstrateHost::new(app_state.clone())
+                .mark_remote_batch(corrupted.clone())
+                .await;
             scrubbed_corrupt = corrupted.len();
         }
     }
@@ -886,6 +909,7 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json:
         "urgent_reencodes": urgent_enqueued,
         "lazy_reencodes": lazy_enqueued,
         "migration_repaired": migration_repaired,
+        "confirms_proposed": confirms_proposed,
         "eviction": eviction,
         "scrub_corrupt": scrubbed_corrupt,
     }))

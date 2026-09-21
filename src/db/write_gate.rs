@@ -56,14 +56,20 @@ impl Drop for WriteGateGuard {
     }
 }
 
-/// Updates queued for the drain task.
+/// Updates queued for the drain task. `done` (RFC-STORAGE-003 S3) is
+/// acknowledged after the batch containing the update is written, so an
+/// awaited mark resolves once belief holds it.
 pub enum LocalStateUpdate {
     /// Fragment is now on local disk.
-    MarkLocal { fragment_hash: Blake3Hash },
-    /// Fragment sent to a remote node (no longer local).
-    MarkRemote { fragment_hash: Blake3Hash },
-    /// Batch variant for distribution — multiple fragments sent to remotes.
-    MarkRemoteBatch { fragment_hashes: Vec<Blake3Hash> },
+    MarkLocal {
+        fragment_hash: Blake3Hash,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+    /// Fragments no longer on local disk (eviction, scrub).
+    MarkRemoteBatch {
+        fragment_hashes: Vec<Blake3Hash>,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    },
 }
 
 /// Long-lived task that batches `LocalStateUpdate` messages and flushes them
@@ -83,12 +89,22 @@ pub async fn drain_local_state_queue(
         // Drain any additional queued items (non-blocking)
         let mut mark_local: Vec<Blake3Hash> = Vec::new();
         let mut mark_remote: Vec<Blake3Hash> = Vec::new();
+        let mut acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
 
         let mut classify = |item: LocalStateUpdate| match item {
-            LocalStateUpdate::MarkLocal { fragment_hash } => mark_local.push(fragment_hash),
-            LocalStateUpdate::MarkRemote { fragment_hash } => mark_remote.push(fragment_hash),
-            LocalStateUpdate::MarkRemoteBatch { fragment_hashes } => {
-                mark_remote.extend(fragment_hashes)
+            LocalStateUpdate::MarkLocal {
+                fragment_hash,
+                done,
+            } => {
+                mark_local.push(fragment_hash);
+                acks.extend(done);
+            }
+            LocalStateUpdate::MarkRemoteBatch {
+                fragment_hashes,
+                done,
+            } => {
+                mark_remote.extend(fragment_hashes);
+                acks.extend(done);
             }
         };
 
@@ -120,6 +136,12 @@ pub async fn drain_local_state_queue(
                 mark_remote.len(),
                 e
             );
+        }
+
+        // Acknowledge the batch (a dropped receiver is a caller that
+        // stopped waiting — fine).
+        for done in acks {
+            let _ = done.send(());
         }
     }
 }

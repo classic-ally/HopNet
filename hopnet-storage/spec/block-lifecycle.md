@@ -881,7 +881,7 @@ optimization and carries no proof obligation.
     `evictable` — the supersede counterexample finally has a fast
     guard. The reconciler half is S3's: it must call `protects`,
     never a current-view responsibility.
-- [ ] **S3 — Pull machinery.** Pull duties derived at declare-apply;
+- [x] **S3 — Pull machinery.** Pull duties derived at declare-apply;
   fetch-with-recovery; awaited-send marks (backpressure); the
   serial worker's deficit-first duty ladder. The push pipeline,
   threshold, and blind placement batcher retire in the same stage —
@@ -891,6 +891,43 @@ optimization and carries no proof obligation.
   asserting state agreement after every step — upgrading "the code
   resembles the model" to "the code refuses to diverge from it on
   every checked execution".
+  - Done 2026-09-21. The engine is one serial worker per node
+    (urgent re-encode > pull checks > lazy re-encode); `pull_owed`
+    derives the owed classes from `StateReader::pull_target` (the
+    goal's assignment) and the manifest, fetches each from attested
+    holders then any peer, and falls through to `reencode_chunk`
+    for whatever nobody served. `LocalStateSink` is awaited end to
+    end: the host's drain acknowledges after the write, so a
+    finished pull sees its own marks. Kicks: `on_decided` for
+    births, `storage.pull` work scheduled at declare-apply, the tick's
+    bounded re-kick of the in-flight set (`in_flight_blobs`, oldest
+    goal first — the LIMIT-1 rung and `get_data_blocks_for_
+    rebalancing` are gone). Retired: the distribution worker pool,
+    send permits, `FAILURE_THRESHOLD_PERCENT`, `distribute_one`,
+    `repair_one`, the placement batcher and every `PLACEMENT_*`
+    knob, `get_distributable_blob`. `update_placement_heights` stays
+    REGISTERED (catch-up replays old blocks) and the `Store` wire arm
+    stays served (RFC-025 compat); nothing submits or sends them.
+  - Boundary move (decided with the S3 plan): the fulfillment floor
+    lands here, not in S4 — after a pull check on an in-flight blob
+    the node attests promptly (`StateReader::self_check_report`
+    submitted as `self_check_fragments`) and proposes
+    `ConfirmPlacement` when `confirm_ready` says the evidence is
+    complete; the tick also proposes one batched confirm for ready
+    in-flight blobs (`CONFIRM_CHECKS_PER_TICK`). Without it nothing
+    would confirm between S3 and S4. S4 still owes the staleness pass
+    (propose hook + grace rung), random-sampled scaling, retirement
+    of the missing-class scan and of `/maintenance/drain-unplaced`
+    (which now re-kicks the in-flight set).
+  - Harness scope (decided with the S3 plan): `reconcile::plan` is
+    the model's re-encode and pull rungs per node, pure and sans-io;
+    `tests/model_conformance.rs` asserts on every trace state that
+    each up node's pull set equals `pullNeedy` restricted to its
+    classes and its re-encode set equals `reencodeReady` (K-gated as
+    the model's rung is). The full tick-by-tick replay with env
+    actions injected waits for S4, when declare and confirm are the
+    worker's rungs too. The deputy rule below W is not yet
+    implemented (S4, with the scan retirement).
 - [ ] **S4 — The two passes.** Propose hook + grace rung (staleness);
   fulfillment sampling fused with the tick (confirm discovery).
   The missing-class scan and the LIMIT-1 rebalance rung retire.

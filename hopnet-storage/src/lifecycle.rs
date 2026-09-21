@@ -311,10 +311,13 @@ pub fn placement_pairs(
 // DeclarePlacementTarget apply
 
 /// Per-entry tally of one declare apply.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DeclareOutcome {
     pub applied: usize,
     pub skipped: usize,
+    /// The blobs whose goal moved — pull duties derive from these at
+    /// apply (the host kicks its reconciler for each under execute).
+    pub applied_ids: Vec<BlobId>,
 }
 
 /// Apply a declare batch under the deciding block's height. Per entry:
@@ -370,11 +373,124 @@ pub fn apply_declare(
             .map_err(db_err("write goal"))?;
         if n == 1 {
             outcome.applied += 1;
+            outcome.applied_ids.push(target.blob_id.clone());
         } else {
             outcome.skipped += 1;
         }
     }
     Ok(outcome)
+}
+
+// ---------------------------------------------------------------------------
+// Reads the reconciler consumes (S3)
+
+/// The blob's goal for the pull side: its pair and the assignment under
+/// the view in force at `desired`. `None` for an unknown blob or a goal
+/// the record does not reach.
+pub fn pull_target(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+) -> Result<Option<crate::traits::PullTarget>, StorageError> {
+    let pair: Option<(Option<i64>, i64)> = conn
+        .query_row(
+            "SELECT placement_height, desired_placement_height FROM data_blocks WHERE id = ?",
+            params![blob_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(db_err("read pull target pair"))?;
+    let Some((placed, desired)) = pair else {
+        return Ok(None);
+    };
+    let desired = height_from_db(desired);
+    let Some(snapshot) = snapshot_at(conn, desired)? else {
+        return Ok(None);
+    };
+    Ok(Some(crate::traits::PullTarget {
+        placement_height: placed.map(height_from_db),
+        desired,
+        assignment: snapshot.assignment(blob_id),
+    }))
+}
+
+/// In-flight blobs — goal not yet confirmed — oldest goal first, bounded.
+/// The level-triggered obligation check's work-list: a blob leaves it at
+/// confirm, so no cursor is needed.
+pub fn in_flight_blobs(
+    conn: &rusqlite::Connection,
+    limit: usize,
+) -> Result<Vec<BlobId>, StorageError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT id FROM data_blocks
+             WHERE placement_height IS NULL OR placement_height != desired_placement_height
+             ORDER BY desired_placement_height ASC, id ASC
+             LIMIT ?",
+        )
+        .map_err(db_err("prepare in-flight read"))?;
+    let ids = stmt
+        .query_map(params![limit as i64], |row| row.get(0))
+        .map_err(db_err("read in-flight blobs"))?
+        .collect::<Result<Vec<BlobId>, _>>()
+        .map_err(db_err("read in-flight row"))?;
+    Ok(ids)
+}
+
+/// Whether every fragment's responsible node under `assignment` has an
+/// attested inventory row — the evidence ConfirmPlacement validates.
+/// Shared by the apply and by the fulfillment read (`confirm_ready`).
+fn evidence_complete(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+    assignment: &[i32],
+) -> Result<bool, StorageError> {
+    let mut fragments = conn
+        .prepare_cached(
+            "SELECT local_index, fragment_hash FROM fragment_hashes WHERE data_block_id = ?",
+        )
+        .map_err(db_err("prepare fragment layout read"))?;
+    let mut attested = conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM fragment_inventory
+                            WHERE fragment_hash = ? AND node_id = ?)",
+        )
+        .map_err(db_err("prepare attestation probe"))?;
+    let rows = fragments
+        .query_map(params![blob_id], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(db_err("read fragment layout"))?;
+    let mut any = false;
+    for row in rows {
+        any = true;
+        let (local_index, hash) = row.map_err(db_err("read fragment row"))?;
+        let Some(node) = assignment.get(local_index as usize) else {
+            return Ok(false);
+        };
+        let has: bool = attested
+            .query_row(params![hash, node], |row| row.get(0))
+            .map_err(db_err("probe attestation"))?;
+        if !has {
+            return Ok(false);
+        }
+    }
+    Ok(any)
+}
+
+/// The fulfillment read: `Some(desired)` when the blob is in flight and
+/// its confirmation evidence is complete — a ConfirmPlacement for it would
+/// apply. `None` when quiescent, unknown, unanswerable, or still owed.
+pub fn confirm_ready(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+) -> Result<Option<u64>, StorageError> {
+    let Some(target) = pull_target(conn, blob_id)? else {
+        return Ok(None);
+    };
+    if target.placement_height == Some(target.desired) {
+        return Ok(None);
+    }
+    Ok(evidence_complete(conn, blob_id, &target.assignment)?.then_some(target.desired))
 }
 
 // ---------------------------------------------------------------------------
@@ -403,17 +519,6 @@ pub fn apply_confirm(
             "SELECT desired_placement_height, placement_height FROM data_blocks WHERE id = ?",
         )
         .map_err(db_err("prepare pair read"))?;
-    let mut fragments = db_tx
-        .prepare_cached(
-            "SELECT local_index, fragment_hash FROM fragment_hashes WHERE data_block_id = ?",
-        )
-        .map_err(db_err("prepare fragment layout read"))?;
-    let mut attested = db_tx
-        .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM fragment_inventory
-                            WHERE fragment_hash = ? AND node_id = ?)",
-        )
-        .map_err(db_err("prepare attestation probe"))?;
     let mut write = db_tx
         .prepare_cached(
             "UPDATE data_blocks SET placement_height = ?
@@ -437,28 +542,7 @@ pub fn apply_confirm(
             None => match snapshot_at(db_tx, c.height)? {
                 None => Some("view at goal not on record"),
                 Some(snapshot) => {
-                    let assignment = snapshot.assignment(&c.blob_id);
-                    let mut complete = true;
-                    let rows = fragments
-                        .query_map(params![c.blob_id], |row| {
-                            Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
-                        })
-                        .map_err(db_err("read fragment layout"))?;
-                    for row in rows {
-                        let (local_index, hash) = row.map_err(db_err("read fragment row"))?;
-                        let Some(node) = assignment.get(local_index as usize) else {
-                            complete = false;
-                            break;
-                        };
-                        let has: bool = attested
-                            .query_row(params![hash, node], |row| row.get(0))
-                            .map_err(db_err("probe attestation"))?;
-                        if !has {
-                            complete = false;
-                            break;
-                        }
-                    }
-                    if complete {
+                    if evidence_complete(db_tx, &c.blob_id, &snapshot.assignment(&c.blob_id))? {
                         None
                     } else {
                         Some("evidence incomplete")
@@ -658,7 +742,8 @@ mod tests {
             ok,
             DeclareOutcome {
                 applied: 1,
-                skipped: 0
+                skipped: 0,
+                applied_ids: vec![b.clone()],
             }
         );
         assert_eq!(goal(&tx, &b).0, 6);
@@ -673,7 +758,8 @@ mod tests {
                 o,
                 DeclareOutcome {
                     applied: 0,
-                    skipped: 1
+                    skipped: 1,
+                    applied_ids: vec![],
                 }
             );
         }
@@ -800,6 +886,60 @@ mod tests {
 
         // Confirmed below the record's first row: unanswerable.
         assert_eq!(epochs_for_blob(&tx, &b, Some(3), 15).unwrap(), None);
+    }
+
+    // Should: list in-flight blobs oldest goal first and stop listing a blob
+    // once confirmed; resolve a pull target only when the record reaches
+    // the goal; report confirm-readiness exactly when every responsible has
+    // attested and the blob is still in flight.
+    // Impact: these three reads ARE the reconciler's work-list, its duty
+    // derivation, and the fulfillment floor.
+    #[test]
+    fn reconciler_reads_follow_the_pair_and_the_record() {
+        let mut conn = test_conn();
+        let tx = conn.transaction().unwrap();
+        let a = blob(1);
+        let b = blob(2);
+        let c = blob(3);
+        insert_blob(&tx, &a, 9, None); // in flight, newest goal
+        insert_blob(&tx, &b, 6, Some(6)); // quiescent
+        insert_blob(&tx, &c, 7, Some(2)); // in flight, older goal
+
+        assert_eq!(
+            in_flight_blobs(&tx, 10).unwrap(),
+            vec![c.clone(), a.clone()]
+        );
+        assert_eq!(in_flight_blobs(&tx, 1).unwrap(), vec![c.clone()]);
+
+        // No record yet: no target, not ready.
+        assert_eq!(pull_target(&tx, &a).unwrap(), None);
+        assert_eq!(confirm_ready(&tx, &a).unwrap(), None);
+
+        record_transition(&tx, 5, &view(&[1, 2, 3])).unwrap();
+        let target = pull_target(&tx, &a).unwrap().unwrap();
+        assert_eq!((target.placement_height, target.desired), (None, 9));
+        assert_eq!(target.assignment, view(&[1, 2, 3]).assignment(&a));
+        assert_eq!(pull_target(&tx, &blob(9)).unwrap(), None, "unknown blob");
+
+        // Quiescent blob: never confirm-ready.
+        assert_eq!(confirm_ready(&tx, &b).unwrap(), None);
+
+        // Attest every class of `a` on its responsible: ready at 9.
+        for (i, node) in target.assignment.iter().take(3).enumerate() {
+            tx.execute(
+                "INSERT INTO fragment_inventory (fragment_hash, node_id) VALUES (?, ?)",
+                params![vec![i as u8; 32], node],
+            )
+            .unwrap();
+        }
+        assert_eq!(confirm_ready(&tx, &a).unwrap(), Some(9));
+        assert_eq!(apply_confirm(&tx, &confirm(&a, 9)).unwrap().applied, 1);
+        assert_eq!(
+            confirm_ready(&tx, &a).unwrap(),
+            None,
+            "confirmed: quiescent"
+        );
+        assert_eq!(in_flight_blobs(&tx, 10).unwrap(), vec![c.clone()]);
     }
 
     // Should: reuse the engine's placement recipe — the class map from a

@@ -45,7 +45,7 @@ impl TransactionHandler for DeclarePlacementTargetHandler {
     fn process(
         &self,
         tx: &TxMeta<'_>,
-        _execute: bool,
+        execute: bool,
         ctx: &HandlerCtx<'_>,
         db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
@@ -62,6 +62,14 @@ impl TransactionHandler for DeclarePlacementTargetHandler {
             skipped = outcome.skipped,
             "declare_placement_target applied"
         );
+        // Pull duties derive at declare-apply (RFC-STORAGE-003 S3): wake
+        // the reconciler for every moved goal — execute only, validation
+        // must stay pure.
+        if execute {
+            for blob_id in &outcome.applied_ids {
+                ctx.work.schedule("storage.pull", blob_id.to_string());
+            }
+        }
         Ok(())
     }
 }

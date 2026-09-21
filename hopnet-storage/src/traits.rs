@@ -13,7 +13,6 @@
 
 use crate::error::StorageError;
 use crate::placement::{MetricsRow, PlacementNode};
-use crate::store::DistributableBlob;
 use crate::types::BlobId;
 use hopnet_common::quorum::QuorumProfile;
 use hopnet_common::Blake3Hash;
@@ -165,15 +164,24 @@ pub trait StateReader: Send + Sync {
     /// a blob has no placement height.
     fn all_peers(&self) -> Result<Vec<PeerRef>, StorageError>;
 
-    /// The blob's local fragment set IF this node should distribute it:
-    /// unplaced and every fragment stored locally (origin filter). `None`
-    /// is the common no-op on non-origin nodes.
-    fn distributable_blob(
-        &self,
-        blob_id: &BlobId,
-    ) -> Result<Option<DistributableBlob>, StorageError>;
+    /// The blob's goal (RFC-STORAGE-003): its `(placement_height, desired)`
+    /// pair and the class → node assignment under the view at `desired`.
+    /// `None` for an unknown blob, or when the transition record does not
+    /// reach the goal (nothing is owed until it does).
+    fn pull_target(&self, blob_id: &BlobId) -> Result<Option<PullTarget>, StorageError>;
 
-    /// The blob's full reassembly manifest (tier-1 repair reads the
+    /// This node's inventory attestation as of now — the differential
+    /// between what it holds and what consensus believes it holds — ready
+    /// to submit as `self_check_fragments`. The prompt attestation after a
+    /// pull rides this (RFC-STORAGE-003 S3/S5).
+    fn self_check_report(&self) -> Result<crate::types::SelfCheckFragments, StorageError>;
+
+    /// `Some(desired)` when the blob is in flight and every responsible
+    /// node under its goal has attested — a ConfirmPlacement for it would
+    /// apply (the fulfillment read; `lifecycle::confirm_ready`).
+    fn confirm_ready(&self, blob_id: &BlobId) -> Result<Option<u64>, StorageError>;
+
+    /// The blob's full reassembly manifest (the pull path reads the
     /// fragment layout + this node's local availability). `None` for an
     /// unknown blob id.
     fn blob_manifest(
@@ -206,12 +214,29 @@ pub trait TxSubmitter: Send + Sync {
     ) -> impl Future<Output = Result<(), SubmitError>> + Send;
 }
 
+/// A blob's goal as the reconciler consumes it (RFC-STORAGE-003).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullTarget {
+    /// The confirmed epoch, `None` = never confirmed.
+    pub placement_height: Option<u64>,
+    /// The declared goal (`desired_placement_height`).
+    pub desired: u64,
+    /// Class → responsible node under the view in force at `desired`.
+    pub assignment: Vec<i32>,
+}
+
 /// Node-local `stored_locally` settlement (RFC-014 invariant: exactly the
-/// crate-owned writers). Fire-and-forget — the host batches through its
-/// write gate; a dropped update self-heals via self-check attestation.
+/// crate-owned writers). AWAITED (RFC-STORAGE-003 S3): the mark resolves
+/// once the host has recorded it, so a full queue or a slow disk slows
+/// the writer instead of lying to it — belief never silently diverges
+/// from disk through this path. The pull side is the initiator, so the
+/// wait paces only this node's own pulls.
 pub trait LocalStateSink: Send + Sync {
-    /// Fragment now on local disk (server store path).
-    fn mark_local(&self, fragment_hash: Blake3Hash);
-    /// Fragments handed to remote peers (distribution path).
-    fn mark_remote_batch(&self, fragment_hashes: Vec<Blake3Hash>);
+    /// Fragment now on local disk (pull, re-encode, server store paths).
+    fn mark_local(&self, fragment_hash: Blake3Hash) -> impl Future<Output = ()> + Send;
+    /// Fragments no longer on local disk (eviction, scrub).
+    fn mark_remote_batch(
+        &self,
+        fragment_hashes: Vec<Blake3Hash>,
+    ) -> impl Future<Output = ()> + Send;
 }

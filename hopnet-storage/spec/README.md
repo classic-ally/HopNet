@@ -133,11 +133,13 @@ The Apalache matrix stays a local ritual.
 `spec/traces/*.itf.json` are ITF exports of the `scaled_bal` lifecycle
 witnesses. `tests/model_conformance.rs` (`cargo test -p hopnet-storage
 --test model_conformance`) replays every state of every trace against
-the Rust protection predicate and eviction planner, driven by the
-model's own `mix` placement scoring: the memo must equal the model's
-`protectedBy`, `protects` must equal `protected`, and the planner's
-verdict must equal `evictable`. Regenerate after a model change (the
-`#meta` block differs per run and is ignored):
+the Rust protection predicate, eviction planner and (S3) duty ladder,
+driven by the model's own `mix` placement scoring: the memo must equal
+the model's `protectedBy`, `protects` must equal `protected`, the
+planner's verdict must equal `evictable`, and per up node
+`reconcile::plan` must owe exactly `pullNeedy` and `reencodeReady`
+restricted to that node's classes. Regenerate after a model change
+(the `#meta` block differs per run and is ignored):
 
 ```bash
 npx @informalsystems/quint test spec/storage_policy.qnt --main scaled_bal \

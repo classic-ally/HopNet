@@ -506,7 +506,7 @@ apply functions inside consensus handlers.
       repair scan, migration pull, eviction, weekly rolling scrub).
       Orchestrator: tier-membership, eviction-under-pressure,
       re-encode-after-departure (kill → decay → regenerate → download)
-- [~] Block lifecycle convergence — S0–S2 of 7 + cutover
+- [~] Block lifecycle convergence — S0–S3 of 7 + cutover
       ([RFC-STORAGE-003](../hopnet-storage/spec/block-lifecycle.md),
       branch `rfc-block-lifecycle`, PR #72): the upload-to-placement
       pipeline joins the proven model. S0 (2026-08-22): the Quint model
@@ -521,9 +521,17 @@ apply functions inside consensus handlers.
       predicate (`hopnet_storage::protection`) — confirmed epoch plus every
       in-flight epoch, never-confirmed clause, pins — is the evictor's
       single guard, and `tests/model_conformance.rs` replays exported Quint
-      witness traces (`spec/traces/`) against it. Push distribution still
-      runs unchanged; S3–S4 (pull machinery, the two passes) retire it,
-      S5–S7 add disk-truth attestation, lifecycle closure, observability.
+      witness traces (`spec/traces/`) against it. S3 (2026-09-21): the push
+      pipeline is gone — one serial reconciler per node pulls the classes
+      it owes under the blob's goal (fetch from attested holders, RS-rebuild
+      fallback), marks are awaited end to end, kicks come from decide,
+      declare-apply and the tick's bounded in-flight re-kick, and the
+      fulfillment floor (prompt attestation + ConfirmPlacement when the
+      evidence is complete) replaces the blind placement batcher; the duty
+      ladder (`hopnet_storage::reconcile`) is trace-checked against the
+      model's rungs. S4 (the staleness pass, sampling, scan retirement),
+      S5–S7 (disk-truth attestation, lifecycle closure, observability) and
+      the cutover remain.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage

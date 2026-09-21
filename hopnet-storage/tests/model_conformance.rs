@@ -1,5 +1,6 @@
-//! Model conformance (RFC-STORAGE-003 S2): the protection predicate and
-//! the eviction planner replayed against exported Quint witness traces.
+//! Model conformance (RFC-STORAGE-003 S2/S3): the protection predicate,
+//! the eviction planner and the reconciler's duty ladder replayed against
+//! exported Quint witness traces.
 //!
 //! `spec/traces/*.itf.json` are ITF traces of `scaled_bal` witnesses
 //! (see spec/README.md for the regeneration command). For every state of
@@ -21,12 +22,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use hopnet_storage::eviction::{plan_evictions, DiskPressure, EvictionCandidate};
 use hopnet_storage::placement::{assign_classes_by_score, qnt_mix};
 use hopnet_storage::protection::{Protection, ProtectionEpochs};
+use hopnet_storage::reconcile::{plan, ChunkState, ClassState, Duty};
 use serde_json::Value;
 
 const N_FRAGS: u32 = 6;
 const VAR_PREFIX: &str = "scaled_bal::storage_policy::";
-/// The model's UP status (`pure val UP = 0`).
+/// The model's UP / DOWN statuses (`pure val UP = 0`, `DOWN = 1`).
 const UP: i64 = 0;
+const DOWN: i64 = 1;
+/// `scaled_bal`'s policy constants.
+const K: usize = 2;
+const W: usize = 3;
+const DELTA: i64 = 3;
 
 // --- ITF reading -----------------------------------------------------------
 
@@ -71,6 +78,7 @@ struct State {
     copies: BTreeMap<i64, BTreeSet<i64>>,
     inv_view: BTreeMap<i64, BTreeSet<i64>>,
     status: BTreeMap<i64, i64>,
+    down_for: BTreeMap<i64, i64>,
     deleted: bool,
 }
 
@@ -94,6 +102,7 @@ fn read_trace(path: &std::path::Path) -> Vec<State> {
             copies: map_of_sets(&var(s, "copies")),
             inv_view: map_of_sets(&var(s, "invView")),
             status: map_of_ints(&var(s, "status")),
+            down_for: map_of_ints(&var(s, "downFor")),
             deleted: var(s, "deleted").as_bool().unwrap(),
         })
         .collect()
@@ -284,5 +293,102 @@ fn supersede_keeps_the_first_destination_protected() {
     assert!(
         checked,
         "the supersede trace never had two epochs in flight"
+    );
+}
+
+// Impact: the S3 reconciler's rungs are the model's re-encode and pull
+// rungs, per node — the duty derivation is what discharges "the pull rung
+// fires for owed classes" in the assumption table.
+// Should: for every state and every up node, owe exactly the model's
+// `pullNeedy` classes assigned to that node, and re-encode exactly the
+// model's `reencodeReady` classes assigned to it (only while K classes are
+// live, as the model's rung guard requires).
+#[test]
+fn duty_ladder_matches_the_models_rungs() {
+    let mut states_checked = 0;
+    for path in traces() {
+        let states = read_trace(&path);
+        for (i, s) in states.iter().enumerate() {
+            if s.deleted {
+                continue;
+            }
+            let assignment = model_assignment(&s.target_view);
+            let up: BTreeSet<i64> = s
+                .status
+                .iter()
+                .filter(|(_, st)| **st == UP)
+                .map(|(n, _)| *n)
+                .collect();
+            let hopeful: BTreeSet<i64> = s
+                .status
+                .iter()
+                .filter(|(n, st)| **st == DOWN && s.down_for[n] < DELTA)
+                .map(|(n, _)| *n)
+                .collect();
+            let chunk = ChunkState {
+                classes: (0..N_FRAGS as i64)
+                    .map(|f| ClassState {
+                        holders: s.copies[&f].iter().map(|n| *n as i32).collect(),
+                        responsible: assignment[f as usize],
+                    })
+                    .collect(),
+                up: up.iter().map(|n| *n as i32).collect(),
+                hopeful_down: hopeful.iter().map(|n| *n as i32).collect(),
+                k: K,
+                watermark: W,
+            };
+
+            // The model's rung sets, transcribed from storage_policy.qnt.
+            let live = |f: i64| s.copies[&f].iter().any(|h| up.contains(h));
+            let live_count = (0..N_FRAGS as i64).filter(|f| live(*f)).count();
+            let resp = |f: i64| assignment[f as usize] as i64;
+            let model_pull: BTreeSet<i64> = (0..N_FRAGS as i64)
+                .filter(|f| !s.copies[f].contains(&resp(*f)) && up.contains(&resp(*f)) && live(*f))
+                .collect();
+            let model_reencode: BTreeSet<i64> = if live_count >= K {
+                (0..N_FRAGS as i64)
+                    .filter(|f| !live(*f) && up.contains(&resp(*f)))
+                    .filter(|f| live_count < W || !s.copies[f].iter().any(|h| hopeful.contains(h)))
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
+
+            for n in &up {
+                let duties = plan(&chunk, *n as i32);
+                let mut rust_pull = BTreeSet::new();
+                let mut rust_reencode = BTreeSet::new();
+                for d in duties {
+                    match d {
+                        Duty::Pull { class } => {
+                            rust_pull.insert(class as i64);
+                        }
+                        Duty::Reencode { classes } => {
+                            rust_reencode.extend(classes.into_iter().map(|c| c as i64));
+                        }
+                    }
+                }
+                let mine = |set: &BTreeSet<i64>| -> BTreeSet<i64> {
+                    set.iter().copied().filter(|f| resp(*f) == *n).collect()
+                };
+                assert_eq!(
+                    rust_pull,
+                    mine(&model_pull),
+                    "{} state {i} node {n}: pull duties",
+                    path.display()
+                );
+                assert_eq!(
+                    rust_reencode,
+                    mine(&model_reencode),
+                    "{} state {i} node {n}: re-encode duties",
+                    path.display()
+                );
+            }
+            states_checked += 1;
+        }
+    }
+    assert!(
+        states_checked > 50,
+        "only {states_checked} states — traces missing?"
     );
 }

@@ -254,7 +254,7 @@ where
         let hash = classes[&class].0;
         fragstore::store_fragment(fragments_dir, &hash, bytes.clone())
             .map_err(|e| EngineError::Transfer(format!("re-encode: store class {class}: {e}")))?;
-        local_state.mark_local(hash);
+        local_state.mark_local(hash).await;
     }
 
     tracing::info!(
