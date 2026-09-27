@@ -12,6 +12,33 @@ pub fn capture(
 ) {
     use hopnet::db::resilience;
 
+    const NAMES: [&str; 3] = [
+        "db::resilience::resilience_level_rows",
+        "db::resilience::get_node_storage_baselines",
+        "db::resilience::generate_fault_tolerance_curve",
+    ];
+    let fail_all = |results: &mut BTreeMap<String, FunctionResult>, error_variant: String| {
+        for name in NAMES {
+            results.insert(
+                name.into(),
+                FunctionResult::Error {
+                    error_variant: error_variant.clone(),
+                },
+            );
+        }
+    };
+
+    // One checkout for every entry: the block/node counts borrow a
+    // connection, and the capture pool is max_size(1).
+    let conn = match pool.get() {
+        Ok(conn) => conn,
+        Err(e) => return fail_all(results, format!("{:?}", e)),
+    };
+    let counts = match resilience::BlockNodeCounts::build(&conn) {
+        Ok(counts) => counts,
+        Err(e) => return fail_all(results, format!("{:?}", e)),
+    };
+
     // Replaces the old compute_network_resilience_stats capture. Member ids
     // come from the storage view rather than a metrics.available subquery, so
     // this exercises the durable predicate. Still deterministic given the DB:
@@ -21,63 +48,25 @@ pub fn capture(
     // Deliberately NOT capturing unplaced_age_buckets — its cutoffs are
     // derived from Utc::now(), so it would diff on every run and tell you
     // nothing about a commit.
-    results.insert("db::resilience::resilience_level_rows".into(), {
-        match pool.get() {
-            Ok(conn) => {
-                let members = hopnet::storage_host::substrate_host::storage_view_with_conn(&conn)
-                    .map(|v| v.members.iter().map(|p| p.node_id).collect::<Vec<_>>())
-                    .unwrap_or_default();
-                match resilience::resilience_level_rows(&conn, &members) {
-                    Ok(levels) => FunctionResult::Ok {
-                        value: serde_json::to_value(&levels).unwrap(),
-                    },
-                    Err(e) => FunctionResult::Error {
-                        error_variant: format!("{:?}", e),
-                    },
-                }
-            }
-            Err(e) => FunctionResult::Error {
-                error_variant: format!("{:?}", e),
-            },
-        }
-    });
+    let members = hopnet::storage_host::substrate_host::storage_view_with_conn(&conn)
+        .map(|v| v.members.iter().map(|p| p.node_id).collect::<Vec<_>>())
+        .unwrap_or_default();
+    results.insert(
+        NAMES[0].into(),
+        wrap(|| resilience::resilience_level_rows(&counts, &members)),
+    );
 
-    // One checkout for both entries: get_node_storage_baselines borrows a
-    // connection now, and the capture pool is max_size(1).
-    match pool.get() {
-        Ok(conn) => {
-            results.insert(
-                "db::resilience::get_node_storage_baselines".into(),
-                wrap(|| resilience::get_node_storage_baselines(&conn)),
-            );
+    results.insert(
+        NAMES[1].into(),
+        wrap(|| resilience::get_node_storage_baselines(&counts)),
+    );
 
-            // generate_fault_tolerance_curve takes baselines + threshold, not a DB connection
-            results.insert("db::resilience::generate_fault_tolerance_curve".into(), {
-                match resilience::get_node_storage_baselines(&conn) {
-                    Ok(baselines) => {
-                        let curve = resilience::generate_fault_tolerance_curve(baselines, 0.5);
-                        FunctionResult::Ok {
-                            value: serde_json::to_value(&curve).unwrap(),
-                        }
-                    }
-                    Err(e) => FunctionResult::Error {
-                        error_variant: format!("{:?}", e),
-                    },
-                }
-            });
-        }
-        Err(e) => {
-            for name in [
-                "db::resilience::get_node_storage_baselines",
-                "db::resilience::generate_fault_tolerance_curve",
-            ] {
-                results.insert(
-                    name.into(),
-                    FunctionResult::Error {
-                        error_variant: format!("{:?}", e),
-                    },
-                );
-            }
-        }
-    }
+    // generate_fault_tolerance_curve takes baselines + threshold, not a DB connection
+    results.insert(
+        NAMES[2].into(),
+        wrap(|| {
+            resilience::get_node_storage_baselines(&counts)
+                .map(|baselines| resilience::generate_fault_tolerance_curve(baselines, 0.5))
+        }),
+    );
 }

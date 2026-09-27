@@ -59,12 +59,23 @@ pub fn health_router(caps: &hopnet_projection::host::HostCapabilities) -> axum::
 /// cache the pane reads (spawn_blocking happens inside it on a miss), so
 /// `df` and the pane cannot disagree and a polling file manager costs
 /// nothing between rescans.
+///
+/// A warm cache answers at once (stale numbers included). Only a cold one
+/// makes the caller wait, and then only for `STATFS_COLD_WAIT`: past that
+/// the answer is 503 while the refresh carries on in the background, so the
+/// next poll is served from cache rather than timing out client-side.
 pub async fn get_mount_statfs(
     State(app_state): State<AppState>,
 ) -> Result<Json<hopnet_common::mount::MountStatfsResponse>, StatusCode> {
-    let (total_bytes, used_bytes) = crate::views::resilience::mount_statfs_bytes(&app_state)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    const STATFS_COLD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let (total_bytes, used_bytes) = tokio::time::timeout(
+        STATFS_COLD_WAIT,
+        crate::views::resilience::mount_statfs_bytes(&app_state),
+    )
+    .await
+    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(hopnet_common::mount::MountStatfsResponse {
         total_bytes,
         used_bytes,

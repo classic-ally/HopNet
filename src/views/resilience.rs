@@ -5,7 +5,10 @@
 //! side needs the in-memory evidence map and the decided-height watch.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use tokio::sync::watch;
 
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -69,15 +72,98 @@ struct Cached {
     parts: StorageParts,
 }
 
+/// What an in-flight refresh publishes to its waiters. `DatabaseError` is not
+/// `Clone`, and every consumer maps failure to a 500 anyway.
+type Outcome = Result<StorageParts, ()>;
+
+#[derive(Default)]
+struct CacheState {
+    entry: Option<Cached>,
+    inflight: Option<watch::Receiver<Option<Outcome>>>,
+}
+
 /// TTL cache in front of the storage scan, shared by every consumer.
 ///
-/// The lock is held ACROSS the refresh on purpose — that is the single-flight.
-/// Without it each expiry is a thundering herd and the pool exhaustion returns
-/// at one-per-TTL instead of one-per-poll. With it, concurrency is 1 by
-/// construction: N waiters produce one scan and then all read its result.
+/// Single-flight without holding a lock across the scan: the refresh runs in
+/// its own task, which owns the cache write, and callers wait on it through a
+/// watch channel. The refresh used to run inside the request future with the
+/// lock held; when a slow scan outlived the mount's 30s statfs timeout, the
+/// dropped request released the lock and discarded the finished scan, so the
+/// cache never filled and every poll started another concurrent scan.
 #[derive(Default)]
 pub struct ResilienceCache {
-    inner: tokio::sync::Mutex<Option<Cached>>,
+    state: std::sync::Mutex<CacheState>,
+}
+
+impl ResilienceCache {
+    /// Fresh entry → served. Otherwise a refresh is started (or joined), and
+    /// a stale entry is served immediately while it runs. With nothing cached,
+    /// or with `ttl` zero, the caller waits for the refresh.
+    async fn get_or_refresh<F>(
+        self: &Arc<Self>,
+        ttl: Duration,
+        scan: F,
+    ) -> Result<StorageParts, DatabaseError>
+    where
+        F: FnOnce() -> Result<StorageParts, DatabaseError> + Send + 'static,
+    {
+        let rx = {
+            let mut state = self.state.lock().expect("resilience cache poisoned");
+            if let Some(cached) = state.entry.as_ref().filter(|c| c.built_at.elapsed() < ttl) {
+                return Ok(cached.parts.clone());
+            }
+            let rx = match state.inflight.clone() {
+                Some(rx) => rx,
+                None => self.start_refresh(&mut state, scan),
+            };
+            if !ttl.is_zero() {
+                if let Some(cached) = &state.entry {
+                    return Ok(cached.parts.clone());
+                }
+            }
+            rx
+        };
+        wait_for_refresh(rx).await
+    }
+
+    fn start_refresh<F>(
+        self: &Arc<Self>,
+        state: &mut CacheState,
+        scan: F,
+    ) -> watch::Receiver<Option<Outcome>>
+    where
+        F: FnOnce() -> Result<StorageParts, DatabaseError> + Send + 'static,
+    {
+        let (tx, rx) = watch::channel(None);
+        state.inflight = Some(rx.clone());
+        let cache = Arc::clone(self);
+        tokio::spawn(async move {
+            let scanned = tokio::task::spawn_blocking(scan)
+                .await
+                .unwrap_or(Err(DatabaseError::ProcessingError));
+            let outcome = {
+                let mut state = cache.state.lock().expect("resilience cache poisoned");
+                state.inflight = None;
+                absorb(scanned, &mut state.entry, Instant::now()).map_err(|_| ())
+            };
+            // No waiters left is fine: the entry above is what the next caller reads.
+            let _ = tx.send(Some(outcome));
+        });
+        rx
+    }
+}
+
+async fn wait_for_refresh(
+    mut rx: watch::Receiver<Option<Outcome>>,
+) -> Result<StorageParts, DatabaseError> {
+    let outcome = rx
+        .wait_for(Option::is_some)
+        .await
+        .map_err(|_| DatabaseError::ProcessingError)?;
+    match outcome.as_ref() {
+        Some(Ok(parts)) => Ok(parts.clone()),
+        _ => Err(DatabaseError::ProcessingError),
+    }
 }
 
 /// Storage numbers for any consumer, rescanning only past the TTL.
@@ -87,24 +173,14 @@ pub struct ResilienceCache {
 pub async fn cached_storage_parts(
     app_state: &crate::AppState,
 ) -> Result<StorageParts, DatabaseError> {
-    let mut guard = app_state.resilience.inner.lock().await;
-
-    if let Some(cached) = guard
-        .as_ref()
-        .filter(|c| c.built_at.elapsed() < storage_ttl())
-    {
-        return Ok(cached.parts.clone());
-    }
-
     let pool = app_state.db_pool.clone();
-    let scanned = tokio::task::spawn_blocking(move || {
-        let conn = pool.get().map_err(|_| DatabaseError::LockError)?;
-        storage_parts(&conn)
-    })
-    .await
-    .map_err(|_| DatabaseError::ProcessingError)?;
-
-    absorb(scanned, &mut guard, Instant::now())
+    app_state
+        .resilience
+        .get_or_refresh(storage_ttl(), move || {
+            let conn = pool.get().map_err(|_| DatabaseError::LockError)?;
+            storage_parts(&conn)
+        })
+        .await
 }
 
 /// What a refresh attempt yields: a good scan replaces the entry, a failed one
@@ -149,9 +225,10 @@ pub fn storage_parts(
         .map(|v| v.members.iter().map(|p| p.node_id).collect())
         .unwrap_or_default();
 
-    let levels = resilience::resilience_level_rows(conn, &member_ids)?;
+    let counts = resilience::BlockNodeCounts::build(conn)?;
+    let levels = resilience::resilience_level_rows(&counts, &member_ids)?;
     let unplaced = resilience::unplaced_age_buckets(conn)?;
-    let baselines = resilience::get_node_storage_baselines(conn)?;
+    let baselines = resilience::get_node_storage_baselines(&counts)?;
     // Threshold 0.9 matches admin::routes, which is where this curve came from.
     let curve = resilience::generate_fault_tolerance_curve(baselines.clone(), 0.9);
 
@@ -503,6 +580,133 @@ mod tests {
         let mut entry = None;
         assert!(absorb(Err(DatabaseError::LockError), &mut entry, Instant::now()).is_err());
         assert!(entry.is_none());
+    }
+
+    // Should: leave no scan tables on a pooled connection after a scan.
+    // Should: scan again on the same connection.
+    #[test]
+    fn a_scan_cleans_up_after_itself_on_a_reused_connection() {
+        let pool = one_connection_pool();
+        let conn = pool.get().expect("conn");
+
+        storage_parts(&conn).expect("first scan");
+        storage_parts(&conn).expect("second scan on the reused connection");
+
+        let leftover: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_temp_master", [], |r| r.get(0))
+            .expect("temp schema");
+        assert_eq!(leftover, 0);
+    }
+
+    fn counted_scan(
+        scans: &Arc<std::sync::atomic::AtomicUsize>,
+        user_data_gb: f64,
+        takes: Duration,
+    ) -> impl FnOnce() -> Result<StorageParts, DatabaseError> + Send + 'static {
+        let scans = Arc::clone(scans);
+        move || {
+            scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(takes);
+            Ok(parts_reporting(user_data_gb))
+        }
+    }
+
+    // Impact: the mount's statfs gave up at 30s while the scan took longer;
+    // the dropped request discarded the finished scan, the cache never
+    // filled, and every poll started another — four concurrent full-table
+    // scans pinning a node at ~400% CPU.
+    // Should: keep a refresh running after its caller gives up, and serve
+    // its result to the next caller.
+    // Should not: start a second scan while the first is still in flight.
+    #[tokio::test]
+    async fn a_cancelled_caller_does_not_lose_the_refresh() {
+        let cache = Arc::new(ResilienceCache::default());
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ttl = Duration::from_secs(60);
+        let slow = Duration::from_millis(200);
+
+        let gave_up = tokio::time::timeout(
+            Duration::from_millis(20),
+            cache.get_or_refresh(ttl, counted_scan(&scans, 800.0, slow)),
+        )
+        .await;
+        assert!(gave_up.is_err(), "caller should have timed out first");
+
+        let served = cache
+            .get_or_refresh(ttl, counted_scan(&scans, 1600.0, slow))
+            .await
+            .expect("joined refresh");
+
+        assert_eq!(
+            statfs_from_parts(&served),
+            statfs_from_parts(&parts_reporting(800.0))
+        );
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // Should: answer a stale read immediately with the cached numbers while
+    // a refresh runs, then serve the refreshed numbers once it lands.
+    #[tokio::test]
+    async fn a_stale_entry_is_served_while_the_refresh_runs() {
+        let cache = Arc::new(ResilienceCache::default());
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        cache
+            .get_or_refresh(
+                Duration::from_secs(60),
+                counted_scan(&scans, 800.0, Duration::ZERO),
+            )
+            .await
+            .expect("first scan");
+
+        let asked = Instant::now();
+        let stale = cache
+            .get_or_refresh(
+                Duration::from_nanos(1),
+                counted_scan(&scans, 1600.0, Duration::from_millis(200)),
+            )
+            .await
+            .expect("stale");
+        assert!(
+            asked.elapsed() < Duration::from_millis(100),
+            "stale read waited on the scan"
+        );
+        assert_eq!(
+            statfs_from_parts(&stale),
+            statfs_from_parts(&parts_reporting(800.0))
+        );
+
+        // A zero TTL waits, and joins the refresh already in flight.
+        let fresh = cache
+            .get_or_refresh(Duration::ZERO, counted_scan(&scans, 3200.0, Duration::ZERO))
+            .await
+            .expect("fresh");
+        assert_eq!(
+            statfs_from_parts(&fresh),
+            statfs_from_parts(&parts_reporting(1600.0))
+        );
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // Should: wait for a fresh scan when caching is disabled, even with an
+    // entry cached.
+    #[tokio::test]
+    async fn a_zero_ttl_always_waits_for_a_fresh_scan() {
+        let cache = Arc::new(ResilienceCache::default());
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        cache
+            .get_or_refresh(Duration::ZERO, counted_scan(&scans, 800.0, Duration::ZERO))
+            .await
+            .expect("first scan");
+
+        let fresh = cache
+            .get_or_refresh(Duration::ZERO, counted_scan(&scans, 1600.0, Duration::ZERO))
+            .await
+            .expect("second scan");
+
+        assert_eq!(
+            statfs_from_parts(&fresh),
+            statfs_from_parts(&parts_reporting(1600.0))
+        );
     }
 
     // Should: replace the cached entry with the result of a successful rescan.
