@@ -21,7 +21,9 @@ use hopnet_consensus::types as engine;
 
 use crate::AppState;
 use crate::DISPATCH_TABLE;
-use crate::consensus::dispatch::{MAX_TRANSACTION_AGE, process_transaction, process_transactions};
+use crate::consensus::dispatch::{
+    MAX_TRANSACTION_AGE, PROPOSAL_AGE_MARGIN, process_transaction, process_transactions,
+};
 use crate::consensus::types::Transactions as OldTransactions;
 use crate::db::consensus as db;
 
@@ -492,10 +494,34 @@ pub fn build_value(
     let nonces: Vec<_> = candidates.iter().map(|t| t.nonce.clone()).collect();
     let committed = db::check_committed_nonces(conn, &nonces).unwrap_or_default();
 
+    // Staleness: every Live validator rejects a block carrying a transaction
+    // older than MAX_TRANSACTION_AGE, so proposing one only burns the round —
+    // and the entry comes back for the next. Two proposers each holding a
+    // stale validator_vote_out rejected each other's blocks for 29 rounds
+    // until restarted. Judged before the solo-block rule so a stale
+    // membership transition cannot hold the solo slot either.
+    let now = chrono::Utc::now();
+    let max_proposable_age = MAX_TRANSACTION_AGE - PROPOSAL_AGE_MARGIN;
+
     let mut survivors: Vec<(usize, &crate::consensus::types::Transaction)> = Vec::new();
     for (i, tx) in candidates.iter().enumerate() {
         if committed.contains(&tx.nonce.to_string()) {
             rejected.push((i, crate::consensus::queue::RejectReason::AlreadyCommitted));
+        } else if let Some(age) = tx
+            .nonce
+            .extract_timestamp()
+            .map(|created_at| now - created_at)
+            .filter(|age| *age > max_proposable_age)
+        {
+            rejected.push((
+                i,
+                crate::consensus::queue::RejectReason::Permanent(format!(
+                    "stale transaction {} (age {}s, proposable up to {}s)",
+                    tx.rpc.function,
+                    age.num_seconds(),
+                    max_proposable_age.num_seconds()
+                )),
+            ));
         } else {
             survivors.push((i, tx));
         }

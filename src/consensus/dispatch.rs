@@ -81,6 +81,12 @@ pub async fn create_signed_user_transaction(
 /// The 10-minute gap provides clock skew tolerance across nodes.
 pub const MAX_TRANSACTION_AGE: chrono::TimeDelta = chrono::TimeDelta::minutes(50);
 
+/// How much younger than [`MAX_TRANSACTION_AGE`] a transaction must be for a
+/// proposer to include it. Validators judge age by their own clocks when the
+/// proposal arrives; the margin keeps a nearly-stale transaction from costing
+/// a round on skew or build latency.
+pub const PROPOSAL_AGE_MARGIN: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
 pub fn process_transactions(
     transactions: &Option<Transactions>,
     app_state: &AppState,

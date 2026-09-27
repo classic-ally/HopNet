@@ -8,6 +8,7 @@ mod byzantine;
 mod malachite_integration;
 mod regenesis;
 mod signatures;
+mod stale_proposal;
 mod transient_restage;
 mod upgrade;
 
