@@ -52,4 +52,21 @@ pub fn capture(
         "storage::lifecycle::snapshot_at(5)".into(),
         storage_wrap(lifecycle::snapshot_at(&conn, 5)),
     );
+
+    // RFC-STORAGE-003 S7 pane reads (hopnet_storage::observe). Height-based,
+    // so deterministic at a fixed tip — unlike unplaced-by-age, which keys
+    // on the wall clock and is deliberately not captured.
+    use hopnet_storage::observe;
+    results.insert(
+        "storage::observe::lifecycle_counts(t=5)".into(),
+        storage_wrap(observe::lifecycle_counts(&conn, Some(5))),
+    );
+    results.insert(
+        "storage::observe::in_flight_age_buckets(tip=100)".into(),
+        storage_wrap(observe::in_flight_age_buckets(&conn, 100)),
+    );
+    results.insert(
+        "storage::observe::verification_by_node(tip=100,window=1024)".into(),
+        storage_wrap(observe::verification_by_node(&conn, 100, 1024)),
+    );
 }

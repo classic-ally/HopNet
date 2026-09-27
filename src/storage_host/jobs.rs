@@ -763,12 +763,36 @@ pub async fn handle_storage_policy_tick(_job: TaskId, ctx: Data<AppState>) -> Re
     run_storage_policy_tick(&ctx).await.map(|_| ())
 }
 
+/// One policy tick's tally (RFC-STORAGE-003 S7): what the rungs found and
+/// did. Kept in `AppState.last_tick` so the pane can show the re-encode
+/// backlog the tick's own scan measured, instead of rescanning.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PolicyTickReport {
+    /// Unix seconds when the tick ran.
+    pub at: i64,
+    pub members: Vec<i32>,
+    pub online: usize,
+    pub watermark: usize,
+    /// Chunks below the watermark with a class this node owes a rebuild
+    /// of (all enqueued, urgently).
+    pub urgent_chunks_owed: usize,
+    /// Chunks at or above the watermark with a class this node owes a
+    /// rebuild of — one is picked per tick.
+    pub lazy_chunks_owed: usize,
+    pub urgent_reencodes: usize,
+    pub lazy_reencodes: usize,
+    pub migration_repaired: usize,
+    pub confirms_proposed: usize,
+    pub grace_declared: usize,
+    pub eviction: serde_json::Value,
+}
+
 /// The engine policy tick (RFC-STORAGE-001 Repair; RFC-STORAGE-002 S6):
 /// view sync → the obligation check's re-encode half (ladder + deputy
 /// under the goal assignment) → grace rung → in-flight re-kick →
 /// fulfillment → eviction check. Disk truth (the sweep, the scrub slice,
 /// belief and attestation) rides the self-check cron.
-pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json::Value, Error> {
+pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<PolicyTickReport, Error> {
     use hopnet_storage::engine::ReencodeCmd;
     use hopnet_storage::reconcile::{self, ChunkState, ClassState, Duty};
     use hopnet_storage::traits::StateReader;
@@ -817,6 +841,7 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json:
     };
     let mut urgent_enqueued = 0usize;
     let mut lazy_enqueued = 0usize;
+    let mut lazy_owed = 0usize;
     if settings.reencode_enabled {
         let online: std::collections::HashSet<i32> = view.online.iter().copied().collect();
         let members: std::collections::HashSet<i32> = member_ids.iter().copied().collect();
@@ -895,8 +920,11 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json:
                 if urgent {
                     engine.enqueue_reencode(cmd, true);
                     urgent_enqueued += 1;
-                } else if lazy_pick.is_none() {
-                    lazy_pick = Some(cmd);
+                } else {
+                    lazy_owed += 1;
+                    if lazy_pick.is_none() {
+                        lazy_pick = Some(cmd);
+                    }
                 }
             }
             if let Some(cmd) = lazy_pick {
@@ -942,15 +970,20 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json:
     // (4) Eviction check (statvfs no-op below the high watermark).
     let eviction = run_watermark_eviction(app_state, None, None).await?;
 
-    Ok(serde_json::json!({
-        "members": member_ids,
-        "online": view.online.len(),
-        "watermark": view.watermark,
-        "urgent_reencodes": urgent_enqueued,
-        "lazy_reencodes": lazy_enqueued,
-        "migration_repaired": migration_repaired,
-        "confirms_proposed": confirms_proposed,
-        "grace_declared": grace_declared,
-        "eviction": eviction,
-    }))
+    let report = PolicyTickReport {
+        at: chrono::Utc::now().timestamp(),
+        members: member_ids,
+        online: view.online.len(),
+        watermark: view.watermark,
+        urgent_chunks_owed: urgent_enqueued,
+        lazy_chunks_owed: lazy_owed,
+        urgent_reencodes: urgent_enqueued,
+        lazy_reencodes: lazy_enqueued,
+        migration_repaired,
+        confirms_proposed,
+        grace_declared,
+        eviction,
+    };
+    *app_state.last_tick.lock().unwrap() = Some(report.clone());
+    Ok(report)
 }

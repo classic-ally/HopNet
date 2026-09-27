@@ -36,7 +36,7 @@ cargo build --release --bin snapshotter --features skip-frontend
 1. Creates an **ephemeral in-memory SQLite database** (no disk I/O)
 2. Initializes schema via `db::shared::initialize()` with custom SQL functions
 3. Seeds **deterministic fixture data** (users, nodes, blocks, files, metrics, etc.)
-4. Calls **69 DB read functions** with known inputs
+4. Calls **64 DB read functions** with known inputs
 5. Serializes all results to a single JSON snapshot file
 
 ### Fixture Data
@@ -61,7 +61,7 @@ All fixture data is fully deterministic — UUIDs use index-derived bytes, times
 | Committed nonces | 3 | For dedup queries |
 | Modification log | 4 | 3 inserts + 1 move |
 
-### Functions Captured (69 total)
+### Functions Captured (64 total)
 
 Organized by module:
 
@@ -79,6 +79,7 @@ Organized by module:
 - **devices** (3): get_device_by_id, get_devices_for_user (x2)
 - **takeout** (4): has_active_takeout (x2), calculate_user_data_size, get_takeouts_by_user, get_expired_takeouts_needing_status_update
 - **setup** (1): get_initial_setup
+- **storage lifecycle** (6, `hopnet_storage`): lifecycle::latest_transition_height, transition_in, snapshot_at; observe::lifecycle_counts, in_flight_age_buckets, verification_by_node (height-based, so deterministic; unplaced-by-age is wall-clock and deliberately not captured)
 
 ## Snapshot JSON Format
 

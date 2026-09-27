@@ -147,3 +147,51 @@ export function formatStorageCapacity(gb: number): string {
         }
     }
 }
+/**
+ * Format a microsecond duration compactly for a tile: "420µs", "42ms", "1.2s".
+ */
+export function formatMicros(us: number): string {
+    if (us < 1000) return `${Math.round(us)}µs`
+    if (us < 1_000_000) {
+        const ms = us / 1000
+        return ms < 10 ? `${ms.toFixed(1)}ms` : `${Math.round(ms)}ms`
+    }
+    const s = us / 1_000_000
+    return s < 10 ? `${s.toFixed(1)}s` : `${Math.round(s)}s`
+}
+
+/**
+ * Format a whole-second duration as the largest two units: "42s", "4m 10s",
+ * "3h 12m", "2d 5h".
+ */
+export function formatSeconds(secs: number): string {
+    if (secs < 60) return `${Math.round(secs)}s`
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ${Math.round(secs % 60)}s`
+    if (secs < 86400) return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`
+    return `${Math.floor(secs / 86400)}d ${Math.floor((secs % 86400) / 3600)}h`
+}
+
+/**
+ * Format a bytes-per-second rate: "512KB/s", "38MB/s", "1.2GB/s".
+ */
+export function formatBytesPerSec(bps: number): string {
+    if (bps < 1024) return `${Math.round(bps)}B/s`
+    const kb = bps / 1024
+    if (kb < 1024) return `${Math.round(kb)}KB/s`
+    const mb = kb / 1024
+    if (mb < 1024) return mb < 10 ? `${mb.toFixed(1)}MB/s` : `${Math.round(mb)}MB/s`
+    const gb = mb / 1024
+    return `${gb.toFixed(1)}GB/s`
+}
+
+/**
+ * Format a unix-seconds timestamp relative to now: "12s ago", "4m ago",
+ * "2h ago", "3d ago".
+ */
+export function formatRelativeAgo(unixSecs: number, nowSecs: number = Date.now() / 1000): string {
+    const age = Math.max(0, nowSecs - unixSecs)
+    if (age < 60) return `${Math.round(age)}s ago`
+    if (age < 3600) return `${Math.floor(age / 60)}m ago`
+    if (age < 86400) return `${Math.floor(age / 3600)}h ago`
+    return `${Math.floor(age / 86400)}d ago`
+}

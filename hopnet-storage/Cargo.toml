@@ -19,6 +19,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 bincode = { version = "2.0.1", features = ["serde"] }
 hex = "0.4.3"
 rusqlite = { version = "0.38", features = ["bundled"] }
+hdrhistogram = { version = "7.5.4", default-features = false }
 tracing = "0.1"
 
 reed-solomon-simd = "3.0.1"

@@ -20,6 +20,7 @@ pub mod eviction;
 pub mod fragstore;
 pub mod lifecycle;
 pub mod membership;
+pub mod observe;
 pub mod pins;
 pub mod placement;
 pub mod protection;

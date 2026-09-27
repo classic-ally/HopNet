@@ -759,6 +759,12 @@ optimization and carries no proof obligation.
     cost is proved linear (CALM_BOUND). The transfer-timing
     histograms that power it land early, in the same shape as the
     existing commit-latency instrumentation.
+    - S7 (2026-09-27): landed as owed fetches × the measured median
+      fetch, per worker queue — the reconciler is one serial worker,
+      so fetch count at the median is the sound unit; bytes over
+      throughput would have modelled a parallelism it does not have.
+      The histograms are fed at the transport wrapper, this node,
+      since process start.
 - **The absorbed lifecycle jobs fold into existing machinery.**
   - Orphaned fragment files stop being a mechanism: a file with no
     `fragment_hashes` row is the third case of the existence
@@ -1026,10 +1032,43 @@ optimization and carries no proof obligation.
     function and the snapshotter capture are deleted (RFC-007's
     redundant-copy cleanup is superseded by watermark eviction under
     the protection predicate, S2).
-- [ ] **S7 — Observability.** The pane series (in-flight ages,
+- [x] **S7 — Observability.** The pane series (in-flight ages,
   staleness backlog, converged predicate, verification freshness);
   transfer-timing histograms; per-tier ETA last, on top of
   measured throughput.
+  - Done 2026-09-27. `hopnet_storage::observe` holds the pane's
+    reads, each the worker's own predicate: `lifecycle_counts`
+    (three disjoint stages — owed `desired < T`, in flight, confirmed
+    — and `converged()`), `in_flight_age_buckets` (heights since goal,
+    edges 8/64/256/1024, severity warn at 256 and stale at the
+    attestation window, set in the crate), `verification_by_node`
+    (fresh / stale / never / suspect against the recency window,
+    grouped by holder), the fetch histograms (`FETCH_LATENCY_US`,
+    `FETCH_THROUGHPUT_BPS`, hdrhistogram statics fed by the transport
+    wrapper on every fetch, plus a failure counter — the commit-latency
+    shape) and the time-to-conformance model. The reconciler is ONE
+    serial worker, so a tier's ETA is its owed fetches at the measured
+    median fetch (`eta_secs`), not bytes over throughput; tiers are
+    the worker's queues — urgent rebuild (K fetches a chunk), pull (one
+    fetch a class, `owed_pull_fetches` over the in-flight set bounded
+    at 2000), lazy rebuild. The policy tick now keeps its tally
+    (`PolicyTickReport` in `AppState.last_tick`) so the rebuild tiers
+    come from the tick's own scan, not a second one. The resilience
+    view (`StoragePanelView`) gained `lifecycle`, `verification`,
+    `transfers`, `eta` — the indexed reads live per 5-second poll, the
+    in-flight owed pass behind the 60-second cache with the other
+    scans. The pane: a Block Lifecycle card (stage strip + in-flight
+    age histogram, Converged / Draining chip), a Disk Truth card (one
+    stacked bar per holder), a Reconciler card (percentile tiles and
+    the three ETA tiles); `AgeHistogram` and `StageStrip` are the two
+    new generic components, and unplaced-by-age now renders through
+    the former. Everything the pane shows is process-local only where
+    it says so (this node's fetches and owed work); the series are
+    replicated reads. Decided with previews (2026-09-27): strip +
+    histogram over a time series (no client-side history exists and a
+    stuck age tail IS the plateau), per-node bars over a mesh
+    histogram, tiles over a log-bucket chart, ETA now rather than
+    deferred.
 - [ ] **Cutover.** One release: migration backfill enrolls the stranded
   class, the first propose hook starts the catch-up drain.
   Validation on the live mesh: watch the drain complete, then the

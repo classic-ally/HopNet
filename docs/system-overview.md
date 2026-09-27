@@ -506,7 +506,7 @@ apply functions inside consensus handlers.
       repair scan, migration pull, eviction, weekly rolling scrub).
       Orchestrator: tier-membership, eviction-under-pressure,
       re-encode-after-departure (kill → decay → regenerate → download)
-- [~] Block lifecycle convergence — S0–S6 of 7 + cutover
+- [~] Block lifecycle convergence — S0–S7 of 7, cutover remains
       ([RFC-STORAGE-003](../hopnet-storage/spec/block-lifecycle.md),
       branch `rfc-block-lifecycle`, PR #72): the upload-to-placement
       pipeline joins the proven model. S0 (2026-08-22): the Quint model
@@ -550,7 +550,12 @@ apply functions inside consensus handlers.
       is the backfill), orphan deletion drops the deleted blobs' inventory
       rows for every node, the orphaned data-block cleanup runs daily per
       node (bounded batches), and the availability-class branch is gone.
-      S7 (observability) and the cutover remain.
+      S7 (2026-09-27): observability — `hopnet_storage::observe` gives the
+      resilience pane the worker's own predicates (stage counts + converged,
+      in-flight ages in heights, verification freshness per holder), fetch
+      histograms in the commit-latency shape, and time-to-conformance per
+      reconciler queue (owed fetches × median fetch); three new cards
+      (Block Lifecycle, Disk Truth, Reconciler). Only the cutover remains.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage

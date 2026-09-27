@@ -119,6 +119,155 @@ pub struct StoragePanelView {
 
     /// Unplaced volume by age, youngest first.
     pub unplaced_buckets: Vec<UnplacedBucket>,
+
+    /// RFC-STORAGE-003 S7: the lifecycle's own work-list predicates.
+    pub lifecycle: LifecycleView,
+    /// Disk-truth freshness per holder.
+    pub verification: VerificationView,
+    /// This node's fetch record since process start.
+    pub transfers: TransferView,
+    /// This node's time to conformance per reconciler queue.
+    pub eta: EtaView,
+}
+
+/// Block Lifecycle card: every number is `hopnet_storage::observe`'s.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct LifecycleView {
+    /// Decided height the ages are measured from.
+    #[typeshare(serialized_as = "number")]
+    pub tip: u64,
+    /// T — the latest storage-view transition on record; absent before
+    /// the first one.
+    #[typeshare(serialized_as = "number")]
+    pub transition_height: Option<u64>,
+    /// Declarations still owed (`desired < T`).
+    #[typeshare(serialized_as = "number")]
+    pub owed: u64,
+    /// Goals not yet confirmed.
+    #[typeshare(serialized_as = "number")]
+    pub in_flight: u64,
+    /// Quiescent blobs.
+    #[typeshare(serialized_as = "number")]
+    pub confirmed: u64,
+    /// The checked predicate: nothing owed, nothing in flight.
+    pub converged: bool,
+    /// The in-flight set by heights since its goal, youngest first.
+    pub in_flight_buckets: Vec<AgeBucketView>,
+}
+
+/// One age bucket of the in-flight set.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct AgeBucketView {
+    pub label: String,
+    #[typeshare(serialized_as = "number")]
+    pub blobs: u64,
+    pub gb: f64,
+    /// Absent means "explainable as in flight".
+    pub severity: Option<AgeSeverity>,
+}
+
+/// How far past explainable an in-flight age bucket is (set by the
+/// storage crate's policy constants, never by a component).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[typeshare]
+#[serde(rename_all = "lowercase")]
+pub enum AgeSeverity {
+    Warn,
+    Stale,
+}
+
+/// Disk Truth card.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct VerificationView {
+    /// Heights a disk verification stays fresh for (confirm evidence).
+    #[typeshare(serialized_as = "number")]
+    pub window: u64,
+    /// Every holder's rows summed.
+    pub mesh: NodeVerificationView,
+    /// One row per holder with inventory rows, by node id.
+    pub nodes: Vec<NodeVerificationView>,
+}
+
+/// One holder's inventory rows by freshness.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct NodeVerificationView {
+    /// -1 for the mesh total.
+    pub node_id: i32,
+    pub name: Option<String>,
+    #[typeshare(serialized_as = "number")]
+    pub fresh: u64,
+    #[typeshare(serialized_as = "number")]
+    pub stale: u64,
+    #[typeshare(serialized_as = "number")]
+    pub never: u64,
+    #[typeshare(serialized_as = "number")]
+    pub suspect: u64,
+}
+
+/// Fetch record, the commit-latency shape: count and five quantiles.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct PercentilesView {
+    #[typeshare(serialized_as = "number")]
+    pub count: u64,
+    #[typeshare(serialized_as = "number")]
+    pub p50: u64,
+    #[typeshare(serialized_as = "number")]
+    pub p90: u64,
+    #[typeshare(serialized_as = "number")]
+    pub p99: u64,
+    #[typeshare(serialized_as = "number")]
+    pub p999: u64,
+    #[typeshare(serialized_as = "number")]
+    pub max: u64,
+}
+
+/// Reconciler card, transfers half: this node, since process start.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct TransferView {
+    #[typeshare(serialized_as = "number")]
+    pub fetches: u64,
+    #[typeshare(serialized_as = "number")]
+    pub failures: u64,
+    /// Fetch duration, microseconds.
+    pub latency_us: PercentilesView,
+    /// Fetch throughput, bytes per second.
+    pub throughput_bps: PercentilesView,
+}
+
+/// Reconciler card, time-to-conformance half: owed fetches at the
+/// measured median fetch, per worker queue.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct EtaView {
+    /// The median fetch this node has measured; absent until a sample.
+    #[typeshare(serialized_as = "number")]
+    pub p50_fetch_us: Option<u64>,
+    /// urgent / pull / lazy, in that order.
+    pub tiers: Vec<EtaTierView>,
+    /// The pull tier's scan hit its bound: owed is a floor.
+    pub partial: bool,
+    /// When the policy tick last measured the re-encode tiers; absent
+    /// before the first tick.
+    #[typeshare(serialized_as = "number")]
+    pub tick_at: Option<i64>,
+}
+
+/// One reconciler queue's owed work.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct EtaTierView {
+    pub tier: String,
+    #[typeshare(serialized_as = "number")]
+    pub owed_fetches: u64,
+    /// Absent until the fetch histogram has a sample.
+    #[typeshare(serialized_as = "number")]
+    pub eta_secs: Option<u64>,
 }
 
 /// Raw user bytes sitting at one worst-case tolerance level.

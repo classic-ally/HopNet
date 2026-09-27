@@ -15,8 +15,11 @@ use r2d2_sqlite::SqliteConnectionManager;
 
 use hopnet_common::db::{FaultToleranceCurvePoint, NodeStorageBaseline};
 use hopnet_common::views::{
-    ConsensusPanelView, ResilienceLevelBytes, StoragePanelView, UnplacedBucket, UnplacedSeverity,
+    AgeBucketView, AgeSeverity, ConsensusPanelView, EtaTierView, EtaView, LifecycleView,
+    NodeVerificationView, PercentilesView, ResilienceLevelBytes, StoragePanelView, TransferView,
+    UnplacedBucket, UnplacedSeverity, VerificationView,
 };
+use hopnet_storage::observe;
 
 use crate::db::DatabaseError;
 
@@ -65,6 +68,10 @@ pub struct StorageParts {
     pub baselines: Vec<NodeStorageBaseline>,
     pub curve: Vec<FaultToleranceCurvePoint>,
     pub unplaced: Vec<(&'static str, f64)>,
+    /// Fetches this node owes across the in-flight set (S7's pull tier)
+    /// and whether the bounded scan was cut short. Behind the TTL with the
+    /// other scans because it walks the in-flight set.
+    pub owed_pull: (u64, bool),
 }
 
 struct Cached {
@@ -174,11 +181,12 @@ pub async fn cached_storage_parts(
     app_state: &crate::AppState,
 ) -> Result<StorageParts, DatabaseError> {
     let pool = app_state.db_pool.clone();
+    let me = app_state.node_id.get().copied();
     app_state
         .resilience
         .get_or_refresh(storage_ttl(), move || {
             let conn = pool.get().map_err(|_| DatabaseError::LockError)?;
-            storage_parts(&conn)
+            storage_parts(&conn, me)
         })
         .await
 }
@@ -215,6 +223,7 @@ fn absorb(
 /// One scan, one connection: the whole DB-derived storage half.
 pub fn storage_parts(
     conn: &PooledConnection<SqliteConnectionManager>,
+    me: Option<i32>,
 ) -> Result<StorageParts, DatabaseError> {
     use crate::db::resilience;
 
@@ -231,6 +240,13 @@ pub fn storage_parts(
     let baselines = resilience::get_node_storage_baselines(&counts)?;
     // Threshold 0.9 matches admin::routes, which is where this curve came from.
     let curve = resilience::generate_fault_tolerance_curve(baselines.clone(), 0.9);
+    // S7: the pull tier's owed fetches — the engine's own owed rule over the
+    // in-flight set, bounded. Nothing owed before this node has an id.
+    let owed_pull = match me {
+        Some(me) => observe::owed_pull_fetches(conn, me, observe::ETA_SCAN_LIMIT)
+            .map_err(|_| DatabaseError::ProcessingError)?,
+        None => (0, false),
+    };
 
     Ok(StorageParts {
         member_ids,
@@ -238,6 +254,7 @@ pub fn storage_parts(
         baselines,
         curve,
         unplaced,
+        owed_pull,
     })
 }
 
@@ -396,6 +413,16 @@ pub fn storage_view(
     // panel, and a stale one would show a departed node as in contact.
     let unreachable_members = unreachable_member_count(app_state, conn, &parts.member_ids);
 
+    // S7: the lifecycle's own predicates, read live on the same connection.
+    // These are indexed counts, not the full-table scan behind the TTL, so
+    // they can follow the 5s poll; the tick report and the fetch histograms
+    // are process state and cost nothing to read.
+    let tip = crate::db::consensus::get_current_consensus_height(conn).unwrap_or(0);
+    let lifecycle = lifecycle_view(conn, tip);
+    let verification = verification_view(conn, tip);
+    let transfers = observe::transfers();
+    let eta = eta_view(app_state, parts, &transfers);
+
     StoragePanelView {
         curve: parts.curve.clone(),
         observed_levels,
@@ -403,6 +430,123 @@ pub fn storage_view(
         unknown_gb,
         unreachable_members,
         unplaced_buckets,
+        lifecycle,
+        verification,
+        transfers: TransferView {
+            fetches: transfers.fetches,
+            failures: transfers.failures,
+            latency_us: percentiles(&transfers.latency_us),
+            throughput_bps: percentiles(&transfers.throughput_bps),
+        },
+        eta,
+    }
+}
+
+fn percentiles(h: &observe::HistogramSnapshot) -> PercentilesView {
+    PercentilesView {
+        count: h.count,
+        p50: h.p50,
+        p90: h.p90,
+        p99: h.p99,
+        p999: h.p999,
+        max: h.max,
+    }
+}
+
+/// Block Lifecycle card. A read failure yields an empty card rather than
+/// failing the whole pane — the durability half is the one that matters.
+fn lifecycle_view(conn: &rusqlite::Connection, tip: u64) -> LifecycleView {
+    let transition_height = hopnet_storage::lifecycle::latest_transition_height(conn)
+        .ok()
+        .flatten();
+    let counts = observe::lifecycle_counts(conn, transition_height).unwrap_or_default();
+    let in_flight_buckets = observe::in_flight_age_buckets(conn, tip)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|b| AgeBucketView {
+            label: b.label.to_string(),
+            blobs: b.blobs,
+            gb: b.bytes as f64 / BYTES_PER_GB,
+            severity: b.severity.map(|s| match s {
+                observe::AgeSeverity::Warn => AgeSeverity::Warn,
+                observe::AgeSeverity::Stale => AgeSeverity::Stale,
+            }),
+        })
+        .collect();
+    LifecycleView {
+        tip,
+        transition_height,
+        owed: counts.owed,
+        in_flight: counts.in_flight,
+        confirmed: counts.confirmed,
+        converged: counts.converged(),
+        in_flight_buckets,
+    }
+}
+
+/// Disk Truth card: the confirm evidence rule over the whole inventory,
+/// per holder, named where the node is known.
+fn verification_view(conn: &rusqlite::Connection, tip: u64) -> VerificationView {
+    let window = observe::INFLIGHT_STALE_HEIGHTS;
+    let nodes = observe::verification_by_node(conn, tip, window).unwrap_or_default();
+    let names: std::collections::HashMap<i32, String> = conn
+        .prepare_cached("SELECT node_id, name FROM nodes")
+        .and_then(|mut s| {
+            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()
+        })
+        .unwrap_or_default();
+    let row = |node_id: i32, name: Option<String>, c: &observe::VerificationCounts| {
+        NodeVerificationView {
+            node_id,
+            name,
+            fresh: c.fresh,
+            stale: c.stale,
+            never: c.never,
+            suspect: c.suspect,
+        }
+    };
+    VerificationView {
+        window,
+        mesh: row(-1, None, &observe::VerificationCounts::total(&nodes)),
+        nodes: nodes
+            .iter()
+            .map(|n| row(n.node_id, names.get(&n.node_id).cloned(), &n.counts))
+            .collect(),
+    }
+}
+
+/// Reconciler card, ETA half: the worker's three queues as owed fetches
+/// (a rebuild fetches K) at this node's measured median fetch.
+fn eta_view(
+    app_state: &crate::AppState,
+    parts: &StorageParts,
+    transfers: &observe::TransferSnapshot,
+) -> EtaView {
+    let k = hopnet_storage::rs::ORIGINAL_FRAGMENTS_PER_CHUNK as u64;
+    let tick = app_state.last_tick.lock().unwrap().clone();
+    let owed = observe::OwedFetches {
+        urgent: tick.as_ref().map_or(0, |t| t.urgent_chunks_owed as u64 * k),
+        pull: parts.owed_pull.0,
+        lazy: tick.as_ref().map_or(0, |t| t.lazy_chunks_owed as u64 * k),
+    };
+    let p50_fetch_us = (transfers.fetches > 0).then_some(transfers.latency_us.p50);
+    let etas = owed.etas(p50_fetch_us);
+    EtaView {
+        p50_fetch_us,
+        tiers: ["urgent", "pull", "lazy"]
+            .into_iter()
+            .map(|tier| {
+                let (owed_fetches, eta_secs) = etas[tier];
+                EtaTierView {
+                    tier: tier.to_string(),
+                    owed_fetches,
+                    eta_secs,
+                }
+            })
+            .collect(),
+        partial: parts.owed_pull.1,
+        tick_at: tick.map(|t| t.at),
     }
 }
 
@@ -525,7 +669,7 @@ mod tests {
         let pool = one_connection_pool();
         let conn = pool.get().expect("conn");
 
-        let parts = storage_parts(&conn).expect("scan");
+        let parts = storage_parts(&conn, Some(1)).expect("scan");
         let (total_bytes, _used_bytes) = statfs_from_parts(&parts);
 
         assert!(
@@ -539,6 +683,7 @@ mod tests {
             member_ids: vec![1, 2, 3],
             levels: vec![(2, 4096.0)],
             baselines: vec![],
+            owed_pull: (0, false),
             curve: vec![FaultToleranceCurvePoint {
                 user_data_gb,
                 active_nodes: 3,
@@ -589,8 +734,8 @@ mod tests {
         let pool = one_connection_pool();
         let conn = pool.get().expect("conn");
 
-        storage_parts(&conn).expect("first scan");
-        storage_parts(&conn).expect("second scan on the reused connection");
+        storage_parts(&conn, None).expect("first scan");
+        storage_parts(&conn, None).expect("second scan on the reused connection");
 
         let leftover: i64 = conn
             .query_row("SELECT COUNT(*) FROM sqlite_temp_master", [], |r| r.get(0))
@@ -707,6 +852,67 @@ mod tests {
             statfs_from_parts(&fresh),
             statfs_from_parts(&parts_reporting(1600.0))
         );
+    }
+
+    // Impact: the view owns no arithmetic — every number here must be the
+    // storage crate's own, so a fixture with known shapes is the drift net.
+    // Should: report the lifecycle stages, the converged predicate, the
+    // in-flight ages and per-holder verification exactly as observe does,
+    // with node names joined where known and a -1 mesh total.
+    #[test]
+    fn lifecycle_and_verification_views_carry_the_crate_numbers() {
+        let pool = one_connection_pool();
+        let conn = pool.get().expect("conn");
+        conn.execute_batch(
+            "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes, placement_height, file_size, desired_placement_height) VALUES
+                ('01890a5d-ac96-774b-b9aa-9f8b24f0c9a1', X'01', 3, 0, 90, 1073741824, 90),
+                ('01890a5d-ac96-774b-b9aa-9f8b24f0c9a2', X'02', 3, 0, NULL, 1073741824, 40),
+                ('01890a5d-ac96-774b-b9aa-9f8b24f0c9a3', X'03', 3, 0, 10, 1073741824, 10);
+             INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height, suspect) VALUES
+                (X'A1', 1, 1999, 0), (X'A2', 1, NULL, 0), (X'A3', 2, 5, 0), (X'A4', 2, 1999, 1);",
+        )
+        .expect("fixture");
+        // T = 50: blobs 2 (goal 40, unplaced) and 3 (goal 10) are owed a
+        // declaration; blob 1 is quiescent. The age histogram still counts
+        // blob 2 at age 60: its goal is unconfirmed whatever the backlog says.
+        conn.execute(
+            "INSERT INTO storage_view_transitions (height, snapshot) VALUES (50, X'00')",
+            [],
+        )
+        .expect("transition");
+
+        let lifecycle = lifecycle_view(&conn, 100);
+        assert_eq!(
+            (lifecycle.owed, lifecycle.in_flight, lifecycle.confirmed),
+            (2, 0, 1)
+        );
+        assert!(!lifecycle.converged);
+        assert_eq!(lifecycle.transition_height, Some(50));
+        let ages: Vec<u64> = lifecycle
+            .in_flight_buckets
+            .iter()
+            .map(|b| b.blobs)
+            .collect();
+        assert_eq!(ages, vec![0, 1, 0, 0, 0], "age 60 lands in <64");
+        assert!((lifecycle.in_flight_buckets[1].gb - 1.0).abs() < 1e-9);
+
+        // Tip 2000 puts the window floor at 976: 1999 is fresh, 5 is stale.
+        let v = verification_view(&conn, 2000);
+        assert_eq!(v.window, observe::INFLIGHT_STALE_HEIGHTS);
+        assert_eq!(
+            (
+                v.mesh.node_id,
+                v.mesh.fresh,
+                v.mesh.stale,
+                v.mesh.never,
+                v.mesh.suspect
+            ),
+            (-1, 1, 1, 1, 1)
+        );
+        assert_eq!(v.nodes.len(), 2);
+        assert_eq!(v.nodes[0].name.as_deref(), Some("node-1"));
+        assert_eq!((v.nodes[0].fresh, v.nodes[0].never), (1, 1));
+        assert_eq!((v.nodes[1].stale, v.nodes[1].suspect), (1, 1));
     }
 
     // Should: replace the cached entry with the result of a successful rescan.

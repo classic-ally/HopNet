@@ -68,6 +68,9 @@ pub struct AppState {
     /// The last disk-truth sweep's report (RFC-STORAGE-003 S5) — the
     /// operator route's payload. Process state.
     pub last_sweep: Arc<std::sync::Mutex<Option<hopnet_storage::sweep::SweepReport>>>,
+    /// The last policy tick's tally (RFC-STORAGE-003 S7) — the pane's
+    /// re-encode backlog source. Process state.
+    pub last_tick: Arc<std::sync::Mutex<Option<storage_host::jobs::PolicyTickReport>>>,
     pub comms: hopnet_comms::IrohComms,
     /// Whether this node has completed setup (genesis or JoinInfo received).
     /// Shared with the comms peer directory — when false, all incoming
