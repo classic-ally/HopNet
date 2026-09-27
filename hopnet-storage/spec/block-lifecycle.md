@@ -506,8 +506,9 @@ state to converged, with obligations never dropped in between.
 - **The staleness pass: a proposer-driven, self-consuming drain.**
   - Selection is one indexed predicate: `desired_placement_height <
     T`, T the latest storage-view transition. Every selected blob is
-    declared to the current height — no per-blob divergence check at
-    declare time. Re-goaling is not movement: capped-HRW minimal
+    declared to T (S4 decision: the view at the tip is the view at
+    T, and goals then coincide with record rows) — no per-blob
+    divergence check at declare time. Re-goaling is not movement: capped-HRW minimal
     movement means most declares are clean re-goals whose holders
     are unchanged; whether a blob actually moves is discovered
     later, by fulfillment, distributed.
@@ -854,9 +855,9 @@ optimization and carries no proof obligation.
     sentinel (Cutover) and the replicated record (Handoff Protocol).
     storage@1 artifacts import through a frozen v1 spec — the first
     covered-set addition to a released section under RFC-020, by the
-    pre-split consensus precedent. Not yet: the recency window on
-    declare's `to` (S4 sizes it with the passes), attestation recency
-    at confirm (S5).
+    pre-split consensus precedent. Not yet: attestation recency at
+    confirm (S5). (A recency window on declare's `to` was deferred
+    here and retired in S4: declares always target T.)
 - [x] **S2 — The protection predicate.** One pure function consuming the
   transition record's memoized snapshots (confirmed epoch plus every
   in-flight epoch); evictor and reconciler both consume it; the
@@ -928,11 +929,34 @@ optimization and carries no proof obligation.
     actions injected waits for S4, when declare and confirm are the
     worker's rungs too. The deputy rule below W is not yet
     implemented (S4, with the scan retirement).
-- [ ] **S4 — The two passes.** Propose hook + grace rung (staleness);
+- [x] **S4 — The two passes.** Propose hook + grace rung (staleness);
   fulfillment sampling fused with the tick (confirm discovery).
   The missing-class scan and the LIMIT-1 rebalance rung retire.
   Gate: orchestrator suite — distribution, departure re-encode,
   rebalance — green on the new machinery only.
+  - Done 2026-09-27. Staleness: `storage_host::staleness` — the
+    propose hook runs beside the cleanup-nonces candidate in the
+    proposer's NeedValue path (queue-bypassing, signed by the
+    assembler, skipped for the seal block and outside the Normal
+    phase) and appends one `lifecycle::stale_page` of
+    `DECLARE_PAGE_SIZE` targets; the grace rung in the policy tick
+    submits a page directly when the check has gone unobserved for
+    `STALENESS_GRACE_SECS` (a proposal of our own, or anyone's page
+    applying, re-arms it). Fulfillment: `lifecycle::in_flight_sample`
+    (random) with an adaptive sample that doubles while ≥ half is
+    ready (cap `CONFIRM_SAMPLE_MAX`); pull kicks stay oldest-first.
+    The obligation check owns re-encode: for every chunk with a dead
+    class, `reconcile::plan` under the blob's GOAL assignment says
+    what this node owes, plus `reconcile::deputy` below the watermark;
+    `repairer_for_chunk` (the election on the current view) is gone.
+    `hopnet_storage::tick` is `engineTick` in Rust over the production
+    predicates and `tests/model_conformance.rs` replays every trace
+    step: env actions adopted, engine ticks asserted state-for-state.
+  - Decisions (S4 plan): declares target T, the latest transition,
+    not the tip — the view is the same and goals then coincide with
+    record rows, so the S1-deferred recency window on `to` is moot
+    and retired; `/maintenance/drain-unplaced` stays as the operator's
+    re-kick until the Cutover stage.
 - [ ] **S5 — Disk-truth attestation.** Existence sweep both directions
   plus orphan-file fold-in; honest `self_verified_height` with
   provenance; suspect state; prompt attestation on pull

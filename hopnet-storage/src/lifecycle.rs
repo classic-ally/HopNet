@@ -436,6 +436,58 @@ pub fn in_flight_blobs(
     Ok(ids)
 }
 
+/// The staleness pass's page (S4): blobs whose goal predates the latest
+/// transition `t`, oldest goal first, as declare targets to `t`. One
+/// indexed predicate; the set consumes itself as pages apply.
+pub fn stale_page(
+    conn: &rusqlite::Connection,
+    t: u64,
+    limit: usize,
+) -> Result<Vec<PlacementTarget>, StorageError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT id, desired_placement_height FROM data_blocks
+             WHERE desired_placement_height < ?
+             ORDER BY desired_placement_height ASC, id ASC
+             LIMIT ?",
+        )
+        .map_err(db_err("prepare stale page"))?;
+    let rows = stmt
+        .query_map(params![height_to_db(t), limit as i64], |row| {
+            Ok(PlacementTarget {
+                blob_id: row.get(0)?,
+                from: height_from_db(row.get(1)?),
+                to: t,
+            })
+        })
+        .map_err(db_err("read stale page"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(db_err("read stale row"))
+}
+
+/// A random sample of in-flight blobs (S4 fulfillment): recurrence over a
+/// draining set makes the sample comprehensive; the order is node-local
+/// (a proposal input, never consensus state).
+pub fn in_flight_sample(
+    conn: &rusqlite::Connection,
+    n: usize,
+) -> Result<Vec<BlobId>, StorageError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT id FROM data_blocks
+             WHERE placement_height IS NULL OR placement_height != desired_placement_height
+             ORDER BY RANDOM()
+             LIMIT ?",
+        )
+        .map_err(db_err("prepare in-flight sample"))?;
+    let ids = stmt
+        .query_map(params![n as i64], |row| row.get(0))
+        .map_err(db_err("read in-flight sample"))?
+        .collect::<Result<Vec<BlobId>, _>>()
+        .map_err(db_err("read in-flight sample row"))?;
+    Ok(ids)
+}
+
 /// Whether every fragment's responsible node under `assignment` has an
 /// attested inventory row — the evidence ConfirmPlacement validates.
 /// Shared by the apply and by the fulfillment read (`confirm_ready`).
@@ -940,6 +992,45 @@ mod tests {
             "confirmed: quiescent"
         );
         assert_eq!(in_flight_blobs(&tx, 10).unwrap(), vec![c.clone()]);
+    }
+
+    // Should: page the blobs whose goal predates T, oldest goal first, as
+    // declares to T; sample in-flight blobs without ever returning a
+    // quiescent one.
+    // Impact: the staleness page is the propose hook's whole payload —
+    // a wrong `from` fails the CAS, a wrong `to` fails the range check.
+    #[test]
+    fn stale_page_and_sample_select_by_the_pair() {
+        let mut conn = test_conn();
+        let tx = conn.transaction().unwrap();
+        let a = blob(1);
+        let b = blob(2);
+        let c = blob(3);
+        insert_blob(&tx, &a, 9, Some(9)); // quiescent, goal 9
+        insert_blob(&tx, &b, 4, Some(4)); // quiescent, goal 4: stale below T=8
+        insert_blob(&tx, &c, 2, None); // in flight, goal 2: stale too
+
+        let page = stale_page(&tx, 8, 10).unwrap();
+        assert_eq!(
+            page,
+            vec![
+                PlacementTarget {
+                    blob_id: c.clone(),
+                    from: 2,
+                    to: 8
+                },
+                PlacementTarget {
+                    blob_id: b.clone(),
+                    from: 4,
+                    to: 8
+                },
+            ]
+        );
+        assert_eq!(stale_page(&tx, 8, 1).unwrap().len(), 1);
+        assert!(stale_page(&tx, 2, 10).unwrap().is_empty());
+
+        let sample = in_flight_sample(&tx, 10).unwrap();
+        assert_eq!(sample, vec![c.clone()], "only in-flight blobs are sampled");
     }
 
     // Should: reuse the engine's placement recipe — the class map from a

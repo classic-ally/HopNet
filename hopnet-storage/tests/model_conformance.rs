@@ -1,6 +1,6 @@
-//! Model conformance (RFC-STORAGE-003 S2/S3): the protection predicate,
-//! the eviction planner and the reconciler's duty ladder replayed against
-//! exported Quint witness traces.
+//! Model conformance (RFC-STORAGE-003 S2–S4): the protection predicate,
+//! the eviction planner, the reconciler's duty ladder and the whole engine
+//! tick replayed against exported Quint witness traces.
 //!
 //! `spec/traces/*.itf.json` are ITF traces of `scaled_bal` witnesses
 //! (see spec/README.md for the regeneration command). For every state of
@@ -72,6 +72,8 @@ fn map_of_ints(v: &Value) -> BTreeMap<i64, i64> {
 }
 
 struct State {
+    calm: i64,
+    member_view: BTreeSet<i64>,
     confirmed_view: BTreeSet<i64>,
     target_view: BTreeSet<i64>,
     protected_by: BTreeMap<i64, BTreeSet<i64>>,
@@ -96,6 +98,8 @@ fn read_trace(path: &std::path::Path) -> Vec<State> {
         .unwrap()
         .iter()
         .map(|s| State {
+            calm: bigint(&var(s, "calm")),
+            member_view: set(&var(s, "memberView")),
             confirmed_view: set(&var(s, "confirmedView")),
             target_view: set(&var(s, "targetView")),
             protected_by: map_of_sets(&var(s, "protectedBy")),
@@ -391,4 +395,90 @@ fn duty_ladder_matches_the_models_rungs() {
         states_checked > 50,
         "only {states_checked} states — traces missing?"
     );
+}
+
+// --- Full tick replay (S4) ------------------------------------------------
+
+fn model_state(s: &State) -> hopnet_storage::tick::ModelState {
+    use hopnet_storage::tick::{ModelState, Status};
+    let status = s
+        .status
+        .iter()
+        .map(|(n, st)| {
+            let st = match *st {
+                0 => Status::Up,
+                1 => Status::Down,
+                _ => Status::Gone,
+            };
+            (*n as i32, st)
+        })
+        .collect();
+    let sets = |m: &BTreeMap<i64, BTreeSet<i64>>| -> BTreeMap<u32, BTreeSet<i32>> {
+        m.iter()
+            .map(|(f, ns)| (*f as u32, ns.iter().map(|n| *n as i32).collect()))
+            .collect()
+    };
+    ModelState {
+        status,
+        down_for: s.down_for.iter().map(|(n, d)| (*n as i32, *d)).collect(),
+        member_view: s.member_view.iter().map(|n| *n as i32).collect(),
+        confirmed_view: s.confirmed_view.iter().map(|n| *n as i32).collect(),
+        target_view: s.target_view.iter().map(|n| *n as i32).collect(),
+        copies: sets(&s.copies),
+        inv_view: sets(&s.inv_view),
+        protected_by: sets(&s.protected_by),
+        deleted: s.deleted,
+    }
+}
+
+// Impact: the harness the RFC promised — the engine tick replayed against
+// every exported model execution, env actions injected between ticks,
+// state agreement asserted after every engine step. The code cannot
+// drift from the checked model on any witnessed execution without this
+// failing.
+// Should: reproduce the model's next state from its previous one on every
+// engineTick step of every trace (view sync, declare, re-encode, pull,
+// belief sync, confirm — one mutation per tick, in the model's order).
+#[test]
+fn engine_tick_replays_every_trace_step() {
+    let place = |view: &BTreeSet<i32>| -> Vec<i32> {
+        model_assignment(&view.iter().map(|n| *n as i64).collect())
+    };
+    let params = hopnet_storage::tick::Params {
+        nodes: (1..=4).collect(),
+        n_frags: N_FRAGS,
+        k: K,
+        watermark: W,
+        delta: DELTA,
+        auto_pull: true,
+        auto_reencode: true,
+        place: &place,
+    };
+    let mut ticks_checked = 0;
+    let mut env_steps = 0;
+    for path in traces() {
+        let states = read_trace(&path);
+        for (i, pair) in states.windows(2).enumerate() {
+            let (prev, next) = (&pair[0], &pair[1]);
+            if next.calm != prev.calm + 1 {
+                env_steps += 1; // an adversary move: adopted, not replayed
+                continue;
+            }
+            let expected = model_state(next);
+            let got = hopnet_storage::tick::step(&model_state(prev), &params);
+            assert_eq!(
+                got,
+                expected,
+                "{} step {i}→{}: engine tick diverged from the model",
+                path.display(),
+                i + 1
+            );
+            ticks_checked += 1;
+        }
+    }
+    assert!(
+        ticks_checked > 50,
+        "only {ticks_checked} ticks replayed — traces missing?"
+    );
+    assert!(env_steps > 0, "no env actions in the traces?");
 }

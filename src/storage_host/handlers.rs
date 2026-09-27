@@ -64,8 +64,10 @@ impl TransactionHandler for DeclarePlacementTargetHandler {
         );
         // Pull duties derive at declare-apply (RFC-STORAGE-003 S3): wake
         // the reconciler for every moved goal — execute only, validation
-        // must stay pure.
+        // must stay pure. Anyone's page applying is the staleness check
+        // observed (S4): it re-arms this node's grace rung.
         if execute {
+            crate::storage_host::staleness::stamp_observed();
             for blob_id in &outcome.applied_ids {
                 ctx.work.schedule("storage.pull", blob_id.to_string());
             }

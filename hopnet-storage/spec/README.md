@@ -136,10 +136,13 @@ witnesses. `tests/model_conformance.rs` (`cargo test -p hopnet-storage
 the Rust protection predicate, eviction planner and (S3) duty ladder,
 driven by the model's own `mix` placement scoring: the memo must equal
 the model's `protectedBy`, `protects` must equal `protected`, the
-planner's verdict must equal `evictable`, and per up node
-`reconcile::plan` must owe exactly `pullNeedy` and `reencodeReady`
-restricted to that node's classes. Regenerate after a model change
-(the `#meta` block differs per run and is ignored):
+planner's verdict must equal `evictable`, per up node `reconcile::plan`
+must owe exactly `pullNeedy` and `reencodeReady` restricted to that
+node's classes, and (S4) `tick::step` — `engineTick` in Rust over the
+production predicates — must reproduce the model's next state on every
+engine-tick step of every trace, with the adversary's steps adopted
+between ticks. Regenerate after a model change (the `#meta` block
+differs per run and is ignored):
 
 ```bash
 npx @informalsystems/quint test spec/storage_policy.qnt --main scaled_bal \

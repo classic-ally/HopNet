@@ -139,6 +139,9 @@ pub struct RepairCandidate {
     /// Classes with at least one ONLINE holder.
     pub live_classes: usize,
     pub missing: Vec<(u32, MissingHolderState)>,
+    /// Every class's attested holders (raw inventory rows), ascending by
+    /// class — the reconciler's ladder input (RFC-STORAGE-003 S4).
+    pub classes: Vec<(u32, Vec<i32>)>,
 }
 
 /// Chunks with missing classes, classified for the repair tick
@@ -185,16 +188,16 @@ pub fn find_chunks_with_missing_classes(
     }
 
     let mut candidates = Vec::new();
-    for ((blob, chunk_number), classes) in chunks {
+    for ((blob, chunk_number), mut classes) in chunks {
         let mut live = 0usize;
         let mut missing = Vec::new();
-        for (class, holders) in classes {
+        for (class, holders) in &classes {
             if holders.iter().any(|n| online_nodes.contains(n)) {
                 live += 1;
             } else if holders.iter().any(|n| member_nodes.contains(n)) {
-                missing.push((class, MissingHolderState::Lazy));
+                missing.push((*class, MissingHolderState::Lazy));
             } else {
-                missing.push((class, MissingHolderState::Hopeless));
+                missing.push((*class, MissingHolderState::Hopeless));
             }
         }
         if !missing.is_empty() {
@@ -204,11 +207,13 @@ pub fn find_chunks_with_missing_classes(
                 continue;
             };
             missing.sort_unstable_by_key(|(c, _)| *c);
+            classes.sort_unstable_by_key(|(c, _)| *c);
             candidates.push(RepairCandidate {
                 blob_id,
                 chunk_number,
                 live_classes: live,
                 missing,
+                classes,
             });
         }
     }
@@ -299,6 +304,11 @@ mod tests {
                 (2, MissingHolderState::Hopeless),
                 (3, MissingHolderState::Hopeless),
             ]
+        );
+        // Should: carry every class's raw holders for the ladder.
+        assert_eq!(
+            c.classes,
+            vec![(0, vec![1]), (1, vec![2]), (2, vec![3]), (3, vec![])]
         );
     }
 }

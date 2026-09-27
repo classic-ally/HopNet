@@ -105,12 +105,73 @@ pub fn plan(state: &ChunkState, me: i32) -> Vec<Duty> {
     duties
 }
 
+/// The deputy rule (RFC-STORAGE-003 Mechanisms, "Recovery is the fetch
+/// fallback"): below the watermark, dead classes whose responsible is not
+/// up would otherwise wait out that node's decay gate while the chunk sits
+/// in the danger zone. The responsible of the lowest LIVE class rebuilds
+/// them instead, as a surplus, belief-protected copy — today's urgent
+/// semantics. A strict superset of the model's ladder (the model's
+/// re-encoder is always the responsible); never fires above the
+/// watermark, and never while fewer than K classes are live.
+pub fn deputy(state: &ChunkState, me: i32) -> Option<Vec<u32>> {
+    if !state.available() || state.live_class_count() >= state.watermark {
+        return None;
+    }
+    let deputy = state
+        .classes
+        .iter()
+        .find(|c| state.live(c))
+        .map(|c| c.responsible)?;
+    if deputy != me {
+        return None;
+    }
+    let orphaned: Vec<u32> = state
+        .classes
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !state.live(c) && !state.up.contains(&c.responsible))
+        .map(|(i, _)| i as u32)
+        .collect();
+    (!orphaned.is_empty()).then_some(orphaned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn set(v: &[i32]) -> BTreeSet<i32> {
         v.iter().copied().collect()
+    }
+
+    // Should: below the watermark, have the responsible of the lowest live
+    // class rebuild dead classes whose own responsible is down; nobody
+    // else, nothing above the watermark, nothing below K.
+    #[test]
+    fn deputy_rebuilds_for_a_down_responsible_below_watermark() {
+        // W = 3, K = 2. Live: class 1 (node 2), class 2 (node 3). Dead:
+        // class 0 (responsible 4, down), class 3 (responsible 2, up).
+        let s = chunk(
+            &[(&[4], 4), (&[2], 2), (&[3], 3), (&[4], 2)],
+            &[1, 2, 3],
+            &[],
+        );
+        assert_eq!(
+            deputy(&s, 2),
+            Some(vec![0]),
+            "node 2 owns the lowest live class"
+        );
+        assert_eq!(deputy(&s, 3), None);
+        assert_eq!(deputy(&s, 1), None);
+        // Above the watermark: the decay gate decides, no deputy.
+        let calm = chunk(
+            &[(&[4], 4), (&[2], 2), (&[3], 3), (&[1], 1)],
+            &[1, 2, 3],
+            &[4],
+        );
+        assert_eq!(deputy(&calm, 2), None);
+        // Below K: nothing to rebuild from.
+        let dark = chunk(&[(&[4], 4), (&[2], 2), (&[4], 3)], &[1, 2, 3], &[]);
+        assert_eq!(deputy(&dark, 2), None);
     }
 
     fn chunk(classes: &[(&[i32], i32)], up: &[i32], hopeful: &[i32]) -> ChunkState {

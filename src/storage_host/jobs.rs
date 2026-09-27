@@ -267,25 +267,38 @@ pub async fn run_network_rebalancing(
 /// many confirmations were proposed.
 pub async fn propose_ready_confirmations(
     app_state: &AppState,
-    limit: usize,
+    base_sample: usize,
 ) -> Result<usize, Error> {
-    let ready: Vec<hopnet_storage::PlacementConfirmation> = {
+    use std::sync::atomic::Ordering;
+    // Adaptive sample (RFC-STORAGE-003 S4): doubles while at least half of
+    // the sample was ready — the post-transition rubber-stamp balloon —
+    // and resets to the base otherwise. Recurrence over a draining set is
+    // what makes a random sample comprehensive.
+    let sample_n = FULFILL_SAMPLE.load(Ordering::Relaxed).max(base_sample);
+    let (ready, sampled): (Vec<hopnet_storage::PlacementConfirmation>, usize) = {
         let conn = app_state
             .db_pool
             .get()
             .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
+        let sample = hopnet_storage::lifecycle::in_flight_sample(&conn, sample_n)
+            .map_err(|e| Error::Failed(Arc::new(format!("in-flight sample: {e}").into())))?;
+        let sampled = sample.len();
         let mut out = Vec::new();
-        for blob_id in hopnet_storage::lifecycle::in_flight_blobs(&conn, limit)
-            .map_err(|e| Error::Failed(Arc::new(format!("in-flight read: {e}").into())))?
-        {
+        for blob_id in sample {
             if let Some(height) = hopnet_storage::lifecycle::confirm_ready(&conn, &blob_id)
                 .map_err(|e| Error::Failed(Arc::new(format!("confirm read: {e}").into())))?
             {
                 out.push(hopnet_storage::PlacementConfirmation { blob_id, height });
             }
         }
-        out
+        (out, sampled)
     };
+    let next = if sampled > 0 && ready.len() * 2 >= sampled {
+        (sample_n * 2).min(hopnet_storage::engine::policy::CONFIRM_SAMPLE_MAX)
+    } else {
+        base_sample
+    };
+    FULFILL_SAMPLE.store(next, Ordering::Relaxed);
     if ready.is_empty() {
         return Ok(0);
     }
@@ -738,6 +751,9 @@ pub async fn run_watermark_eviction(
 
 /// Last-seen storage view summary — INFO logging only on change.
 static LAST_VIEW_SUMMARY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// The fulfillment pass's current sample size (adaptive; see
+/// `propose_ready_confirmations`).
+static FULFILL_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Day stamp of the last scrub slice (one slice per day, full walk weekly).
 static LAST_SCRUB_DAY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
@@ -751,7 +767,8 @@ pub async fn handle_storage_policy_tick(_job: TaskId, ctx: Data<AppState>) -> Re
 /// pull → eviction check → daily scrub slice. Inventory attestation stays
 /// with its own self-check cron.
 pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json::Value, Error> {
-    use hopnet_storage::engine::{ReencodeCmd, assign_for_blob, reencode::repairer_for_chunk};
+    use hopnet_storage::engine::ReencodeCmd;
+    use hopnet_storage::reconcile::{self, ChunkState, ClassState, Duty};
     use hopnet_storage::traits::StateReader;
 
     let my_node_id = app_state
@@ -781,7 +798,13 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json:
         }
     }
 
-    // (2) Repair scan: this node re-encodes the chunks it was elected for.
+    // (2) The obligation check's re-encode half (RFC-STORAGE-003 S4): for
+    // every chunk with a dead class, the reconciler's ladder under the
+    // blob's GOAL assignment says what THIS node owes — the responsible of
+    // a dead class rebuilds it once ready (below the watermark, or no
+    // holder is merely asleep inside its tier); below the watermark the
+    // deputy rule has the lowest live class's responsible cover a down
+    // responsible. Urgent items preempt pulls; one lazy pick per tick.
     let settings = {
         let conn = app_state
             .db_pool
@@ -795,42 +818,82 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json:
     if settings.reencode_enabled {
         let online: std::collections::HashSet<i32> = view.online.iter().copied().collect();
         let members: std::collections::HashSet<i32> = member_ids.iter().copied().collect();
-        let candidates = {
+        let (candidates, goals) = {
             let conn = app_state
                 .db_pool
                 .get()
                 .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-            crate::db::inventory::find_chunks_with_missing_classes(&conn, &online, &members)
-                .map_err(|e| Error::Failed(Arc::new(format!("repair scan: {e:?}").into())))?
+            let candidates =
+                crate::db::inventory::find_chunks_with_missing_classes(&conn, &online, &members)
+                    .map_err(|e| Error::Failed(Arc::new(format!("repair scan: {e:?}").into())))?;
+            // Goal assignments, memoized per blob (many chunks share one).
+            let mut goals: std::collections::HashMap<hopnet_storage::BlobId, Option<Vec<i32>>> =
+                Default::default();
+            for cand in &candidates {
+                if !goals.contains_key(&cand.blob_id) {
+                    let assignment = hopnet_storage::lifecycle::pull_target(&conn, &cand.blob_id)
+                        .map_err(|e| Error::Failed(Arc::new(format!("pull target: {e}").into())))?
+                        .map(|t| t.assignment);
+                    goals.insert(cand.blob_id.clone(), assignment);
+                }
+            }
+            (candidates, goals)
         };
         if let Some(engine) = app_state.storage.get() {
+            let up: std::collections::BTreeSet<i32> = online.iter().copied().collect();
             let mut lazy_pick: Option<ReencodeCmd> = None;
             for cand in candidates {
-                let missing: Vec<u32> = cand.missing.iter().map(|(c, _)| *c).collect();
-                let seed = hopnet_storage::placement::placement_seed(&cand.blob_id);
-                let (_, assignment) = assign_for_blob(
-                    &seed,
-                    view.members.clone(),
-                    view.metrics.clone(),
-                    &view.weights,
-                );
-                if repairer_for_chunk(&assignment, &missing) != Some(my_node_id) {
+                // No goal on record: nothing is owed until the record
+                // reaches it (the staleness pass will re-goal it).
+                let Some(Some(assignment)) = goals.get(&cand.blob_id) else {
+                    continue;
+                };
+                let hopeful_down: std::collections::BTreeSet<i32> = cand
+                    .classes
+                    .iter()
+                    .flat_map(|(_, holders)| holders.iter().copied())
+                    .filter(|n| !online.contains(n) && members.contains(n))
+                    .collect();
+                let chunk = ChunkState {
+                    classes: cand
+                        .classes
+                        .iter()
+                        .map(|(class, holders)| ClassState {
+                            holders: holders.iter().copied().collect(),
+                            responsible: assignment.get(*class as usize).copied().unwrap_or(-1),
+                        })
+                        .collect(),
+                    up: up.clone(),
+                    hopeful_down,
+                    k: hopnet_storage::rs::ORIGINAL_FRAGMENTS_PER_CHUNK,
+                    watermark: view.watermark,
+                };
+                let mut owed: Vec<u32> = reconcile::plan(&chunk, my_node_id)
+                    .into_iter()
+                    .filter_map(|d| match d {
+                        Duty::Reencode { classes } => Some(classes),
+                        Duty::Pull { .. } => None,
+                    })
+                    .flatten()
+                    .collect();
+                if let Some(deputy) = reconcile::deputy(&chunk, my_node_id) {
+                    owed.extend(deputy);
+                }
+                owed.sort_unstable();
+                owed.dedup();
+                if owed.is_empty() {
                     continue;
                 }
                 let urgent = cand.live_classes < view.watermark;
-                let hopeless = cand
-                    .missing
-                    .iter()
-                    .any(|(_, s)| *s == crate::db::inventory::MissingHolderState::Hopeless);
                 let cmd = ReencodeCmd {
                     blob_id: cand.blob_id,
                     chunk_number: cand.chunk_number,
-                    missing_classes: missing,
+                    missing_classes: owed,
                 };
                 if urgent {
                     engine.enqueue_reencode(cmd, true);
                     urgent_enqueued += 1;
-                } else if hopeless && lazy_pick.is_none() {
+                } else if lazy_pick.is_none() {
                     lazy_pick = Some(cmd);
                 }
             }
@@ -840,6 +903,16 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json:
             }
         }
     }
+
+    // (2b) The staleness pass's grace rung (S4): if no proposer has run
+    // the `desired < T` check within the grace window, declare a page
+    // directly so convergence never rests on a sibling's heartbeat.
+    let grace_declared = crate::storage_host::staleness::grace_rung(app_state)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("staleness grace rung failed: {e}");
+            0
+        });
 
     // (3) The obligation check (RFC-STORAGE-003 S3): re-kick a bounded page
     // of in-flight blobs through the reconciler — pulls owed under each
@@ -910,6 +983,7 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json:
         "lazy_reencodes": lazy_enqueued,
         "migration_repaired": migration_repaired,
         "confirms_proposed": confirms_proposed,
+        "grace_declared": grace_declared,
         "eviction": eviction,
         "scrub_corrupt": scrubbed_corrupt,
     }))
