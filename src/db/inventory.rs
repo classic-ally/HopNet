@@ -75,10 +75,11 @@ pub fn batch_query_fragment_inventory(
                  FROM (
                      SELECT fi.fragment_hash, fi.node_id, n.pubkey,
                             ROW_NUMBER() OVER (PARTITION BY fi.fragment_hash
-                                               ORDER BY fi.self_verified_height DESC) as rn
+                                               ORDER BY fi.verified_height DESC NULLS LAST) as rn
                      FROM fragment_inventory fi
                      JOIN nodes n ON fi.node_id = n.node_id
                      WHERE fi.fragment_hash IN ({})
+                       AND fi.suspect = 0
                  )
                  WHERE rn <= {}",
                 placeholders, max_nodes
@@ -164,7 +165,8 @@ pub fn find_chunks_with_missing_classes(
             "SELECT fh.data_block_id, fh.chunk_number, fh.local_index,
                     COALESCE(GROUP_CONCAT(fi.node_id), '')
              FROM fragment_hashes fh
-             LEFT JOIN fragment_inventory fi ON fi.fragment_hash = fh.fragment_hash
+             LEFT JOIN fragment_inventory fi
+               ON fi.fragment_hash = fh.fragment_hash AND fi.suspect = 0
              GROUP BY fh.data_block_id, fh.chunk_number, fh.local_index",
         )
         .map_err(|_| DatabaseError::RecallError)?;

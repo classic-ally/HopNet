@@ -19,6 +19,13 @@ pub const CONFIRM_CHECKS_PER_TICK: usize = 256;
 /// Consensus function names the reconciler submits through the
 /// `TxSubmitter` seam.
 pub const SELF_CHECK_FN: &str = "self_check_fragments";
+/// Disk-truth attestation (S5): stamps `verified_height` on the rows this
+/// node has just verified on its own disk.
+pub const ATTEST_FN: &str = "attest_fragments";
+
+/// Confirmation evidence recency (S5) — defined beside the evidence check
+/// in `lifecycle` (feature-free), re-exported here with the other knobs.
+pub use crate::lifecycle::ATTESTATION_RECENCY_HEIGHTS;
 
 /// Blobs per declare page (S4 staleness pass). Pagination for block-size
 /// hygiene, not a cap: the work-list consumes itself, so the next

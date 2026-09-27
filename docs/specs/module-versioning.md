@@ -215,7 +215,9 @@ inside the boot transition, before the node is live.
     an artifact at that version to the frozen spec and materializes
     the module at that ordinal before fast-forwarding. First use:
     storage@1 → `PRE_LIFECYCLE_SNAPSHOT_SECTION` (RFC-STORAGE-003 S1,
-    `storage_view_transitions`).
+    `storage_view_transitions`); second: storage@2 →
+    `PRE_DISK_TRUTH_SNAPSHOT_SECTION` (S5, the disk-truth columns —
+    a covered-shape change with the same table set).
 
 ## Execution — The Seam
 

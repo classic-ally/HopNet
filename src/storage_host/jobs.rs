@@ -9,7 +9,6 @@ use crate::{
     storage_host::substrate_host::SubstrateHost,
 };
 use apalis::prelude::*;
-use hopnet_storage::maintenance::{OrphanedFragmentCleanupResult, OrphanedFragmentScan};
 use hopnet_storage::traits::TxSubmitter;
 use std::sync::Arc;
 
@@ -283,9 +282,11 @@ pub async fn propose_ready_confirmations(
         let sample = hopnet_storage::lifecycle::in_flight_sample(&conn, sample_n)
             .map_err(|e| Error::Failed(Arc::new(format!("in-flight sample: {e}").into())))?;
         let sampled = sample.len();
+        let tip = crate::db::consensus::get_current_consensus_height(&conn)
+            .map_err(|e| Error::Failed(Arc::new(format!("height: {e:?}").into())))?;
         let mut out = Vec::new();
         for blob_id in sample {
-            if let Some(height) = hopnet_storage::lifecycle::confirm_ready(&conn, &blob_id)
+            if let Some(height) = hopnet_storage::lifecycle::confirm_ready(&conn, &blob_id, tip)
                 .map_err(|e| Error::Failed(Arc::new(format!("confirm read: {e}").into())))?
             {
                 out.push(hopnet_storage::PlacementConfirmation { blob_id, height });
@@ -401,162 +402,203 @@ pub struct UnplacedDrainResult {
     pub limit: i32,
 }
 
-/// Scheduled job handler for fragment inventory self-check
-/// Runs every 20-30 minutes to ensure node's inventory matches local fragment storage
+/// Scheduled job handler for the disk-truth sweep + self-check (the
+/// 20–30 minute cron): every self-check is disk-backed (RFC-STORAGE-003 S5).
 pub async fn handle_fragment_inventory_self_check(
     job: TaskId,
     ctx: Data<AppState>,
 ) -> Result<(), Error> {
-    run_fragment_inventory_self_check(&ctx).await
-}
-
-/// Core self-check logic that can be called from job handler or manual trigger
-pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(), Error> {
-    // Get node ID
-    let node_id = match app_state.get_node_id() {
-        Ok(id) => id,
-        Err(_) => {
-            tracing::error!("Node ID not initialized, cannot run self-check");
-            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                "Node ID not initialized",
-            )))));
-        }
-    };
-
-    // Compute differential between consensus inventory and local fragments
-    let differential = match crate::db::inventory::compute_inventory_differential(
-        app_state.db_pool.get(),
-        node_id,
-    ) {
-        Ok(diff) => diff,
-        Err(e) => {
-            tracing::error!("Failed to compute inventory differential: {:?}", e);
-            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                format!("Failed to compute inventory differential: {:?}", e),
-            )))));
-        }
-    };
-
-    // Create payload for consensus submission
-    let serialized_payload =
-        match bincode::serde::encode_to_vec(&differential, bincode::config::standard()) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::error!("Failed to serialize self-check differential: {:?}", e);
-                return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                    format!("Failed to serialize differential: {:?}", e),
-                )))));
-            }
-        };
-
-    // Submit through the TxSubmitter seam (sign + consensus queue)
-    match SubstrateHost::new(app_state.clone())
-        .submit("self_check_fragments", serialized_payload)
+    run_disk_truth_sweep(&ctx, SWEEP_ORPHAN_GRACE_SECS)
         .await
-    {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            tracing::error!("Failed to submit self-check to consensus: {:?}", e);
-            Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                format!("Failed to submit to consensus: {:?}", e),
-            )))))
-        }
-    }
+        .map(|_| ())
 }
 
-// =============================================================================
-// ORPHANED FRAGMENT CLEANUP
-// Filesystem garbage collection for fragments not in database
-// (scan/cleanup logic lives in hopnet_storage::maintenance — RFC-017 Stage 5;
-// the host keeps the conn checkout, clock reads, and the scan cache)
-// =============================================================================
+/// Orphan grace: a rowless file younger than this is an in-flight store,
+/// not an orphan.
+pub const SWEEP_ORPHAN_GRACE_SECS: u64 = 3600;
+/// Day stamp of the last scrub slice (one slice per day, full walk weekly),
+/// now ridden by the sweep's walk.
+static LAST_SCRUB_DAY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
-/// Scan filesystem for fragments that don't exist in database
-/// Only considers fragments older than grace_period_hours to avoid race conditions
-pub async fn run_orphaned_fragments_scan(
+/// The disk-truth sweep (RFC-STORAGE-003 S5) — discharges `invView' =
+/// copies`, repairing the record, never the data. One readdir walk:
+///   1. diff disk against `fragment_hashes` and repair `stored_locally`
+///      both ways (awaited marks);
+///   2. delete orphan files older than the grace period (the former
+///      two-call scan/delete API, folded in);
+///   3. on the day's turn, verify one weekly scrub slice's content on the
+///      same listing — corrupt bytes are deleted and un-marked;
+///   4. run the self-check differential (now reading repaired flags) and
+///      submit it — belief for what we hold;
+///   5. submit `attest_fragments` for every file with a row — disk truth,
+///      stamped with the current height.
+///
+/// The report is kept for the operator route. Belief is dishonest for at
+/// most one cycle of this job.
+pub async fn run_disk_truth_sweep(
     app_state: &AppState,
-    grace_period_hours: i64,
-) -> Result<OrphanedFragmentScan, Error> {
-    use std::time::SystemTime;
+    orphan_grace_secs: u64,
+) -> Result<hopnet_storage::sweep::SweepReport, Error> {
+    use hopnet_storage::traits::LocalStateSink;
 
-    tracing::info!(
-        "Starting orphaned fragments scan (grace period: {} hours)",
-        grace_period_hours
-    );
-
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|_| {
-            Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                "Failed to get current time",
-            ))))
-        })?
+    let node_id = app_state
+        .get_node_id()
+        .map_err(|_| Error::Failed(Arc::new("node id not set".to_string().into())))?;
+    let fragments_dir = app_state.fragments_dir.clone();
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
         .as_secs();
 
-    let db_conn = app_state.db_pool.get().map_err(|e| {
-        Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
-            "Failed to get database connection: {:?}",
-            e
-        )))))
-    })?;
+    // (1) The walk (blocking IO off the async thread) and the table.
+    let dir = fragments_dir.clone();
+    let listing = tokio::task::spawn_blocking(move || {
+        hopnet_storage::fragstore::scan_fragments_detailed(&dir)
+    })
+    .await
+    .map_err(|e| Error::Failed(Arc::new(format!("sweep join: {e}").into())))?
+    .map_err(|e| Error::Failed(Arc::new(format!("sweep walk: {e}").into())))?;
+    let rows = {
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
+        crate::db::fragments::all_fragment_flags(&conn)
+            .map_err(|e| Error::Failed(Arc::new(format!("fragment flags: {e:?}").into())))?
+    };
+    let diff =
+        hopnet_storage::sweep::diff(&listing, &rows, now_unix.saturating_sub(orphan_grace_secs));
 
-    let scan_result = hopnet_storage::maintenance::scan_orphaned_fragments(
-        &db_conn,
-        &app_state.fragments_dir,
-        grace_period_hours,
-        now,
-    )
-    .map_err(|e| {
-        Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
-            "Scan failed: {}",
-            e
-        )))))
-    })?;
+    // Repair the flag both ways.
+    let host = SubstrateHost::new(app_state.clone());
+    if !diff.present_unflagged.is_empty() {
+        tracing::info!(
+            "sweep: {} fragments on disk but unflagged — re-flagging",
+            diff.present_unflagged.len()
+        );
+        for hash in &diff.present_unflagged {
+            host.mark_local(*hash).await;
+        }
+    }
+    if !diff.flagged_missing.is_empty() {
+        tracing::warn!(
+            "sweep: {} fragments flagged but gone from disk — un-flagging",
+            diff.flagged_missing.len()
+        );
+        host.mark_remote_batch(diff.flagged_missing.clone()).await;
+    }
 
-    // Store scan result in app state
-    *app_state.orphaned_fragment_scan.lock().unwrap() = Some(scan_result.clone());
+    // (2) Orphans past grace.
+    let mut orphans_deleted = 0usize;
+    let mut orphan_bytes_freed = 0u64;
+    for (hash, size) in &diff.orphans {
+        match hopnet_storage::fragstore::delete_fragment(&fragments_dir, hash) {
+            Ok(()) => {
+                orphans_deleted += 1;
+                orphan_bytes_freed += size;
+            }
+            Err(e) => tracing::warn!("sweep: delete orphan {} failed: {e}", hash.to_hex()),
+        }
+    }
 
-    Ok(scan_result)
+    // (3) The weekly scrub slice shares the walk.
+    let day = (now_unix / 86400) as i64;
+    let mut corrupt_deleted = 0usize;
+    let mut present = diff.present.clone();
+    if LAST_SCRUB_DAY.swap(day, std::sync::atomic::Ordering::SeqCst) != day {
+        let slice = (day % 7) as u8;
+        let dir = fragments_dir.clone();
+        let listing_for_scrub = listing.clone();
+        let corrupted = tokio::task::spawn_blocking(move || {
+            hopnet_storage::fragstore::verify_listing(&dir, &listing_for_scrub, slice, 7)
+        })
+        .await
+        .map_err(|e| Error::Failed(Arc::new(format!("scrub join: {e}").into())))?;
+        if !corrupted.is_empty() {
+            tracing::warn!(
+                "scrub: {} corrupt fragments on slice {slice}",
+                corrupted.len()
+            );
+            for hash in &corrupted {
+                let _ = hopnet_storage::fragstore::delete_fragment(&fragments_dir, hash);
+            }
+            host.mark_remote_batch(corrupted.clone()).await;
+            let gone: std::collections::HashSet<_> = corrupted.iter().collect();
+            present.retain(|h| !gone.contains(h));
+            corrupt_deleted = corrupted.len();
+        }
+    }
+
+    // (4) Belief: the differential over repaired flags.
+    let differential =
+        crate::db::inventory::compute_inventory_differential(app_state.db_pool.get(), node_id)
+            .map_err(|e| {
+                Error::Failed(Arc::new(format!("inventory differential: {e:?}").into()))
+            })?;
+    if !differential.is_empty() {
+        let payload = bincode::serde::encode_to_vec(&differential, bincode::config::standard())
+            .map_err(|e| Error::Failed(Arc::new(format!("self-check encode: {e}").into())))?;
+        host.submit(hopnet_storage::engine::policy::SELF_CHECK_FN, payload)
+            .await
+            .map_err(|e| Error::Failed(Arc::new(format!("self-check submit: {e:?}").into())))?;
+    }
+
+    // (5) Truth: attest everything seen on disk this cycle.
+    let mut attested = false;
+    if !present.is_empty() {
+        let height = {
+            let conn = app_state
+                .db_pool
+                .get()
+                .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
+            crate::db::consensus::get_current_consensus_height(&conn)
+                .map_err(|e| Error::Failed(Arc::new(format!("height: {e:?}").into())))?
+        };
+        let attestation = hopnet_storage::FragmentAttestation {
+            node_id,
+            height,
+            present: present.clone(),
+            suspect: Vec::new(),
+        };
+        let payload = bincode::serde::encode_to_vec(&attestation, bincode::config::standard())
+            .map_err(|e| Error::Failed(Arc::new(format!("attestation encode: {e}").into())))?;
+        host.submit(hopnet_storage::engine::policy::ATTEST_FN, payload)
+            .await
+            .map_err(|e| Error::Failed(Arc::new(format!("attestation submit: {e:?}").into())))?;
+        attested = true;
+    }
+
+    let report = hopnet_storage::sweep::SweepReport {
+        swept_at: now_unix as i64,
+        files_on_disk: listing.len(),
+        present: present.len(),
+        reflagged: diff.present_unflagged.len(),
+        unflagged: diff.flagged_missing.len(),
+        orphans_deleted,
+        orphan_bytes_freed,
+        young_orphans: diff.young_orphans,
+        corrupt_deleted,
+        attested,
+    };
+    tracing::info!(
+        "sweep: {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} corrupt deleted",
+        report.files_on_disk,
+        report.present,
+        report.reflagged,
+        report.unflagged,
+        report.orphans_deleted,
+        report.corrupt_deleted
+    );
+    *app_state.last_sweep.lock().unwrap() = Some(report.clone());
+    Ok(report)
 }
 
-/// Delete orphaned fragments based on previous scan
-/// Validates scan exists and isn't stale (> 1 hour old)
-pub async fn run_orphaned_fragments_cleanup(
-    app_state: &AppState,
-) -> Result<OrphanedFragmentCleanupResult, Error> {
-    use std::time::SystemTime;
-
-    tracing::info!("Starting orphaned fragments cleanup");
-
-    // Get and clear scan from state (take ownership)
-    let scan = {
-        let mut scan_lock = app_state.orphaned_fragment_scan.lock().unwrap();
-        scan_lock.take()
-    };
-
-    let scan = scan.ok_or_else(|| {
-        Error::Failed(Arc::new(Box::new(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "No scan results available. Run GET /maintenance/orphaned-fragments first",
-        ))))
-    })?;
-
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|_| {
-            Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                "Failed to get current time",
-            ))))
-        })?
-        .as_secs() as i64;
-
-    hopnet_storage::maintenance::cleanup_orphaned_fragments(&app_state.fragments_dir, scan, now)
-        .map_err(|stale| {
-            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
-                "Scan is stale ({} seconds old). Run a new scan first",
-                stale.age_seconds
-            )))))
-        })
+/// Kept for callers that only want belief refreshed (tests, routes): the
+/// full sweep is the self-check now.
+pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(), Error> {
+    run_disk_truth_sweep(app_state, SWEEP_ORPHAN_GRACE_SECS)
+        .await
+        .map(|_| ())
 }
 
 /// Watermark eviction (RFC-STORAGE-001 GC, RFC-STORAGE-002 S5): under
@@ -754,18 +796,16 @@ static LAST_VIEW_SUMMARY: std::sync::Mutex<Option<String>> = std::sync::Mutex::n
 /// The fulfillment pass's current sample size (adaptive; see
 /// `propose_ready_confirmations`).
 static FULFILL_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// Day stamp of the last scrub slice (one slice per day, full walk weekly).
-static LAST_SCRUB_DAY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
 pub async fn handle_storage_policy_tick(_job: TaskId, ctx: Data<AppState>) -> Result<(), Error> {
     run_storage_policy_tick(&ctx).await.map(|_| ())
 }
 
 /// The engine policy tick (RFC-STORAGE-001 Repair; RFC-STORAGE-002 S6):
-/// view sync → repair scan (urgent below-watermark re-encodes + one lazy
-/// hopeless re-encode, elected by lowest-missing-class) → one migration
-/// pull → eviction check → daily scrub slice. Inventory attestation stays
-/// with its own self-check cron.
+/// view sync → the obligation check's re-encode half (ladder + deputy
+/// under the goal assignment) → grace rung → in-flight re-kick →
+/// fulfillment → eviction check. Disk truth (the sweep, the scrub slice,
+/// belief and attestation) rides the self-check cron.
 pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json::Value, Error> {
     use hopnet_storage::engine::ReencodeCmd;
     use hopnet_storage::reconcile::{self, ChunkState, ClassState, Duty};
@@ -940,41 +980,6 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json:
     // (4) Eviction check (statvfs no-op below the high watermark).
     let eviction = run_watermark_eviction(app_state, None, None).await?;
 
-    // (5) Daily scrub slice (full walk weekly): corrupt bytes are deleted
-    // and un-attested; the next repair scan regenerates them.
-    let day = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        / 86400) as i64;
-    let mut scrubbed_corrupt = 0usize;
-    if LAST_SCRUB_DAY.swap(day, std::sync::atomic::Ordering::SeqCst) != day {
-        let fragments_dir = crate::storage_host::functions::get_fragments_dir()
-            .map_err(|e| Error::Failed(Arc::new(format!("fragments dir: {e:?}").into())))?;
-        let slice = (day % 7) as u8;
-        let dir = fragments_dir.clone();
-        let corrupted = tokio::task::spawn_blocking(move || {
-            hopnet_storage::fragstore::verify_slice(&dir, slice, 7)
-        })
-        .await
-        .map_err(|e| Error::Failed(Arc::new(format!("scrub join: {e}").into())))?
-        .map_err(|e| Error::Failed(Arc::new(format!("scrub: {e}").into())))?;
-        if !corrupted.is_empty() {
-            tracing::warn!(
-                "scrub: {} corrupt fragments on slice {slice}",
-                corrupted.len()
-            );
-            for hash in &corrupted {
-                let _ = hopnet_storage::fragstore::delete_fragment(&fragments_dir, hash);
-            }
-            use hopnet_storage::traits::LocalStateSink;
-            SubstrateHost::new(app_state.clone())
-                .mark_remote_batch(corrupted.clone())
-                .await;
-            scrubbed_corrupt = corrupted.len();
-        }
-    }
-
     Ok(serde_json::json!({
         "members": member_ids,
         "online": view.online.len(),
@@ -985,6 +990,5 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json:
         "confirms_proposed": confirms_proposed,
         "grace_declared": grace_declared,
         "eviction": eviction,
-        "scrub_corrupt": scrubbed_corrupt,
     }))
 }

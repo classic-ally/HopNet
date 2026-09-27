@@ -2417,14 +2417,19 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = sealed_db(dir.path());
         // Simulate the pre-chain sealed shape by reverting every
-        // post-baseline step: identity 0001 (schema_ordinals) and
-        // storage 0002 (RFC-STORAGE-003: the goal column, its indexes,
-        // the transition record). Fingerprints compare DDL text, so the
-        // reverts must restore the baseline statements byte for byte.
+        // post-baseline step: identity 0001 (schema_ordinals), storage
+        // 0002 (RFC-STORAGE-003: the goal column, its indexes, the
+        // transition record) and storage 0003 (the disk-truth columns).
+        // Fingerprints compare DDL text, so the reverts must restore the
+        // baseline statements byte for byte.
         {
             let conn = open(&db_path);
             conn.execute_batch(
                 "DROP TABLE schema_ordinals;
+                 DROP INDEX idx_fragment_inventory_verified;
+                 ALTER TABLE fragment_inventory DROP COLUMN suspect;
+                 ALTER TABLE fragment_inventory DROP COLUMN provenance;
+                 ALTER TABLE fragment_inventory DROP COLUMN verified_height;
                  DROP INDEX idx_data_blocks_desired;
                  DROP INDEX idx_data_blocks_inflight;
                  DROP TABLE storage_view_transitions;

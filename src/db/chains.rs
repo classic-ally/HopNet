@@ -933,6 +933,32 @@ mod tests {
     const STEP_FIXTURE_STORAGE_0002_HASH: &str =
         "46f6def7429d041e4597f5193dca03a78f33e9c7f4501fa87b425f32b5a15940";
 
+    // Should: add the disk-truth columns with NULL verification and a
+    // clear suspect flag on an existing inventory row.
+    // Impact: the RFC-STORAGE-003 S5 crossing — belief carried over the
+    // boundary starts unverified everywhere, and the first sweep stamps it.
+    #[test]
+    fn step_fixture_storage_0003_disk_truth() {
+        let hash = run_step_fixture(
+            "storage",
+            3,
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+             VALUES (1, 'fixture', X'01', X'02', X'03', X'04');
+             INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (1, 'n1', 1, X'0A');
+             INSERT INTO fragment_inventory (fragment_hash, node_id, self_verified_height)
+             VALUES (X'F1', 1, 42);",
+        );
+        assert_eq!(
+            hash, STEP_FIXTURE_STORAGE_0003_HASH,
+            "storage/0003 output moved — a released step may never change \
+             (contract rules 1-2); if this is an intentional pre-release \
+             redefinition, re-pin in the same commit"
+        );
+    }
+
+    const STEP_FIXTURE_STORAGE_0003_HASH: &str =
+        "bd97c09ecda981e83097518932b770706a4ac18c3a9396de27ccb4c447f6245e";
+
     // Should: land the documented backfill values, not just a stable hash.
     #[test]
     fn storage_0002_backfill_values() {

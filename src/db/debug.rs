@@ -253,7 +253,7 @@ pub fn get_file_fragment_distribution(
                         "SELECT node_id
                      FROM fragment_inventory
                      WHERE fragment_hash = ?
-                     ORDER BY self_verified_height DESC",
+                     ORDER BY verified_height DESC NULLS LAST, node_id ASC",
                     )
                     .map_err(|_| DatabaseError::RecallError)?;
 

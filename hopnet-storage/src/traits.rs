@@ -177,9 +177,13 @@ pub trait StateReader: Send + Sync {
     fn self_check_report(&self) -> Result<crate::types::SelfCheckFragments, StorageError>;
 
     /// `Some(desired)` when the blob is in flight and every responsible
-    /// node under its goal has attested — a ConfirmPlacement for it would
-    /// apply (the fulfillment read; `lifecycle::confirm_ready`).
+    /// node under its goal has attested recently — a ConfirmPlacement for
+    /// it would apply (the fulfillment read; `lifecycle::confirm_ready`).
     fn confirm_ready(&self, blob_id: &BlobId) -> Result<Option<u64>, StorageError>;
+
+    /// The current committed height — the stamp for this node's
+    /// disk-truth attestations (S5).
+    fn current_height(&self) -> Result<u64, StorageError>;
 
     /// The blob's full reassembly manifest (the pull path reads the
     /// fragment layout + this node's local availability). `None` for an

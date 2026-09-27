@@ -459,6 +459,9 @@ impl StateReader for NullNet {
     fn confirm_ready(&self, _blob_id: &BlobId) -> Result<Option<u64>, StorageError> {
         Ok(None)
     }
+    fn current_height(&self) -> Result<u64, StorageError> {
+        Err(StorageError::Host("null state reader".into()))
+    }
     fn blob_manifest(&self, _blob_id: &BlobId) -> Result<Option<BlobManifest>, StorageError> {
         Ok(None)
     }
@@ -1169,6 +1172,9 @@ mod tests {
         }
         fn confirm_ready(&self, _blob_id: &BlobId) -> Result<Option<u64>, StorageError> {
             Ok(None)
+        }
+        fn current_height(&self) -> Result<u64, StorageError> {
+            Ok(1)
         }
         fn blob_manifest(&self, _blob_id: &BlobId) -> Result<Option<BlobManifest>, StorageError> {
             Ok(None)

@@ -222,8 +222,29 @@ pub struct DiskFragmentInfo {
     pub local_index: u32,
 }
 
+/// Every fragment row's hash and this node's `stored_locally` flag — the
+/// disk-truth sweep's table side (RFC-STORAGE-003 S5). A full-table read
+/// once per sweep; the walk it is diffed against is the same size.
+pub fn all_fragment_flags(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<(crate::types::Blake3Hash, bool)>, DatabaseError> {
+    let mut stmt = conn
+        .prepare("SELECT fragment_hash, stored_locally FROM fragment_hashes")
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, crate::types::Blake3Hash>(0)?,
+                row.get::<_, Option<bool>>(1)?.unwrap_or(false),
+            ))
+        })
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))
+}
+
 /// Look up (blob, class) for on-disk fragment hashes. Hashes absent from
-/// fragment_hashes are orphans — the orphan GC flow owns those, not
+/// fragment_hashes are orphans — the disk-truth sweep owns those, not
 /// eviction.
 pub fn lookup_disk_fragments(
     conn: &rusqlite::Connection,
@@ -281,7 +302,7 @@ pub fn member_holder_counts(
         let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let query = format!(
             "SELECT fragment_hash, node_id FROM fragment_inventory
-             WHERE fragment_hash IN ({placeholders})"
+             WHERE fragment_hash IN ({placeholders}) AND suspect = 0"
         );
         let mut stmt = conn
             .prepare(&query)

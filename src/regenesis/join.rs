@@ -925,16 +925,20 @@ pub fn reconcile_fragment_store(
         remarked += 1;
     }
 
-    let scan =
-        hopnet_storage::maintenance::scan_orphaned_fragments(conn, fragments_dir, 0, now_unix)
-            .map_err(|e| format!("orphan scan: {e:?}"))?;
-    let cleanup = hopnet_storage::maintenance::cleanup_orphaned_fragments(
-        fragments_dir,
-        scan,
-        now_unix as i64,
-    )
-    .map_err(|e| format!("orphan cleanup: {e:?}"))?;
-    Ok((remarked, cleanup.deleted_count))
+    // Orphans (files with no row in the freshly imported table): the
+    // sweep's diff with no grace — nothing is in flight during a join.
+    let listing = hopnet_storage::fragstore::scan_fragments_detailed(fragments_dir)
+        .map_err(|e| format!("orphan walk: {e:?}"))?;
+    let rows = crate::db::fragments::all_fragment_flags(conn)
+        .map_err(|e| format!("fragment flags: {e:?}"))?;
+    let diff = hopnet_storage::sweep::diff(&listing, &rows, now_unix);
+    let mut deleted = 0usize;
+    for (hash, _) in &diff.orphans {
+        if hopnet_storage::fragstore::delete_fragment(fragments_dir, hash).is_ok() {
+            deleted += 1;
+        }
+    }
+    Ok((remarked, deleted))
 }
 
 /// Seconds since the epoch, for the reconcile clock.

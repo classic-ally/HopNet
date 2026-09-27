@@ -16,7 +16,61 @@ pub const TX_FUNCTIONS: &[&str] = &[
     "self_check_fragments",
     hopnet_storage::lifecycle::DECLARE_TX_FN,
     hopnet_storage::lifecycle::CONFIRM_TX_FN,
+    hopnet_storage::engine::policy::ATTEST_FN,
 ];
+
+/// RFC-STORAGE-003 S5 disk-truth attestation: stamp the rows this node
+/// verified on its own disk. A node may attest only for itself.
+pub struct AttestFragmentsHandler;
+
+impl TransactionHandler for AttestFragmentsHandler {
+    fn name(&self) -> &'static str {
+        hopnet_storage::engine::policy::ATTEST_FN
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (report, _) =
+            bincode::serde::decode_from_slice::<hopnet_storage::FragmentAttestation, _>(
+                tx.payload,
+                bincode::config::standard(),
+            )
+            .map_err(|_| DatabaseError::InvalidPayload)?;
+        if report.node_id != tx.submitter_node {
+            tracing::warn!(
+                "Authorization failed: node {} attempted to attest for node {}",
+                tx.submitter_node,
+                report.node_id
+            );
+            return Err(DatabaseError::AuthorizationError);
+        }
+        let stamped = hopnet_storage::store::apply_attestation(
+            db_tx,
+            report.node_id,
+            report.height,
+            &report.present,
+            &report.suspect,
+        )
+        .map_err(storage_err("apply_attestation"))?;
+        tracing::debug!(
+            node = report.node_id,
+            height = report.height,
+            stamped,
+            suspect = report.suspect.len(),
+            "attest_fragments applied"
+        );
+        Ok(())
+    }
+}
+
+inventory::submit! {
+    &AttestFragmentsHandler as &dyn TransactionHandler
+}
 
 /// Storage apply errors → handler errors: SQLite contention stays
 /// transient (validation must surface it as Undetermined, never a
@@ -103,7 +157,7 @@ impl TransactionHandler for ConfirmPlacementHandler {
                 bincode::config::standard(),
             )
             .map_err(|_| DatabaseError::InvalidPayload)?;
-        let outcome = hopnet_storage::lifecycle::apply_confirm(db_tx, &payload)
+        let outcome = hopnet_storage::lifecycle::apply_confirm(db_tx, &payload, ctx.height)
             .map_err(storage_err("apply_confirm"))?;
         tracing::debug!(
             height = ctx.height,

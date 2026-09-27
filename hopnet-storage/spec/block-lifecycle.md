@@ -855,8 +855,8 @@ optimization and carries no proof obligation.
     sentinel (Cutover) and the replicated record (Handoff Protocol).
     storage@1 artifacts import through a frozen v1 spec — the first
     covered-set addition to a released section under RFC-020, by the
-    pre-split consensus precedent. Not yet: attestation recency at
-    confirm (S5). (A recency window on declare's `to` was deferred
+    pre-split consensus precedent. Attestation recency at confirm
+    landed in S5. (A recency window on declare's `to` was deferred
     here and retired in S4: declares always target T.)
 - [x] **S2 — The protection predicate.** One pure function consuming the
   transition record's memoized snapshots (confirmed epoch plus every
@@ -957,10 +957,40 @@ optimization and carries no proof obligation.
     record rows, so the S1-deferred recency window on `to` is moot
     and retired; `/maintenance/drain-unplaced` stays as the operator's
     re-kick until the Cutover stage.
-- [ ] **S5 — Disk-truth attestation.** Existence sweep both directions
+- [x] **S5 — Disk-truth attestation.** Existence sweep both directions
   plus orphan-file fold-in; honest `self_verified_height` with
   provenance; suspect state; prompt attestation on pull
   completion.
+  - Done 2026-09-27. Storage chain step 0003 adds the REPLICATED
+    verification record to `fragment_inventory` — `verified_height`
+    (NULL until disk-verified), `provenance` (0 self-scan, 1 remote
+    challenge reserved), `suspect` — stamped only by the new
+    `attest_fragments` transaction (`store::apply_attestation`,
+    authorized to the submitter). The legacy `self_verified_height`
+    stays as the excluded, node-local column, written once at row
+    insert: the blanket restamp in `apply_self_check` is gone, and a
+    wire change to the self-check payload would have broken replay
+    of pre-S5 blocks. The sweep (`hopnet_storage::sweep::diff`, one
+    readdir walk via `fragstore::scan_fragments_detailed`) rides the
+    self-check cron: repair `stored_locally` both ways (awaited
+    marks), delete rowless files past the grace period (the two-call
+    orphan scan/delete API, its process-memory cache and
+    `maintenance.rs` are gone; `GET /maintenance/orphaned-fragments`
+    reports the last sweep, `?run=true` runs one), verify the weekly
+    scrub slice on the same listing, then submit the differential and
+    the attestation. Cadence decision: every 30-minute self-check is
+    disk-backed (the RFC's "daily" was a floor) — belief is dishonest
+    for at most one cycle. Confirmation evidence now requires a row
+    verified within `ATTESTATION_RECENCY_HEIGHTS` (1024) of the
+    deciding height and not suspect; read routing ranks by
+    `verified_height` and skips suspect rows; the obligation check and
+    the eviction belt treat suspect as missing. Prompt attestation on
+    pull completion: the pull path submits its self-check (the rows for
+    what it holds), then content-verifies every fragment of the blob on
+    its disk and attests them, then proposes the confirmation — so the
+    origin's classes are evidence too.
+    Storage@2 artifacts import through a frozen v2 spec (S1's
+    precedent, second use).
 - [ ] **S6 — Lifecycle closure.** Data-block cleanup registered on
   schedule; availability-class branch deleted; departed-node row
   pruning at confirm-apply plus one-time backfill.

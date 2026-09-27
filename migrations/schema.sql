@@ -258,7 +258,7 @@ CREATE INDEX idx_fragment_hash ON fragment_hashes(fragment_hash);
 CREATE TABLE fragment_inventory (
             fragment_hash           BLOB NOT NULL,
             node_id                 INTEGER NOT NULL,
-            self_verified_height    INTEGER, -- Once every so often we ensure this verification is actual disk check NOT only DB check.
+            self_verified_height    INTEGER, verified_height INTEGER, provenance INTEGER, suspect INTEGER NOT NULL DEFAULT 0, -- Once every so often we ensure this verification is actual disk check NOT only DB check.
 
             PRIMARY KEY (fragment_hash, node_id),
             FOREIGN KEY (node_id) REFERENCES nodes(node_id)
@@ -290,6 +290,8 @@ CREATE TABLE storage_view_transitions (
     height   INTEGER PRIMARY KEY,
     snapshot BLOB NOT NULL
 );
+
+CREATE INDEX idx_fragment_inventory_verified ON fragment_inventory (node_id, verified_height);
 
 CREATE TABLE inodes (
             -- stable identifier for FileProvider (UUIDv7 encodes creation time)

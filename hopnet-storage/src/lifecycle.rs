@@ -34,6 +34,12 @@ pub const DECLARE_TX_FN: &str = "declare_placement_target";
 /// Consensus function name of the confirm transaction.
 pub const CONFIRM_TX_FN: &str = "confirm_placement";
 
+/// Confirmation evidence must have been disk-verified within this many
+/// heights of the deciding block (S5). Sized against the sweep cadence
+/// (every self-check, ~30 min) with a wide margin: heights only advance
+/// with traffic, and metrics alone make ~144 a day.
+pub const ATTESTATION_RECENCY_HEIGHTS: u64 = 1024;
+
 /// One blob's re-goal: compare-and-swap `desired_placement_height` from
 /// `from` to `to`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -495,7 +501,12 @@ fn evidence_complete(
     conn: &rusqlite::Connection,
     blob_id: &BlobId,
     assignment: &[i32],
+    tip: u64,
 ) -> Result<bool, StorageError> {
+    // Recency (S5): the row must have been disk-verified within the
+    // window of the deciding height, and not be suspect. A row that was
+    // never disk-verified (verified_height NULL) is belief, not evidence.
+    let floor = tip.saturating_sub(ATTESTATION_RECENCY_HEIGHTS);
     let mut fragments = conn
         .prepare_cached(
             "SELECT local_index, fragment_hash FROM fragment_hashes WHERE data_block_id = ?",
@@ -504,7 +515,10 @@ fn evidence_complete(
     let mut attested = conn
         .prepare_cached(
             "SELECT EXISTS (SELECT 1 FROM fragment_inventory
-                            WHERE fragment_hash = ? AND node_id = ?)",
+                            WHERE fragment_hash = ? AND node_id = ?
+                              AND suspect = 0
+                              AND verified_height IS NOT NULL
+                              AND verified_height >= ?)",
         )
         .map_err(db_err("prepare attestation probe"))?;
     let rows = fragments
@@ -520,7 +534,7 @@ fn evidence_complete(
             return Ok(false);
         };
         let has: bool = attested
-            .query_row(params![hash, node], |row| row.get(0))
+            .query_row(params![hash, node, height_to_db(floor)], |row| row.get(0))
             .map_err(db_err("probe attestation"))?;
         if !has {
             return Ok(false);
@@ -535,6 +549,7 @@ fn evidence_complete(
 pub fn confirm_ready(
     conn: &rusqlite::Connection,
     blob_id: &BlobId,
+    tip: u64,
 ) -> Result<Option<u64>, StorageError> {
     let Some(target) = pull_target(conn, blob_id)? else {
         return Ok(None);
@@ -542,7 +557,7 @@ pub fn confirm_ready(
     if target.placement_height == Some(target.desired) {
         return Ok(None);
     }
-    Ok(evidence_complete(conn, blob_id, &target.assignment)?.then_some(target.desired))
+    Ok(evidence_complete(conn, blob_id, &target.assignment, tip)?.then_some(target.desired))
 }
 
 // ---------------------------------------------------------------------------
@@ -564,6 +579,7 @@ pub struct ConfirmOutcome {
 pub fn apply_confirm(
     db_tx: &rusqlite::Transaction,
     payload: &ConfirmPlacement,
+    deciding_height: u64,
 ) -> Result<ConfirmOutcome, StorageError> {
     let mut outcome = ConfirmOutcome::default();
     let mut read = db_tx
@@ -594,7 +610,12 @@ pub fn apply_confirm(
             None => match snapshot_at(db_tx, c.height)? {
                 None => Some("view at goal not on record"),
                 Some(snapshot) => {
-                    if evidence_complete(db_tx, &c.blob_id, &snapshot.assignment(&c.blob_id))? {
+                    if evidence_complete(
+                        db_tx,
+                        &c.blob_id,
+                        &snapshot.assignment(&c.blob_id),
+                        deciding_height,
+                    )? {
                         None
                     } else {
                         Some("evidence incomplete")
@@ -627,6 +648,7 @@ pub fn apply_confirm(
 mod tests {
     use super::*;
     use crate::types::BlobId;
+    use hopnet_common::Blake3Hash;
     use std::str::FromStr;
 
     /// The S1 schema subset these functions touch (chain step 0002 shape).
@@ -647,6 +669,8 @@ mod tests {
             CREATE TABLE fragment_inventory (
                 fragment_hash BLOB NOT NULL, node_id INTEGER NOT NULL,
                 self_verified_height INTEGER,
+                verified_height INTEGER, provenance INTEGER,
+                suspect INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (fragment_hash, node_id)
             );
             CREATE TABLE storage_view_transitions (
@@ -854,43 +878,43 @@ mod tests {
         insert_blob(&tx, &b, 6, None);
 
         // Goal's view not on record yet.
-        assert_eq!(apply_confirm(&tx, &confirm(&b, 6)).unwrap().skipped, 1);
+        assert_eq!(apply_confirm(&tx, &confirm(&b, 6), 10).unwrap().skipped, 1);
 
         record_transition(&tx, 5, &view(&[1, 2, 3])).unwrap();
         let assignment = snapshot_at(&tx, 6).unwrap().unwrap().assignment(&b);
 
         // Wrong height.
-        assert_eq!(apply_confirm(&tx, &confirm(&b, 5)).unwrap().skipped, 1);
+        assert_eq!(apply_confirm(&tx, &confirm(&b, 5), 10).unwrap().skipped, 1);
         // No attestations at all.
-        assert_eq!(apply_confirm(&tx, &confirm(&b, 6)).unwrap().skipped, 1);
+        assert_eq!(apply_confirm(&tx, &confirm(&b, 6), 10).unwrap().skipped, 1);
 
         // Attest two of three classes on their responsible nodes.
         for i in 0..2u32 {
             tx.execute(
-                "INSERT INTO fragment_inventory (fragment_hash, node_id) VALUES (?, ?)",
+                "INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height) VALUES (?, ?, 6)",
                 params![vec![i as u8; 32], assignment[i as usize]],
             )
             .unwrap();
         }
-        assert_eq!(apply_confirm(&tx, &confirm(&b, 6)).unwrap().skipped, 1);
+        assert_eq!(apply_confirm(&tx, &confirm(&b, 6), 10).unwrap().skipped, 1);
         assert_eq!(goal(&tx, &b), (6, None));
 
         // Third class attested on the WRONG node: still incomplete.
         let wrong = (1..=3).find(|n| *n != assignment[2]).unwrap();
         tx.execute(
-            "INSERT INTO fragment_inventory (fragment_hash, node_id) VALUES (?, ?)",
+            "INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height) VALUES (?, ?, 6)",
             params![vec![2u8; 32], wrong],
         )
         .unwrap();
-        assert_eq!(apply_confirm(&tx, &confirm(&b, 6)).unwrap().skipped, 1);
+        assert_eq!(apply_confirm(&tx, &confirm(&b, 6), 10).unwrap().skipped, 1);
 
         tx.execute(
-            "INSERT INTO fragment_inventory (fragment_hash, node_id) VALUES (?, ?)",
+            "INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height) VALUES (?, ?, 6)",
             params![vec![2u8; 32], assignment[2]],
         )
         .unwrap();
         assert_eq!(
-            apply_confirm(&tx, &confirm(&b, 6)).unwrap(),
+            apply_confirm(&tx, &confirm(&b, 6), 10).unwrap(),
             ConfirmOutcome {
                 applied: 1,
                 skipped: 0
@@ -899,7 +923,7 @@ mod tests {
         assert_eq!(goal(&tx, &b), (6, Some(6)));
 
         // Re-confirming the confirmed goal is a no-op.
-        assert_eq!(apply_confirm(&tx, &confirm(&b, 6)).unwrap().skipped, 1);
+        assert_eq!(apply_confirm(&tx, &confirm(&b, 6), 10).unwrap().skipped, 1);
     }
 
     // Should: resolve a blob's protection epochs from the record — the
@@ -965,7 +989,7 @@ mod tests {
 
         // No record yet: no target, not ready.
         assert_eq!(pull_target(&tx, &a).unwrap(), None);
-        assert_eq!(confirm_ready(&tx, &a).unwrap(), None);
+        assert_eq!(confirm_ready(&tx, &a, 10).unwrap(), None);
 
         record_transition(&tx, 5, &view(&[1, 2, 3])).unwrap();
         let target = pull_target(&tx, &a).unwrap().unwrap();
@@ -974,20 +998,20 @@ mod tests {
         assert_eq!(pull_target(&tx, &blob(9)).unwrap(), None, "unknown blob");
 
         // Quiescent blob: never confirm-ready.
-        assert_eq!(confirm_ready(&tx, &b).unwrap(), None);
+        assert_eq!(confirm_ready(&tx, &b, 10).unwrap(), None);
 
         // Attest every class of `a` on its responsible: ready at 9.
         for (i, node) in target.assignment.iter().take(3).enumerate() {
             tx.execute(
-                "INSERT INTO fragment_inventory (fragment_hash, node_id) VALUES (?, ?)",
+                "INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height) VALUES (?, ?, 6)",
                 params![vec![i as u8; 32], node],
             )
             .unwrap();
         }
-        assert_eq!(confirm_ready(&tx, &a).unwrap(), Some(9));
-        assert_eq!(apply_confirm(&tx, &confirm(&a, 9)).unwrap().applied, 1);
+        assert_eq!(confirm_ready(&tx, &a, 10).unwrap(), Some(9));
+        assert_eq!(apply_confirm(&tx, &confirm(&a, 9), 10).unwrap().applied, 1);
         assert_eq!(
-            confirm_ready(&tx, &a).unwrap(),
+            confirm_ready(&tx, &a, 10).unwrap(),
             None,
             "confirmed: quiescent"
         );
@@ -1031,6 +1055,82 @@ mod tests {
 
         let sample = in_flight_sample(&tx, 10).unwrap();
         assert_eq!(sample, vec![c.clone()], "only in-flight blobs are sampled");
+    }
+
+    // Should: stamp verified_height / provenance on the attested rows,
+    // mark suspect rows, clear suspect on a later present attestation,
+    // ignore hashes with no row, and apply idempotently.
+    // Should not: let a stale or suspect row count as confirmation
+    // evidence, nor one that was never disk-verified.
+    // Impact: this is what makes belief honest — confirm validation and
+    // read routing trust verified_height, never the self-check's flag.
+    #[test]
+    fn attestation_stamps_rows_and_evidence_needs_recent_verified_rows() {
+        let mut conn = test_conn();
+        let tx = conn.transaction().unwrap();
+        let b = blob(1);
+        insert_blob(&tx, &b, 6, None);
+        record_transition(&tx, 5, &view(&[1, 2, 3])).unwrap();
+        let assignment = snapshot_at(&tx, 6).unwrap().unwrap().assignment(&b);
+
+        // Belief rows without verification: not evidence.
+        for i in 0..3u32 {
+            tx.execute(
+                "INSERT INTO fragment_inventory (fragment_hash, node_id) VALUES (?, ?)",
+                params![vec![i as u8; 32], assignment[i as usize]],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            confirm_ready(&tx, &b, 10).unwrap(),
+            None,
+            "never disk-verified"
+        );
+
+        // Each responsible attests its own class.
+        for i in 0..3u32 {
+            let stamped = crate::store::apply_attestation(
+                &tx,
+                assignment[i as usize],
+                8,
+                &[Blake3Hash::from_bytes([i as u8; 32])],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(stamped, 1);
+        }
+        assert_eq!(confirm_ready(&tx, &b, 10).unwrap(), Some(6));
+        // Unknown hash: nothing stamped, nothing created.
+        assert_eq!(
+            crate::store::apply_attestation(&tx, 1, 8, &[Blake3Hash::from_bytes([9; 32])], &[])
+                .unwrap(),
+            0
+        );
+        let rows: i64 = tx
+            .query_row("SELECT COUNT(*) FROM fragment_inventory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 3);
+
+        // Too old for the window: not evidence.
+        let far = 8 + ATTESTATION_RECENCY_HEIGHTS + 1;
+        assert_eq!(confirm_ready(&tx, &b, far).unwrap(), None);
+
+        // Suspect on one class: evidence gone; a fresh present attestation
+        // clears it.
+        let victim = Blake3Hash::from_bytes([0; 32]);
+        crate::store::apply_attestation(&tx, assignment[0], 9, &[], &[victim]).unwrap();
+        assert_eq!(confirm_ready(&tx, &b, 10).unwrap(), None);
+        crate::store::apply_attestation(&tx, assignment[0], 9, &[victim], &[]).unwrap();
+        assert_eq!(confirm_ready(&tx, &b, 10).unwrap(), Some(6));
+        let (verified, provenance, suspect): (i64, i64, i64) = tx
+            .query_row(
+                "SELECT verified_height, provenance, suspect FROM fragment_inventory
+                 WHERE fragment_hash = ? AND node_id = ?",
+                params![victim, assignment[0]],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((verified, provenance, suspect), (9, 0, 0));
     }
 
     // Should: reuse the engine's placement recipe — the class map from a

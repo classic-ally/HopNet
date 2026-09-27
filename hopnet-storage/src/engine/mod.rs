@@ -412,6 +412,11 @@ where
     let in_flight = target.placement_height != Some(target.desired);
     let holds_now = holds_any || outcome.pulled + outcome.rebuilt > 0;
     if in_flight && holds_now {
+        // Belief first (rows for what we hold), then disk truth (S5):
+        // every fragment of this blob on our disk is content-verified
+        // right now and attested with the current height, so the
+        // confirmation's recency check has fresh evidence — the origin's
+        // classes included, which no pull ever touches.
         let report = seams.state.self_check_report()?;
         if !report.is_empty() {
             let encoded = bincode::serde::encode_to_vec(&report, bincode::config::standard())
@@ -421,6 +426,32 @@ where
                 Err(SubmitError::Rejected(r)) => tracing::warn!("prompt attestation rejected: {r}"),
                 Err(SubmitError::Transient(e)) => {
                     tracing::debug!("prompt attestation deferred to the self-check cron: {e}")
+                }
+            }
+        }
+        let present: Vec<Blake3Hash> = manifest
+            .chunks
+            .values()
+            .flat_map(|(o, r)| o.values().chain(r.values()))
+            .map(|(hash, _, _)| *hash)
+            .filter(|hash| fragstore::fragment_exists_and_valid(fragments_dir, hash))
+            .collect();
+        if !present.is_empty() {
+            let attestation = crate::types::FragmentAttestation {
+                node_id: me,
+                height: seams.state.current_height()?,
+                present,
+                suspect: Vec::new(),
+            };
+            let encoded = bincode::serde::encode_to_vec(&attestation, bincode::config::standard())
+                .map_err(|e| EngineError::Transfer(format!("attestation encode: {e}")))?;
+            match seams.submitter.submit(policy::ATTEST_FN, encoded).await {
+                Ok(()) => outcome.attested = true,
+                Err(SubmitError::Rejected(r)) => {
+                    tracing::warn!("disk-truth attestation rejected: {r}")
+                }
+                Err(SubmitError::Transient(e)) => {
+                    tracing::debug!("disk-truth attestation deferred to the sweep: {e}")
                 }
             }
         }
@@ -559,6 +590,9 @@ mod tests {
         fn confirm_ready(&self, _blob_id: &BlobId) -> Result<Option<u64>, StorageError> {
             Ok(self.ready)
         }
+        fn current_height(&self) -> Result<u64, StorageError> {
+            Ok(9)
+        }
         fn blob_manifest(
             &self,
             _blob_id: &BlobId,
@@ -686,7 +720,7 @@ mod tests {
         assert_eq!(net.marked_local.lock().unwrap().len(), 30);
         assert_eq!(
             *net.submitted.lock().unwrap(),
-            vec![policy::SELF_CHECK_FN, CONFIRM_TX_FN],
+            vec![policy::SELF_CHECK_FN, policy::ATTEST_FN, CONFIRM_TX_FN],
             "attestation lands before the confirm proposal"
         );
         for f in &outcome.fragments {
@@ -712,7 +746,10 @@ mod tests {
             .unwrap();
         assert_eq!(result.pulled, 30);
         assert!(!result.confirm_proposed);
-        assert_eq!(*net2.submitted.lock().unwrap(), vec![policy::SELF_CHECK_FN]);
+        assert_eq!(
+            *net2.submitted.lock().unwrap(),
+            vec![policy::SELF_CHECK_FN, policy::ATTEST_FN]
+        );
 
         // Nothing assigned to me: nothing owed, nothing pulled.
         let net3 = Arc::new(PullNet {

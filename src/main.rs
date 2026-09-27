@@ -501,7 +501,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 fragments_dir,
                 port,
                 test_mode: cfg!(debug_assertions) || std::env::var("HOPNET_TEST_MODE").is_ok(),
-                orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
+                last_sweep: Arc::new(std::sync::Mutex::new(None)),
                 comms,
                 setup_complete,
                 entered_join_code,
@@ -841,8 +841,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .route(
                     "/maintenance/orphaned-fragments",
-                    get(storage_host::routes::get_orphaned_fragments_scan)
-                        .delete(storage_host::routes::delete_orphaned_fragments),
+                    get(storage_host::routes::get_orphaned_fragments_scan),
                 )
                 .route(
                     "/maintenance/watermark-eviction",

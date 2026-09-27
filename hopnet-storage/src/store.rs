@@ -83,7 +83,10 @@ pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionS
     // v2 (RFC-STORAGE-003 S1): data_blocks.desired_placement_height and
     // the storage_view_transitions record — both replicated (derived at
     // apply from replicated inputs on every node).
-    format_version: 2,
+    // v3 (RFC-STORAGE-003 S5): fragment_inventory.verified_height /
+    // provenance / suspect — the replicated disk-truth record (stamped by
+    // attest_fragments); the legacy self_verified_height stays excluded.
+    format_version: 3,
     tables: &[
         hopnet_common::TableSpec::exported("data_blocks"),
         hopnet_common::TableSpec::exported("storage_view_transitions"),
@@ -103,6 +106,33 @@ pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionS
         hopnet_common::TableSpec::exported("hopnet_storage_policy"),
     ],
 };
+
+/// The storage section as sealed by S1–S4 binaries (ordinal 2): the v3
+/// covered set, columns as of ordinal 2. FROZEN — the import mapping for
+/// storage@2 artifacts (same precedent as the ordinal-1 freeze below).
+pub const PRE_DISK_TRUTH_SNAPSHOT_SECTION: hopnet_common::SectionSpec =
+    hopnet_common::SectionSpec {
+        name: "storage",
+        format_version: 2,
+        tables: &[
+            hopnet_common::TableSpec::exported("data_blocks"),
+            hopnet_common::TableSpec::exported("storage_view_transitions"),
+            hopnet_common::TableSpec::exported("blob_access"),
+            hopnet_common::TableSpec::exported("mesh_key"),
+            hopnet_common::TableSpec::exported("mesh_key_access"),
+            hopnet_common::TableSpec {
+                name: "fragment_hashes",
+                role: hopnet_common::TableRole::Exported,
+                excluded_columns: &["stored_locally"],
+            },
+            hopnet_common::TableSpec {
+                name: "fragment_inventory",
+                role: hopnet_common::TableRole::Exported,
+                excluded_columns: &["self_verified_height"],
+            },
+            hopnet_common::TableSpec::exported("hopnet_storage_policy"),
+        ],
+    };
 
 /// The storage section as sealed by pre-lifecycle binaries (ordinal 1):
 /// the covered set without `storage_view_transitions`. FROZEN — the
@@ -152,6 +182,11 @@ pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
             2,
             "block_lifecycle",
             include_str!("../migrations/storage/0002_block_lifecycle.sql"),
+        ),
+        hopnet_common::Step::sql(
+            3,
+            "disk_truth",
+            include_str!("../migrations/storage/0003_disk_truth.sql"),
         ),
     ],
 };
@@ -311,13 +346,10 @@ pub fn apply_self_check(
             .map_err(db_err("remove inventory fragment"))?;
     }
 
-    db_tx
-        .execute(
-            "UPDATE fragment_inventory SET self_verified_height = ? WHERE node_id = ?",
-            params![height_to_db(self_verified_height), node_id],
-        )
-        .map_err(db_err("update inventory verified height"))?;
-
+    // No blanket restamp (RFC-STORAGE-003 S5): a self-check reads the flag,
+    // not the disk, so it verifies nothing. `verified_height` is stamped
+    // only by disk-verified attestations (`apply_attestation`); the legacy
+    // self_verified_height is written once, at insert.
     for hash in added {
         db_tx
             .execute(
@@ -328,6 +360,53 @@ pub fn apply_self_check(
     }
 
     Ok(())
+}
+
+/// Disk-truth attestation apply (RFC-STORAGE-003 S5): stamp the rows this
+/// node verified on its own disk (`verified_height = height`, provenance
+/// self-scan, suspect cleared) and flag the rows it marks suspect. Only
+/// rows that exist are touched — attestation never creates belief, the
+/// self-check does; unknown hashes are ignored. Idempotent.
+pub fn apply_attestation(
+    db_tx: &rusqlite::Transaction,
+    node_id: i32,
+    height: u64,
+    present: &[Blake3Hash],
+    suspect: &[Blake3Hash],
+) -> Result<usize, StorageError> {
+    let mut stamped = 0usize;
+    let height_db = height_to_db(height);
+    for chunk in present.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let query = format!(
+            "UPDATE fragment_inventory
+             SET verified_height = ?, provenance = 0, suspect = 0
+             WHERE node_id = ? AND fragment_hash IN ({placeholders})"
+        );
+        let mut stmt = db_tx
+            .prepare(&query)
+            .map_err(db_err("prepare attestation stamp"))?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&height_db, &node_id];
+        params.extend(chunk.iter().map(|h| h as &dyn rusqlite::ToSql));
+        stamped += stmt
+            .execute(params.as_slice())
+            .map_err(db_err("stamp attestation"))?;
+    }
+    for chunk in suspect.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let query = format!(
+            "UPDATE fragment_inventory SET suspect = 1
+             WHERE node_id = ? AND fragment_hash IN ({placeholders})"
+        );
+        let mut stmt = db_tx
+            .prepare(&query)
+            .map_err(db_err("prepare suspect mark"))?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&node_id];
+        params.extend(chunk.iter().map(|h| h as &dyn rusqlite::ToSql));
+        stmt.execute(params.as_slice())
+            .map_err(db_err("mark suspect"))?;
+    }
+    Ok(stamped)
 }
 
 /// Read the node's current inventory count and which of `candidates` are

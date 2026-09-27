@@ -179,6 +179,17 @@ pub fn resolve_import_plan(headers: &[(String, u32)]) -> Result<ImportPlan, Stri
                 plan.targets.insert("consensus", 2);
             }
             "storage"
+                if *fv == hopnet_storage::store::PRE_DISK_TRUTH_SNAPSHOT_SECTION.format_version =>
+            {
+                // Covered-shape bump (RFC-STORAGE-003 S5 added the disk-
+                // truth columns): a storage@2 artifact imports with the
+                // frozen v2 spec at ordinal 2, then fast-forwards.
+                plan.specs
+                    .push(&hopnet_storage::store::PRE_DISK_TRUTH_SNAPSHOT_SECTION);
+                plan.expected.insert(name.clone(), *fv);
+                plan.targets.insert("storage", *fv);
+            }
+            "storage"
                 if *fv == hopnet_storage::store::PRE_LIFECYCLE_SNAPSHOT_SECTION.format_version =>
             {
                 // Covered-set bump (RFC-STORAGE-003 S1 added
@@ -320,7 +331,8 @@ pub(crate) mod tests {
              INSERT INTO mesh_key VALUES (1, X'AB', 1);
              INSERT INTO mesh_key_access VALUES (X'BB02', X'E2', X'78');
              INSERT INTO fragment_hashes VALUES ('blob1', 0, 0, 'f1', X'F1', 0, 1);
-             INSERT INTO fragment_inventory VALUES (X'F1', 1, 42);
+             INSERT INTO fragment_inventory (fragment_hash, node_id, self_verified_height)
+                 VALUES (X'F1', 1, 42);
              INSERT INTO hopnet_storage_policy VALUES ('sk', 'sv');
              INSERT INTO inodes VALUES ('i1', 1, 'deadbeef', 0, 'blob1');
              INSERT INTO incoming_shares VALUES ('s1', 'blob1', 1, 1, X'AC', X'AD', X'AE');
@@ -481,7 +493,7 @@ pub(crate) mod tests {
         assert_eq!(report.manifest.top_hash.to_hex(), EMPTY_TOP_HASH);
     }
 
-    const EMPTY_TOP_HASH: &str = "3e1c0296d37d197ad5e5d9a4f9ba5e2e2ecdc41413d787dfe2fe782e77e13aff";
+    const EMPTY_TOP_HASH: &str = "c24bc5aa4197b5db6446090740892c16da95b2aac34dc1068b132229e5a5722f";
     const EMPTY_SECTION_HASHES: &[(&str, &str)] = &[
         (
             "identity",
@@ -497,9 +509,10 @@ pub(crate) mod tests {
         ),
         (
             // v2 (RFC-STORAGE-003 S1): storage_view_transitions joined
-            // the covered set and data_blocks gained a column.
+            // the covered set and data_blocks gained a column. v3 (S5):
+            // fragment_inventory gained the disk-truth columns.
             "storage",
-            "1018b217b7687d066244b86a15b253d9d81dbb18683f9af0bad8cda7a19be8f3",
+            "42446bf68a066064557ec7f93b2e15f259210bcd14b907a42050957d22b36a6f",
         ),
         (
             "drive",
@@ -535,16 +548,17 @@ pub(crate) mod tests {
     }
 
     const SEEDED_TOP_HASH: &str =
-        "0439b790d9083e789011e68e61dcc0481896829fa298d7483b75abe75b92e3f2";
+        "83d775e1a337cc76ba8f84176f0adf08443a32debf0b76b373df80bfff2508ef";
     const SEEDED_ARTIFACT_HASH: &str =
-        "e2fc12903fcbf6b11ba130fae3a5ac96ba127dcf66ef07044513521e11aed691";
+        "5583484c291194293f80d04f37306123aa208bc38d9bda1b5c7c24d77059a378";
     // 5159 pre-split + 25: the "host" section header (16 bytes) became
     // identity (20) + telemetry (21) headers. Row bytes unchanged — the
     // delta being exactly the header arithmetic is the cheap proof the
     // RFC-020 S1 split moved no table content. 5184 + 118 at
     // RFC-STORAGE-003 S1: the desired_placement_height column on blob1
-    // and the one-row storage_view_transitions table (see the seed).
-    const SEEDED_ARTIFACT_LEN: usize = 5302;
+    // and the one-row storage_view_transitions table (see the seed);
+    // + 55 at S5: the three disk-truth columns on the one inventory row.
+    const SEEDED_ARTIFACT_LEN: usize = 5357;
 
     // Should: report identical manifests from the hash-only walk and the
     // full export, and byte-identical artifacts from two independently

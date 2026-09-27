@@ -211,7 +211,19 @@ impl StateReader for SubstrateHost {
             .db_pool
             .get()
             .map_err(|e| StorageError::Host(format!("pool checkout: {e}")))?;
-        hopnet_storage::lifecycle::confirm_ready(&conn, blob_id)
+        let tip = crate::db::consensus::get_current_consensus_height(&conn)
+            .map_err(|e| StorageError::Host(format!("current height: {e:?}")))?;
+        hopnet_storage::lifecycle::confirm_ready(&conn, blob_id, tip)
+    }
+
+    fn current_height(&self) -> Result<u64, StorageError> {
+        let conn = self
+            .app_state
+            .db_pool
+            .get()
+            .map_err(|e| StorageError::Host(format!("pool checkout: {e}")))?;
+        crate::db::consensus::get_current_consensus_height(&conn)
+            .map_err(|e| StorageError::Host(format!("current height: {e:?}")))
     }
 
     fn blob_manifest(

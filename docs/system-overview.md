@@ -506,7 +506,7 @@ apply functions inside consensus handlers.
       repair scan, migration pull, eviction, weekly rolling scrub).
       Orchestrator: tier-membership, eviction-under-pressure,
       re-encode-after-departure (kill → decay → regenerate → download)
-- [~] Block lifecycle convergence — S0–S4 of 7 + cutover
+- [~] Block lifecycle convergence — S0–S5 of 7 + cutover
       ([RFC-STORAGE-003](../hopnet-storage/spec/block-lifecycle.md),
       branch `rfc-block-lifecycle`, PR #72): the upload-to-placement
       pipeline joins the proven model. S0 (2026-08-22): the Quint model
@@ -535,8 +535,16 @@ apply functions inside consensus handlers.
       in-flight set adaptively, the missing-class scan folds into the
       obligation check (ladder + deputy rule under the goal assignment),
       and `hopnet_storage::tick` replays the model's engine tick against
-      every exported trace, state for state. S5–S7 (disk-truth attestation,
-      lifecycle closure, observability) and the cutover remain.
+      every exported trace, state for state. S5 (2026-09-27): disk truth —
+      storage step 0003 adds the replicated `verified_height` / `provenance`
+      / `suspect` record stamped only by the new `attest_fragments` tx; the
+      sweep (`hopnet_storage::sweep`) rides every 30-minute self-check,
+      repairing `stored_locally` both ways, deleting aged orphans (the
+      two-call orphan API is gone), scrubbing the weekly slice on the same
+      walk and attesting what it saw; the pull path attests the blob's
+      local fragments before proposing; confirmation evidence must be
+      verified within 1024 heights and not suspect. S6–S7 (lifecycle
+      closure, observability) and the cutover remain.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage
