@@ -568,13 +568,19 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     "AppState initialized from persisted database (user keys require login)"
                 );
 
+                let takeout_state = takeout_host::takeout_state(&app_state);
+
+                // Drop work tables whose cleanup was lost to a restart, before
+                // the engine can start any new pipeline.
+                match hopnet_takeout::jobs::sweep_at_startup(&takeout_state).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("Dropped {} orphaned takeout/import work table(s)", n),
+                    Err(e) => tracing::warn!("Work table sweep failed: {:?}", e),
+                }
+
                 // Scan for stranded imports owned by this node so that on the
                 // next user authentication event the resume hook can finish them.
-                match hopnet_takeout::jobs::scan_at_startup(&takeout_host::takeout_state(
-                    &app_state,
-                ))
-                .await
-                {
+                match hopnet_takeout::jobs::scan_at_startup(&takeout_state).await {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("Import resume registry: {} stranded import(s)", n),
                     Err(e) => tracing::warn!("Import resume scan failed: {:?}", e),

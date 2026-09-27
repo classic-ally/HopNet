@@ -202,6 +202,21 @@ pub async fn scan_at_startup(
     Ok(count)
 }
 
+/// Owner-startup sweep of work tables whose cleanup was lost (see
+/// [`crate::db::sweep_orphaned_work_tables`]). Runs before the engine starts,
+/// so nothing is materializing or importing concurrently. Returns how many
+/// tables were dropped.
+pub async fn sweep_at_startup(
+    state: &TakeoutState,
+) -> Result<usize, hopnet_projection::DatabaseError> {
+    let conn = state
+        .db_pool
+        .get()
+        .map_err(|_| hopnet_projection::DatabaseError::LockError)?;
+    let report = crate::db::sweep_orphaned_work_tables(&conn)?;
+    Ok(report.dropped.len())
+}
+
 /// Hook fired immediately after a session insert. If the user has a stranded
 /// import in the registry, drains it and spawns `run_creation_phase` to
 /// finish the work. No-op when registry has no entry. Idempotent on repeat

@@ -145,8 +145,16 @@ pub fn schema_rows(
          WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
          ORDER BY type, name",
     )?;
-    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-        .collect()
+    let rows: Vec<(String, String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<_, _>>()?;
+    // Runtime work tables (and anything indexed on them) are node-local
+    // pipeline state, not schema: a node restarted mid-takeout or holding a
+    // finished import must still boot.
+    Ok(rows
+        .into_iter()
+        .filter(|(_, _, tbl, _)| !hopnet_takeout::db::is_work_table(tbl))
+        .collect())
 }
 
 /// blake3 over the canonical schema rows — "what shape is this file",
@@ -651,6 +659,53 @@ mod tests {
             .unwrap();
         assert!(matches!(
             adopt_legacy(&conn),
+            Err(SchemaError::FingerprintMismatch { .. })
+        ));
+    }
+
+    // Impact: a leftover takeout_entries_{id} made thor refuse every boot
+    // for a week after a power loss; import_paths_{id} tables are never
+    // dropped at all, so any node that has run an import was one restart
+    // from the same lockout.
+    // Should: fast-forward to head with per-job work tables (and an index
+    // on one) present, leaving them in place.
+    #[test]
+    fn fast_forward_ignores_runtime_work_tables() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        install(&conn).unwrap();
+        let takeout_id = hopnet_common::CustomUUID::new(None);
+        let import_id = hopnet_common::CustomUUID::new(None);
+        let entries = hopnet_takeout::db::entries::table_name(&takeout_id);
+        let paths = hopnet_takeout::db::import_paths::table_name(&import_id);
+        conn.execute_batch(&format!(
+            "CREATE TABLE {entries} (projection TEXT, path TEXT);
+             CREATE INDEX idx_{entries}_path ON {entries} (path);
+             CREATE TABLE {paths} (projection TEXT, path TEXT);"
+        ))
+        .unwrap();
+
+        fast_forward(&mut conn).unwrap();
+
+        let still_there: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN (?1, ?2)",
+                [&entries, &paths],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_there, 2);
+    }
+
+    // Should: refuse to fast-forward a database with a stray table that
+    // only resembles a work table.
+    #[test]
+    fn fast_forward_refuses_a_near_miss_work_table() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        install(&conn).unwrap();
+        conn.execute_batch("CREATE TABLE takeout_entries_notahex (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert!(matches!(
+            fast_forward(&mut conn),
             Err(SchemaError::FingerprintMismatch { .. })
         ));
     }
