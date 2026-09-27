@@ -5,6 +5,74 @@ use rusqlite::params;
 use crate::db::DatabaseError;
 use hopnet_common::db::{CustomUUID, FaultToleranceCurvePoint, NodeStorageBaseline};
 
+/// Per-(block, node) fragment counts and per-block K, computed once per scan.
+///
+/// `fragment_hashes ⋈ fragment_inventory` on the 32-byte hash is the cost of
+/// the whole storage scan — ~1.3M random index probes on a real node — and
+/// the level rows and the storage baselines both need it. Each used to run it
+/// itself (three times in total, ~24s on a 730 MB database, long enough for
+/// the mount's statfs to time out and retry into a pile of concurrent scans).
+/// Materialising it into TEMP tables lets both read the same result.
+///
+/// TEMP objects live in `sqlite_temp_master`, so they never touch the schema
+/// fingerprint. Pooled connections are reused, so the tables are dropped both
+/// before building (a failed earlier build) and on drop.
+pub struct BlockNodeCounts<'c> {
+    conn: &'c PooledConnection<SqliteConnectionManager>,
+}
+
+impl<'c> BlockNodeCounts<'c> {
+    pub fn build(
+        conn: &'c PooledConnection<SqliteConnectionManager>,
+    ) -> Result<Self, DatabaseError> {
+        let start_time = std::time::Instant::now();
+
+        conn.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS temp.resilience_block_node;
+            DROP TABLE IF EXISTS temp.resilience_block_k;
+
+            CREATE TEMP TABLE resilience_block_node AS
+                SELECT fh.data_block_id, fi.node_id, COUNT(*) AS on_node
+                FROM fragment_hashes fh
+                JOIN fragment_inventory fi ON fi.fragment_hash = fh.fragment_hash
+                GROUP BY fh.data_block_id, fi.node_id;
+
+            CREATE TEMP TABLE resilience_block_k AS
+                SELECT data_block_id, COUNT(*) AS k
+                FROM fragment_hashes
+                WHERE chunk_type = 0
+                GROUP BY data_block_id;
+
+            CREATE INDEX temp.idx_resilience_block_node ON resilience_block_node (data_block_id);
+            CREATE UNIQUE INDEX temp.idx_resilience_block_k ON resilience_block_k (data_block_id);
+            "#,
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to build block/node fragment counts: {:?}", e);
+            DatabaseError::ProcessingError
+        })?;
+
+        tracing::debug!(
+            "block/node fragment counts built in {}ms",
+            start_time.elapsed().as_millis()
+        );
+
+        Ok(Self { conn })
+    }
+}
+
+impl Drop for BlockNodeCounts<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.conn.execute_batch(
+            "DROP TABLE IF EXISTS temp.resilience_block_node;
+             DROP TABLE IF EXISTS temp.resilience_block_k;",
+        ) {
+            tracing::debug!("Failed to drop block/node fragment counts: {:?}", e);
+        }
+    }
+}
+
 /// Raw user bytes sitting at each distinct worst-case tolerance level.
 ///
 /// `-2` is unknown (no attestation anywhere) and `-1` unrecoverable (fewer than
@@ -19,9 +87,10 @@ use hopnet_common::db::{CustomUUID, FaultToleranceCurvePoint, NodeStorageBaselin
 /// `durable` predicate the storage spec names, and it drops the dependency on
 /// the ~10-minute metrics cron.
 pub fn resilience_level_rows(
-    conn: &PooledConnection<SqliteConnectionManager>,
+    counts: &BlockNodeCounts<'_>,
     member_ids: &[i32],
 ) -> Result<Vec<(i32, f64)>, DatabaseError> {
+    let conn = counts.conn;
     let start_time = std::time::Instant::now();
 
     // An empty member set is legitimate (fresh mesh): `IN (NULL)` matches
@@ -51,28 +120,18 @@ pub fn resilience_level_rows(
     let query = format!(
         r#"
         WITH
-        block_k AS (
-            SELECT data_block_id, COUNT(*) AS k
-            FROM fragment_hashes
-            WHERE chunk_type = 0
-            GROUP BY data_block_id
-        ),
-
         -- Attested anywhere, member or not: separates "never placed" (-2)
         -- from "placed, but nothing survives on a member" (-1).
         block_attested AS (
-            SELECT DISTINCT fh.data_block_id
-            FROM fragment_hashes fh
-            JOIN fragment_inventory fi ON fi.fragment_hash = fh.fragment_hash
+            SELECT DISTINCT data_block_id
+            FROM resilience_block_node
         ),
 
         member_counts AS (
-            SELECT fh.data_block_id, fi.node_id, COUNT(*) AS on_node, bk.k
-            FROM fragment_hashes fh
-            JOIN block_k bk ON bk.data_block_id = fh.data_block_id
-            JOIN fragment_inventory fi ON fi.fragment_hash = fh.fragment_hash
-            WHERE fi.node_id IN ({placeholders})
-            GROUP BY fh.data_block_id, fi.node_id, bk.k
+            SELECT bn.data_block_id, bn.node_id, bn.on_node, bk.k
+            FROM resilience_block_node bn
+            JOIN resilience_block_k bk ON bk.data_block_id = bn.data_block_id
+            WHERE bn.node_id IN ({placeholders})
         ),
 
         -- Adversarial ordering: largest holders lost first, so the level is a
@@ -213,39 +272,30 @@ pub fn unplaced_age_buckets(
 /// Get node storage baselines for fault tolerance curve generation
 /// Returns each node's total capacity and baseline usage for simulation
 ///
-/// Borrows the connection rather than taking a checkout, matching
-/// `resilience_level_rows` above: callers that already hold one MUST reuse it.
-/// Taking a second checkout while the first was still held made a single
-/// request cost two of the pool's 32 connections, and blocked for the full 2s
-/// `connection_timeout` while holding the first — so pool pressure amplified
-/// instead of draining (issue #68).
+/// Reads through the scan's [`BlockNodeCounts`], which borrows the caller's
+/// connection rather than taking a checkout: callers that already hold one
+/// MUST reuse it. Taking a second checkout while the first was still held made
+/// a single request cost two of the pool's 32 connections, and blocked for the
+/// full 2s `connection_timeout` while holding the first — so pool pressure
+/// amplified instead of draining (issue #68).
 pub fn get_node_storage_baselines(
-    conn: &PooledConnection<SqliteConnectionManager>,
+    counts: &BlockNodeCounts<'_>,
 ) -> Result<Vec<NodeStorageBaseline>, DatabaseError> {
+    let conn = counts.conn;
     let start_time = std::time::Instant::now();
 
     let query = r#"
         WITH
-        -- Calculate original fragment counts per data block first
-        data_block_original_counts AS (
-            SELECT
-                fh.data_block_id,
-                COUNT(*) as original_count
-            FROM fragment_hashes fh
-            WHERE fh.chunk_type = 0
-            GROUP BY fh.data_block_id
-        ),
-
-        -- Calculate current HopNet storage per node
+        -- Calculate current HopNet storage per node: each held fragment is
+        -- 1/K of its block, plus 10% overhead.
         node_hopnet_storage AS (
             SELECT
-                fi.node_id,
-                SUM((CAST(db.file_size AS REAL) / MAX(dboc.original_count, 1)) * 1.1 / (1024.0 * 1024.0 * 1024.0)) as hopnet_storage_gb
-            FROM fragment_inventory fi
-            JOIN fragment_hashes fh ON fi.fragment_hash = fh.fragment_hash
-            JOIN data_blocks db ON fh.data_block_id = db.id
-            JOIN data_block_original_counts dboc ON db.id = dboc.data_block_id
-            GROUP BY fi.node_id
+                bn.node_id,
+                SUM((CAST(db.file_size AS REAL) / MAX(bk.k, 1)) * bn.on_node * 1.1 / (1024.0 * 1024.0 * 1024.0)) as hopnet_storage_gb
+            FROM resilience_block_node bn
+            JOIN data_blocks db ON bn.data_block_id = db.id
+            JOIN resilience_block_k bk ON bk.data_block_id = bn.data_block_id
+            GROUP BY bn.node_id
         ),
 
         -- Get latest storage metrics for each node
