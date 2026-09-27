@@ -1,38 +1,47 @@
 use crate::{
     AppState,
-    db::{
-        CustomUUID,
-        fragments::{
-            AvailabilityClass, find_orphaned_data_blocks, get_node_availability_classification,
-        },
-    },
+    db::{CustomUUID, fragments::find_orphaned_data_blocks},
     storage_host::substrate_host::SubstrateHost,
 };
 use apalis::prelude::*;
 use hopnet_storage::traits::TxSubmitter;
 use std::sync::Arc;
 
-/// Manual trigger for orphaned data block cleanup
-/// Initially only supports manual trigger - threshold checking and scheduling to be added later
+/// Orphaned data-block cleanup: the scheduled fire (RFC-STORAGE-003 S6 —
+/// registered daily with per-node jitter in main.rs) and the manual
+/// route's defaults. Blobs no reference provider claims, older than the
+/// retention window, oldest first; at most `MAX_BATCHES` consensus
+/// transactions per fire — the rest waits for the next one. Deletion
+/// policy, not convergence: the retention window is the recovery window
+/// for anything a projection dropped.
+pub const ORPHAN_CLEANUP_BATCH_SIZE: i32 = 50;
+pub const ORPHAN_CLEANUP_RETENTION_DAYS: i64 = 30;
+pub const ORPHAN_CLEANUP_MAX_BATCHES: usize = 10;
+
+/// The daily cron entry.
 pub async fn handle_orphaned_data_block_cleanup(
-    job: TaskId,
+    _job: TaskId,
     ctx: Data<AppState>,
 ) -> Result<(), Error> {
-    // Use default values for scheduled jobs
-    run_orphaned_data_block_cleanup(&ctx, 50, 30)
-        .await
-        .map(|_| ())
+    run_orphaned_data_block_cleanup(
+        &ctx,
+        ORPHAN_CLEANUP_BATCH_SIZE,
+        ORPHAN_CLEANUP_RETENTION_DAYS,
+    )
+    .await
+    .map(|_| ())
 }
 
-/// Core cleanup logic that can be called from job handler or manual trigger
+/// Core cleanup logic shared by the cron and `POST /maintenance/cleanup-orphaned`.
+/// The takeout gate here is the pre-flight; the apply re-checks it inside
+/// the transaction (`db_apply::delete_orphaned_data_blocks_consensus`).
 pub async fn run_orphaned_data_block_cleanup(
     app_state: &AppState,
     batch_size: i32,
     retention_days: i64,
 ) -> Result<usize, Error> {
-    tracing::info!("Starting orphaned data block cleanup");
+    tracing::debug!("Starting orphaned data block cleanup");
 
-    // Pre-flight check: Ensure no active takeouts are in progress
     match crate::db::takeout::has_active_takeout(app_state.db_pool.get(), None) {
         Ok(true) => {
             let error_msg = "Cannot run orphaned data cleanup: active takeout(s) in progress. Wait for takeouts to expire or complete before running cleanup.";
@@ -41,9 +50,7 @@ pub async fn run_orphaned_data_block_cleanup(
                 error_msg,
             )))));
         }
-        Ok(false) => {
-            tracing::info!("Pre-flight check passed: no active takeouts found");
-        }
+        Ok(false) => {}
         Err(e) => {
             tracing::error!(
                 "Failed to check for active takeouts before cleanup: {:?}",
@@ -55,62 +62,11 @@ pub async fn run_orphaned_data_block_cleanup(
         }
     }
 
-    // Get node ID for availability classification
-    let node_id = match app_state.get_node_id() {
-        Ok(id) => id,
-        Err(_) => {
-            tracing::error!("Node ID not initialized, cannot run cleanup");
-            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                "Node ID not initialized",
-            )))));
-        }
-    };
-
-    // Get database connection
-    let db_connection = app_state.db_pool.get();
-
-    // Determine cleanup strategy based on availability
-    let (node_availability, availability_class) = match get_node_availability_classification(
-        db_connection,
-        node_id,
-        30, // 30-day rolling average
-    ) {
-        Ok((avail, class)) => (avail, class),
-        Err(e) => {
-            tracing::error!("Failed to determine node availability: {:?}", e);
-            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                format!("Failed to determine node availability: {:?}", e),
-            )))));
-        }
-    };
-
-    tracing::info!(
-        "Node availability: {:.1}%, classification: {:?}",
-        node_availability * 100.0,
-        availability_class
-    );
-
-    // For now, implement only historical data cleanup (Stage 1 for below-average nodes)
-    // Redundant copy cleanup to be implemented later
-    match availability_class {
-        AvailabilityClass::BelowAverage => {
-            tracing::info!("Below-average availability node: cleaning historical data first");
-            cleanup_orphaned_data_blocks(app_state, node_id, batch_size, retention_days).await
-        }
-        AvailabilityClass::AboveAverage => {
-            tracing::info!(
-                "Above-average availability node: would clean redundant copies first (not implemented yet)"
-            );
-            // TODO: Implement redundant copy cleanup
-            // For now, also clean historical data
-            cleanup_orphaned_data_blocks(app_state, node_id, batch_size, retention_days).await
-        }
-    }
+    cleanup_orphaned_data_blocks(app_state, batch_size, retention_days).await
 }
 
 async fn cleanup_orphaned_data_blocks(
     app_state: &AppState,
-    _node_id: i32,
     batch_size: i32,
     retention_days: i64,
 ) -> Result<usize, Error> {
@@ -119,7 +75,7 @@ async fn cleanup_orphaned_data_blocks(
     // Generate cutoff UUID for retention policy
     let cutoff_uuid = CustomUUID::retention_cutoff(retention_days);
 
-    tracing::info!(
+    tracing::debug!(
         "Using {}-day retention policy, batch size: {}, cutoff UUID: {}",
         retention_days,
         batch_size,
@@ -129,7 +85,7 @@ async fn cleanup_orphaned_data_blocks(
     // Storage-owned tx submission rides the TxSubmitter seam (sign + queue).
     let submitter = SubstrateHost::new(app_state.clone());
 
-    loop {
+    for batch in 0..ORPHAN_CLEANUP_MAX_BATCHES {
         // Get database connection for this batch
         let db_connection = app_state.db_pool.get();
 
@@ -146,11 +102,14 @@ async fn cleanup_orphaned_data_blocks(
             };
 
         if data_block_ids.is_empty() {
-            tracing::info!("No more orphaned data blocks to clean");
+            tracing::debug!("No more orphaned data blocks to clean");
             break;
         }
+        if batch + 1 == ORPHAN_CLEANUP_MAX_BATCHES && data_block_ids.len() as i32 == batch_size {
+            tracing::debug!("orphan cleanup batch cap reached; more may remain for the next fire");
+        }
 
-        tracing::info!(
+        tracing::debug!(
             "Found {} orphaned data blocks in this batch",
             data_block_ids.len()
         );
@@ -176,8 +135,8 @@ async fn cleanup_orphaned_data_blocks(
             .await
         {
             Ok(()) => {
-                tracing::info!(
-                    "Successfully submitted consensus transaction to delete {} data blocks",
+                tracing::debug!(
+                    "Submitted consensus transaction to delete {} data blocks",
                     batch_len
                 );
                 total_cleaned += batch_len;
@@ -191,6 +150,9 @@ async fn cleanup_orphaned_data_blocks(
         }
     }
 
+    if total_cleaned > 0 {
+        tracing::info!("orphan cleanup: {total_cleaned} data blocks submitted for deletion");
+    }
     Ok(total_cleaned)
 }
 

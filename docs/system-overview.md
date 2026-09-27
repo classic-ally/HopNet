@@ -506,7 +506,7 @@ apply functions inside consensus handlers.
       repair scan, migration pull, eviction, weekly rolling scrub).
       Orchestrator: tier-membership, eviction-under-pressure,
       re-encode-after-departure (kill → decay → regenerate → download)
-- [~] Block lifecycle convergence — S0–S5 of 7 + cutover
+- [~] Block lifecycle convergence — S0–S6 of 7 + cutover
       ([RFC-STORAGE-003](../hopnet-storage/spec/block-lifecycle.md),
       branch `rfc-block-lifecycle`, PR #72): the upload-to-placement
       pipeline joins the proven model. S0 (2026-08-22): the Quint model
@@ -543,8 +543,14 @@ apply functions inside consensus handlers.
       two-call orphan API is gone), scrubbing the weekly slice on the same
       walk and attesting what it saw; the pull path attests the blob's
       local fragments before proposing; confirmation evidence must be
-      verified within 1024 heights and not suspect. S6–S7 (lifecycle
-      closure, observability) and the cutover remain.
+      verified within 1024 heights and not suspect. S6 (2026-09-27):
+      lifecycle closure — confirm-apply prunes departed holders'
+      inventory rows through a host-injected `MeshMembership` oracle over
+      the validator record (view decay is not departure; the cutover drain
+      is the backfill), orphan deletion drops the deleted blobs' inventory
+      rows for every node, the orphaned data-block cleanup runs daily per
+      node (bounded batches), and the availability-class branch is gone.
+      S7 (observability) and the cutover remain.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage
@@ -751,7 +757,7 @@ End-to-end encryption and comprehensive authentication system.
 - [ ] Thin client architecture for mobile/constrained devices
 
 ### 7. Maintenance & Operations System ([RFC-007](specs/maintenance-operations.md))
-**Status**: Orphaned data cleanup and manual rebalancing complete, automated recovery pending
+**Status**: Storage surfaces absorbed by RFC-STORAGE-003 (orphan cleanup scheduled daily, recovery and rebalance triggers = the reconciler); consensus archival pending
 
 Automated background processes ensuring network health and storage efficiency.
 
@@ -761,13 +767,13 @@ Automated background processes ensuring network health and storage efficiency.
 - [x] **NEW**: Manual network rebalancing trigger with placement height consensus updates
 - [x] **NEW**: Atomic data block rebalancing (only update placement_height after all fragments migrate)
 - [x] **NEW**: RPC fragment fetch instructions with dual Ed25519 authentication
-- [ ] Availability-aware cleanup prioritization (redundant vs historical)
+- [x] ~~Availability-aware cleanup prioritization (redundant vs historical)~~ — superseded (RFC-STORAGE-003 S6): watermark eviction under the protection predicate replaces redundant-copy cleanup; the decorative branch is deleted
 - [ ] Automated background network rebalancing for node join/leave events
 - [ ] Lost shard recovery with Reed-Solomon reconstruction
-- [ ] Redundant copy cleanup for download/rebalancing artifacts
+- [x] ~~Redundant copy cleanup for download/rebalancing artifacts~~ — superseded (RFC-STORAGE-003 S2 eviction belt)
 - [ ] Fragment health monitoring and remediation
 - [ ] Consensus state management and archival
-- [ ] Fragment filesystem cleanup for orphaned files
+- [x] Fragment filesystem cleanup for orphaned files — the disk-truth sweep (RFC-STORAGE-003 S5); orphaned data-block cleanup registered daily (S6)
 - [ ] Job coordination using node ID proximity to minimize duplicate work
 
 ### 8. User Data Takeout & Import System ([RFC-010](specs/user-data-takeout.md))

@@ -119,7 +119,7 @@ LIMIT ?; -- Process in batches
 #### Redundant Copy Cleanup
 **Purpose**: Ensure redundant copies of fragments are cleaned up safely while preserving network redundancy
 
-**Implementation Status**: [ ] Pending - Design complete, availability-aware logic partially implemented in orphaned data block cleanup
+**Implementation Status**: [x] Superseded (RFC-STORAGE-003 S2/S6, 2026-09-27) — surplus copies are reclaimed by watermark eviction under the protection predicate (`hopnet_storage::eviction` + `protection`), which is model-checked; the availability-class branch that guarded orphan cleanup was decorative (both arms identical) and is deleted. The design below is kept for the record only.
 
 **Potential Causes**:
 - **Download-Induced Redundancy**: Fragments cached locally during file downloads but not optimal storage locations
@@ -242,9 +242,7 @@ pub async fn is_fragment_safely_removable(
 - **Manual Trigger Only**: No automated triggers for network topology changes
   - **Future**: Detect node joins/leaves and automatically trigger targeted rebalancing
   - **Benefit**: Self-healing network that maintains optimal placement automatically
-- **Simple Availability Classification**: Cleanup prioritization uses basic above/below average availability
-  - **Future**: Implement sophisticated node reliability scoring and availability-aware cleanup
-  - **Benefit**: Better storage optimization decisions based on predicted node longevity
+- **Availability classification**: removed (RFC-STORAGE-003 S6); node reliability is the storage view's decay tiers (RFC-STORAGE-001), and surplus reclamation is the eviction belt
 
 ### 3. Health Monitoring System
 
@@ -344,7 +342,7 @@ let maintenance_worker = WorkerBuilder::new("fragment-health-monitoring")
 - [ ] Add orphan recovery system with distributed fragment retrieval
 - [ ] Create fragment health monitoring with automated remediation
 - [ ] Implement automated rebalancing triggers for dynamic node changes
-- [ ] Implement fragment filesystem cleanup for orphaned files
+- [x] Fragment filesystem cleanup for orphaned files — absorbed by RFC-STORAGE-003 S5 (the disk-truth sweep); orphaned data-block cleanup registered on a daily schedule in S6
 
 ### Phase 2: Advanced Operations [Future]
 - [ ] **Performance Optimizations**:

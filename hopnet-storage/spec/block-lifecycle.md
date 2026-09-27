@@ -117,11 +117,12 @@ surface per-urgency-tier time-to-conformance in the resilience pane.
   same oldest blob: the automatic path examines one blob, mesh-wide,
   forever. Only the manual `POST /maintenance/rebalance` route
   escapes.
-- **The remaining lifecycle jobs exist but never run.** Orphaned
-  data-block cleanup has an apalis handler registered with no worker
-  (`src/storage_host/jobs.rs:18`); orphaned fragment-file GC is
-  manual, two-call, and its scan cache is process-memory — lost on
-  restart (`jobs.rs:418`). RFC-007 specified schedules for both;
+- **The remaining lifecycle jobs exist but never run** (as found;
+  landed in S5 and S6). Orphaned data-block cleanup has an apalis
+  handler registered with no worker (`src/storage_host/jobs.rs:18`);
+  orphaned fragment-file GC is manual, two-call, and its scan cache
+  is process-memory — lost on restart (`jobs.rs:418`). RFC-007
+  specified schedules for both;
   none were built. This RFC absorbs those surfaces so lifecycle
   ownership lands in one place.
 
@@ -773,14 +774,29 @@ optimization and carries no proof obligation.
     watermark eviction under the protection predicate.
   - Departed-node inventory rows are pruned incrementally at
     ConfirmPlacement apply — the one moment the blob is freshly
-    proven healthy without them — plus a one-time backfill at
-    migration. Departed means removed from mesh membership (the
-    model's GONE), never mere storage-view decay, whose rows must
-    persist as flap-back insurance. Because pruning happens only at
-    confirm, unrecoverable blobs keep their ghost rows — the
-    evidence the resilience pane's classification depends on. Rows
-    on live non-members stay: surplus copies are read sources and
-    eviction guards.
+    proven healthy without them. Departed means removed from mesh
+    membership (the model's GONE), never mere storage-view decay,
+    whose rows must persist as flap-back insurance. Because pruning
+    happens only at confirm, unrecoverable blobs keep their ghost
+    rows — the evidence the resilience pane's classification depends
+    on. Rows on live non-members stay: surplus copies are read
+    sources and eviction guards.
+    - S6 decision (2026-09-27): the draft added "plus a one-time
+      backfill at migration". The cutover drain IS the backfill —
+      every recoverable blob is declared forward and confirmed, and
+      each confirm prunes — so no storage step reads the consensus
+      module's validator record or needs a height (RFC-020 contract
+      rule 2), and the ghost rows of already-lost blobs survive the
+      crossing as they do afterwards. Membership is answered by the
+      host over the validator record at the deciding height
+      (`MeshMembership`, injected into the apply); a node with no
+      record is kept.
+  - Orphan deletion also drops the deleted blobs' inventory rows for
+    every node in the same apply (S6): once the blob's manifest and
+    access rows are gone a row for one of its hashes can support no
+    recovery — live nodes' self-checks would reap their own next
+    cycle, departed nodes' would leak forever. The retention window
+    before deletion is the recovery window; the row after it is not.
 - **The cutover is also the recovery event.**
   - The migration backfills `desired_placement_height =
     COALESCE(placement_height, 0)` (riding RFC-020's schema
@@ -991,9 +1007,25 @@ optimization and carries no proof obligation.
     origin's classes are evidence too.
     Storage@2 artifacts import through a frozen v2 spec (S1's
     precedent, second use).
-- [ ] **S6 — Lifecycle closure.** Data-block cleanup registered on
+- [x] **S6 — Lifecycle closure.** Data-block cleanup registered on
   schedule; availability-class branch deleted; departed-node row
-  pruning at confirm-apply plus one-time backfill.
+  pruning at confirm-apply.
+  - Done 2026-09-27. `apply_confirm` takes a `MeshMembership` oracle
+    (`traits.rs`) and, for each confirmation it applies, deletes the
+    blob's inventory rows on every holder the oracle calls departed —
+    blob-scoped, both passes, `ConfirmOutcome.pruned`. The host's
+    `ValidatorMembership` answers from the latest validator row at or
+    below the deciding height (no row: member). No backfill step: the
+    cutover drain confirms every recoverable blob (decision recorded in
+    the Handoff Protocol). `apply_delete_orphaned` now also deletes the
+    deleted blobs' inventory rows for every node. The orphaned data-
+    block cleanup runs as the `orphaned-data-block-cleanup` worker,
+    randomized daily per node, batch 50, 30-day retention, at most 10
+    consensus transactions per fire; the manual route and both takeout
+    gates are unchanged. The availability-class branch, its DB
+    function and the snapshotter capture are deleted (RFC-007's
+    redundant-copy cleanup is superseded by watermark eviction under
+    the protection predicate, S2).
 - [ ] **S7 — Observability.** The pane series (in-flight ages,
   staleness backlog, converged predicate, verification freshness);
   transfer-timing histograms; per-tier ETA last, on top of

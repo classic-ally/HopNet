@@ -244,3 +244,15 @@ pub trait LocalStateSink: Send + Sync {
         fragment_hashes: Vec<Blake3Hash>,
     ) -> impl Future<Output = ()> + Send;
 }
+
+/// Mesh membership at a deciding height (RFC-STORAGE-003 S6). Answers
+/// "is this node still part of the mesh" — CONSENSUS membership, the
+/// model's GONE when false — never storage-view membership, which is
+/// decay and flaps back. The host implements it over its validator
+/// record at the block's deciding height so every node answers alike;
+/// the confirm apply prunes departed holders' inventory rows through it.
+/// A node the host cannot place (no record at all) must answer `true`:
+/// unknown is kept, never pruned.
+pub trait MeshMembership {
+    fn is_member(&self, node_id: i32) -> Result<bool, StorageError>;
+}

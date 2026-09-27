@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::placement::{self, MetricsRow};
 use crate::store::db_err;
-use crate::traits::StorageView;
+use crate::traits::{MeshMembership, StorageView};
 use crate::types::BlobId;
 use crate::StorageError;
 
@@ -563,11 +563,13 @@ pub fn confirm_ready(
 // ---------------------------------------------------------------------------
 // ConfirmPlacement apply
 
-/// Per-entry tally of one confirm apply.
+/// Per-entry tally of one confirm apply. `pruned` counts departed holders'
+/// inventory rows removed for the confirmed blobs (S6).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ConfirmOutcome {
     pub applied: usize,
     pub skipped: usize,
+    pub pruned: usize,
 }
 
 /// Apply a confirm batch. Per entry: the blob exists; `height` equals the
@@ -576,12 +578,23 @@ pub struct ConfirmOutcome {
 /// view has an attested inventory row for it. Effect: `placement_height =
 /// height` — old holders' obligations lapse. Recency of the attestation is
 /// S5's addition. An already-confirmed goal is a no-op.
+///
+/// S6: a confirmed blob is freshly proven healthy without any departed
+/// holder, so its inventory rows on nodes no longer in the mesh
+/// (`membership`, consensus membership at the deciding height) are pruned
+/// here, blob-scoped. Rows on live nodes — view members or not — stay:
+/// surplus copies are read sources and eviction guards, and a view-decayed
+/// node flaps back. Unconfirmable blobs keep their ghost rows, the evidence
+/// the resilience classification reads. Deterministic (replicated inputs
+/// only), so it runs on both the validation and the execute pass.
 pub fn apply_confirm(
     db_tx: &rusqlite::Transaction,
     payload: &ConfirmPlacement,
     deciding_height: u64,
+    membership: &dyn MeshMembership,
 ) -> Result<ConfirmOutcome, StorageError> {
     let mut outcome = ConfirmOutcome::default();
+    let mut departed_memo: HashMap<i32, bool> = HashMap::new();
     let mut read = db_tx
         .prepare_cached(
             "SELECT desired_placement_height, placement_height FROM data_blocks WHERE id = ?",
@@ -637,11 +650,58 @@ pub fn apply_confirm(
             .map_err(db_err("write confirm"))?;
         if n == 1 {
             outcome.applied += 1;
+            outcome.pruned +=
+                prune_departed_rows(db_tx, &c.blob_id, membership, &mut departed_memo)?;
         } else {
             outcome.skipped += 1;
         }
     }
     Ok(outcome)
+}
+
+/// Delete the inventory rows of one blob's fragments on every holder that
+/// has left the mesh. Returns the row count. `memo` caches the oracle's
+/// answers across a batch.
+fn prune_departed_rows(
+    db_tx: &rusqlite::Transaction,
+    blob_id: &BlobId,
+    membership: &dyn MeshMembership,
+    memo: &mut HashMap<i32, bool>,
+) -> Result<usize, StorageError> {
+    let holders: Vec<i32> = db_tx
+        .prepare_cached(
+            "SELECT DISTINCT fi.node_id FROM fragment_inventory fi
+             JOIN fragment_hashes fh ON fh.fragment_hash = fi.fragment_hash
+             WHERE fh.data_block_id = ? ORDER BY fi.node_id",
+        )
+        .map_err(db_err("prepare holder read"))?
+        .query_map(params![blob_id], |row| row.get(0))
+        .map_err(db_err("read holders"))?
+        .collect::<Result<_, _>>()
+        .map_err(db_err("collect holders"))?;
+    let mut pruned = 0;
+    for node in holders {
+        let departed = match memo.get(&node) {
+            Some(d) => *d,
+            None => {
+                let d = !membership.is_member(node)?;
+                memo.insert(node, d);
+                d
+            }
+        };
+        if !departed {
+            continue;
+        }
+        pruned += db_tx
+            .prepare_cached(
+                "DELETE FROM fragment_inventory WHERE node_id = ? AND fragment_hash IN
+                 (SELECT fragment_hash FROM fragment_hashes WHERE data_block_id = ?)",
+            )
+            .map_err(db_err("prepare departed prune"))?
+            .execute(params![node, blob_id])
+            .map_err(db_err("prune departed rows"))?;
+    }
+    Ok(pruned)
 }
 
 #[cfg(test)]
@@ -732,6 +792,15 @@ mod tests {
             }],
         }
     }
+
+    /// Mesh membership as a fixed set; `ALL` treats every node as a member.
+    struct Members(&'static [i32]);
+    impl MeshMembership for Members {
+        fn is_member(&self, node_id: i32) -> Result<bool, StorageError> {
+            Ok(self.0.is_empty() || self.0.contains(&node_id))
+        }
+    }
+    const ALL: Members = Members(&[]);
 
     fn confirm(id: &BlobId, height: u64) -> ConfirmPlacement {
         ConfirmPlacement {
@@ -878,15 +947,30 @@ mod tests {
         insert_blob(&tx, &b, 6, None);
 
         // Goal's view not on record yet.
-        assert_eq!(apply_confirm(&tx, &confirm(&b, 6), 10).unwrap().skipped, 1);
+        assert_eq!(
+            apply_confirm(&tx, &confirm(&b, 6), 10, &ALL)
+                .unwrap()
+                .skipped,
+            1
+        );
 
         record_transition(&tx, 5, &view(&[1, 2, 3])).unwrap();
         let assignment = snapshot_at(&tx, 6).unwrap().unwrap().assignment(&b);
 
         // Wrong height.
-        assert_eq!(apply_confirm(&tx, &confirm(&b, 5), 10).unwrap().skipped, 1);
+        assert_eq!(
+            apply_confirm(&tx, &confirm(&b, 5), 10, &ALL)
+                .unwrap()
+                .skipped,
+            1
+        );
         // No attestations at all.
-        assert_eq!(apply_confirm(&tx, &confirm(&b, 6), 10).unwrap().skipped, 1);
+        assert_eq!(
+            apply_confirm(&tx, &confirm(&b, 6), 10, &ALL)
+                .unwrap()
+                .skipped,
+            1
+        );
 
         // Attest two of three classes on their responsible nodes.
         for i in 0..2u32 {
@@ -896,7 +980,12 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(apply_confirm(&tx, &confirm(&b, 6), 10).unwrap().skipped, 1);
+        assert_eq!(
+            apply_confirm(&tx, &confirm(&b, 6), 10, &ALL)
+                .unwrap()
+                .skipped,
+            1
+        );
         assert_eq!(goal(&tx, &b), (6, None));
 
         // Third class attested on the WRONG node: still incomplete.
@@ -906,7 +995,12 @@ mod tests {
             params![vec![2u8; 32], wrong],
         )
         .unwrap();
-        assert_eq!(apply_confirm(&tx, &confirm(&b, 6), 10).unwrap().skipped, 1);
+        assert_eq!(
+            apply_confirm(&tx, &confirm(&b, 6), 10, &ALL)
+                .unwrap()
+                .skipped,
+            1
+        );
 
         tx.execute(
             "INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height) VALUES (?, ?, 6)",
@@ -914,16 +1008,111 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            apply_confirm(&tx, &confirm(&b, 6), 10).unwrap(),
+            apply_confirm(&tx, &confirm(&b, 6), 10, &ALL).unwrap(),
             ConfirmOutcome {
                 applied: 1,
-                skipped: 0
+                skipped: 0,
+                pruned: 0,
             }
         );
         assert_eq!(goal(&tx, &b), (6, Some(6)));
 
         // Re-confirming the confirmed goal is a no-op.
-        assert_eq!(apply_confirm(&tx, &confirm(&b, 6), 10).unwrap().skipped, 1);
+        assert_eq!(
+            apply_confirm(&tx, &confirm(&b, 6), 10, &ALL)
+                .unwrap()
+                .skipped,
+            1
+        );
+    }
+
+    // Impact: the confirm is the one moment a blob is proven healthy without
+    // its departed holders; pruning anywhere else would erase the ghost
+    // rows the resilience classification reads for unrecoverable blobs.
+    // Should: delete a departed holder's inventory rows for the confirmed
+    // blob only, and report the count.
+    // Should not: touch rows on live nodes (view members or surplus
+    // holders outside the view), rows of an unconfirmed blob on the same
+    // departed node, or anything when the confirm is skipped.
+    #[test]
+    fn confirm_prunes_departed_holders_blob_scoped() {
+        let mut conn = test_conn();
+        let tx = conn.transaction().unwrap();
+        let a = blob(1); // will confirm
+        let b = blob(2); // stays in flight
+        insert_blob(&tx, &a, 6, None);
+        insert_blob(&tx, &b, 6, None);
+        record_transition(&tx, 5, &view(&[1, 2, 3])).unwrap();
+        let assignment = snapshot_at(&tx, 6).unwrap().unwrap().assignment(&a);
+
+        let attest = |hash: Vec<u8>, node: i32| {
+            tx.execute(
+                "INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height) VALUES (?, ?, 6)",
+                params![hash, node],
+            )
+            .unwrap();
+        };
+        // Evidence for `a` on its responsibles; surplus copies of class 0
+        // on node 4 (live, outside the view) and node 9 (departed); a
+        // fragment of `b` on node 9 too. Hashes: `a` and `b` share the
+        // per-index bytes in this fixture, so distinguish by data_block_id.
+        for (i, node) in assignment.iter().take(3).enumerate() {
+            attest(vec![i as u8; 32], *node);
+        }
+        attest(vec![0u8; 32], 4);
+        attest(vec![0u8; 32], 9);
+        let rows = |node: i32| -> i64 {
+            tx.query_row(
+                "SELECT COUNT(*) FROM fragment_inventory WHERE node_id = ?",
+                params![node],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let members = Members(&[1, 2, 3, 4]);
+
+        // Skipped confirm (wrong height): nothing pruned.
+        let skipped = apply_confirm(&tx, &confirm(&a, 5), 10, &members).unwrap();
+        assert_eq!((skipped.skipped, skipped.pruned), (1, 0));
+        assert_eq!(rows(9), 1);
+
+        let ok = apply_confirm(&tx, &confirm(&a, 6), 10, &members).unwrap();
+        assert_eq!(
+            ok,
+            ConfirmOutcome {
+                applied: 1,
+                skipped: 0,
+                pruned: 1,
+            }
+        );
+        assert_eq!(goal(&tx, &a), (6, Some(6)));
+        assert_eq!(rows(9), 0, "departed holder pruned");
+        assert_eq!(rows(4), 1, "live surplus holder outside the view kept");
+        for node in assignment.iter().take(3) {
+            assert!(rows(*node) >= 1, "responsible kept");
+        }
+
+        // The same hash bytes also index `b`'s fragments in this fixture:
+        // the prune was scoped by data_block_id, so `b` (unconfirmed, on
+        // node 9 via the shared hash) would only lose rows through `a`'s
+        // hashes. Make that explicit with a hash only `b` has.
+        tx.execute(
+            "INSERT INTO fragment_hashes VALUES (?, 0, 7, 'f', X'BB', 0, 0)",
+            params![b],
+        )
+        .unwrap();
+        attest(vec![0xBB], 9);
+        assert_eq!(
+            apply_confirm(&tx, &confirm(&a, 6), 10, &members)
+                .unwrap()
+                .pruned,
+            0
+        );
+        assert_eq!(
+            rows(9),
+            1,
+            "unconfirmed blob's row on the departed node stays"
+        );
     }
 
     // Should: resolve a blob's protection epochs from the record — the
@@ -1009,7 +1198,12 @@ mod tests {
             .unwrap();
         }
         assert_eq!(confirm_ready(&tx, &a, 10).unwrap(), Some(9));
-        assert_eq!(apply_confirm(&tx, &confirm(&a, 9), 10).unwrap().applied, 1);
+        assert_eq!(
+            apply_confirm(&tx, &confirm(&a, 9), 10, &ALL)
+                .unwrap()
+                .applied,
+            1
+        );
         assert_eq!(
             confirm_ready(&tx, &a, 10).unwrap(),
             None,

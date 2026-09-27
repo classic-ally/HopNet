@@ -565,6 +565,52 @@ mod lifecycle_handlers {
         ));
     }
 
+    // Impact: the confirm-apply prune (S6) reads this oracle on every
+    // node; an answer that depended on anything but the validator record
+    // at the deciding height would diverge the replicated inventory.
+    // Should: treat a node active at the height as a member, a node whose
+    // latest row at or below the height is a departure as departed, and a
+    // node with no record at all as a member.
+    // Should not: see a departure recorded above the deciding height.
+    #[test]
+    fn validator_membership_answers_from_the_record_at_the_height() {
+        use hopnet_storage::traits::MeshMembership;
+        let pool = super::setup_test_db();
+        let mut conn = pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        crate::db::consensus::activate_validator(&db_tx, 1, 0).unwrap();
+        crate::db::consensus::activate_validator(&db_tx, 2, 0).unwrap();
+        crate::db::consensus::deactivate_validator(
+            &db_tx,
+            2,
+            5,
+            crate::db::consensus::DepartureKind::Voluntary,
+        )
+        .unwrap();
+        crate::db::consensus::activate_validator(&db_tx, 3, 0).unwrap();
+        crate::db::consensus::deactivate_validator(
+            &db_tx,
+            3,
+            20,
+            crate::db::consensus::DepartureKind::VotedOut,
+        )
+        .unwrap();
+
+        let at = |height| crate::storage_host::handlers::ValidatorMembership {
+            db_tx: &db_tx,
+            height,
+        };
+        assert!(at(10).is_member(1).unwrap(), "active");
+        assert!(!at(10).is_member(2).unwrap(), "departed at 5");
+        assert!(at(4).is_member(2).unwrap(), "not yet departed at 4");
+        assert!(
+            at(10).is_member(3).unwrap(),
+            "departure at 20 is above the height"
+        );
+        assert!(!at(20).is_member(3).unwrap());
+        assert!(at(10).is_member(42).unwrap(), "no record: kept");
+    }
+
     // Should: register both lifecycle functions in the dispatch table
     // and the boot tripwire's list, so a dropped registration is loud.
     #[test]

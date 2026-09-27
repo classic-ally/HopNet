@@ -13,7 +13,6 @@ mod devices;
 mod documentprovider;
 mod fileprovider;
 mod files;
-mod fragments;
 mod helpers;
 mod inventory;
 mod lifecycle;
@@ -51,7 +50,6 @@ pub fn capture_all(
 
     // Phase 3: Capture time-windowed functions (metrics are now "recent")
     metrics::capture_time_windowed(pool, &mut results);
-    fragments::capture_time_windowed(pool, &mut results);
 
     // Phase 4: All other captures (not time-sensitive)
     consensus::capture(pool, ctx, &mut results);

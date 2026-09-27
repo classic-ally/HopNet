@@ -513,11 +513,16 @@ pub fn compute_inventory_differential(
     })
 }
 
-/// Delete orphaned blobs: fragment_hashes + blob_access + data_blocks rows,
-/// child-first. Returns the locally-stored fragment hashes so the host can
-/// opportunistically remove the files post-commit. LIVENESS GATES (takeout
-/// in flight, reference providers) are the HOST's responsibility — this
-/// deletes unconditionally.
+/// Delete orphaned blobs: the fragment_inventory, fragment_hashes,
+/// blob_access and data_blocks rows, child-first. Returns the locally-
+/// stored fragment hashes so the host can opportunistically remove the
+/// files post-commit. LIVENESS GATES (takeout in flight, reference
+/// providers) are the HOST's responsibility — this deletes unconditionally.
+///
+/// The inventory rows go for every node (S6 closure): once the blob's
+/// manifest and access rows are gone a row for one of its hashes can
+/// support no recovery. A live node's self-check would reap its own rows
+/// next cycle; a departed node's would leak forever.
 pub fn apply_delete_orphaned(
     db_tx: &rusqlite::Transaction,
     blob_ids: &[BlobId],
@@ -545,6 +550,15 @@ pub fn apply_delete_orphaned(
         .map_err(db_err("collect local fragment hashes"))?;
     drop(stmt);
 
+    let inventory_deleted = db_tx
+        .execute(
+            &format!(
+                "DELETE FROM fragment_inventory WHERE fragment_hash IN
+                 (SELECT fragment_hash FROM fragment_hashes WHERE data_block_id IN ({placeholders}))"
+            ),
+            id_params.as_slice(),
+        )
+        .map_err(db_err("delete fragment_inventory"))?;
     let fragments_deleted = db_tx
         .execute(
             &format!("DELETE FROM fragment_hashes WHERE data_block_id IN ({placeholders})"),
@@ -564,8 +578,9 @@ pub fn apply_delete_orphaned(
         )
         .map_err(db_err("delete data_blocks"))?;
 
-    tracing::info!(
-        "Blob deletion applied: {blocks_deleted} blobs, {fragments_deleted} fragments, {access_deleted} access entries"
+    tracing::debug!(
+        "Blob deletion applied: {blocks_deleted} blobs, {fragments_deleted} fragments, \
+         {inventory_deleted} inventory rows, {access_deleted} access entries"
     );
     Ok(local_hashes)
 }
@@ -1018,5 +1033,67 @@ mod tests {
         conn.execute("UPDATE data_blocks SET placement_height = 1", [])
             .unwrap();
         assert_eq!(count_unplaced_blobs(&conn).unwrap(), 0);
+    }
+
+    // Impact: S6 closure — a row for a hash whose blob no longer exists can
+    // support no recovery, and a departed node never self-checks it away.
+    // Should: delete the deleted blobs' inventory rows on every node and
+    // still return this node's local hashes for file removal.
+    // Should not: touch a surviving blob's rows.
+    #[test]
+    fn delete_orphaned_removes_inventory_rows_for_every_node() {
+        let mut conn = test_conn();
+        conn.execute_batch(
+            "CREATE TABLE fragment_inventory (
+                fragment_hash BLOB NOT NULL, node_id INTEGER NOT NULL,
+                self_verified_height INTEGER, verified_height INTEGER,
+                provenance INTEGER, suspect INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (fragment_hash, node_id)
+            );",
+        )
+        .unwrap();
+        let gone = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap();
+        let kept = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap();
+        for (id, hash, local) in [(&gone, 1u8, true), (&gone, 2, false), (&kept, 3, true)] {
+            conn.execute(
+                "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes, file_size) VALUES (?, X'00', 1, 0, 1)",
+                params![id],
+            )
+            .ok();
+            conn.execute(
+                "INSERT INTO fragment_hashes VALUES (?, 0, ?, 'f', ?, 0, ?)",
+                params![id, hash, vec![hash; 32], local],
+            )
+            .unwrap();
+            for node in [1, 2, 9] {
+                conn.execute(
+                    "INSERT INTO fragment_inventory (fragment_hash, node_id) VALUES (?, ?)",
+                    params![vec![hash; 32], node],
+                )
+                .unwrap();
+            }
+        }
+
+        let tx = conn.transaction().unwrap();
+        let local = apply_delete_orphaned(&tx, std::slice::from_ref(&gone)).unwrap();
+        assert_eq!(local, vec![Blake3Hash::from_bytes([1u8; 32])]);
+        let count = |hash: u8| -> i64 {
+            tx.query_row(
+                "SELECT COUNT(*) FROM fragment_inventory WHERE fragment_hash = ?",
+                params![vec![hash; 32]],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            (count(1), count(2)),
+            (0, 0),
+            "deleted blob's rows gone on every node"
+        );
+        assert_eq!(count(3), 3, "surviving blob untouched");
+        let blobs: i64 = tx
+            .query_row("SELECT COUNT(*) FROM data_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blobs, 1);
     }
 }
