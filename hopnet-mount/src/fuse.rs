@@ -122,6 +122,7 @@ fn errno(e: &CoreError) -> Errno {
         CoreError::Staging(_) => Errno::EIO,
         CoreError::Transport(_) => Errno::EIO,
         CoreError::Cache(_) => Errno::EIO,
+        CoreError::NotReady => Errno::EAGAIN,
     }
 }
 
@@ -576,10 +577,14 @@ impl Filesystem for HopFs {
         // Node-side numbers (RFC-018 S8): total = capacity while the mesh
         // tolerates >= 2 failures, used = observed bytes — never local
         // cache state. The core TTL-caches and serves last-known on
-        // transport blips, so this arm cannot error.
+        // transport blips, so this only errors (EAGAIN) before the node
+        // has ever answered.
         let core = self.core.clone();
         self.rt.spawn(async move {
-            let info = core.statfs().await;
+            let info = match core.statfs().await {
+                Ok(info) => info,
+                Err(e) => return reply.error(errno(&e)),
+            };
             const BLOCK: u64 = 4096;
             let blocks = info.total_bytes / BLOCK;
             let free = info.total_bytes.saturating_sub(info.used_bytes) / BLOCK;

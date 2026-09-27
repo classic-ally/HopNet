@@ -37,6 +37,8 @@ pub enum CoreError {
     Transport(TransportError),
     /// Content cache failure. (EIO)
     Cache(crate::cache::CacheError),
+    /// Node has not produced an answer yet; retry later. (EAGAIN)
+    NotReady,
 }
 
 impl std::fmt::Display for CoreError {
@@ -51,6 +53,7 @@ impl std::fmt::Display for CoreError {
             CoreError::Staging(why) => write!(f, "staging: {why}"),
             CoreError::Transport(e) => write!(f, "transport: {e}"),
             CoreError::Cache(e) => write!(f, "cache: {e}"),
+            CoreError::NotReady => write!(f, "not ready"),
         }
     }
 }
@@ -168,16 +171,17 @@ impl MountCore {
         self.conflicts.load(Ordering::Relaxed)
     }
 
-    /// Mesh capacity for the statfs arm, TTL-cached and never failing:
-    /// within the TTL the cached numbers answer directly; past it we
-    /// refetch, and a transport error falls back to the last-known
-    /// numbers (zeros before the first success). Concurrent expiry may
-    /// double-fetch — harmless, the route is a read.
-    pub async fn statfs(&self) -> crate::transport::StatfsInfo {
+    /// Mesh capacity for the statfs arm, TTL-cached: within the TTL the
+    /// cached numbers answer directly; past it we refetch, and a transport
+    /// error falls back to the last-known numbers. Before the first success
+    /// there is nothing true to report, so that is `NotReady` rather than
+    /// zeros — a zero-size drive reads as full, not as "ask again".
+    /// Concurrent expiry may double-fetch — harmless, the route is a read.
+    pub async fn statfs(&self) -> Result<crate::transport::StatfsInfo, CoreError> {
         let cached = {
             let state = self.statfs.lock().expect("statfs poisoned");
             match (state.info, state.fetched_at) {
-                (Some(info), Some(at)) if at.elapsed() < STATFS_TTL => return info,
+                (Some(info), Some(at)) if at.elapsed() < STATFS_TTL => return Ok(info),
                 (info, _) => info,
             }
         };
@@ -186,14 +190,11 @@ impl MountCore {
                 let mut state = self.statfs.lock().expect("statfs poisoned");
                 state.info = Some(info);
                 state.fetched_at = Some(tokio::time::Instant::now());
-                info
+                Ok(info)
             }
             Err(e) => {
                 tracing::debug!("statfs fetch failed, serving last-known: {e}");
-                cached.unwrap_or(crate::transport::StatfsInfo {
-                    total_bytes: 0,
-                    used_bytes: 0,
-                })
+                cached.ok_or(CoreError::NotReady)
             }
         }
     }
