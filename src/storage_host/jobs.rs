@@ -156,14 +156,14 @@ async fn cleanup_orphaned_data_blocks(
     Ok(total_cleaned)
 }
 
-/// The level-triggered obligation check (RFC-STORAGE-003 S3): re-kick up
-/// to `max_data_blocks` in-flight blobs — goal not yet confirmed, oldest
-/// goal first — through this node's reconciler, which pulls what it owes
-/// under each goal, attests, and proposes confirmation when the evidence
-/// is complete. Every kick is idempotent; the in-flight set is the
-/// work-list and a blob leaves it at confirm, so no cursor exists to
-/// starve. `min_age_heights` is accepted for the route's compatibility
-/// and ignored: need is need.
+/// The operator's AWAITED obligation check (`POST /maintenance/rebalance-network`,
+/// RFC-STORAGE-003 S3): run up to `max_data_blocks` in-flight blobs — goal
+/// not yet confirmed, oldest goal first — through this node's reconciler
+/// and report what it pulled. The tick does not use this: it wakes the
+/// worker without waiting (`kick_in_flight`). Every kick is idempotent;
+/// the in-flight set is the work-list and a blob leaves it at confirm, so
+/// no cursor exists to starve. `min_age_heights` is accepted for the
+/// route's compatibility and ignored: need is need.
 pub async fn run_network_rebalancing(
     app_state: &AppState,
     max_data_blocks: i32,
@@ -221,62 +221,85 @@ pub async fn run_network_rebalancing(
     Ok(result)
 }
 
-/// The fulfillment floor (RFC-STORAGE-003 S3): one batched
-/// ConfirmPlacement for the in-flight blobs whose evidence is complete
-/// right now. Apply validation re-checks on every node, so a stale read
-/// here costs a skipped entry, never a wrong confirmation. Returns how
-/// many confirmations were proposed.
+/// The fulfillment pass (RFC-STORAGE-003 S4): the bulk confirmation path.
+/// Up to `CONFIRM_ROUNDS_PER_TICK` rounds per tick; each samples the
+/// in-flight set, proposes one batched ConfirmPlacement for the entries
+/// whose evidence is complete, and awaits its commit. The sample doubles
+/// between rounds while at least half of it was ready (the
+/// post-transition rubber-stamp balloon) and the pass rests as soon as a
+/// round comes back sparse — a sparse sample means the remaining work is
+/// pulls, which the worker owns. Apply validation re-checks on every node,
+/// so a stale read here costs a skipped entry, never a wrong confirmation.
+/// Returns how many confirmations were proposed across the rounds.
 pub async fn propose_ready_confirmations(
     app_state: &AppState,
     base_sample: usize,
 ) -> Result<usize, Error> {
-    use std::sync::atomic::Ordering;
-    // Adaptive sample (RFC-STORAGE-003 S4): doubles while at least half of
-    // the sample was ready — the post-transition rubber-stamp balloon —
-    // and resets to the base otherwise. Recurrence over a draining set is
-    // what makes a random sample comprehensive.
-    let sample_n = FULFILL_SAMPLE.load(Ordering::Relaxed).max(base_sample);
-    let (ready, sampled): (Vec<hopnet_storage::PlacementConfirmation>, usize) = {
+    use hopnet_storage::engine::policy::{CONFIRM_ROUNDS_PER_TICK, next_fulfillment_sample};
+    let mut sample_n = base_sample;
+    let mut proposed = 0usize;
+    for round in 0..CONFIRM_ROUNDS_PER_TICK {
+        let (ready, sampled) = {
+            let conn = app_state
+                .db_pool
+                .get()
+                .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
+            let tip = crate::db::consensus::get_current_consensus_height(&conn)
+                .map_err(|e| Error::Failed(Arc::new(format!("height: {e:?}").into())))?;
+            hopnet_storage::lifecycle::ready_confirmations(&conn, sample_n, tip)
+                .map_err(|e| Error::Failed(Arc::new(format!("fulfillment read: {e}").into())))?
+        };
+        let count = ready.len();
+        let next = next_fulfillment_sample(sample_n, sampled, count);
+        if count > 0 {
+            let payload = hopnet_storage::ConfirmPlacement {
+                confirmations: ready,
+            };
+            let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+                .map_err(|e| Error::Failed(Arc::new(format!("confirm encode: {e}").into())))?;
+            SubstrateHost::new(app_state.clone())
+                .submit(hopnet_storage::lifecycle::CONFIRM_TX_FN, encoded)
+                .await
+                .map_err(|e| Error::Failed(Arc::new(format!("confirm submit: {e:?}").into())))?;
+            proposed += count;
+            tracing::info!(
+                "fulfillment: round {round} proposed {count} of {sampled} sampled confirmations"
+            );
+        }
+        match next {
+            Some(n) => sample_n = n,
+            None => break,
+        }
+    }
+    Ok(proposed)
+}
+
+/// The tick's in-flight re-kick (RFC-STORAGE-003 S3): wake this node's
+/// reconciler for up to `limit` in-flight blobs, oldest goal first, and
+/// return at once with how many were enqueued. NON-BLOCKING — the worker
+/// pulls (and attests, and proposes for births and moved bytes) on its own
+/// time; the tick never waits on a consensus round it did not submit.
+/// Level-triggered: any blob a hint missed is found here next tick.
+fn kick_in_flight(app_state: &AppState, limit: usize) -> Result<usize, Error> {
+    // Scoped checkout, dropped before the engine is touched.
+    let blob_ids = {
         let conn = app_state
             .db_pool
             .get()
             .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-        let sample = hopnet_storage::lifecycle::in_flight_sample(&conn, sample_n)
-            .map_err(|e| Error::Failed(Arc::new(format!("in-flight sample: {e}").into())))?;
-        let sampled = sample.len();
-        let tip = crate::db::consensus::get_current_consensus_height(&conn)
-            .map_err(|e| Error::Failed(Arc::new(format!("height: {e:?}").into())))?;
-        let mut out = Vec::new();
-        for blob_id in sample {
-            if let Some(height) = hopnet_storage::lifecycle::confirm_ready(&conn, &blob_id, tip)
-                .map_err(|e| Error::Failed(Arc::new(format!("confirm read: {e}").into())))?
-            {
-                out.push(hopnet_storage::PlacementConfirmation { blob_id, height });
-            }
-        }
-        (out, sampled)
+        hopnet_storage::lifecycle::in_flight_blobs(&conn, limit)
+            .map_err(|e| Error::Failed(Arc::new(format!("in-flight page: {e}").into())))?
     };
-    let next = if sampled > 0 && ready.len() * 2 >= sampled {
-        (sample_n * 2).min(hopnet_storage::engine::policy::CONFIRM_SAMPLE_MAX)
-    } else {
-        base_sample
+    let Some(storage) = app_state.storage.get() else {
+        return Err(Error::Failed(Arc::new(
+            "storage engine not running".to_string().into(),
+        )));
     };
-    FULFILL_SAMPLE.store(next, Ordering::Relaxed);
-    if ready.is_empty() {
-        return Ok(0);
+    let kicked = blob_ids.len();
+    for blob_id in blob_ids {
+        storage.notify_blob_committed(blob_id);
     }
-    let count = ready.len();
-    let payload = hopnet_storage::ConfirmPlacement {
-        confirmations: ready,
-    };
-    let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
-        .map_err(|e| Error::Failed(Arc::new(format!("confirm encode: {e}").into())))?;
-    SubstrateHost::new(app_state.clone())
-        .submit(hopnet_storage::lifecycle::CONFIRM_TX_FN, encoded)
-        .await
-        .map_err(|e| Error::Failed(Arc::new(format!("confirm submit: {e:?}").into())))?;
-    tracing::info!("fulfillment: proposed {count} confirmations");
-    Ok(count)
+    Ok(kicked)
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -755,9 +778,12 @@ pub async fn run_watermark_eviction(
 
 /// Last-seen storage view summary — INFO logging only on change.
 static LAST_VIEW_SUMMARY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-/// The fulfillment pass's current sample size (adaptive; see
-/// `propose_ready_confirmations`).
-static FULFILL_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Whether a policy tick is running on this node. The cron fires every
+/// five minutes and the maintenance route on demand; a tick that overruns
+/// (a long fulfillment pass, a slow eviction scan) must not stack a second
+/// one on top — two passes over the same in-flight set would propose the
+/// same confirmations twice and double the consensus traffic for nothing.
+static TICK_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub async fn handle_storage_policy_tick(_job: TaskId, ctx: Data<AppState>) -> Result<(), Error> {
     run_storage_policy_tick(&ctx).await.map(|_| ())
@@ -781,7 +807,10 @@ pub struct PolicyTickReport {
     pub lazy_chunks_owed: usize,
     pub urgent_reencodes: usize,
     pub lazy_reencodes: usize,
-    pub migration_repaired: usize,
+    /// In-flight blobs handed to the reconciler this tick (a wake-up, not
+    /// a result — the worker pulls on its own time).
+    pub pull_kicks: usize,
+    /// Confirmations proposed by the fulfillment pass, across its rounds.
     pub confirms_proposed: usize,
     pub grace_declared: usize,
     pub eviction: serde_json::Value,
@@ -789,10 +818,36 @@ pub struct PolicyTickReport {
 
 /// The engine policy tick (RFC-STORAGE-001 Repair; RFC-STORAGE-002 S6):
 /// view sync → the obligation check's re-encode half (ladder + deputy
-/// under the goal assignment) → grace rung → in-flight re-kick →
-/// fulfillment → eviction check. Disk truth (the sweep, the scrub slice,
-/// belief and attestation) rides the self-check cron.
+/// under the goal assignment) → grace rung → fulfillment pass → in-flight
+/// re-kick → eviction check. Disk truth (the sweep, the scrub slice,
+/// belief and attestation) rides the self-check cron. One tick at a time
+/// per node: a second caller while one runs gets an error, never a
+/// concurrent pass.
 pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<PolicyTickReport, Error> {
+    use std::sync::atomic::Ordering;
+    if TICK_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(Error::Failed(Arc::new(
+            "policy tick already running".to_string().into(),
+        )));
+    }
+    // Released on every exit — an error, or the future being dropped when
+    // the maintenance route's client gives up mid-tick.
+    struct Running;
+    impl Drop for Running {
+        fn drop(&mut self) {
+            TICK_RUNNING.store(false, Ordering::Release);
+        }
+    }
+    let _running = Running;
+    policy_tick_rungs(app_state).await
+}
+
+/// The tick's body; `run_storage_policy_tick` holds the one-at-a-time
+/// guard around it.
+async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Error> {
     use hopnet_storage::engine::ReencodeCmd;
     use hopnet_storage::reconcile::{self, ChunkState, ClassState, Duty};
     use hopnet_storage::traits::StateReader;
@@ -944,28 +999,35 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<PolicyTickR
             0
         });
 
-    // (3) The obligation check (RFC-STORAGE-003 S3): re-kick a bounded page
-    // of in-flight blobs through the reconciler — pulls owed under each
-    // goal, prompt attestation, confirm proposals where the evidence is
-    // complete. Level-triggered: any blob a kick missed is found here.
-    let migration_repaired = run_network_rebalancing(
-        app_state,
-        hopnet_storage::engine::policy::PULL_KICKS_PER_TICK as i32,
-        0,
-    )
-    .await
-    .map(|r| r.data_blocks_rebalanced)
-    .unwrap_or(0);
-
-    // (3b) Fulfillment floor: propose confirmation for in-flight blobs
-    // whose evidence is already complete (other nodes' pulls finished
-    // after our own check). One batched ConfirmPlacement per tick.
+    // (3) The fulfillment pass (RFC-STORAGE-003 S4): confirm, in batches,
+    // every in-flight blob whose evidence is already complete — after a
+    // transition that is most of them, and nothing else can retire them.
+    // Runs BEFORE the re-kick so the tick's consensus budget goes to what
+    // is provable now; the worker owns the rest.
     let confirms_proposed = propose_ready_confirmations(
         app_state,
         hopnet_storage::engine::policy::CONFIRM_CHECKS_PER_TICK,
     )
     .await
-    .unwrap_or(0);
+    .unwrap_or_else(|e| {
+        tracing::warn!("fulfillment pass failed: {e}");
+        0
+    });
+
+    // (3b) The obligation check (RFC-STORAGE-003 S3): wake the reconciler
+    // for a bounded page of in-flight blobs, oldest goal first — it pulls
+    // what each goal owes this node, attests, and proposes for births and
+    // moved bytes. Non-blocking: the tick returns in seconds whatever the
+    // worker's backlog. Level-triggered: any blob a hint missed is found
+    // here next tick.
+    let pull_kicks = kick_in_flight(
+        app_state,
+        hopnet_storage::engine::policy::PULL_KICKS_PER_TICK,
+    )
+    .unwrap_or_else(|e| {
+        tracing::warn!("in-flight re-kick failed: {e}");
+        0
+    });
 
     // (4) Eviction check (statvfs no-op below the high watermark).
     let eviction = run_watermark_eviction(app_state, None, None).await?;
@@ -979,7 +1041,7 @@ pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<PolicyTickR
         lazy_chunks_owed: lazy_owed,
         urgent_reencodes: urgent_enqueued,
         lazy_reencodes: lazy_enqueued,
-        migration_repaired,
+        pull_kicks,
         confirms_proposed,
         grace_declared,
         eviction,

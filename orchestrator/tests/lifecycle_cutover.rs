@@ -234,9 +234,25 @@ impl TestScenario for LifecycleCutoverDrain {
 
         // 4. The drain. The backfill put every blob at the sentinel goal;
         //    the first transition and declare page start it; the pane's
-        //    converged predicate ends it. Deadline scales with the blob
-        //    count; progress is sampled so a stall is diagnosable.
-        let deadline = Duration::from_secs(180 + 2 * blobs as u64);
+        //    converged predicate ends it. Confirmation evidence is a row
+        //    disk-verified within the recency window, and the old regime's
+        //    rows carry no verified_height at all — so the drain cannot
+        //    confirm anything until the first disk-truth sweep has run
+        //    (the 30-minute cron in production; the runbook kicks it right
+        //    after the flip, as this does). Then the fulfillment pass on
+        //    the 5-minute tick confirms in batches. Deadline: two ticks'
+        //    worth of cron slack plus a per-blob allowance; progress is
+        //    sampled so a stall is diagnosable.
+        for node in &fresh_nodes {
+            let (status, body) =
+                post_json(node, "/api/maintenance/fragment-inventory-self-check", None).await?;
+            anyhow::ensure!(
+                status == 200,
+                "post-flip sweep on node {}: {status} {body}",
+                node.node_id
+            );
+        }
+        let deadline = Duration::from_secs(600 + 2 * blobs as u64);
         let drain_started = Instant::now();
         let mut last: Vec<(u32, bool, u64, u64, u64)> = Vec::new();
         let mut converged_at: Option<Duration> = None;
@@ -291,12 +307,13 @@ impl TestScenario for LifecycleCutoverDrain {
             return Ok(result);
         }
 
-        // 5. Disk truth crossed too. The drain attests each blob's local
-        //    fragments as it processes it, but a prompt attestation can land
-        //    before the self-check that creates the rows (seen 2026-09-27:
-        //    ~15% of the origin's rows unverified right after convergence),
-        //    so the sweep — the 30-minute cron in production — is what
-        //    settles every row. Run it here, then assert.
+        // 5. Disk truth crossed too. Rows the drain's pulls created after
+        //    the post-flip sweep are verified by the puller's prompt
+        //    attestation, but a prompt attestation can land before the
+        //    self-check that creates the rows (seen 2026-09-27: ~15% of the
+        //    origin's rows unverified right after convergence), so the
+        //    sweep — the 30-minute cron in production — is what settles
+        //    every row. Run it once more, then assert.
         for node in &fresh_nodes {
             let (status, body) =
                 post_json(node, "/api/maintenance/fragment-inventory-self-check", None).await?;

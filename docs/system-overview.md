@@ -517,7 +517,10 @@ apply functions inside consensus handlers.
       NOT NULL stamped at insert, the replicated `storage_view_transitions`
       record memoized after every block — plus `declare_placement_target`
       / `confirm_placement` consensus txs with per-entry apply validation
-      (`hopnet_storage::lifecycle`). S2 (2026-09-21): the protection
+      (`hopnet_storage::lifecycle`; the memoized view snapshot is exactly
+      members + quantized weights — narrowed 2026-09-27 after the
+      rehearsal showed raw metrics rows made every heartbeat a
+      transition). S2 (2026-09-21): the protection
       predicate (`hopnet_storage::protection`) — confirmed epoch plus every
       in-flight epoch, never-confirmed clause, pins — is the evictor's
       single guard, and `tests/model_conformance.rs` replays exported Quint
@@ -527,12 +530,15 @@ apply functions inside consensus handlers.
       fallback), marks are awaited end to end, kicks come from decide,
       declare-apply and the tick's bounded in-flight re-kick, and the
       fulfillment floor (prompt attestation + ConfirmPlacement when the
-      evidence is complete) replaces the blind placement batcher; the duty
-      ladder (`hopnet_storage::reconcile`) is trace-checked against the
-      model's rungs. S4 (2026-09-27): the two passes — the block proposer's
-      staleness hook declares every blob whose goal predates the latest
-      view transition (grace rung as backstop), fulfillment samples the
-      in-flight set adaptively, the missing-class scan folds into the
+      evidence is complete — for births and moved bytes; re-goaled blobs
+      already held are the batched pass's) replaces the blind placement
+      batcher; the duty ladder (`hopnet_storage::reconcile`) is
+      trace-checked against the model's rungs. S4 (2026-09-27): the two
+      passes — the block proposer's staleness hook declares every blob
+      whose goal predates the latest view transition (grace rung as
+      backstop), fulfillment samples the in-flight set adaptively (rounds
+      within one tick, ahead of a non-blocking re-kick, one tick at a time
+      — the 2026-09-27 rehearsal fix), the missing-class scan folds into the
       obligation check (ladder + deputy rule under the goal assignment),
       and `hopnet_storage::tick` replays the model's engine tick against
       every exported trace, state for state. S5 (2026-09-27): disk truth —
@@ -555,7 +561,10 @@ apply functions inside consensus handlers.
       in-flight ages in heights, verification freshness per holder), fetch
       histograms in the commit-latency shape, and time-to-conformance per
       reconciler queue (owed fetches × median fetch); three new cards
-      (Block Lifecycle, Disk Truth, Reconciler). Only the cutover remains.
+      (Block Lifecycle, Disk Truth, Reconciler). Only the cutover remains;
+      its rehearsal (`lifecycle-cutover-drain`, born on the deployed
+      release image) passed at 60 blobs, failed at 500 on 2026-09-27 and
+      drove the two fixes above; rerun at 500 before the tag.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage

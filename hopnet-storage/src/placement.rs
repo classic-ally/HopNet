@@ -3,7 +3,7 @@
 //! Moved from the main crate's files/placement.rs, generalized over the host's
 //! node type: the substrate never sees the host's Node/NodeMetrics structs —
 //! callers implement [`PlacementNode`] and map their metrics into
-//! [`MetricsRow`]. Logic is unchanged.
+//! [`MetricsRow`] for the quantized weights.
 //!
 //! The placement seed is currently the caller's choice (the fs projection
 //! passes file_hash bytes); Stage B re-seeds from blob_id.
@@ -29,10 +29,11 @@ impl PlacementNode for i32 {
 }
 
 /// Node quality metrics at a consensus height — the substrate-owned mirror of
-/// the host's replicated metrics row (score fields only). Serialized only
-/// inside the lifecycle's canonical view snapshots (replicated rows, so the
-/// float bytes agree on every node).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+/// the host's replicated metrics row (score fields only). Consumed by
+/// `quantized_weight` and the diagnostics scoring; never serialized into
+/// replicated state (RFC-STORAGE-003: the view snapshot carries the
+/// quantized weight, not the floats, so metric noise cannot move the view).
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetricsRow {
     pub node_id: i32,
     pub trust_factor: f64,
@@ -49,90 +50,76 @@ pub enum FragmentType {
     Recovery,
 }
 
-/// Select nodes for a specific file's fragment placement
+/// Select the nodes a blob's fragment classes are assigned over.
 ///
-/// This function implements file-level node selection with two strategies:
-/// - Networks with ≤30 validators: Use ALL validators (maximum failure tolerance)
-/// - Networks with >30 validators: Select best 30 using scoring + deterministic shuffle
+/// Two strategies, both deterministic functions of replicated state:
+/// - At most 30 members: use ALL members (maximum failure tolerance).
+/// - More than 30 members: rank by quantized placement weight (16 buckets, ties by
+///   node id), take the top 60 as a diversity pool, shuffle it with the
+///   seed (Blake3 Fisher-Yates), keep 30.
 ///
-/// The deterministic shuffle ensures that the same seed always selects the same
-/// 30 nodes, which guarantees that fragments with the same local_index (but different
-/// chunk_number) are placed on the same nodes - critical for Reed-Solomon properties.
+/// The seed makes selection per-blob stable: fragments of every chunk of one
+/// blob land on the same 30 nodes, which Reed-Solomon recovery relies on.
+///
+/// Weights rather than raw scores (RFC-STORAGE-003): the lifecycle's view
+/// snapshot is exactly `(members, weights)`, and a transition is recorded
+/// only when those bytes change — the 16-level quantization is what keeps
+/// metric noise from moving the view. Ranking by the same bucketed weight
+/// the assignment already divides by means selection and assignment read
+/// one input, and no raw float ever enters replicated state.
 ///
 /// # Arguments
-/// * `validators` - Active validators at consensus height
-/// * `all_metrics` - All node metrics at consensus height
+/// * `members` - Storage members at the view's height
+/// * `weights` - Quantized weight per member (missing = 1, the minimum)
 /// * `placement_seed` - 32-byte deterministic seed (same seed → same selection)
 ///
 /// # Returns
-/// * Vector of selected nodes for placement (length ≤ min(validators.len(), 30))
+/// * Selected nodes (length ≤ min(members.len(), 30))
 pub fn select_nodes_for_blob<N: PlacementNode + Clone>(
-    validators: Vec<N>,
-    all_metrics: Vec<MetricsRow>,
+    members: Vec<N>,
+    weights: &std::collections::HashMap<i32, u64>,
     placement_seed: &[u8; 32],
 ) -> Vec<N> {
-    // Strategy 1: Small network (≤30 validators) - use ALL for maximum failure tolerance
-    if validators.len() <= 30 {
-        tracing::debug!(
-            "Small network ({}≤30): using all validators",
-            validators.len()
-        );
-        return validators; // Early exit - no metrics filtering needed
+    // Strategy 1: Small network (≤30 members) - use ALL for maximum failure tolerance
+    if members.len() <= 30 {
+        tracing::debug!("Small network ({}≤30): using all members", members.len());
+        return members;
     }
 
-    // Strategy 2: Large network (>30 validators) - select best 30
-    // Step 1: Filter metrics to only active validators
-    let validator_ids: std::collections::HashSet<i32> =
-        validators.iter().map(|v| v.node_id()).collect();
-    let validator_metrics: Vec<MetricsRow> = all_metrics
-        .into_iter()
-        .filter(|m| validator_ids.contains(&m.node_id))
-        .collect();
+    // Strategy 2: Large network (>30 members) - rank by quantized weight,
+    // heaviest first, ties to the smaller node id: a total order over
+    // replicated inputs, so every node builds the same pool.
+    let mut ranked = members;
+    ranked.sort_by_key(|n| {
+        let id = n.node_id();
+        (
+            std::cmp::Reverse(weights.get(&id).copied().unwrap_or(1)),
+            id,
+        )
+    });
+
+    // Top 60 candidates (2× target for diversity)
+    let pool = 60.min(ranked.len());
+    ranked.truncate(pool);
+
+    // Deterministic shuffle using the seed (Fisher-Yates with Blake3)
+    deterministic_shuffle(&mut ranked, placement_seed);
+
+    // Top 30 after shuffle
+    let target_count = 30.min(ranked.len());
+    ranked.truncate(target_count);
 
     tracing::debug!(
-        "Large network ({}): {} validators with metrics",
-        validators.len(),
-        validator_metrics.len()
-    );
-
-    // Step 2: Score all validator metrics (using FragmentType::Original for base scoring)
-    let mut scored_candidates =
-        calculate_final_placement_scores(validator_metrics, FragmentType::Original);
-
-    // Step 3: Take top 60 candidates (2× target for diversity)
-    let top_count = 60.min(scored_candidates.len());
-    scored_candidates.truncate(top_count);
-
-    tracing::debug!("Scored top {} candidates", top_count);
-
-    // Step 4: Convert scored candidates back to nodes for shuffle
-    let mut top_nodes: Vec<N> = scored_candidates
-        .into_iter()
-        .filter_map(|candidate| {
-            validators
-                .iter()
-                .find(|v| v.node_id() == candidate.node_id)
-                .cloned()
-        })
-        .collect();
-
-    // Step 5: Deterministic shuffle using the seed (Fisher-Yates with Blake3)
-    deterministic_shuffle(&mut top_nodes, placement_seed);
-
-    // Step 6: Return top 30 after shuffle
-    let target_count = 30.min(top_nodes.len());
-    top_nodes.truncate(target_count);
-
-    tracing::debug!(
-        "Selected {} nodes for seed {}",
+        "Selected {} of {} members for seed {}",
         target_count,
+        pool,
         placement_seed[..4]
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     );
 
-    top_nodes
+    ranked
 }
 
 /// Deterministic Fisher-Yates shuffle using Blake3 hash as entropy source
@@ -342,17 +329,11 @@ mod tests {
             .collect()
     }
 
-    fn create_test_metrics(count: usize) -> Vec<MetricsRow> {
-        (1..=count)
-            .map(|i| MetricsRow {
-                node_id: i as i32,
-                trust_factor: 1.0,
-                availability_score: 0.9 + (i as f64 * 0.01),
-                throughput_score: 0.8 + (i as f64 * 0.01),
-                latency_score: 0.7 + (i as f64 * 0.01),
-                stability_score: 0.6 + (i as f64 * 0.01),
-                storage_multiplier: 1.0,
-            })
+    /// Quantized weights rising with the node id: node i weighs
+    /// `1 + i mod 16` — a spread over every bucket, deterministic.
+    fn graded_weights(count: usize) -> std::collections::HashMap<i32, u64> {
+        (1..=count as i32)
+            .map(|i| (i, 1 + (i as u64 % 16)))
             .collect()
     }
 
@@ -362,28 +343,26 @@ mod tests {
 
     #[test]
     fn test_select_nodes_small_network_uses_all() {
-        // With ≤30 validators, should return all validators without filtering
-        let validators = create_test_nodes(20);
-        let metrics = create_test_metrics(20);
+        // With ≤30 members, should return all members without filtering
+        let members = create_test_nodes(20);
 
-        let selected = select_nodes_for_blob(validators.clone(), metrics, &seed(1));
+        let selected = select_nodes_for_blob(members.clone(), &graded_weights(20), &seed(1));
 
-        // Should return all 20 validators
+        // Should return all 20 members
         assert_eq!(selected.len(), 20);
 
-        // Should contain all original validators (order may differ due to no shuffle in small network)
-        for validator in &validators {
-            assert!(selected.iter().any(|n| n.node_id == validator.node_id));
+        // Should contain all original members (order may differ due to no shuffle in small network)
+        for member in &members {
+            assert!(selected.iter().any(|n| n.node_id == member.node_id));
         }
     }
 
     #[test]
     fn test_select_nodes_large_network_filters_to_30() {
-        // With >30 validators, should filter to best 30
-        let validators = create_test_nodes(50);
-        let metrics = create_test_metrics(50);
+        // With >30 members, should filter to 30
+        let members = create_test_nodes(50);
 
-        let selected = select_nodes_for_blob(validators, metrics, &seed(2));
+        let selected = select_nodes_for_blob(members, &graded_weights(50), &seed(2));
 
         // Should return exactly 30 nodes
         assert_eq!(selected.len(), 30);
@@ -395,14 +374,79 @@ mod tests {
         assert_eq!(node_ids.len(), 30);
     }
 
+    // Should: rank the >30 pool by quantized weight, heaviest first, so a
+    // sole heavyweight is always in the pool and, with a pool no larger
+    // than the target, always selected.
+    // Should: select identically for two weight maps that are the same
+    // buckets — the raw scores behind them never enter selection.
+    // Should not: let member order change the selection (ties break on
+    // node id, a total order).
+    // Impact: the lifecycle's view snapshot is (members, weights) and a
+    // transition is recorded only when those bytes change; if selection
+    // read anything finer than the bucket, snapshots equal in bytes could
+    // place differently across nodes.
+    #[test]
+    fn large_network_ranks_by_quantized_weight() {
+        // 61 members, uniform weight 1 except node 61 at 16. Node 61 has
+        // the largest id, so under uniform weights it is exactly the one
+        // node cut from the 60-pool and can never be selected; ranking by
+        // weight puts it first in the pool, where the shuffle keeps it for
+        // about half the seeds.
+        let members = create_test_nodes(61);
+        let mut weights: std::collections::HashMap<i32, u64> =
+            (1..=61).map(|i| (i, 1u64)).collect();
+        weights.insert(61, 16);
+        let mut kept = 0;
+        for s in 0..64u8 {
+            let selected = select_nodes_for_blob(members.clone(), &weights, &seed(s));
+            assert_eq!(selected.len(), 30);
+            if selected.iter().any(|n| n.node_id == 61) {
+                kept += 1;
+            }
+        }
+        // In the pool of 60 shuffled to 30, a member survives about half
+        // the seeds; never in the pool → never kept.
+        assert!(kept > 16, "heavyweight was kept for {kept}/64 seeds");
+
+        // The same buckets derived from different raw scores are the same
+        // weight map, so selection cannot tell them apart.
+        let a = select_nodes_for_blob(members.clone(), &weights, &seed(7));
+        let noisier = MetricsRow {
+            node_id: 61,
+            trust_factor: 1.0,
+            availability_score: 0.99,
+            throughput_score: 0.98,
+            latency_score: 0.97,
+            stability_score: 0.96,
+            storage_multiplier: 1.0,
+        };
+        let mut same_buckets = weights.clone();
+        same_buckets.insert(61, quantized_weight(&noisier));
+        assert_eq!(same_buckets, weights, "the noisier row still buckets to 16");
+        let b = select_nodes_for_blob(members.clone(), &same_buckets, &seed(7));
+        assert_eq!(
+            a.iter().map(|n| n.node_id).collect::<Vec<_>>(),
+            b.iter().map(|n| n.node_id).collect::<Vec<_>>()
+        );
+
+        // Member order is irrelevant.
+        let mut reversed = members.clone();
+        reversed.reverse();
+        let c = select_nodes_for_blob(reversed, &weights, &seed(7));
+        assert_eq!(
+            a.iter().map(|n| n.node_id).collect::<Vec<_>>(),
+            c.iter().map(|n| n.node_id).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_select_nodes_deterministic_same_seed() {
         // Same seed should always select the same nodes
-        let validators = create_test_nodes(50);
-        let metrics = create_test_metrics(50);
+        let members = create_test_nodes(50);
+        let weights = graded_weights(50);
 
-        let selected1 = select_nodes_for_blob(validators.clone(), metrics.clone(), &seed(3));
-        let selected2 = select_nodes_for_blob(validators, metrics, &seed(3));
+        let selected1 = select_nodes_for_blob(members.clone(), &weights, &seed(3));
+        let selected2 = select_nodes_for_blob(members, &weights, &seed(3));
 
         // Should be identical
         assert_eq!(selected1.len(), selected2.len());
@@ -414,11 +458,11 @@ mod tests {
     #[test]
     fn test_select_nodes_different_seed_different_selection() {
         // Different seed should select different nodes (with high probability)
-        let validators = create_test_nodes(50);
-        let metrics = create_test_metrics(50);
+        let members = create_test_nodes(50);
+        let weights = graded_weights(50);
 
-        let selected1 = select_nodes_for_blob(validators.clone(), metrics.clone(), &seed(4));
-        let selected2 = select_nodes_for_blob(validators, metrics, &seed(5));
+        let selected1 = select_nodes_for_blob(members.clone(), &weights, &seed(4));
+        let selected2 = select_nodes_for_blob(members, &weights, &seed(5));
 
         // Should have 30 nodes each
         assert_eq!(selected1.len(), 30);
@@ -439,16 +483,16 @@ mod tests {
 
     #[test]
     fn test_select_nodes_filters_inactive_validators() {
-        // Metrics for 50 nodes, but only 40 are active validators
-        let validators = create_test_nodes(40);
-        let metrics = create_test_metrics(50); // Extra metrics for nodes not in validator set
+        // Weights for 50 nodes, but only 40 are members
+        let members = create_test_nodes(40);
+        let weights = graded_weights(50); // Extra weights for nodes not in the member set
 
-        let selected = select_nodes_for_blob(validators, metrics, &seed(6));
+        let selected = select_nodes_for_blob(members, &weights, &seed(6));
 
-        // Should return 30 nodes (filtered from active validators only)
+        // Should return 30 nodes (from the members only)
         assert_eq!(selected.len(), 30);
 
-        // All selected nodes should be from the active validator set (node_id 1-40)
+        // All selected nodes should be members (node_id 1-40)
         for node in &selected {
             assert!(node.node_id >= 1 && node.node_id <= 40);
         }

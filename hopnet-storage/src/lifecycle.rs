@@ -23,7 +23,7 @@ use hopnet_common::height::{height_from_db, height_to_db};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::placement::{self, MetricsRow};
+use crate::placement;
 use crate::store::db_err;
 use crate::traits::StorageView;
 use crate::types::BlobId;
@@ -37,7 +37,12 @@ pub const CONFIRM_TX_FN: &str = "confirm_placement";
 /// Confirmation evidence must have been disk-verified within this many
 /// heights of the deciding block (S5). Sized against the sweep cadence
 /// (every self-check, ~30 min) with a wide margin: heights only advance
-/// with traffic, and metrics alone make ~144 a day.
+/// with traffic, and metrics alone make ~144 a day. The drain's own
+/// traffic must stay inside that budget — confirms ride batched
+/// fulfillment rounds and the worker attests only births and moved
+/// bytes, because a round per blob (the 2026-09-27 rehearsal) ran the
+/// chain at ~45 heights a minute and aged the sweep's rows out of this
+/// window in 23 minutes.
 pub const ATTESTATION_RECENCY_HEIGHTS: u64 = 1024;
 
 /// One blob's re-goal: compare-and-swap `desired_placement_height` from
@@ -72,17 +77,18 @@ pub struct ConfirmPlacement {
 
 /// The placement inputs of one storage view, canonically ordered: exactly
 /// what `placement::select_nodes_for_blob` + `assign_fragment_classes`
-/// consume, nothing else (liveness sets, watermark, tiers stay out — they
-/// do not move bytes).
+/// consume, nothing else. Members and their quantized weights move bytes;
+/// liveness sets, watermark and tiers do not, and raw metric scores never
+/// enter — the 16-level weight bucket is the finest thing selection reads,
+/// so a metrics submission that stays inside its bucket leaves the
+/// snapshot's bytes, and therefore the transition record, untouched
+/// (the model's view: a member set and a constant weight map).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViewSnapshot {
     /// Member node ids, ascending.
     pub members: Vec<i32>,
     /// Quantized placement weight per member.
     pub weights: BTreeMap<i32, u64>,
-    /// Members' metrics rows, ascending by node id (the >30-member
-    /// selection stage scores these).
-    pub metrics: Vec<MetricsRow>,
 }
 
 impl From<&StorageView> for ViewSnapshot {
@@ -94,18 +100,7 @@ impl From<&StorageView> for ViewSnapshot {
             .iter()
             .map(|n| (*n, view.weights.get(n).copied().unwrap_or(1)))
             .collect();
-        let mut metrics: Vec<MetricsRow> = view
-            .metrics
-            .iter()
-            .filter(|m| members.binary_search(&m.node_id).is_ok())
-            .cloned()
-            .collect();
-        metrics.sort_by_key(|m| m.node_id);
-        Self {
-            members,
-            weights,
-            metrics,
-        }
+        Self { members, weights }
     }
 }
 
@@ -123,14 +118,15 @@ impl ViewSnapshot {
             .map_err(|e| StorageError::Host(format!("view snapshot decode: {e}")))
     }
 
-    /// Class → responsible node for one blob under this view, the same
-    /// recipe the engine runs (`engine::assign_for_blob`): seeded selection
-    /// then balanced capped rendezvous. Empty when the view has no members.
+    /// Class → responsible node for one blob under this view — THE placement
+    /// recipe (every consumer, engine included, reaches it through here):
+    /// seeded selection over the members by weight, then balanced capped
+    /// rendezvous. Empty when the view has no members.
     pub fn assignment(&self, blob_id: &BlobId) -> Vec<i32> {
         let seed = placement::placement_seed(blob_id);
-        let selected: Vec<i32> =
-            placement::select_nodes_for_blob(self.members.clone(), self.metrics.clone(), &seed);
         let weights: HashMap<i32, u64> = self.weights.iter().map(|(k, v)| (*k, *v)).collect();
+        let selected: Vec<i32> =
+            placement::select_nodes_for_blob(self.members.clone(), &weights, &seed);
         placement::assign_fragment_classes(
             &seed,
             &selected,
@@ -560,6 +556,55 @@ pub fn confirm_ready(
     Ok(evidence_complete(conn, blob_id, &target.assignment, tip)?.then_some(target.desired))
 }
 
+/// The fulfillment pass's read (S4): a random sample of `n` in-flight
+/// blobs, reduced to the confirmation entries whose evidence is complete
+/// right now, plus how many were sampled (the density the adaptive sample
+/// steers by). One snapshot decode per distinct goal height — after a
+/// transition nearly every in-flight blob shares one goal, so the balloon
+/// costs one decode, not thousands.
+pub fn ready_confirmations(
+    conn: &rusqlite::Connection,
+    n: usize,
+    tip: u64,
+) -> Result<(Vec<PlacementConfirmation>, usize), StorageError> {
+    let sample = in_flight_sample(conn, n)?;
+    let sampled = sample.len();
+    let mut pair = conn
+        .prepare_cached(
+            "SELECT placement_height, desired_placement_height FROM data_blocks WHERE id = ?",
+        )
+        .map_err(db_err("prepare pair read"))?;
+    let mut snapshots: HashMap<u64, Option<ViewSnapshot>> = HashMap::new();
+    let mut ready = Vec::new();
+    for blob_id in sample {
+        let goal: Option<(Option<i64>, i64)> = pair
+            .query_row(params![blob_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+            .map_err(db_err("read pull target pair"))?;
+        let Some((placed, desired)) = goal else {
+            continue;
+        };
+        let desired = height_from_db(desired);
+        if placed.map(height_from_db) == Some(desired) {
+            continue;
+        }
+        let snapshot = match snapshots.entry(desired) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(snapshot_at(conn, desired)?),
+        };
+        let Some(snapshot) = snapshot.as_ref() else {
+            continue;
+        };
+        if evidence_complete(conn, &blob_id, &snapshot.assignment(&blob_id), tip)? {
+            ready.push(PlacementConfirmation {
+                blob_id,
+                height: desired,
+            });
+        }
+    }
+    Ok((ready, sampled))
+}
+
 // ---------------------------------------------------------------------------
 // ConfirmPlacement apply
 
@@ -647,6 +692,7 @@ pub fn apply_confirm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::placement::MetricsRow;
     use crate::types::BlobId;
     use hopnet_common::Blake3Hash;
     use std::str::FromStr;
@@ -705,7 +751,40 @@ mod tests {
         ViewSnapshot {
             members: members.to_vec(),
             weights: members.iter().map(|m| (*m, 1)).collect(),
-            metrics: Vec::new(),
+        }
+    }
+
+    /// A host-shaped view: members with their raw metrics rows, weights
+    /// derived the way `membership::derive_view` derives them.
+    fn host_view(rows: &[MetricsRow]) -> StorageView {
+        StorageView {
+            height: 7,
+            members: rows
+                .iter()
+                .map(|m| hopnet_comms::PeerRef {
+                    node_id: m.node_id,
+                    pubkey: [0; 32],
+                })
+                .collect(),
+            tiers: Default::default(),
+            weights: rows
+                .iter()
+                .map(|m| (m.node_id, placement::quantized_weight(m)))
+                .collect(),
+            watermark: 1,
+            online: vec![],
+        }
+    }
+
+    fn row(node_id: i32, availability: f64) -> MetricsRow {
+        MetricsRow {
+            node_id,
+            trust_factor: 1.0,
+            availability_score: availability,
+            throughput_score: 0.5,
+            latency_score: 0.5,
+            stability_score: 0.5,
+            storage_multiplier: 1.0,
         }
     }
 
@@ -742,24 +821,14 @@ mod tests {
         }
     }
 
-    // Should: round-trip the canonical bytes and order members, weights and
-    // metrics by node id regardless of the view's own order.
+    // Should: round-trip the canonical bytes and order members and weights
+    // by node id regardless of the view's own order.
+    // Should not: carry anything but members and weights — no metrics row,
+    // no liveness, no watermark.
     // Impact: every node must produce byte-identical snapshot rows — the
     // record is replicated, divergence-checked state.
     #[test]
     fn snapshot_is_canonical_and_round_trips() {
-        let mut metrics = Vec::new();
-        for n in [3, 1, 2] {
-            metrics.push(MetricsRow {
-                node_id: n,
-                trust_factor: 1.0,
-                availability_score: 0.5,
-                throughput_score: 0.5,
-                latency_score: 0.5,
-                stability_score: 0.5,
-                storage_multiplier: 1.0,
-            });
-        }
         let mk = |order: &[i32]| StorageView {
             height: 7,
             members: order
@@ -769,11 +838,10 @@ mod tests {
                     pubkey: [0; 32],
                 })
                 .collect(),
-            tiers: Default::default(),
+            tiers: [(1, 3600)].into_iter().collect(),
             weights: [(1, 4), (2, 8), (3, 16), (9, 2)].into_iter().collect(),
             watermark: 1,
-            online: vec![],
-            metrics: metrics.clone(),
+            online: vec![1],
         };
         let a = ViewSnapshot::from(&mk(&[3, 1, 2]));
         let b = ViewSnapshot::from(&mk(&[1, 2, 3]));
@@ -781,6 +849,43 @@ mod tests {
         assert_eq!(a.members, vec![1, 2, 3]);
         assert!(!a.weights.contains_key(&9), "non-members carry no weight");
         assert_eq!(ViewSnapshot::decode(&a.encode()).unwrap(), a);
+        let mut bare = view(&[1, 2, 3]);
+        bare.weights = [(1, 4), (2, 8), (3, 16)].into_iter().collect();
+        assert_eq!(
+            a.encode(),
+            bare.encode(),
+            "the bytes are a function of members and weights alone"
+        );
+    }
+
+    // Should: leave the transition record untouched when a metrics
+    // submission moves a member's raw scores inside its weight bucket.
+    // Should: append a transition when the scores cross a bucket edge.
+    // Impact: the 500-blob cutover rehearsal (2026-09-27) never converged
+    // because every submit_metrics commit was a transition that re-declared
+    // every blob; the snapshot must key on what moves bytes, quantized.
+    #[test]
+    fn metrics_only_change_records_no_transition() {
+        let mut conn = test_conn();
+        let tx = conn.transaction().unwrap();
+        let before = host_view(&[row(1, 0.50), row(2, 0.50), row(3, 0.50)]);
+        let noisier = host_view(&[row(1, 0.55), row(2, 0.50), row(3, 0.50)]);
+        let bucket_up = host_view(&[row(1, 0.60), row(2, 0.50), row(3, 0.50)]);
+        assert_eq!(before.weights[&1], 8);
+        assert_eq!(noisier.weights[&1], 8, "0.55 stays in bucket 8");
+        assert_eq!(bucket_up.weights[&1], 9, "0.60 crosses into bucket 9");
+
+        assert!(record_transition(&tx, 5, &ViewSnapshot::from(&before)).unwrap());
+        assert!(
+            !record_transition(&tx, 6, &ViewSnapshot::from(&noisier)).unwrap(),
+            "same buckets, same bytes: no transition"
+        );
+        assert_eq!(latest_transition_height(&tx).unwrap(), Some(5));
+        assert!(
+            record_transition(&tx, 9, &ViewSnapshot::from(&bucket_up)).unwrap(),
+            "a weight bucket moved: the view changed"
+        );
+        assert_eq!(latest_transition_height(&tx).unwrap(), Some(9));
     }
 
     // Should: write the first row unconditionally, skip an identical view,
@@ -924,6 +1029,87 @@ mod tests {
 
         // Re-confirming the confirmed goal is a no-op.
         assert_eq!(apply_confirm(&tx, &confirm(&b, 6), 10).unwrap().skipped, 1);
+    }
+
+    // Should: return, from a sample of the in-flight set, exactly the blobs
+    // whose evidence is complete at the tip — as entries a ConfirmPlacement
+    // would apply — and report how many were sampled.
+    // Should not: sample a quiescent blob, or list one with a stale or
+    // missing attestation.
+    // Impact: this is the fulfillment pass's read; the ratio ready/sampled
+    // steers the adaptive sample, so both numbers must be honest.
+    #[test]
+    fn ready_confirmations_lists_only_complete_evidence() {
+        let mut conn = test_conn();
+        let tx = conn.transaction().unwrap();
+        record_transition(&tx, 5, &view(&[1, 2, 3])).unwrap();
+
+        // a: fully attested at the goal's assignment. b: one class short.
+        // c: quiescent (confirmed at its goal) — never sampled.
+        let a = blob(1);
+        let b = blob(2);
+        let c = blob(3);
+        insert_blob(&tx, &a, 6, None);
+        insert_blob(&tx, &c, 6, Some(6));
+        tx.execute(
+            "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes, placement_height, file_size, desired_placement_height)
+             VALUES (?, X'00', 3, 0, NULL, 10, ?)",
+            params![b, height_to_db(6)],
+        )
+        .unwrap();
+        for i in 0..3u32 {
+            tx.execute(
+                "INSERT INTO fragment_hashes VALUES (?, 0, ?, 'f', ?, 0, 0)",
+                params![b, i, vec![0x10 + i as u8; 32]],
+            )
+            .unwrap();
+        }
+        let snapshot = snapshot_at(&tx, 6).unwrap().unwrap();
+        let (assign_a, assign_b) = (snapshot.assignment(&a), snapshot.assignment(&b));
+        for i in 0..3u32 {
+            tx.execute(
+                "INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height) VALUES (?, ?, 6)",
+                params![vec![i as u8; 32], assign_a[i as usize]],
+            )
+            .unwrap();
+        }
+        for i in 0..2u32 {
+            tx.execute(
+                "INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height) VALUES (?, ?, 6)",
+                params![vec![0x10 + i as u8; 32], assign_b[i as usize]],
+            )
+            .unwrap();
+        }
+
+        let (ready, sampled) = ready_confirmations(&tx, 10, 10).unwrap();
+        assert_eq!(sampled, 2, "the quiescent blob is not in flight");
+        assert_eq!(
+            ready,
+            vec![PlacementConfirmation {
+                blob_id: a.clone(),
+                height: 6,
+            }]
+        );
+
+        // The entries apply as-is.
+        assert_eq!(
+            apply_confirm(
+                &tx,
+                &ConfirmPlacement {
+                    confirmations: ready
+                },
+                10
+            )
+            .unwrap()
+            .applied,
+            1
+        );
+        assert_eq!(goal(&tx, &a), (6, Some(6)));
+
+        // Evidence past the recency window is not evidence.
+        let far = 6 + ATTESTATION_RECENCY_HEIGHTS + 1;
+        let (ready, sampled) = ready_confirmations(&tx, 10, far).unwrap();
+        assert_eq!((ready.len(), sampled), (0, 1));
     }
 
     // Should: resolve a blob's protection epochs from the record — the

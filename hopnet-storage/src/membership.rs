@@ -330,7 +330,6 @@ pub fn derive_view(
 
     let mut members = Vec::with_capacity(member_ids.len());
     let mut weights = HashMap::new();
-    let mut rows = Vec::with_capacity(nodes.len());
     for n in nodes {
         weights.insert(n.node_id, crate::placement::quantized_weight(&n.metrics));
         if member_set.contains(&n.node_id) {
@@ -339,7 +338,6 @@ pub fn derive_view(
                 pubkey: n.pubkey,
             });
         }
-        rows.push(n.metrics);
     }
 
     crate::traits::StorageView {
@@ -349,7 +347,6 @@ pub fn derive_view(
         weights,
         watermark,
         online,
-        metrics: rows,
     }
 }
 

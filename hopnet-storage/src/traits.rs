@@ -109,10 +109,6 @@ pub struct StorageView {
     /// Members whose current absence is zero (newest bucket saw them) —
     /// the repair tick's liveness set for class counting.
     pub online: Vec<i32>,
-    /// Score rows for the >30-member selection stage — read on the SAME
-    /// checkout as the rest of the view so selection and assignment see
-    /// one consistent state.
-    pub metrics: Vec<MetricsRow>,
 }
 
 /// Replicated-state reads the engine needs. Sync — implementations read from
@@ -144,7 +140,6 @@ pub trait StateReader: Send + Sync {
             weights,
             online: inputs.validators.iter().map(|p| p.node_id).collect(),
             members: inputs.validators,
-            metrics: inputs.metrics,
         })
     }
 

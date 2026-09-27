@@ -580,12 +580,21 @@ state to converged, with obligations never dropped in between.
       same rows from the same replicated inputs, so writing them
       into an exported table costs nothing and removes the rebuild
       path entirely; the artifact carries the record across epochs.
-    - The snapshot is exactly the placement inputs (members,
-      weights, selection metrics), canonically ordered; the view
-      in force at height h is the latest row at or below h. Transitions are designed-rare: the decay gate
-    and quantized tiers exist so metric noise does not move the
-    view — days-to-weeks cadence in a steady mesh, and sustained
-    churn is visible as a drain that never completes.
+    - The snapshot is exactly what moves bytes — the member set
+      and each member's quantized placement weight — canonically
+      ordered, and nothing else; the view in force at height h is
+      the latest row at or below h. Selection above 30 members
+      ranks by the same 16-level weight the assignment divides by,
+      so no raw metric score enters the snapshot (the model's view:
+      a member set and a constant weight map). Rehearsal finding,
+      2026-09-27: the first cut carried the members' raw metrics
+      rows for that selection stage, and every `submit_metrics`
+      commit changed the bytes — a transition per heartbeat, every
+      blob re-declared every few minutes, a 500-blob drain that
+      never converged. Transitions are designed-rare: the decay
+      gate and quantized weights exist so metric noise does not
+      move the view — days-to-weeks cadence in a steady mesh, and
+      sustained churn is visible as a drain that never completes.
   - Silence is legitimate iff no blob has `desired < T` and the
     in-flight set is empty — two indexed predicates, checkable by
     any node, and exactly the model's converged fixpoint projected
@@ -943,7 +952,14 @@ optimization and carries no proof obligation.
     `ConfirmPlacement` when `confirm_ready` says the evidence is
     complete; the tick also proposes one batched confirm for ready
     in-flight blobs (`CONFIRM_CHECKS_PER_TICK`). Without it nothing
-    would confirm between S3 and S4. S4 still owes the staleness pass
+    would confirm between S3 and S4. Narrowed 2026-09-27 (rehearsal
+    finding): the worker's prompt attest + confirm is for births
+    (a never-confirmed blob this node holds) and moved bytes (a
+    pull that changed its disk) only. A re-goaled blob already held
+    here submits nothing from the worker — each `submit` awaits a
+    consensus round, and awaiting one per rubber stamp on the
+    serial worker capped the drain at ~30 confirms a minute; those
+    blobs are the fulfillment pass's, in batches. S4 still owes the staleness pass
     (propose hook + grace rung), random-sampled scaling, retirement
     of the missing-class scan and of `/maintenance/drain-unplaced`
     (which now re-kicks the in-flight set).
@@ -969,9 +985,16 @@ optimization and carries no proof obligation.
     `DECLARE_PAGE_SIZE` targets; the grace rung in the policy tick
     submits a page directly when the check has gone unobserved for
     `STALENESS_GRACE_SECS` (a proposal of our own, or anyone's page
-    applying, re-arms it). Fulfillment: `lifecycle::in_flight_sample`
-    (random) with an adaptive sample that doubles while ≥ half is
-    ready (cap `CONFIRM_SAMPLE_MAX`); pull kicks stay oldest-first.
+    applying, re-arms it). Fulfillment: `lifecycle::ready_confirmations`
+    over a random in-flight sample, one batched confirm per round,
+    up to `CONFIRM_ROUNDS_PER_TICK` rounds per tick with the sample
+    doubling while ≥ half was ready (cap `CONFIRM_SAMPLE_MAX`) and
+    resting on the first sparse round; pull kicks stay oldest-first.
+    Reordered 2026-09-27 (rehearsal finding): the pass runs before
+    the re-kick, the re-kick is a non-blocking wake-up of the worker
+    (the tick had awaited 64 pull checks, each awaiting up to three
+    consensus rounds, and never reached the pass), and one tick runs
+    at a time per node.
     The obligation check owns re-encode: for every chunk with a dead
     class, `reconcile::plan` under the blob's GOAL assignment says
     what this node owes, plus `reconcile::deputy` below the watermark;
@@ -1087,6 +1110,17 @@ optimization and carries no proof obligation.
     must hold on every node, every inventory row must be
     disk-verified, every surviving file must download byte-identical.
     Run at production scale (thousands of blobs) before the tag.
+    The 60-blob run passed; the 500-blob run did not converge and
+    found two defects, both fixed the same day: raw metrics rows in
+    the view snapshot made every metrics heartbeat a transition
+    (Handoff Protocol bullet), and the tick awaited the worker's
+    per-blob consensus rounds ahead of the batched fulfillment pass
+    (S3/S4 records). Runbook consequence: the old regime's inventory
+    rows carry no `verified_height`, so nothing confirms until the
+    first disk-truth sweep after the flip — kick
+    `POST /maintenance/fragment-inventory-self-check` on each node
+    once the crossing is decided (or wait for the 30-minute cron);
+    the rehearsal does the same.
 
 ## Out of scope
 

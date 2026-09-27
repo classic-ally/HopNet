@@ -48,6 +48,7 @@ This document outlines the requirements for implementing distributed shard synch
     - Deterministic shuffle using Blake3-based Fisher-Yates with file_hash as seed
     - Return top 30 nodes after shuffle
     - **Performance**: ~10-50ms for 100 nodes using DuckDB analytics
+    - **Revised 2026-09-27 (RFC-STORAGE-003):** the >30 ranking uses the quantized placement weight (16 buckets) rather than raw scores, so the lifecycle's (members, weights) view snapshot is the whole selection input
   - **Phase 2 - Fragment Placement**: `get_fragment_placement(local_index, selected_nodes) -> Vec<&Node>`
     - Primary: `local_index % selected_nodes.len()`
     - Backup 1: `(local_index + 1) % selected_nodes.len()`

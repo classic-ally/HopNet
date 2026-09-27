@@ -17,11 +17,14 @@
 //! bandwidth (the model's ladder as queue order: urgent re-encode > pulls >
 //! lazy re-encode).
 //!
-//! After a pull check on an in-flight blob the node attests promptly
-//! (its `self_check_fragments` differential) and, when the goal's evidence
-//! is complete, proposes `ConfirmPlacement` — the fulfillment floor until
-//! S4's sampling pass. Racing proposers are harmless: apply validation
-//! carries the safety.
+//! After a pull check that changed this node's disk — or for a
+//! never-confirmed blob it holds (the origin at birth) — the node attests
+//! promptly (its `self_check_fragments` differential, then disk truth) and,
+//! when the goal's evidence is complete, proposes `ConfirmPlacement`: the
+//! latency path for uploads and real moves. Re-goaled blobs already held
+//! here submit nothing from the worker; the tick's fulfillment pass
+//! confirms them in batches (RFC-STORAGE-003 S4). Racing proposers are
+//! harmless: apply validation carries the safety.
 //!
 //! The push pipeline (origin-push worker pool, send permits, the failure
 //! threshold, the blind placement batcher) is gone. The engine owns NO
@@ -33,8 +36,7 @@ pub mod reencode;
 use crate::error::StorageError;
 use crate::fragstore;
 use crate::lifecycle::{ConfirmPlacement, PlacementConfirmation, CONFIRM_TX_FN};
-use crate::placement;
-use crate::traits::{LocalStateSink, PeerRef, StateReader, SubmitError, Transport, TxSubmitter};
+use crate::traits::{LocalStateSink, StateReader, SubmitError, Transport, TxSubmitter};
 use crate::types::BlobId;
 use hopnet_common::Blake3Hash;
 use std::collections::BTreeMap;
@@ -283,28 +285,6 @@ async fn run_reencode_cmd<T, S, X, L>(
     }
 }
 
-/// Class → responsible node for one blob under the balanced capped
-/// rendezvous placement (RFC-STORAGE-001): seeded selection first (all
-/// members at ≤30, scored top-30 above), then the balanced assignment over
-/// the selected ids. Returns the selected peers (pull-candidate pool)
-/// alongside the class map.
-pub fn assign_for_blob(
-    seed: &[u8; 32],
-    members: Vec<PeerRef>,
-    metrics: Vec<crate::placement::MetricsRow>,
-    weights: &std::collections::HashMap<i32, u64>,
-) -> (Vec<PeerRef>, Vec<i32>) {
-    let selected: Vec<PeerRef> = placement::select_nodes_for_blob(members, metrics, seed);
-    let ids: Vec<i32> = selected.iter().map(|p| p.node_id).collect();
-    let assignment = placement::assign_fragment_classes(
-        seed,
-        &ids,
-        weights,
-        crate::rs::TOTAL_FRAGMENTS_PER_CHUNK as u32,
-    );
-    (selected, assignment)
-}
-
 /// The pull check for one blob on this node: derive the owed classes from
 /// the goal, fetch each with recovery, then attest and (if the goal's
 /// evidence is complete) propose confirmation.
@@ -407,11 +387,18 @@ where
         }
     }
 
-    // In flight and this node holds bytes of it: attest promptly, then
-    // propose confirmation when the goal's evidence is complete.
+    // Prompt evidence is for births and moved bytes only: a never-confirmed
+    // blob this node holds (the origin's classes at birth), or a blob this
+    // pull just changed on disk. A re-goaled blob whose classes were
+    // already here submits nothing — its rows are the sweep's, its
+    // confirmation is the fulfillment floor's batched one (RFC-STORAGE-003:
+    // fulfillment is the bulk path; awaiting a consensus round per rubber
+    // stamp on the serial worker is what capped the 500-blob drain at
+    // ~30 confirms a minute).
     let in_flight = target.placement_height != Some(target.desired);
-    let holds_now = holds_any || outcome.pulled + outcome.rebuilt > 0;
-    if in_flight && holds_now {
+    let moved_bytes = outcome.pulled + outcome.rebuilt > 0;
+    let birth_holder = target.placement_height.is_none() && holds_any;
+    if in_flight && (moved_bytes || birth_holder) {
         // Belief first (rows for what we hold), then disk truth (S5):
         // every fragment of this blob on our disk is content-verified
         // right now and attested with the current height, so the
@@ -495,7 +482,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::{PlacementInputs, PullTarget, StoreResult, TransportError};
+    use crate::traits::{PeerRef, PlacementInputs, PullTarget, StoreResult, TransportError};
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Mutex;
@@ -766,6 +753,72 @@ mod tests {
         });
         let result = pull_owed(&seams(net3), &dir_dst2, &blob_id).await.unwrap();
         assert_eq!(result, PullOutcome::default());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Should: submit nothing for a re-goaled blob whose classes this node
+    // already holds — no self-check, no attestation, no confirm proposal;
+    // the sweep owns its rows and the fulfillment floor its confirmation.
+    // Should: still attest and propose for a never-confirmed blob this
+    // node holds (the origin at birth), so uploads confirm promptly.
+    // Impact: the serial worker awaited a consensus round per rubber stamp
+    // after every view transition (~30 confirms/min); the 500-blob cutover
+    // rehearsal never converged. Only births and moved bytes buy a round.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn regoal_with_nothing_owed_submits_nothing() {
+        let base = std::env::temp_dir().join(format!("hopnet-regoal-test-{}", std::process::id()));
+        let dir = base.join("held").to_str().unwrap().to_string();
+        let (blob_id, _outcome, mut manifest) = encoded_blob(&dir).await;
+        for (originals, recovery) in manifest.chunks.values_mut() {
+            for entry in originals.values_mut().chain(recovery.values_mut()) {
+                entry.2 = true; // every class already on this disk
+            }
+        }
+
+        // Re-goal: confirmed at 5, declared to 9, everything still mine.
+        let regoal = Arc::new(PullNet {
+            served: Mutex::new(HashMap::new()),
+            manifest: Mutex::new(Some(manifest.clone())),
+            target: Some(PullTarget {
+                placement_height: Some(5),
+                desired: 9,
+                assignment: vec![1; crate::rs::TOTAL_FRAGMENTS_PER_CHUNK],
+            }),
+            ready: Some(9),
+            marked_local: Mutex::new(Vec::new()),
+            submitted: Mutex::new(Vec::new()),
+        });
+        let result = pull_owed(&seams(regoal.clone()), &dir, &blob_id)
+            .await
+            .unwrap();
+        assert_eq!(result, PullOutcome::default(), "nothing owed, nothing done");
+        assert!(
+            regoal.submitted.lock().unwrap().is_empty(),
+            "a rubber stamp buys no consensus round on the worker"
+        );
+
+        // Birth: never confirmed, held here — the origin's prompt evidence.
+        let birth = Arc::new(PullNet {
+            served: Mutex::new(HashMap::new()),
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ready: Some(9),
+            marked_local: Mutex::new(Vec::new()),
+            submitted: Mutex::new(Vec::new()),
+        });
+        let result = pull_owed(&seams(birth.clone()), &dir, &blob_id)
+            .await
+            .unwrap();
+        assert_eq!(result.owed, 0);
+        assert!(result.attested);
+        assert!(result.confirm_proposed);
+        // No pull → the mock's self-check differential is empty and is
+        // skipped; disk truth and the proposal still go out.
+        assert_eq!(
+            *birth.submitted.lock().unwrap(),
+            vec![policy::ATTEST_FN, CONFIRM_TX_FN]
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

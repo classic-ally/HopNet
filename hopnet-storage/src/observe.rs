@@ -632,7 +632,6 @@ mod tests {
             &ViewSnapshot {
                 members: vec![1, 2, 3],
                 weights: [(1, 1), (2, 1), (3, 1)].into_iter().collect(),
-                metrics: Vec::new(),
             },
         )
         .unwrap();
