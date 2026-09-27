@@ -778,25 +778,30 @@ optimization and carries no proof obligation.
     decorative availability-class branch is deleted, not
     implemented: RFC-007's redundant-copy cleanup is subsumed by
     watermark eviction under the protection predicate.
-  - Departed-node inventory rows are pruned incrementally at
-    ConfirmPlacement apply — the one moment the blob is freshly
-    proven healthy without them. Departed means removed from mesh
-    membership (the model's GONE), never mere storage-view decay,
-    whose rows must persist as flap-back insurance. Because pruning
-    happens only at confirm, unrecoverable blobs keep their ghost
-    rows — the evidence the resilience pane's classification depends
-    on. Rows on live non-members stay: surplus copies are read
-    sources and eviction guards.
-    - S6 decision (2026-09-27): the draft added "plus a one-time
-      backfill at migration". The cutover drain IS the backfill —
-      every recoverable blob is declared forward and confirmed, and
-      each confirm prunes — so no storage step reads the consensus
-      module's validator record or needs a height (RFC-020 contract
-      rule 2), and the ghost rows of already-lost blobs survive the
-      crossing as they do afterwards. Membership is answered by the
-      host over the validator record at the deciding height
-      (`MeshMembership`, injected into the apply); a node with no
-      record is kept.
+  - Inventory rows persist for every registered node, dark or not,
+    until the node is EJECTED from the network. A row is belief about
+    who holds what; for a dark node it is the only record the mesh has
+    that those bytes exist — the evidence behind the resilience
+    classification's "unrecoverable" (vs "never placed") split, and
+    the operator's signal that restoring one node would bring
+    fragments back. Deleting it saves nothing: the node's own disk is
+    the truth, and its first self-check on return re-adds every row.
+    The model's GONE is ejection — the node's copies are gone for
+    good — not vote-out and not view decay, both of which are the
+    model's DOWN, under which copies and belief both persist.
+    - S6 decision (2026-09-27), revised the same day: the draft pruned
+      departed rows at ConfirmPlacement apply with "departed" read off
+      the validator record. RFC-CONSENSUS-002 says deactivation ends
+      validator duties only — a voted-out or voluntarily departed node
+      keeps its data and its storage standing — so that prune would
+      have erased a live holder's belief and lost the recovery signal
+      for a dark one. It was removed before release. Ejection (a
+      tombstone on `nodes` plus a consensus transaction whose apply
+      deletes the node's inventory rows) is a node-lifecycle feature
+      for its own RFC; until it exists nothing deletes a registered
+      node's rows. No migration backfill either: the cutover drain
+      re-goals and confirms every recoverable blob, and ghost rows
+      of already-lost blobs survive the crossing as they do afterwards.
   - Orphan deletion also drops the deleted blobs' inventory rows for
     every node in the same apply (S6): once the blob's manifest and
     access rows are gone a row for one of its hashes can support no
@@ -1014,16 +1019,17 @@ optimization and carries no proof obligation.
     Storage@2 artifacts import through a frozen v2 spec (S1's
     precedent, second use).
 - [x] **S6 — Lifecycle closure.** Data-block cleanup registered on
-  schedule; availability-class branch deleted; departed-node row
-  pruning at confirm-apply.
-  - Done 2026-09-27. `apply_confirm` takes a `MeshMembership` oracle
-    (`traits.rs`) and, for each confirmation it applies, deletes the
-    blob's inventory rows on every holder the oracle calls departed —
-    blob-scoped, both passes, `ConfirmOutcome.pruned`. The host's
-    `ValidatorMembership` answers from the latest validator row at or
-    below the deciding height (no row: member). No backfill step: the
-    cutover drain confirms every recoverable blob (decision recorded in
-    the Handoff Protocol). `apply_delete_orphaned` now also deletes the
+  schedule; availability-class branch deleted; inventory rows of
+  deleted blobs dropped with the blob.
+  - Done 2026-09-27. The draft's third item — departed-node row
+    pruning at confirm-apply — was built, then removed the same day:
+    its "departed" oracle read the validator record, which
+    RFC-CONSENSUS-002 says ends validator duties only, so it would
+    have pruned live holders and erased the dark-node recovery
+    signal; the correct trigger is node ejection, which does not
+    exist yet (Handoff Protocol, departed-rows bullet). No backfill
+    step: the cutover drain confirms every recoverable blob.
+    `apply_delete_orphaned` now also deletes the
     deleted blobs' inventory rows for every node. The orphaned data-
     block cleanup runs as the `orphaned-data-block-cleanup` worker,
     randomized daily per node, batch 50, 30-day retention, at most 10
@@ -1074,6 +1080,13 @@ optimization and carries no proof obligation.
   Validation on the live mesh: watch the drain complete, then the
   converged predicate hold. The 518-block incident class is the
   acceptance test.
+  - Rehearsal (2026-09-27): `orchestrator test --test
+    lifecycle-cutover-drain --flags blobs=N` — a mesh born on the
+    deployed release image, populated, crosses into the build under
+    test through the RFC-019 choreography; the pane's `converged`
+    must hold on every node, every inventory row must be
+    disk-verified, every surviving file must download byte-identical.
+    Run at production scale (thousands of blobs) before the tag.
 
 ## Out of scope
 

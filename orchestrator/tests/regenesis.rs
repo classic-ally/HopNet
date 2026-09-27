@@ -45,7 +45,7 @@ pub struct RegenesisCutover;
 /// image ref (`hopnet:<hash>-<this>`) from it.
 pub(crate) const CUTOVER_OLD_RELEASE: &str = "2026.8.5";
 
-async fn post_json(
+pub(crate) async fn post_json(
     node: &NodeInfo,
     path: &str,
     body: Option<serde_json::Value>,
@@ -65,13 +65,13 @@ async fn post_json(
     Ok((status, text))
 }
 
-async fn get_json(node: &NodeInfo, path: &str) -> Result<serde_json::Value> {
+pub(crate) async fn get_json(node: &NodeInfo, path: &str) -> Result<serde_json::Value> {
     let resp = crate::call_node_api(node, path, true).await?;
     anyhow::ensure!(resp.status().is_success(), "{path} {}", resp.status());
     Ok(resp.json().await?)
 }
 
-async fn regenesis_status(node: &NodeInfo) -> Result<serde_json::Value> {
+pub(crate) async fn regenesis_status(node: &NodeInfo) -> Result<serde_json::Value> {
     get_json(node, "/api/views/regenesis-status").await
 }
 
@@ -82,7 +82,7 @@ async fn regenesis_phase(node: &NodeInfo) -> Result<String> {
         .to_string())
 }
 
-async fn decided_height(node: &NodeInfo) -> Result<u64> {
+pub(crate) async fn decided_height(node: &NodeInfo) -> Result<u64> {
     let v = get_json(node, "/api/consensus").await?;
     Ok(v["last_decided_height"].as_u64().unwrap_or(0))
 }
@@ -359,7 +359,7 @@ pub(crate) async fn reauth_node(
 
 /// Boot attestation gate + a start decided at the given target. Returns
 /// the RUNNING version string the mesh attested.
-async fn attest_and_freeze(
+pub(crate) async fn attest_and_freeze(
     result: &mut TestResult,
     nodes: &[NodeInfo],
     target_override: Option<&str>,
@@ -422,7 +422,7 @@ async fn attest_and_freeze(
 
 /// Poll until every node reports the sealed phase; returns the terminal
 /// height from the status view.
-async fn wait_sealed_everywhere(nodes: &[NodeInfo]) -> Result<Option<u64>> {
+pub(crate) async fn wait_sealed_everywhere(nodes: &[NodeInfo]) -> Result<Option<u64>> {
     for _ in 0..120 {
         let mut all = true;
         for node in nodes {
@@ -862,7 +862,7 @@ impl TestScenario for RegenesisAwaitingUpgrade {
 }
 
 /// The status view's `schema_ordinals` as a comparable map.
-fn ordinal_map(status: &serde_json::Value) -> std::collections::BTreeMap<String, u64> {
+pub(crate) fn ordinal_map(status: &serde_json::Value) -> std::collections::BTreeMap<String, u64> {
     status["schema_ordinals"]
         .as_array()
         .into_iter()
@@ -1638,7 +1638,11 @@ pub struct DivergedNodeRebuild;
 /// epoch's genesis height and still has to decided-value-sync the tail,
 /// so comparing state before this settles compares a node mid-catch-up
 /// against the tip and reports a divergence that is really a race.
-async fn wait_for_convergence(nodes: &[NodeInfo], floor: u64, secs: u64) -> (bool, Vec<u64>) {
+pub(crate) async fn wait_for_convergence(
+    nodes: &[NodeInfo],
+    floor: u64,
+    secs: u64,
+) -> (bool, Vec<u64>) {
     let mut heights = Vec::new();
     for _ in 0..secs {
         heights.clear();
@@ -1658,7 +1662,7 @@ async fn wait_for_convergence(nodes: &[NodeInfo], floor: u64, secs: u64) -> (boo
 /// node id and would never match. Returns a detail string naming the
 /// heights and hashes, so a failure says what diverged instead of just
 /// that something did.
-fn coherence(snapshots: &[(u32, hopnet_common::NodeStateReport)]) -> (bool, String) {
+pub(crate) fn coherence(snapshots: &[(u32, hopnet_common::NodeStateReport)]) -> (bool, String) {
     let agreed = snapshots.windows(2).all(|w| {
         w[0].1.consensus_height == w[1].1.consensus_height
             && w[0].1.manifest.top_hash == w[1].1.manifest.top_hash

@@ -544,12 +544,12 @@ apply functions inside consensus handlers.
       walk and attesting what it saw; the pull path attests the blob's
       local fragments before proposing; confirmation evidence must be
       verified within 1024 heights and not suspect. S6 (2026-09-27):
-      lifecycle closure — confirm-apply prunes departed holders'
-      inventory rows through a host-injected `MeshMembership` oracle over
-      the validator record (view decay is not departure; the cutover drain
-      is the backfill), orphan deletion drops the deleted blobs' inventory
-      rows for every node, the orphaned data-block cleanup runs daily per
-      node (bounded batches), and the availability-class branch is gone.
+      lifecycle closure — orphan deletion drops the deleted blobs'
+      inventory rows for every node, the orphaned data-block cleanup runs
+      daily per node (bounded batches), and the availability-class branch
+      is gone; a confirm-time prune of "departed" holders' rows was built
+      and removed the same day (rows persist for every registered node
+      until ejection, which is a future node-lifecycle feature).
       S7 (2026-09-27): observability — `hopnet_storage::observe` gives the
       resilience pane the worker's own predicates (stage counts + converged,
       in-flight ages in heights, verification freshness per holder), fetch

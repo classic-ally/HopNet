@@ -4,7 +4,6 @@ use crate::{
     storage_host::db_apply::delete_orphaned_data_blocks_consensus,
 };
 use hopnet_storage::DeleteOrphanedDataBlocksPayload;
-use rusqlite::OptionalExtension;
 
 /// The storage substrate's consensus tx functions, registered from the
 /// HOST (not hopnet-storage): the layering is projection → storage, so
@@ -158,18 +157,12 @@ impl TransactionHandler for ConfirmPlacementHandler {
                 bincode::config::standard(),
             )
             .map_err(|_| DatabaseError::InvalidPayload)?;
-        let membership = ValidatorMembership {
-            db_tx,
-            height: ctx.height,
-        };
-        let outcome =
-            hopnet_storage::lifecycle::apply_confirm(db_tx, &payload, ctx.height, &membership)
-                .map_err(storage_err("apply_confirm"))?;
+        let outcome = hopnet_storage::lifecycle::apply_confirm(db_tx, &payload, ctx.height)
+            .map_err(storage_err("apply_confirm"))?;
         tracing::debug!(
             height = ctx.height,
             applied = outcome.applied,
             skipped = outcome.skipped,
-            pruned = outcome.pruned,
             "confirm_placement applied"
         );
         Ok(())
@@ -178,33 +171,6 @@ impl TransactionHandler for ConfirmPlacementHandler {
 
 inventory::submit! {
     &ConfirmPlacementHandler as &dyn TransactionHandler
-}
-
-/// Mesh membership for the confirm apply (RFC-STORAGE-003 S6): a node is
-/// a member while its latest validator row at or below the deciding height
-/// is active — replicated rows at a replicated height, so every node
-/// answers alike. A node with no validator row at all is kept (unknown is
-/// never pruned). Storage-view decay is not departure.
-pub(crate) struct ValidatorMembership<'a> {
-    pub db_tx: &'a rusqlite::Transaction<'a>,
-    pub height: u64,
-}
-
-impl hopnet_storage::traits::MeshMembership for ValidatorMembership<'_> {
-    fn is_member(&self, node_id: i32) -> Result<bool, hopnet_storage::StorageError> {
-        let latest: Option<bool> = self
-            .db_tx
-            .query_row(
-                "SELECT is_active FROM validators
-                 WHERE node_id = ? AND effective_height <= ?
-                 ORDER BY effective_height DESC LIMIT 1",
-                rusqlite::params![node_id, hopnet_common::height::height_to_db(self.height)],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| hopnet_storage::StorageError::Host(format!("validator lookup: {e}")))?;
-        Ok(latest.unwrap_or(true))
-    }
 }
 
 pub struct UpdatePlacementHeightsHandler;

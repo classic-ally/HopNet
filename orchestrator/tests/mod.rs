@@ -28,6 +28,7 @@ pub(crate) mod graceful_leave;
 mod import;
 mod iroh_ping;
 mod iroh_reject_unknown;
+mod lifecycle_cutover;
 mod malachite;
 pub(crate) mod mesh_growth;
 mod metrics;
@@ -145,7 +146,10 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, String)> {
     // newest PRE-ENFORCEMENT release — the mesh crosses the actual
     // enforcement severance (load the old image with
     // `scripts/build-release-image.sh v<ENFORCEMENT_OLD_RELEASE>`).
-    if test_name == "enforcement-crossing" {
+    // RFC-STORAGE-003 cutover rehearsal: the same crossing as above, on a
+    // POPULATED mesh, watched through the lifecycle drain (see
+    // lifecycle_cutover.rs). Same old image, same staged claim.
+    if test_name == "enforcement-crossing" || test_name == "lifecycle-cutover-drain" {
         return vec![
             (
                 "HOPNET_GENESIS_CONSENSUS_POLICY",
@@ -323,7 +327,8 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         | "straggler-rejoin"
         | "diverged-node-rebuild"
         | "regenesis-rollback"
-        | "enforcement-crossing" => Some(3),
+        | "enforcement-crossing"
+        | "lifecycle-cutover-drain" => Some(3),
         _ => None,
     }
 }
@@ -487,6 +492,11 @@ pub async fn run_test_by_name(
                 .await
         }
         "regenesis-cutover" => regenesis::RegenesisCutover.run(mesh_id, nodes, flags).await,
+        "lifecycle-cutover-drain" => {
+            lifecycle_cutover::LifecycleCutoverDrain
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "evidence-observe" => {
             evidence_observe::EvidenceObserve
                 .run(mesh_id, nodes, flags)
@@ -685,6 +695,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "diverged-node-rebuild",
         "regenesis-rollback",
         "regenesis-cutover",
+        "lifecycle-cutover-drain",
         "mesh-growth",
         "mixed-version-mesh",
         "retired-dialer",
