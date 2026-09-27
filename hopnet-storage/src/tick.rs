@@ -304,6 +304,61 @@ mod tests {
         });
     }
 
+    // Impact: the model's hope is `status == DOWN and downFor < DELTA` —
+    // a node exactly at DELTA is hopeless, and a GONE node never hopeful
+    // whatever its clock. The 2026-09-27 mutation run flipped both
+    // comparisons unnoticed: no trace sits on the boundary.
+    // Should: count a down node as hopeful strictly inside the decay
+    // window, and never a gone one.
+    #[test]
+    fn hope_ends_exactly_at_delta_and_never_covers_gone() {
+        let p = params(&table);
+        let mut s = birth();
+        s.status.insert(1, Status::Down);
+        s.down_for.insert(1, 1); // inside the window (DELTA 2)
+        s.status.insert(3, Status::Gone);
+        s.down_for.insert(3, 0);
+        assert_eq!(
+            s.chunk_state(&p).hopeful_down,
+            [1].into_iter().collect(),
+            "down inside the window is hopeful; gone never is"
+        );
+        s.down_for.insert(1, 2); // exactly DELTA: hopeless
+        assert!(s.chunk_state(&p).hopeful_down.is_empty());
+    }
+
+    // Impact: the re-encode rung's guard is `AUTO_REENCODE and not(deleted)`;
+    // the exported deleted-blob trace has no dead class, so only a direct
+    // witness discriminates each conjunct (the 2026-09-27 mutation run
+    // left `||` alive here).
+    // Should: rebuild a dead class when allowed and the blob lives.
+    // Should not: rebuild it for a deleted blob, or with re-encode off.
+    #[test]
+    fn reencode_needs_both_the_policy_and_a_live_blob() {
+        let p = params(&table);
+        let mut s = birth();
+        s.copies.insert(1, BTreeSet::new()); // class 1 dead; class 0 live = K
+        s.inv_view = s.copies.clone();
+        assert_eq!(
+            step(&s, &p).copies[&1],
+            [3].into_iter().collect(),
+            "dead class rebuilt on its responsible"
+        );
+
+        let mut gone = s.clone();
+        gone.deleted = true;
+        assert!(
+            step(&gone, &p).copies[&1].is_empty(),
+            "deleted: no bytes move"
+        );
+
+        let off = Params {
+            auto_reencode: false,
+            ..params(&table)
+        };
+        assert!(step(&s, &off).copies[&1].is_empty(), "re-encode off: waits");
+    }
+
     // Should: sync the view first when a node decays past DELTA, then
     // declare (the new epoch joins protection), before any mover runs.
     #[test]

@@ -60,6 +60,25 @@ jobs:
         # (tokio shell smoke + the 2026-08-17 contention-wedge guard), which
         # otherwise never runs in CI.
         run: nix develop --command cargo test -p hopnet-consensus --tests --features shell
+
+      - name: cargo test (storage integration binaries — model conformance, consensus contract)
+        # --lib --bins skips hopnet-storage/tests/* too: the RFC-STORAGE-003
+        # trace-conformance harness (the kernel replayed against exported
+        # Quint executions) and the consensus-contract tests live there
+        # and must gate merges. Seconds.
+        run: nix develop --command cargo test -p hopnet-storage --tests
+
+      - name: kernel mutation gate (RFC-STORAGE-003 — reconcile, protection, eviction, tick)
+        # Every surviving mutant is kernel logic no test discriminates.
+        # The survivor list is kept at zero; a new survivor means a new
+        # branch without a witness. ~2 min. Unviable mutants (do not
+        # compile) do not fail the run.
+        run: >
+          nix develop --command nix shell nixpkgs#cargo-mutants --command
+          cargo mutants -p hopnet-storage
+          -f hopnet-storage/src/reconcile.rs -f hopnet-storage/src/protection.rs
+          -f hopnet-storage/src/eviction.rs -f hopnet-storage/src/tick.rs
+          --jobs 4 --timeout 600 --no-shuffle
       # The mount stack suite boots the real node binary over localhost HTTP
       # (no /dev/fuse needed — the two kernel smokes stay #[ignore]d).
       - name: hopnet-mount stack suite

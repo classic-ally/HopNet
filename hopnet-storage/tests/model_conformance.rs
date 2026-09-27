@@ -482,3 +482,51 @@ fn engine_tick_replays_every_trace_step() {
     );
     assert!(env_steps > 0, "no env actions in the traces?");
 }
+
+// Impact: `converged` is the pane's headline predicate (S7) and the
+// INV-CONVERGE target; the state replay above never evaluates it, so a
+// broken conjunct would go unnoticed (the 2026-09-27 mutation run left
+// all four of its mutants alive).
+// Should: agree with the model's `converged` — conformant to target,
+// confirmed == target, same assignment under target and member views,
+// belief == truth — on every state of every trace, both ways.
+#[test]
+fn converged_predicate_matches_the_model() {
+    let place = |view: &BTreeSet<i32>| -> Vec<i32> {
+        model_assignment(&view.iter().map(|n| *n as i64).collect())
+    };
+    let params = hopnet_storage::tick::Params {
+        nodes: (1..=4).collect(),
+        n_frags: N_FRAGS,
+        k: K,
+        watermark: W,
+        delta: DELTA,
+        auto_pull: true,
+        auto_reencode: true,
+        place: &place,
+    };
+    let (mut yes, mut no) = (0, 0);
+    for path in traces() {
+        for (i, s) in read_trace(&path).iter().enumerate() {
+            // The model's `converged`, transcribed from storage_policy.qnt.
+            let target = model_assignment(&s.target_view);
+            let conformant_to_target =
+                (0..N_FRAGS as i64).all(|f| s.copies[&f].contains(&(target[f as usize] as i64)));
+            let model = conformant_to_target
+                && s.confirmed_view == s.target_view
+                && target == model_assignment(&s.member_view)
+                && s.inv_view == s.copies;
+            let rust = model_state(s).converged(&params);
+            assert_eq!(rust, model, "{} state {i}: converged", path.display());
+            if model {
+                yes += 1
+            } else {
+                no += 1
+            }
+        }
+    }
+    assert!(
+        yes > 0 && no > 0,
+        "traces must witness both verdicts ({yes}/{no})"
+    );
+}

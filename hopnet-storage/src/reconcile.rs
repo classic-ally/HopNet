@@ -249,4 +249,28 @@ mod tests {
         let urgent = chunk(&[(&[4], 1), (&[2], 2), (&[3], 3)], &[1, 2, 3], &[4]);
         assert_eq!(plan(&urgent, 1), vec![Duty::Reencode { classes: vec![0] }]);
     }
+
+    // Impact: the model's urgency floor is `liveClassCount < W`, strict —
+    // exactly W live classes is not yet urgent. The 2026-09-27 mutation
+    // run flipped it to `<=` unnoticed: no trace sits on the boundary.
+    // Should: at exactly W live classes, let a hopeful holder defer the
+    // rebuild; one fewer live class and hope no longer counts.
+    #[test]
+    fn urgency_floor_is_strict_at_the_watermark() {
+        // Three live classes (1, 2, 3) = W; class 0 dead on hopeful 4.
+        let at_w = chunk(
+            &[(&[4], 1), (&[2], 2), (&[3], 3), (&[2], 1)],
+            &[1, 2, 3],
+            &[4],
+        );
+        assert_eq!(at_w.live_class_count(), 3);
+        assert_eq!(
+            plan(&at_w, 1),
+            vec![Duty::Pull { class: 3 }],
+            "at W: hope defers the rebuild"
+        );
+        // Two live classes < W: the same dead class is rebuilt now.
+        let below = chunk(&[(&[4], 1), (&[2], 2), (&[3], 3)], &[1, 2, 3], &[4]);
+        assert_eq!(plan(&below, 1), vec![Duty::Reencode { classes: vec![0] }]);
+    }
 }

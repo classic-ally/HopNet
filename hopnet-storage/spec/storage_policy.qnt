@@ -929,6 +929,20 @@ module scaled_bal {
       .then(engineTick)
       .expect(converged)
 
+  // WITNESS (a deleted blob owes nothing): after envDelete the movers
+  // and the confirm stand down — belief sync still runs, truth is
+  // truth — so the engine moves no bytes for a blob consensus has
+  // deleted; the orphan flow owns what remains. Exported as a trace so
+  // the Rust ladder's `!deleted` guards are replayed, not just read.
+  run deletedBlobOwesNothingTest =
+    initOriginHeldAt(3)
+      .then(2.reps(_ => engineTick))
+      .expect(not(conformantToTarget))
+      .then(envDelete)
+      .then(4.reps(_ => engineTick))
+      .expect(deleted and not(conformantToTarget)
+        and confirmedView == Set() and invView == copies)
+
   // WITNESS (random regression): any short adversarial burst, then a
   // CALM_BOUND window — the blob is converged, excused (unreadable), or
   // deleted. This is the sampling half of the INV-CONVERGE regime run

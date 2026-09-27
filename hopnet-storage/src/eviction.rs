@@ -151,4 +151,45 @@ mod tests {
         );
         assert_eq!(planned, vec![hash(1), hash(2)]);
     }
+
+    // Impact: the watermark arithmetic decides how much surplus a
+    // pressured node sheds; the conformance harness only ever runs the
+    // planner under full pressure, and the 2026-09-27 mutation run
+    // rewrote the byte math three ways unnoticed.
+    // Should: act only above high_pct of total, and free exactly down to
+    // low_pct of total — no more, oldest first — with percentages of a
+    // total that is not 100.
+    #[test]
+    fn watermark_bytes_are_percentages_of_total() {
+        let pressure = DiskPressure {
+            used_bytes: 950,
+            total_bytes: 1000,
+            high_pct: 90,
+            low_pct: 80,
+        };
+        // Free 950 − 800 = 150: two of the 100-byte copies, not three.
+        let planned = plan_evictions(
+            vec![
+                candidate(1, "0170-a", 100),
+                candidate(2, "0180-b", 100),
+                candidate(3, "0190-c", 100),
+            ],
+            &pressure,
+        );
+        assert_eq!(planned, vec![hash(1), hash(2)]);
+
+        // 850 used is below 900 = 90% of 1000: nothing.
+        let calm = DiskPressure {
+            used_bytes: 850,
+            ..pressure
+        };
+        assert!(plan_evictions(vec![candidate(1, "0170-a", 100)], &calm).is_empty());
+
+        // Exactly at the high mark is not above it.
+        let edge = DiskPressure {
+            used_bytes: 900,
+            ..pressure
+        };
+        assert!(plan_evictions(vec![candidate(1, "0170-a", 100)], &edge).is_empty());
+    }
 }

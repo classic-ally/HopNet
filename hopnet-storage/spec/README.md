@@ -146,7 +146,7 @@ differs per run and is ignored):
 
 ```bash
 npx @informalsystems/quint test spec/storage_policy.qnt --main scaled_bal \
-  --match 'prematureEvictionSafeTest|supersedeMidFlightTest|originHeldRegionTraceTest|originSurplusLapsesTest|evictLaunderAccountingTest|calmTightnessTest|dropMarkHealsTest' \
+  --match 'prematureEvictionSafeTest|supersedeMidFlightTest|originHeldRegionTraceTest|originSurplusLapsesTest|evictLaunderAccountingTest|calmTightnessTest|dropMarkHealsTest|deletedBlobOwesNothingTest' \
   --out-itf 'spec/traces/{test}_{seq}.itf.json'
 ```
 
@@ -165,3 +165,25 @@ printf '%s\n' \
 ```
 
 Verified working 2026-07-13 with quint 0.32.0, node 24.
+
+## Mutation gate (kernel)
+
+CI runs `cargo mutants` over the four kernel modules — `reconcile`,
+`protection`, `eviction`, `tick` — against the crate's tests, the
+conformance harness included, and fails on any surviving mutant. A
+survivor is a branch no witness discriminates: add the witness (a
+Quint run exported to `spec/traces/`, or a boundary unit test beside
+the code), never weaken the gate. First measured 2026-09-27: 132
+mutants, 112 caught, 14 missed, 6 unviable; the 14 were the
+`converged` predicate (never evaluated by the replay), the `!deleted`
+rung guards (no deleted-blob trace), the strict `< W` urgency floor
+and the `downFor < DELTA` hope window (no trace on the boundary), the
+watermark byte arithmetic (the planner was only ever run under full
+pressure) and an unread accessor — each closed the same day.
+
+```bash
+nix develop --command nix shell nixpkgs#cargo-mutants --command \
+  cargo mutants -p hopnet-storage -f hopnet-storage/src/reconcile.rs \
+  -f hopnet-storage/src/protection.rs -f hopnet-storage/src/eviction.rs \
+  -f hopnet-storage/src/tick.rs --jobs 4
+```

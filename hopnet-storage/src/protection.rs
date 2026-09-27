@@ -98,10 +98,6 @@ impl Protection {
         static EMPTY: BTreeSet<i32> = BTreeSet::new();
         self.holders_by_class.get(class as usize).unwrap_or(&EMPTY)
     }
-
-    pub fn never_confirmed(&self) -> bool {
-        self.never_confirmed
-    }
 }
 
 #[cfg(test)]
