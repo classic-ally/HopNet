@@ -262,7 +262,12 @@ rejected. Across proposers the nonce table still decides.
 - **Orchestrator** (Docker meshes, self-hosted iroh relay): consensus-leader-down
   (idle-proposer wake), consensus-lagging-catch-up, consensus-bft-quorum-loss
   (negative control), barrier tests (before_decide, before_publish_proposal),
-  plus the full application suite and divergence checks.
+  plus the full application suite and divergence checks. `GET
+  /api/consensus/blocks?from=&to=` lists the functions decided at each height
+  (debug read, ≤1000 heights) so a check can attribute heights to the traffic
+  that filled them — consensus-queue-burst's batching check counts only the
+  heights carrying its own ten operations, not the storage lifecycle's
+  follow-up transactions.
 
 ## Configuration
 

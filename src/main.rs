@@ -933,6 +933,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     get(consensus::routes::get_consensus_history),
                 )
                 .route("/consensus/view", post(consensus::routes::debug_view_state))
+                .route(
+                    "/consensus/blocks",
+                    get(consensus::routes::get_decided_functions),
+                )
                 .route("/consensus/leave", post(consensus::routes::post_leave))
                 .route(
                     "/consensus/regenesis/start",
