@@ -5,6 +5,7 @@ use rand::rngs::SysRng;
 
 mod authorization;
 mod byzantine;
+mod forward_dedup;
 mod malachite_integration;
 mod regenesis;
 mod signatures;

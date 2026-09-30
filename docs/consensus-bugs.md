@@ -137,3 +137,9 @@ t=60.2s: Nodes B,C,D receive TC → advance view without commit
 **Issue**: /qc and /tc routes check state then modify separately
 **Impact**: Race condition between check and modification
 **Mitigation**: Consensus mutex prevents concurrent modifications
+## 10. ✅ Retried Forward Duplicated in the Proposer's Pool
+**Status**: FIXED 2026-09-27 (nonce-unique PendingPool + committed re-check on rejection)
+**Issue**: A forwarder retries the moment a height decides without its transaction (`AckedDecided` → `RetryNow`), while the proposer still holds the original in its pending pool for a later block. The proposer's forward handler dedups against `committed_tx_nonces` only, so the retry became a second pool entry; preflight applies pool entries in order under savepoints, the first copy applied and the second was rejected `Permanent("ProcessingError")` (e.g. "pubkey already registered"). On a 3-validator mesh one rejection is final, so the API answered 500 while the transaction committed.
+**Impact**: Any queue-submitted write could report failure after committing; seen as the fourth node's join in `regenesis-cutover`, likelier under the RFC-STORAGE-003 catch-up drain's transaction volume.
+**Location**: `PendingPool::push` and `process_forward_results` in src/consensus/queue.rs
+**Fix**: `PendingPool::push` joins a same-nonce entry's waiters (staged or in flight) instead of pushing a duplicate — `QueuedTransaction` carries `Notifiers`, a fan-out of every submitter waiting on it. On the forwarder, a `Rejected` verdict for a nonce already committed locally resolves through the settler as committed. Tests: `duplicate_nonce_joins_the_pooled_entry`, `notifiers_fan_out_and_ignore_dropped_receivers` (queue.rs), `rejection_of_a_locally_committed_nonce_resolves_as_committed` (consensus/tests/forward_dedup.rs).

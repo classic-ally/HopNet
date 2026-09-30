@@ -48,7 +48,8 @@ impl fmt::Display for ConsensusSubmitError {
 }
 
 /// Result sent back to callers via oneshot channel.
-enum ConsensusResult {
+#[derive(Debug, Clone)]
+pub(crate) enum ConsensusResult {
     /// Decided AND applied on THIS node. `height` is an upper bound on
     /// the applying block: the nonce row's presence proves local
     /// application at some height ≤ this one, so any read anchored at
@@ -60,10 +61,47 @@ enum ConsensusResult {
     Failed(String),
 }
 
+/// Every submitter waiting on one queued transaction. Normally one; a
+/// re-forwarded copy of a transaction the pool already holds joins the
+/// pooled entry instead of duplicating it (`PendingPool::push`), so the
+/// entry's outcome fans out to each waiter. Dropped receivers (a client that
+/// gave up) are ignored.
+pub(crate) struct Notifiers(Vec<oneshot::Sender<ConsensusResult>>);
+
+impl Notifiers {
+    fn one(sender: oneshot::Sender<ConsensusResult>) -> Self {
+        Self(vec![sender])
+    }
+
+    /// Take over another entry's waiters (its transaction is ours).
+    fn join(&mut self, other: Notifiers) {
+        self.0.extend(other.0);
+    }
+
+    /// Resolve every waiter with the same result. Returns whether at least
+    /// one waiter was still listening.
+    pub(crate) fn send(self, result: ConsensusResult) -> bool {
+        let mut waiters = self.0.into_iter();
+        let Some(last) = waiters.next_back() else {
+            return false;
+        };
+        let mut delivered = false;
+        for waiter in waiters {
+            delivered |= waiter.send(result.clone()).is_ok();
+        }
+        delivered | last.send(result).is_ok()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// A transaction waiting in the queue.
 pub struct QueuedTransaction {
     tx: Transaction,
-    notifier: oneshot::Sender<ConsensusResult>,
+    notifier: Notifiers,
     /// Node IDs of leaders that have explicitly rejected this transaction.
     rejecting_leaders: HashSet<i32>,
     /// Preflight restages consumed by transient storage contention. Bounded
@@ -194,8 +232,35 @@ pub struct PendingPool {
 
 impl PendingPool {
     /// Stage a transaction for the next proposal this node makes.
+    ///
+    /// The pool is nonce-unique: if the transaction is already staged or in
+    /// flight here, the newcomer's waiters join the pooled entry and nothing
+    /// is pushed. A forwarder retries a forward the moment a height decides
+    /// without its transaction (the proposer had pooled it for a later
+    /// block), so the retry MUST land on the same entry — two copies in one
+    /// pool would both pass the committed-nonce check at preflight, the
+    /// first would apply and the second be rejected as a semantic
+    /// duplicate, and the submitter would be told its committed transaction
+    /// failed. Across proposers the committed-nonce table still owns
+    /// idempotency (`AlreadyCommitted` at preflight, `settle`'s second pass).
     pub fn push(&self, entry: QueuedTransaction) {
-        self.queued.lock().unwrap().push(entry);
+        let nonce = &entry.tx.nonce;
+        {
+            let mut inflight = self.inflight.lock().unwrap();
+            if let Some(pooled) = inflight.iter_mut().find(|i| &i.entry.tx.nonce == nonce) {
+                tracing::debug!("pool: nonce {nonce} already in flight — joined its waiters");
+                pooled.entry.notifier.join(entry.notifier);
+                return;
+            }
+        }
+        let mut queued = self.queued.lock().unwrap();
+        if let Some(pooled) = queued.iter_mut().find(|q| &q.tx.nonce == nonce) {
+            tracing::debug!("pool: nonce {nonce} already staged — joined its waiters");
+            pooled.notifier.join(entry.notifier);
+            return;
+        }
+        queued.push(entry);
+        drop(queued);
         self.work.notify_one();
     }
 
@@ -371,6 +436,21 @@ impl PendingPool {
 }
 
 impl QueuedTransaction {
+    /// A fresh entry for `transaction` with one waiter; the receiver is the
+    /// submitter's end.
+    pub(crate) fn new(transaction: Transaction) -> (Self, oneshot::Receiver<ConsensusResult>) {
+        let (result_tx, result_rx) = oneshot::channel();
+        (
+            Self {
+                tx: transaction,
+                notifier: Notifiers::one(result_tx),
+                rejecting_leaders: HashSet::new(),
+                transient_attempts: 0,
+            },
+            result_rx,
+        )
+    }
+
     /// The wrapped transaction (for building proposals / forwarding).
     pub fn transaction(&self) -> &Transaction {
         &self.tx
@@ -473,13 +553,8 @@ impl ConsensusQueue {
     ) -> Vec<Result<(), ConsensusSubmitError>> {
         let mut receivers = Vec::with_capacity(transactions.len());
         for transaction in transactions {
-            let (result_tx, result_rx) = oneshot::channel();
-            self.pending_pool().push(QueuedTransaction {
-                tx: transaction,
-                notifier: result_tx,
-                rejecting_leaders: HashSet::new(),
-                transient_attempts: 0,
-            });
+            let (queued, result_rx) = QueuedTransaction::new(transaction);
+            self.pending_pool().push(queued);
             receivers.push(result_rx);
         }
         let mut results = Vec::with_capacity(receivers.len());
@@ -523,13 +598,7 @@ impl ConsensusQueue {
     }
 
     async fn enqueue_one(&self, transaction: Transaction) -> Result<u64, ConsensusSubmitError> {
-        let (result_tx, result_rx) = oneshot::channel();
-        let queued = QueuedTransaction {
-            tx: transaction,
-            notifier: result_tx,
-            rejecting_leaders: HashSet::new(),
-            transient_attempts: 0,
-        };
+        let (queued, result_rx) = QueuedTransaction::new(transaction);
 
         self.sender
             .send(queued)
@@ -543,13 +612,7 @@ impl ConsensusQueue {
         &self,
         transaction: Transaction,
     ) -> Result<((), oneshot::Receiver<ConsensusResult>), ConsensusSubmitError> {
-        let (result_tx, result_rx) = oneshot::channel();
-        let queued = QueuedTransaction {
-            tx: transaction,
-            notifier: result_tx,
-            rejecting_leaders: HashSet::new(),
-            transient_attempts: 0,
-        };
+        let (queued, result_rx) = QueuedTransaction::new(transaction);
 
         self.sender
             .send(queued)
@@ -584,7 +647,7 @@ const RETRY_DELAY_SECS: u64 = 5;
 
 /// Outcome from a dispatch attempt, determines how the batch processor gates
 /// before the next drain cycle.
-enum DispatchOutcome {
+pub(crate) enum DispatchOutcome {
     /// Batch fully resolved (staged locally or answered) — no gate needed.
     Resolved,
     /// Network-level failure (proposer unreachable). Retry after a short delay.
@@ -948,7 +1011,12 @@ fn synthesize_results_from_nonces(
 }
 
 /// Process per-transaction results from the proposer's forward response.
-fn process_forward_results(
+/// Route the proposer's per-transaction verdicts: committed entries wait for
+/// the local settler, rejections count toward the Byzantine threshold, and
+/// transient misses retry. A rejection for a nonce THIS node has already
+/// committed is treated as committed — a committed transaction cannot be
+/// rejected, whatever a stale verdict says.
+pub(crate) fn process_forward_results(
     batch: Vec<QueuedTransaction>,
     results: Vec<super::rpc::TransactionForwardResult>,
     proposer: i32,
@@ -958,6 +1026,20 @@ fn process_forward_results(
     let mut retries = Vec::new();
     let mut settle_locally = Vec::new();
 
+    // One indexed read for the rejected subset: a verdict formed before the
+    // block that carried our transaction is stale by the time it arrives.
+    let rejected_nonces: Vec<_> = batch
+        .iter()
+        .zip(&results)
+        .filter(|(_, r)| matches!(r, super::rpc::TransactionForwardResult::Rejected { .. }))
+        .map(|(q, _)| q.tx.nonce.clone())
+        .collect();
+    let committed_here = if rejected_nonces.is_empty() {
+        HashSet::new()
+    } else {
+        db::check_committed_nonces(conn, &rejected_nonces).unwrap_or_default()
+    };
+
     for (queued, result) in batch.into_iter().zip(results) {
         match result {
             super::rpc::TransactionForwardResult::Committed => {
@@ -965,6 +1047,15 @@ fn process_forward_results(
                 // ours. Submitters are promised decided-AND-applied-HERE
                 // (RFC-018 S6), so resolution waits for the settler to see
                 // the nonce in OUR committed_tx_nonces.
+                settle_locally.push(queued);
+            }
+            super::rpc::TransactionForwardResult::Rejected { .. }
+                if committed_here.contains(&queued.tx.nonce.to_string()) =>
+            {
+                tracing::debug!(
+                    "proposer node {proposer} rejected nonce {} that is committed here — resolving as committed",
+                    queued.tx.nonce
+                );
                 settle_locally.push(queued);
             }
             super::rpc::TransactionForwardResult::Rejected { reason } => {
@@ -1052,7 +1143,13 @@ mod preflight_resolution_tests {
     fn entry_with_attempts(
         attempts: u32,
     ) -> (QueuedTransaction, oneshot::Receiver<ConsensusResult>) {
-        let (result_tx, result_rx) = oneshot::channel();
+        entry_with_nonce(hopnet_common::CustomUUID::new(None), attempts)
+    }
+
+    fn entry_with_nonce(
+        nonce: hopnet_common::CustomUUID,
+        attempts: u32,
+    ) -> (QueuedTransaction, oneshot::Receiver<ConsensusResult>) {
         let tx = Transaction {
             rpc: crate::consensus::types::RpcCall {
                 function: "test.noop".into(),
@@ -1063,17 +1160,83 @@ mod preflight_resolution_tests {
                 signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
             },
             user: None,
-            nonce: hopnet_common::CustomUUID::new(None),
+            nonce,
         };
-        (
-            QueuedTransaction {
-                tx,
-                notifier: result_tx,
-                rejecting_leaders: HashSet::new(),
-                transient_attempts: attempts,
-            },
-            result_rx,
-        )
+        let (mut queued, result_rx) = QueuedTransaction::new(tx);
+        queued.transient_attempts = attempts;
+        (queued, result_rx)
+    }
+
+    // Impact: a forwarder retries the moment a height decides without its
+    // transaction, while the proposer still holds the original in its pool
+    // (regenesis-cutover, 2026-09-27: the fourth node's join committed at
+    // height 32 and the API answered 500). Two copies in one pool means the
+    // second is a semantic duplicate at preflight.
+    // Should: fold a same-nonce push into the staged entry, and into an
+    // in-flight one, so the pool holds each nonce once.
+    // Should: resolve every joined waiter with the entry's one outcome.
+    // Should not: join entries whose nonces differ.
+    #[tokio::test]
+    async fn duplicate_nonce_joins_the_pooled_entry() {
+        let pool = PendingPool::default();
+        let nonce = hopnet_common::CustomUUID::new(None);
+        let (first, first_rx) = entry_with_nonce(nonce.clone(), 0);
+        let (retry, retry_rx) = entry_with_nonce(nonce.clone(), 0);
+        let (other, other_rx) = entry();
+
+        pool.push(first);
+        pool.push(retry);
+        pool.push(other);
+        assert_eq!(
+            pool.staged_len(),
+            2,
+            "the retry joined; the other nonce did not"
+        );
+
+        let mut taken = pool.take_for_proposal(10);
+        assert_eq!(taken.len(), 2);
+        let joined = taken.remove(0);
+        assert_eq!(joined.notifier.len(), 2);
+        assert_eq!(taken[0].notifier.len(), 1);
+
+        // In flight now; a third copy joins the in-flight entry.
+        pool.mark_inflight(vec![joined], 7);
+        let (late, late_rx) = entry_with_nonce(nonce, 0);
+        pool.push(late);
+        assert_eq!(pool.staged_len(), 0);
+        assert_eq!(pool.inflight_len(), 1);
+
+        let inflight = pool.inflight.lock().unwrap().drain(..).next().unwrap();
+        assert_eq!(inflight.entry.notifier.len(), 3);
+        pool.resolve_committed(inflight.entry, 9);
+        for rx in [first_rx, retry_rx, late_rx] {
+            assert!(matches!(
+                rx.await.unwrap(),
+                ConsensusResult::Committed { height: 9 }
+            ));
+        }
+        pool.reject(taken.remove(0), "no".into());
+        assert!(matches!(other_rx.await.unwrap(), ConsensusResult::Rejected(r) if r == "no"));
+    }
+
+    // Should: deliver one result to every waiter and report delivery even
+    // when some receivers were dropped; report none when all were.
+    #[tokio::test]
+    async fn notifiers_fan_out_and_ignore_dropped_receivers() {
+        let (a_tx, a_rx) = oneshot::channel();
+        let (b_tx, b_rx) = oneshot::channel();
+        let (c_tx, c_rx) = oneshot::channel();
+        drop(b_rx);
+        let mut n = Notifiers::one(a_tx);
+        n.join(Notifiers::one(b_tx));
+        n.join(Notifiers::one(c_tx));
+        assert!(n.send(ConsensusResult::Failed("x".into())));
+        assert!(matches!(a_rx.await.unwrap(), ConsensusResult::Failed(_)));
+        assert!(matches!(c_rx.await.unwrap(), ConsensusResult::Failed(_)));
+
+        let (d_tx, d_rx) = oneshot::channel();
+        drop(d_rx);
+        assert!(!Notifiers::one(d_tx).send(ConsensusResult::Rejected("y".into())));
     }
 
     // Impact: this routing is what keeps a transient SQLITE_BUSY during the

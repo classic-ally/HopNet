@@ -235,6 +235,14 @@ Non-proposer nodes forward queued transactions to the proposer from the shell's
 height while paused. Undeliverable batches resume the node's own engine (wake
 rule 1 corollary).
 
+Idempotency across a forward's retries (2026-09-27): the proposer's `PendingPool`
+is nonce-unique — a re-forwarded transaction it already holds (staged or in
+flight) joins the pooled entry's waiters instead of becoming a second copy, which
+preflight would have rejected as a semantic duplicate while the first committed.
+On the forwarder, a `Rejected` verdict for a nonce already in the local
+`committed_tx_nonces` resolves as committed: a committed transaction cannot be
+rejected. Across proposers the nonce table still decides.
+
 ## Testing
 
 - **Crate units** (~52): OUR surface only — the engine is upstream-verified.
