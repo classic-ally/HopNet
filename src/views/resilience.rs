@@ -123,10 +123,8 @@ impl ResilienceCache {
                 Some(rx) => rx,
                 None => self.start_refresh(&mut state, scan),
             };
-            if !ttl.is_zero() {
-                if let Some(cached) = &state.entry {
-                    return Ok(cached.parts.clone());
-                }
+            if let Some(cached) = state.entry.as_ref().filter(|_| !ttl.is_zero()) {
+                return Ok(cached.parts.clone());
             }
             rx
         };

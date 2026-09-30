@@ -384,9 +384,12 @@ impl TestScenario for LifecycleCutoverDrain {
             },
         );
 
-        // 7. Coherent everywhere.
+        // 7. Coherent everywhere. Coherence, not progress: a fully drained
+        //    mesh is idle (on-demand heights), so the floor is one below the
+        //    tip — every node at the tip, or past it, satisfies it at once.
         let tip = decided_height(&fresh_nodes[0]).await.unwrap_or(seal_height);
-        let (converged, heights) = wait_for_convergence(&fresh_nodes, tip, 120).await;
+        let (converged, heights) =
+            wait_for_convergence(&fresh_nodes, tip.saturating_sub(1), 120).await;
         let snapshots = fetch_state_snapshots(&fresh_nodes).await?;
         let (coherent, detail) = coherence(&snapshots);
         print_and_add_check(
