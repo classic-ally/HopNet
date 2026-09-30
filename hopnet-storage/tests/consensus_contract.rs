@@ -223,7 +223,7 @@ fn placement_is_profile_invariant() {
     let place = |profile| {
         let view = derive_view(100, nodes.clone(), &grid, step, &policy, profile);
         let mut selected: Vec<i32> =
-            select_nodes_for_blob(view.members.clone(), view.metrics.clone(), &seed)
+            select_nodes_for_blob(view.members.clone(), &view.weights, &seed)
                 .iter()
                 .map(|p| p.node_id)
                 .collect();

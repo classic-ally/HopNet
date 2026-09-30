@@ -232,7 +232,7 @@ impl TransactionHandler for PhotoAddHandler {
                 tracing::warn!("photo_add: user {user_id} is not a member of library {lib}",);
                 return Err(DatabaseError::AuthorizationError);
             }
-            insert_photo_entry(db_tx, entry, ctx.fragments_dir)?;
+            insert_photo_entry(db_tx, entry, &ctx.into())?;
         }
 
         Ok(())
@@ -506,7 +506,7 @@ impl TransactionHandler for PhotoEditContentHandler {
                     &entry.metadata_access,
                 )?;
             }
-            edit_photo_content(db_tx, entry, ctx.fragments_dir, user_id)?;
+            edit_photo_content(db_tx, entry, &ctx.into(), user_id)?;
         }
         Ok(())
     }

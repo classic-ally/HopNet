@@ -28,6 +28,7 @@ pub(crate) mod graceful_leave;
 mod import;
 mod iroh_ping;
 mod iroh_reject_unknown;
+mod lifecycle_cutover;
 mod malachite;
 pub(crate) mod mesh_growth;
 mod metrics;
@@ -145,7 +146,10 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, String)> {
     // newest PRE-ENFORCEMENT release — the mesh crosses the actual
     // enforcement severance (load the old image with
     // `scripts/build-release-image.sh v<ENFORCEMENT_OLD_RELEASE>`).
-    if test_name == "enforcement-crossing" {
+    // RFC-STORAGE-003 cutover rehearsal: the same crossing as above, on a
+    // POPULATED mesh, watched through the lifecycle drain (see
+    // lifecycle_cutover.rs). Same old image, same staged claim.
+    if test_name == "enforcement-crossing" || test_name == "lifecycle-cutover-drain" {
         return vec![
             (
                 "HOPNET_GENESIS_CONSENSUS_POLICY",
@@ -323,7 +327,8 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         | "straggler-rejoin"
         | "diverged-node-rebuild"
         | "regenesis-rollback"
-        | "enforcement-crossing" => Some(3),
+        | "enforcement-crossing"
+        | "lifecycle-cutover-drain" => Some(3),
         _ => None,
     }
 }
@@ -487,6 +492,11 @@ pub async fn run_test_by_name(
                 .await
         }
         "regenesis-cutover" => regenesis::RegenesisCutover.run(mesh_id, nodes, flags).await,
+        "lifecycle-cutover-drain" => {
+            lifecycle_cutover::LifecycleCutoverDrain
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "evidence-observe" => {
             evidence_observe::EvidenceObserve
                 .run(mesh_id, nodes, flags)
@@ -685,6 +695,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "diverged-node-rebuild",
         "regenesis-rollback",
         "regenesis-cutover",
+        "lifecycle-cutover-drain",
         "mesh-growth",
         "mixed-version-mesh",
         "retired-dialer",
@@ -773,6 +784,46 @@ pub fn device_client() -> Client {
 
 /// Get the maximum consensus view across all nodes
 /// Polls all nodes in parallel and returns the highest view number
+/// The consensus functions decided at each height in `from..=to` on `node`
+/// (`GET /api/consensus/blocks`), so a check can attribute heights to the
+/// traffic that filled them.
+pub async fn decided_functions(
+    node: &NodeInfo,
+    from: u64,
+    to: u64,
+) -> Result<Vec<(u64, Vec<String>)>> {
+    let client = crate::insecure_client();
+    let url = format!(
+        "https://{}:{}/api/consensus/blocks?from={from}&to={to}",
+        node.ip_address, node.port
+    );
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", node.jwt_token))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "decided functions {from}..={to} on node {}: HTTP {}",
+        node.node_id,
+        response.status()
+    );
+    let rows: Vec<serde_json::Value> = response.json().await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let height = row["height"].as_u64()?;
+            let functions = row["functions"]
+                .as_array()?
+                .iter()
+                .filter_map(|f| f.as_str().map(str::to_string))
+                .collect();
+            Some((height, functions))
+        })
+        .collect())
+}
+
 pub async fn get_max_view(nodes: &[NodeInfo]) -> Result<u64> {
     let client = crate::insecure_client();
 

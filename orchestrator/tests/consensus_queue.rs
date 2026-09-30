@@ -11,7 +11,7 @@ use crate::tests::files::{
 };
 use crate::tests::multi_user::fetch_state_snapshots;
 use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
-use crate::tests::{get_max_view, wait_for_minimum_view};
+use crate::tests::{decided_functions, get_max_view, wait_for_minimum_view};
 
 // ============================================================================
 // Helpers
@@ -337,18 +337,42 @@ impl TestScenario for ConsensusQueueBurst {
         tokio::time::sleep(Duration::from_secs(8)).await;
 
         // ── Batching efficiency ──────────────────────────────────────────
+        // Count only the heights that carried the burst's OWN operations.
+        // Every upload also spawns the storage lifecycle's follow-up
+        // transactions on every node (self-check, attestation, confirm —
+        // RFC-STORAGE-003 S3/S5), which fill heights of their own; the
+        // question here is how many heights the ten requests needed, not
+        // how busy the chain was afterwards.
         let view_after = get_max_view(nodes).await.unwrap_or(view_before);
         let views_consumed = view_after.saturating_sub(view_before);
+        const BURST_FUNCTIONS: [&str; 3] =
+            ["insert_files", "register_device", "update_user_profile"];
+        let (own_heights, own_txs) =
+            match decided_functions(target, view_before + 1, view_after).await {
+                Ok(rows) => rows
+                    .iter()
+                    .fold((0u64, 0usize), |(heights, txs), (_, functions)| {
+                        let mine = functions
+                            .iter()
+                            .filter(|f| BURST_FUNCTIONS.contains(&f.as_str()))
+                            .count();
+                        (heights + (mine > 0) as u64, txs + mine)
+                    }),
+                Err(e) => {
+                    eprintln!("    decided functions read failed: {e}");
+                    (views_consumed, 0)
+                }
+            };
 
-        let batched = views_consumed < 10;
+        let batched = own_heights < 10;
         print_and_add_check(
             &mut result,
             Check {
                 name: "Batching efficiency".to_string(),
                 passed: batched,
                 detail: Some(format!(
-                    "{} views consumed for 10 ops (views {}-{})",
-                    views_consumed, view_before, view_after
+                    "{own_txs} burst txs landed in {own_heights} heights ({views_consumed} views consumed overall, {}-{})",
+                    view_before, view_after
                 )),
             },
         );

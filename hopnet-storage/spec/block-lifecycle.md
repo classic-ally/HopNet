@@ -1,0 +1,1146 @@
+# RFC-STORAGE-003: Block Lifecycle Convergence
+
+**Status**: Draft (2026-08-20)
+**Depends on**: RFC-STORAGE-001 (the durability policy and normative
+model this extends), RFC-STORAGE-002 (the tick/engine seams and stage
+discipline this builds on), RFC-014 (the distribution engine, and the
+NULL-placement reconciliation follow-up named twice in engine/mod.rs
+that this RFC discharges)
+**Amends**: RFC-STORAGE-001 (the model gains pipeline states —
+origin-held init, declare/confirm rungs, a lossy-mark adversary — and
+INV-CONVERGE), RFC-014 (distribution ownership: the decide-time kick
+demotes to a latency hint; the reconciliation scan becomes the
+authority)
+**Absorbs**: RFC-007's remaining storage surfaces (orphan-cleanup
+scheduling, lost-shard recovery, rebalance triggers); the
+self-attestation half of the attestation RFC (disk-truth verification;
+retrieval reputation stays out)
+**Related**: RFC-020 (schema evolution for any new column/tx), RFC-025
+(any new RPC scope is born under the ALPN class scheme), regenesis
+(`reconcile_fragment_store` is the one-shot ancestor of the disk-truth
+rung)
+**Unblocks**: RFC-STORAGE-004 — performance-aware placement (weight
+derivation stays a single injected seam; deferred by design)
+
+## Summary
+
+Every committed, undeleted blob converges to policy-conformant
+placement from any reachable pipeline state within a bounded calm
+window, under the fault budget.
+
+RFC-STORAGE-001 establishes this only under the assumption of
+successful placement. The entire upload-to-placement pipeline sits
+outside the proof, and there are gaps the model cannot see — one
+found in production, two by inspection:
+
+- blobs stranded unplaced with no retry path,
+- local-state marks dropped permanently by a full channel,
+- a migration cursor that re-selects the same blob forever.
+
+This RFC extends the model to the whole pipeline and states
+INV-CONVERGE as a checked invariant — safety verified exhaustively,
+convergence by witness and simulation.
+
+The implementation follows by refinement: every fairness assumption
+the model makes is named and the discharge mechanism is described.
+
+One level-triggered reconciliation loop owns all fragment movement:
+distribution unifies on pull by the responsible nodes, attestation
+reconciles against bytes on disk, and the staleness drain consumes
+its own work-list, so progress cannot stall on a cursor. A mechanism
+is in scope iff it discharges a model
+assumption. Placement inputs stay frozen; the weight derivation
+remains one injected seam so RFC-STORAGE-004 (performance-aware
+placement) can follow without touching the reconciler. Late stages
+surface per-urgency-tier time-to-conformance in the resilience pane.
+
+## Motivation
+
+- **The proof starts after the pipeline.** The RFC-STORAGE-001 model
+  assumes every class is already on its responsible node
+  (`spec/storage_policy.qnt:180-192` — "Init: conformant, fresh
+  views, everyone up"). There is no unplaced state nor distribution
+  modeling: the stranded-blob failure mode is unrepresentable as it
+  exists outside (earlier than) the model's universe. INV-RECOVER's
+  guarantee is conditioned on the chunk being inside the engine's
+  loop, but whether a blob ever enters that loop is out of that
+  model's scope.
+- **Blobs strand at `placement_height IS NULL` — found in
+  production.** If a peer restarts, the origin's transfer path can
+  become stale. Distribution fails, and the blocks remain held only
+  by the origin (single-copy) with no code path that would ever
+  retry distribution.
+- Three independent gaps compose:
+  - the distribution worker logs a failure and drops the blob — no
+    requeue, no backoff, no dead-letter (`engine/mod.rs:283-287`);
+  - tier-1 repair structurally excludes unplaced blobs — `repair_one`
+    diffs placement against a prior height that does not exist
+    (`engine/mod.rs:375-379`; candidate query filters
+    `placement_height IS NOT NULL`, `store.rs:777`);
+  - `FAILURE_THRESHOLD_PERCENT = 10.0` is unreachable on a small
+    mesh — 30 fragments across 3 nodes admits only 0/33.3/66.7/100%
+    failure rates, so losing any single peer fails 100% of writes
+    (`engine/policy.rs:21`, enforced `engine/mod.rs:721`).
+  - Further entries into the same state, never observed but open:
+    blob ids decided before the engine's OnceCell is set are silently
+    dropped (`consensus/malachite/app.rs:414`); the placement batcher
+    drops commits on `Rejected`, on encode failure, and after 3 flush
+    attempts (`engine/mod.rs:852-874`) — fragments distributed,
+    height forever NULL.
+  - The operator drain (`POST /maintenance/drain-unplaced`, commit
+    6692302) makes the incident recoverable by hand. It does not
+    close the hole: new failures strand new blobs, and recovery
+    requires a human noticing the resilience pane.
+- **Local-state marks are lossy, and the loss is permanent.**
+  - `mark_local`/`mark_remote_batch` are `try_send` onto a
+    bounded(1024) channel; overflow drops the update with a warning
+    (`substrate_host.rs:244`).
+  - The trait doc claims a dropped update "self-heals via self-check
+    attestation" (`hopnet-storage/src/traits.rs:209-211`) — false:
+    the self-check differential reads the `stored_locally` flag,
+    never the disk (`store.rs:440`).
+  - A dropped mark is never attested, invisible to repair, yet not
+    an orphan (its hash is in `fragment_hashes`), so the mesh
+    re-encodes a byte-identical duplicate elsewhere while the bytes
+    sit unused.
+  - The only reconciliation against disk truth is
+    `reconcile_fragment_store`, which runs solely during a regenesis
+    epoch join. Relatedly, `self_verified_height` is
+    blanket-restamped by every self-check without any disk read
+    (`store.rs:352-357`) — and read routing ranks fragment sources
+    by it (`src/db/inventory.rs:78`).
+- **The migration cursor never advances.** The automatic rebalance
+  rung calls `run_network_rebalancing(app_state, 1, 0)`
+  (`jobs.rs:741`) against an `ORDER BY placement_height ASC LIMIT 1`
+  query (`store.rs:775-780`). A `RepairOutcome::Unchanged` does not
+  rewrite `placement_height`, so every 5-minute tick re-selects the
+  same oldest blob: the automatic path examines one blob, mesh-wide,
+  forever. Only the manual `POST /maintenance/rebalance` route
+  escapes.
+- **The remaining lifecycle jobs exist but never run** (as found;
+  landed in S5 and S6). Orphaned data-block cleanup has an apalis
+  handler registered with no worker (`src/storage_host/jobs.rs:18`);
+  orphaned fragment-file GC is manual, two-call, and its scan cache
+  is process-memory — lost on restart (`jobs.rs:418`). RFC-007
+  specified schedules for both;
+  none were built. This RFC absorbs those surfaces so lifecycle
+  ownership lands in one place.
+
+## The Model Extension
+
+- **One new state pair, one new init.** The chunk gains
+  `(confirmed, target)` — the model image of the two columns
+  `placement_height` / `desired_placement_height`.
+  - `confirmed` is the obligation epoch: the view height whose
+    assignment defines who must currently hold what. NULL until the
+    first confirmation — "never placed" keeps its meaning and its
+    pane observable.
+  - `target` is the goal: the view height whose assignment the
+    reconciler always converges toward. Never NULL — stamped at blob
+    insert with the insert's own decided height, moved only by
+    declaration, equal to `confirmed` when quiescent.
+  - Birth is a declaration: `apply_blob_insert` runs in consensus,
+    so stamping `target` at insert is deterministic and free — a
+    newborn blob is already in-flight toward the current view, and
+    initial distribution needs no separate declaration tx.
+  - The stranded state becomes unrepresentable: with
+    `desired_placement_height NOT NULL` as a schema constraint,
+    "no defined goal" cannot be stored, and the worker never
+    case-splits on its absence — it always attempts convergence on
+    `target`.
+  - `initOriginHeld` models birth: every class on a single origin
+    node, `confirmed = ⊥`, `target = the current view`. The
+    existing conformant init remains for regression against
+    RFC-STORAGE-001's properties.
+- **Stuck points are regions, not histories.** The chunk's state is
+  the cross-product (`copies`, `invView`, `(confirmed, target)`) —
+  `copies` being the model's per-class holder sets (class → set of
+  nodes), `invView` the mesh's consensus-replicated inventory belief
+  of them, and the pair the control-plane record: `confirmed` the
+  committed baseline (`placement_height`), `target` the declared
+  goal. Every production stuck point maps to a region:
+  - origin-only × unplaced — not yet processed by the distribution
+    worker, or dropped after a failed distribution;
+  - mixed × unplaced — partial distribution: the engine moves one
+    class per tick, so the model passes through every in-between
+    configuration (1 of 30 moved, 2 of 30, ...), and a fault can
+    land on any of them; whatever state it lands on is the starting
+    point recovery must handle;
+  - conformant × unplaced — distribution finished, but the placement
+    commit was dropped;
+  - `invView ≠ copies`, either direction — a dropped `mark_local`
+    under-claims a node's own inventory state, a dropped
+    `mark_remote` over-claims it.
+  - INV-CONVERGE quantifies over all reachable states, so the
+    checker's obligation is exactly: no region is a fixpoint short
+    of the target under calm (non-increasing pressure). The target
+    is the full fixpoint defined by INV-CONVERGE below — belief
+    included, because a converged-but-misbelieved state re-diverges
+    through the actions that read belief.
+  - The model does not track how a state was reached — entry paths
+    matter for evidence, not for convergence.
+  - `(confirmed, target)` gates nothing: the pair appears only in
+    the invariant and in its own declare/confirm rungs. The three
+    axes carry different weight — `copies` bears durability
+    (INV-DURABLE reads it alone), `invView` bears action-safety
+    (eviction deletes on its say-so), the pair bears neither. The
+    implementation inverted this, making the least critical axis
+    the gatekeeper of recovery; `placement_height` is record, never
+    filter.
+- **The protection predicate — the single eviction guard.** A copy
+  of class f held by node n is protected iff any of:
+  - `confirmed` is NULL — the blob has never been confirmed, no
+    obligation has ever lapsed, and every existing copy is
+    load-bearing regardless of who holds it (this is what makes the
+    origin's copies safe between birth and first confirmation);
+  - `confirmed` is set and n is responsible for f under
+    `assignment(view@confirmed)` — the standing obligation;
+  - n is responsible for f under the assignment of ANY
+    declared-but-unconfirmed epoch — the transition record's view
+    snapshots in `(placement_height, desired]`, the current target
+    always among them. Without this clause a pressure spike
+    mid-handoff evicts the newly pulled copy and the handoff
+    livelocks — and covering only the newest target is not enough
+    (S0 finding, by checker counterexample): a supersede-declare
+    would strip the previous destination's freshly pulled copy —
+    possibly the only real bytes — of protection, evictable through
+    a stale row. Protection lapses only at confirm, exactly as
+    obligations do;
+  - the copy is pinned.
+  Everything else is surplus: evictable, lazily, under the normal
+  pressure-driven watermark rules, with the attested-other-holder
+  belief check retained as a second belt. This predicate is one pure
+  function in hopnet-storage, consumed by both the reconciler and
+  the evictor, and it is the model's `envEvict` guard verbatim —
+  eviction timing stays adversarial in the model, so scheduling is
+  free; computing the guard differently anywhere is the only way to
+  reintroduce the loss, and single-sourcing forbids it.
+- **INV-EVICT-SAFE — the system never self-harms.** No eviction
+  step ever removes the last extant copy of a class *on truthful
+  belief*. Encoded with a one-bit history variable (set when an
+  `envEvict` empties a class's extant copy set while belief for
+  that class was a subset of truth; invariant: never set), and
+  checked unconditionally — under any fault interleaving, with
+  every budget spent — because eviction is the system's own action:
+  the environment may destroy copies, the system never may.
+  - The truthful-belief condition is an S0 refinement, forced by a
+    checker counterexample: a fresh attestation can precede an
+    instant disk death (surplus holder n, sole responsible m dies
+    undetected, belief still names m, n evicts) — no recency scheme
+    closes that window, in the model or in the implementation.
+    Last-copy loss on *false* belief is therefore the environment's
+    harm, budgeted, and bounded by INV-DURABLE; the invariant's job
+    is blame isolation, and under a correct belt the truthful case
+    provably cannot fire — so a violation is definitionally a
+    predicate/belt regression, no triage.
+- **A new environment action: `envDropMark`.** The queue can lie to
+  the database, the database lies to the mesh, and the mesh's belief
+  is what eviction trusts — so the model gains the power to lie in
+  exactly that way, and the proofs must still hold. `envDropMark`
+  under-claims: a real copy vanishes from belief under a drop budget
+  (MAX_DROPS, the analogue of MAX_CORRUPT) — the model image of a
+  full local-state channel dropping a `mark_local`, leaving bytes
+  the mesh never learns about. This models an honest node whose
+  bookkeeping went wrong — not a node that lies; the lying node is
+  outside the perimeter (see below).
+  - The over-claim direction (belief counting a copy it should not
+    — the dropped `mark_remote`) is deliberately NOT a fabricating
+    action; S0 finding. Inventory rows originate solely from a
+    holder's own self-attestation, so an over-claiming row was true
+    at attestation and went stale through a loss; the model already
+    represents that as belief lag between faults/evictions and the
+    sync rung, under fully adversarial scheduling. The
+    stale-laundering such rows enable is fault-anchored: every
+    class an eviction chain kills through a stale row traces to a
+    budgeted fault that already accounts for that class in the
+    burst math (witnessed: `evictLaunderAccountingTest`).
+  - A FABRICATED positive — a row for bytes never held — is
+    provably outside what the design can survive: handed one
+    phantom entry, the checker kills a class with no budget spent,
+    because the phantom launders ConfirmPlacement (real obligations
+    lapse against fake evidence) and the eviction belt then trusts
+    the same phantom — one lie spent twice. That counterexample is
+    the formal justification for S5's honest attestation: rows must
+    be disk-verified at write time precisely because confirm
+    validation and the eviction belt both stand on them. The
+    fabricating attester is the lying node, excluded with it.
+  Consequences:
+  - **Convergence forces disk-truth attestation.** The model's
+    inventory-sync rung restores belief from truth (`invView' =
+    copies`). The implementation as built restores belief from the
+    flag — the corrupted thing itself — so a single drop diverges
+    belief forever, and the checker will exhibit exactly that
+    counterexample. The only honest discharge is a mechanism that
+    reads the disk: scan, compare, repair the flag and the
+    attestation.
+  - **Safety must be re-proven under drops.** Stale belief aims at
+    the one action that deletes bytes, and the drop makes real
+    copies invisible to repair and to confirm evidence. The widened
+    protection predicate carries the proof (obligations come from
+    consensus columns; belief is demoted to a second belt) — proved,
+    not expected: the check runs with the action enabled, and the
+    stale-eviction chains the belt admits are fault-anchored per the
+    accounting witness above.
+  - **The property schedules the mechanism.** Belief is dishonest
+    for at most one disk-truth cycle, so the sweep's cadence enters
+    the wall-clock convergence bound and is chosen from it, not
+    from taste. Drops are also locally observable, and the
+    implementation removes them outright: the marks become awaited
+    sends (backpressure — see Mechanisms), leaving the periodic
+    sweep as the backstop for divergences nobody observed: a crash
+    between store and mark, manual file surgery, bugs. The
+    adversary does not care why belief diverged, so the proof
+    covers all of them.
+  - **Recency becomes a first-class input.** `self_verified_height`
+    finally means "the last height these bytes were seen on disk":
+    confirmation validation and the eviction belt may demand
+    attestations verified within N heights, with N sized against
+    the sweep cadence the bound already fixed.
+- **INV-CONVERGE.** At every moment, at least one of these holds:
+  the blob was deleted, or the engine has not yet had CALM_BOUND
+  uninterrupted turns, or the blob is unreadable from online nodes,
+  or the blob is converged. Read backwards: given enough
+  uninterrupted turns over a readable chunk, the engine finishes
+  the job. (Phrased as an always-true formula because that is what
+  the checker can verify — the same encoding INV-RECOVER already
+  uses.)
+  - The readability disjunct (`available`: K classes live on online
+    nodes) is an S0 finding: with most holders asleep, pulls have
+    no source and re-encode is correctly gated on K live classes,
+    so the engine must idle without penalty until wake or decay —
+    you cannot converge what you cannot read. v2's INV-RECOVER had
+    the same hole unstated; it survived because random simulation
+    cannot string CALM_BOUND consecutive engine ticks (~1e-12 per
+    trace) and Apalache only ever checked safety. `available` is
+    monotone under engine ticks (pull needs a live source,
+    re-encode needs K live), so holding at check time means it held
+    through the window being judged.
+  "Converged" is four plain conditions:
+  - the bytes are in the right places — every class sits on the
+    node the goal assignment names;
+  - the paperwork is done — `confirmed = target`, no handoff in
+    flight;
+  - the goal is not stale — the assignment at `target` equals the
+    assignment under today's view, so victory is never declared
+    against an outdated map. This is also the propose hook's
+    nothing-owed check: "model converged" and "consensus quiet"
+    are the same test;
+  - belief matches reality — `invView = copies`.
+  The tick gains two rungs, which are just the two txs under model
+  names: declare (move the goal when the world changed) and confirm
+  (stamp the paperwork once the bytes arrived). Pulling bytes is
+  the existing rung, unchanged — birth is a pull toward a goal,
+  same as migration.
+- **CALM_BOUND is a promise about the engine, not the weather.**
+  - It does not claim the network gives us N quiet ticks; it claims
+    N quiet ticks suffice to finish one chunk. If quiet never
+    comes, convergence was never promised — but safety
+    (INV-DURABLE, INV-EVICT-SAFE) holds the whole time regardless.
+  - The number is counted, not tuned: one tick to sync the view,
+    one to declare, N_FRAGS to pull each class, sync ticks for
+    inventory, one to confirm. One counting subtlety: confirm
+    cannot look at reality directly — the real ConfirmPlacement is
+    validated against attested inventory rows, so the model's
+    confirm rung reads belief (`invView`) too. Belief lags reality
+    by one sync rung, so at least one sync tick must land between
+    the last pull and the confirm. Whether the engine syncs after
+    every pull (two ticks per class) or once after all pulls
+    (N_FRAGS + 1) is decided by rung priority in the tick's ladder;
+    the count, and thus CALM_BOUND, follows from that choice.
+  - S0 decided the ladder: view sync > declare > re-encode > pull >
+    belief sync > confirm — sync once, after the moves. It is the
+    faithful image of the implementation (inventory rows land via
+    batched self-checks, never per-pull), it puts re-encode above
+    pull (liveness deficit first, matching the duty ladder), and it
+    makes the bound linear at ~1 tick per moved class: 13 at the
+    scaled size, witnessed tight (12 provably insufficient — the
+    worst window is an origin flap that re-runs the decay gate over
+    a fully pruned surplus). The sync-after-every-pull alternative
+    measured 19 on the same config with the same invariants, and
+    would additionally promise a belief freshness the
+    implementation does not deliver.
+  - The checker keeps the count honest in both directions: the
+    invariant must pass at CALM_BOUND (it is enough) and a witness
+    must fail at CALM_BOUND − 1 (it is tight). A miscount breaks
+    loudly, with a counterexample naming the true cost.
+  - It is ticks for one chunk, not wall-clock for the mesh.
+    Fleet-level time-to-optimality is backlog work over measured
+    throughput — the ETA observable, a late stage. The bound's
+    contribution there is soundness: linear-in-N_FRAGS per-chunk
+    cost is what licenses summing bounded per-chunk costs into an
+    ETA at all.
+- **The checking regime, stated honestly.**
+  - Safety — INV-DURABLE, INV-SPREAD, INV-EVICT-SAFE: exhaustive
+    bounded model checking (Apalache), small depth, from all three
+    inits, with `envDropMark` enabled.
+  - One budget asterisk (S0): from the origin-held init, INV-DURABLE
+    is checked with the depart budget zeroed — a single-copy blob
+    whose origin disk dies before first replication is data loss by
+    nature, the upload durability window every storage system has
+    until first replication; no placement policy can carry that
+    proof. Everything else stays adversarial from birth: sleep,
+    eviction pressure, corruption, mark loss. The window itself is
+    bounded by the same CALM_BOUND that bounds distribution.
+  - Convergence — INV-CONVERGE: scripted witness runs from every
+    region the stuck-point bullet names, plus large random
+    simulation on the full-scale config. Exhaustive checking cannot
+    reach depth ≥ CALM_BOUND, so this is witnesses and simulation
+    by necessity — the same regime INV-RECOVER already lives under.
+    The RFC claims exhaustively-checked safety and witnessed,
+    simulated convergence; nothing stronger.
+- **Outside the perimeter.** The proofs are strong because their
+  boundaries are explicit; these are the boundaries.
+  - **A node that lies about its own holdings.** The fault model is
+    crash/corrupt/drop — honest nodes with wrong state, never
+    dishonest nodes. The damaging lie is a responsible node faking
+    its own obligation: the repair scan sees the class as live and
+    never re-encodes, confirmation counts the phantom attestation,
+    old holders lapse and evict — phantom durability, green
+    dashboards, dead chunk. No local mechanism closes this; the
+    closure is external proof-of-possession (passive retrieval
+    evidence, active nonce-keyed spot-checks), deferred with the
+    retrieval-reputation half of the attestation RFC. Deferrable
+    because the deployment profile is a personal mesh of one's own
+    and family's devices; a lying storage node is a secondary
+    threat there. Two hooks land now so the successor needs no
+    schema churn: verification provenance recorded beside
+    `self_verified_height` (self-scan vs remote challenge), and
+    "suspect" as an inventory-row state that triggers repair
+    exactly as missing does.
+  - **Cross-chunk scheduling fairness.** The model is one chunk;
+    starvation between chunks (the LIMIT-1 bug) is invisible to it
+    by construction. Fairness is structural instead: the staleness
+    drain consumes its own work-list, and fulfillment samples
+    randomly over a draining set — pinned by tests, not by the
+    checker.
+  - **Substrate liveness.** Tokio channels deliver, apalis crons
+    fire, the serial worker eventually runs: trusted, not modeled.
+    The model's tick abstracts all of it; a wedged runtime stalls
+    convergence but cannot break safety, since deletion is guarded
+    by the predicate, not by timing.
+  - **Consensus itself.** Decided blocks apply identically
+    everywhere (that is Malachite's BFT job), so consensus columns
+    and inventory rows are agreed state. The model consumes this as
+    an axiom; nothing here re-proves it.
+
+## The Handoff Protocol
+
+How the pair of columns and the pair of txs move a blob from any
+state to converged, with obligations never dropped in between.
+
+- **Two columns.**
+  - `placement_height` (nullable) is `confirmed`: the obligation
+    epoch. NULL until the first confirmation ever — "never placed"
+    keeps its meaning.
+  - `desired_placement_height` (NOT NULL, stamped at insert with
+    the insert's decided height) is `target`: the goal the
+    reconciler always converges toward.
+  - Quiescent means equal; in-flight means different. Both are one
+    indexed comparison.
+  - The in-flight set with its ages — decided height minus
+    `desired` — is the pane's new first-class observable, and it
+    degrades gracefully into today's unplaced-age chart for
+    newborns.
+- **DeclarePlacementTarget** — `{ targets: [(blob_id, from, to)] }`,
+  batched, proposer-originated (permissionless floor).
+  - Apply-side validation, identical on every node (there is no
+    per-tx voting; the block certificate is the vote):
+    - the blob exists and is undeleted;
+    - `from == desired_placement_height` — compare-and-swap, so a
+      stale declaration racing a newer one rejects cleanly;
+    - `to` is sane: a decided height, greater than `from`, within a
+      recency window of the tip;
+    - legitimate need: a storage-view transition exists in
+      `(from, to]` — one height comparison against the transition
+      record; no per-blob assignment computation anywhere in
+      declare's apply, which is row writes only.
+  - Effect: `desired_placement_height = to`. Nobody's hold
+    obligation changes — and nobody's protection either: the new
+    epoch joins the in-flight set the predicate covers; earlier
+    destinations stay protected until confirm. The new responsibles
+    under `view@to` gain a pull duty, derived from the column
+    itself.
+  - The columns record need, not activity. There is deliberately no
+    cap on the in-flight set: capping declarations would make the
+    control plane's liveness depend on data-plane capacity, and a
+    wedged worker would silence the mechanism that records what is
+    owed. Unbounded need is safe — transfer concurrency is bounded
+    where it executes (pull budgets, the serial worker), and a stalled
+    drain shows as the in-flight ages growing, never as refused
+    txs. The model has no cap either; the implementation stays a
+    faithful refinement. Declare batches are chunked for block-size
+    hygiene only — pagination, not a cap.
+  - Supersede is just another declare: if the view moves again
+    mid-flight, a later declaration moves `desired` forward under
+    the same validation. No timeouts exist anywhere — a stalled
+    handoff is simply still in flight, visible by its age, and the
+    next declaration or completed pull advances it.
+- **ConfirmPlacement** — `{ confirmations: [(blob_id, height)] }`,
+  batched, proposable by anyone.
+  - The proofs are not collected by the proposer — they are already
+    in consensus: attestation rows (`fragment_inventory`) placed
+    there by the existing self-check machinery, which this RFC
+    leaves as the only evidence path. The proposer merely points at
+    blobs whose evidence is now sufficient.
+  - Apply-side validation:
+    - `height == desired_placement_height` — confirming exactly the
+      declared goal, nothing else;
+    - for every class of `assignment(view@height)`: the responsible
+      node under that view has an attested inventory row for it —
+      and, once disk-truth attestation lands, one verified within
+      the recency bound;
+    - a confirmation failing validation is a rejected no-op; the
+      need stays recorded and the next pass re-proposes.
+  - Effect: `placement_height = height`. Old holders' obligations
+    lapse — their copies become surplus, protected now only by the
+    attested-successor belt, reclaimed lazily under pressure.
+  - This is the sole writer of `placement_height` after
+    `apply_blob_insert`'s NULL. It retires the blind-stamping
+    `update_placement_heights` (the batcher emits ConfirmPlacement
+    and inherits validation) and closes repair's side door — a
+    migration's re-stamp is a declare/confirm pair like any other.
+  - No election protects it because none is needed: validation
+    carries all the safety, so racing proposers are harmless. Any
+    node's fulfillment pass proposes confirmations it discovers; an
+    optional fast path lets the new class-0 responsible propose the
+    moment its attestation lands.
+- **The staleness pass: a proposer-driven, self-consuming drain.**
+  - Selection is one indexed predicate: `desired_placement_height <
+    T`, T the latest storage-view transition. Every selected blob is
+    declared to T (S4 decision: the view at the tip is the view at
+    T, and goals then coincide with record rows) — no per-blob
+    divergence check at declare time. Re-goaling is not movement: capped-HRW minimal
+    movement means most declares are clean re-goals whose holders
+    are unchanged; whether a blob actually moves is discovered
+    later, by fulfillment, distributed.
+  - The work-list consumes itself: a declared blob leaves the set,
+    so pagination (sized for max block size) needs no cursor and no
+    progress txs — the schema records processedness. The backlog
+    count is the pane observable; "missed transition" detection is
+    simply the set being nonempty.
+  - Triggers: the primary mechanism is a propose hook — whoever
+    assembles a block, at any height and round, runs the indexed
+    `desired < T` check and appends owed declare pages to its own
+    proposal. Origination and inclusion collapse into one act by
+    the one node empowered to include; a transition block is
+    naturally followed by the next proposer's hook draining the
+    first pages. The role rotates wherever consensus is active,
+    and recurring background traffic (metrics, uploads) reactivates
+    consensus within minutes, carrying the role past dead or
+    censoring proposers. Last rung, for self-containment: any node
+    that has not observed the `desired < T` check occur within a
+    generous wall-clock grace (~15 minutes — longer than the
+    metrics heartbeat, so it never fires while the propose hook is
+    healthy) submits a page directly, so convergence never rests on
+    a sibling subsystem's heartbeat. Per-blob CAS dedups every
+    race.
+- **The fulfillment pass: universal, random-sampled, and the sole
+  confirmation path.**
+  - Fused with redistribution: each node's tick pulls the classes
+    it owes, then samples N random in-flight blobs and recomputes
+    their confirm-readiness from ground state — assignment at
+    `view@desired`, attested inventory rows, recency — batching
+    ConfirmPlacement for those satisfied. Recurrence over a
+    draining set is what makes the sample comprehensive; the
+    apply-time-derived ready-index is a latency optimization with
+    no proof obligations attached.
+  - After a transition the in-flight set balloons with clean
+    re-goals awaiting their rubber stamp. Harmless: identical
+    holders under both epochs means zero extra protected copies and
+    zero eviction impact. Drain rate is M × N per tick — a 3-node
+    mesh at N = 1000 per 5-minute tick retires ~36k/hour, a million
+    stale blobs in about a day; N adapts upward when sampled
+    ready-density is high.
+  - Confirm validation recomputes assignment at apply on every node
+    — M-redundant by nature, the intrinsic price of validated
+    placement, bounded per block by confirmation batch size and
+    spread over the drain rather than spiking at declare time.
+- **Clocks, workload split, and the transition record.**
+  - Every schedule is wall-clock, never height-driven: chain
+    quiescence cannot pause a worker, and a worker submitting is
+    precisely what wakes the chain — the dependency points one way
+    only. Timers gate who proposes, never what is valid, so they
+    need no agreement.
+  - The split: staleness rides block assembly (the propose hook)
+    plus the grace rung, costing the tick nothing; fulfillment owns
+    the tick's budget on every node. If the in-flight set balloons
+    pathologically, the proposer may pace its declare pages:
+    scheduling backpressure, never refusal of recorded need.
+  - The transition record — heights where the derived storage view
+    actually changed, each with a memoized view snapshot — is
+    derived incrementally at apply (every block, after its txs) and
+    prunable below `min(desired)`. Only confirm validation reads
+    historical snapshots; the sweep needs just the latest.
+    - S1 decision (2026-09-21): the record is REPLICATED state
+      (`storage_view_transitions`, exported and divergence-checked),
+      not node-local as first drafted. Apply validation must be
+      identical on every node, and a node-local record a joiner
+      lacked would make it skip declare/confirm entries other nodes
+      applied — diverging `data_blocks`. Every node derives the
+      same rows from the same replicated inputs, so writing them
+      into an exported table costs nothing and removes the rebuild
+      path entirely; the artifact carries the record across epochs.
+    - The snapshot is exactly what moves bytes — the member set
+      and each member's quantized placement weight — canonically
+      ordered, and nothing else; the view in force at height h is
+      the latest row at or below h. Selection above 30 members
+      ranks by the same 16-level weight the assignment divides by,
+      so no raw metric score enters the snapshot (the model's view:
+      a member set and a constant weight map). Rehearsal finding,
+      2026-09-27: the first cut carried the members' raw metrics
+      rows for that selection stage, and every `submit_metrics`
+      commit changed the bytes — a transition per heartbeat, every
+      blob re-declared every few minutes, a 500-blob drain that
+      never converged. Transitions are designed-rare: the decay
+      gate and quantized weights exist so metric noise does not
+      move the view — days-to-weeks cadence in a steady mesh, and
+      sustained churn is visible as a drain that never completes.
+  - Silence is legitimate iff no blob has `desired < T` and the
+    in-flight set is empty — two indexed predicates, checkable by
+    any node, and exactly the model's converged fixpoint projected
+    onto the schema.
+
+## The Assumption-Discharge Table
+
+The model's guarantees transfer to the implementation only if every
+assumption the model makes is made true by a named mechanism. This
+table is that binding. A mechanism is in scope for this RFC iff it
+appears in the right column; anything not appearing here is an
+optimization and carries no proof obligation.
+
+```
+| The model assumes              | Made true by                               |
+|--------------------------------|--------------------------------------------|
+| Every chunk is inside the loop | desired_placement_height NOT NULL, stamped |
+| from birth -- no unreachable   | at insert; no rung filters on              |
+| regions                        | placement_height (record, never filter);   |
+|                                | the staleness predicate desired < T covers |
+|                                | quiescent and in-flight blobs alike        |
+|--------------------------------|--------------------------------------------|
+| The declare rung fires when    | The propose hook: every block assembler    |
+| the goal is stale              | runs the desired < T check and appends     |
+|                                | owed pages; the ~15 min any-node grace     |
+|                                | rung backstops a traffic-less chain        |
+|--------------------------------|--------------------------------------------|
+| The pull rung fires for owed   | Pull duties derived from the desired       |
+| classes                        | column at declare-apply; the serial worker |
+|                                | executes them; the fulfillment pass re-    |
+|                                | derives them from ground state each cycle  |
+|--------------------------------|--------------------------------------------|
+| The confirm rung fires once    | The fulfillment pass: every node, every    |
+| evidence is complete, and its  | tick, recomputes readiness for N random    |
+| guard reads belief             | in-flight blobs from fragment_inventory    |
+|                                | directly; ConfirmPlacement apply re-       |
+|                                | validates the same predicate on every node |
+|--------------------------------|--------------------------------------------|
+| Belief is restored from truth  | Disk-truth attestation: a periodic disk    |
+| (invView' = copies)            | sweep whose cadence enters the convergence |
+|                                | bound, plus awaited-send backpressure so   |
+|                                | observed drops cannot occur;               |
+|                                | self_verified_height stamped only by       |
+|                                | actual disk reads, with provenance         |
+|--------------------------------|--------------------------------------------|
+| Eviction fires only under the  | One pure function in hopnet-storage -- the |
+| protection predicate           | envEvict guard verbatim -- consumed by     |
+|                                | both the evictor and the reconciler; INV-  |
+|                                | EVICT-SAFE pins it under full adversarial  |
+|                                | interleaving                               |
+|--------------------------------|--------------------------------------------|
+| Obligations derive from agreed | The protection predicate reads             |
+| state, never belief            | (placement_height, desired) columns;       |
+|                                | obligations lapse only at ConfirmPlacement |
+|                                | apply, which cannot exist without attested |
+|                                | successors                                 |
+|--------------------------------|--------------------------------------------|
+| Assignment is a pure function  | The existing placement functions; the      |
+| of (view, blob)                | literal-table parity guard (table_guard)   |
+|                                | keeps model and backend in agreement       |
+|--------------------------------|--------------------------------------------|
+| Rungs are serviced fairly      | The self-consuming drain (processing       |
+| across chunks (outside the     | removes from the set) and random sampling  |
+| one-chunk model)               | over a draining set; pinned by tests, not  |
+|                                | the checker                                |
+|--------------------------------|--------------------------------------------|
+| Consensus applies decided txs  | Malachite BFT -- trusted axiom (perimeter) |
+| identically everywhere         |                                            |
+|--------------------------------|--------------------------------------------|
+| Faults stay within budget;     | Environment assumptions, not mechanisms -- |
+| calm windows occur             | deliberately unproven; their violation is  |
+|                                | visible (fault budget: repair shortfall in |
+|                                | the pane; calm: a drain that never         |
+|                                | completes)                                 |
+|--------------------------------|--------------------------------------------|
+```
+
+## Mechanisms
+
+- **Disk-truth attestation** — discharges `invView' = copies`;
+  repairs the record, never the data.
+  - The record path gets backpressure, not loss: `mark_local` /
+    `mark_remote` become awaited sends on the bounded local-state
+    channel, so a full queue slows the writer instead of lying to
+    it. Pull unification is what makes this safe — the receiver is
+    the initiator, so awaiting its own record write paces only its
+    own pulls, with no cross-node stall (under push, the same
+    backpressure would have blocked the sender's RPC). Accepting
+    bytes faster than the record can absorb them was never
+    throughput; on a slow disk the node now converges visibly
+    slower rather than diverging invisibly. The remaining
+    divergence sources — the crash window between store and mark,
+    manual surgery, bugs — are exactly what the existence sweep
+    repairs, and the model keeps `envDropMark` so the proof never
+    trusts this code being right.
+  - Unobserved divergence: a periodic existence sweep walks the
+    fragment store, diffs it against `stored_locally`, and repairs
+    the flag in both directions — bytes present but unflagged are
+    re-attested; bytes flagged but gone are un-attested. The next
+    self-check carries corrections into `fragment_inventory`, which
+    is the only truth channel: there is no separate rebuild list.
+  - Cadence is derived, not chosen: belief is dishonest for at most
+    one sweep cycle, and that cycle appears inside the wall-clock
+    convergence bound. An existence sweep is a readdir walk — daily
+    is cheap; the weekly scrub slices keep content verification and
+    share the walk when they coincide.
+  - `self_verified_height` becomes honest: stamped only by
+    disk-verified attestations — the blanket restamp in
+    `apply_self_check` dies. A provenance column records how a row
+    was verified (self-scan now; remote challenge reserved for the
+    proof-of-possession successor). "Suspect" becomes an
+    inventory-row state that triggers repair exactly as missing
+    does.
+- **Recovery is the fetch fallback** — repair-of-data belongs to
+  the one worker, not to a subsystem.
+  - The convergence worker's primitive is fetch-with-recovery: owed
+    class f is requested from its attested holders; if none serves
+    within the bound, it is RS-rebuilt from any K live classes.
+    Every operation inherits recovery for free — first
+    distribution, rebalance handoffs, and steady-state loss, which
+    needs no view change: the responsible node's standing
+    obligation is level-triggered, so its own tick discovers the
+    gap the sweep exposed and falls through to rebuild.
+  - Repair is thereby not a separate concern but an unfulfilled
+    obligation; the standalone missing-class scan retires into the
+    obligation check. The model said so first: pull and re-encode
+    are adjacent rungs with the same actor and guard shape.
+  - The urgency ladder survives as queue order: duties sort by
+    liveness deficit first (below-watermark chunks rebuild before
+    routine handoffs), then age — same serial worker, same bounded
+    memory. Below W with a down responsible, the lowest-live-class
+    responsible rebuilds as a deputy: a surplus, belief-protected
+    copy, matching today's urgent semantics so degraded chunks do
+    not wait out the decay gate.
+- **What this RFC retires.** The push pipeline dies whole:
+  - the distribution worker pool and `distribute_one`'s origin-push
+    path, including `FAILURE_THRESHOLD_PERCENT` (a threshold with
+    no reachable value on a small mesh) and the per-blob send
+    permits — transfer pacing moves to the pull side;
+  - the placement batcher's blind `update_placement_heights` tx —
+    ConfirmPlacement with apply validation replaces it;
+  - `repair_one`'s baseline diff and the `IS NOT NULL` rebalance
+    query — migration is now declare/confirm like everything else;
+  - the standalone missing-class repair scan — recovery folded into
+    the obligation check;
+  - `notify_blob_committed` survives demoted: a latency hint that
+    wakes the worker early, carrying no correctness weight; the
+    engine-not-yet-spawned drop becomes harmless by construction;
+  - the operator drain route (`/maintenance/drain-unplaced`)
+    survives as a manual re-kick during migration, then retires
+    once the reconciler owns the full lifecycle — its selection
+    query is the reconciler's own.
+- **Observability: the pane shows the worker's own queries.**
+  - Every observable is literally a work-list predicate — the same
+    indexed queries the workers run, so the pane and the machinery
+    cannot drift apart: unplaced-by-age keeps its chart
+    (`placement_height IS NULL`, now drainable); the in-flight set
+    with ages (`desired ≠ placement_height`, age = decided height
+    minus `desired`) is the new first-class series, where a plateau
+    means stalled handoffs; the staleness backlog (`desired < T`)
+    counts declarations still owed.
+  - Convergence stops being inferred from silence: "converged" is a
+    displayed, checked predicate — no blob below T, nothing in
+    flight — so a quiet mesh is visibly quiet-because-done rather
+    than quiet-because-nobody-looked.
+  - Verification freshness becomes a series once
+    `self_verified_height` is honest: the distribution of "last
+    seen on disk" ages, with the suspect count beside it.
+  - Late stage: per-urgency-tier time-to-conformance — backlog work
+    over measured transfer throughput, sound because the per-chunk
+    cost is proved linear (CALM_BOUND). The transfer-timing
+    histograms that power it land early, in the same shape as the
+    existing commit-latency instrumentation.
+    - S7 (2026-09-27): landed as owed fetches × the measured median
+      fetch, per worker queue — the reconciler is one serial worker,
+      so fetch count at the median is the sound unit; bytes over
+      throughput would have modelled a parallelism it does not have.
+      The histograms are fed at the transport wrapper, this node,
+      since process start.
+- **The absorbed lifecycle jobs fold into existing machinery.**
+  - Orphaned fragment files stop being a mechanism: a file with no
+    `fragment_hashes` row is the third case of the existence
+    sweep's diff, deleted in the same walk after the grace period.
+    The two-call scan/delete API and its process-memory scan cache
+    die; the manual route becomes a report of the sweep's last
+    findings.
+  - Orphaned data-block cleanup stays a slow cron — deletion
+    policy, not convergence — but actually registered on a
+    schedule, keeping the manual route and the takeout gate. The
+    decorative availability-class branch is deleted, not
+    implemented: RFC-007's redundant-copy cleanup is subsumed by
+    watermark eviction under the protection predicate.
+  - Inventory rows persist for every registered node, dark or not,
+    until the node is EJECTED from the network. A row is belief about
+    who holds what; for a dark node it is the only record the mesh has
+    that those bytes exist — the evidence behind the resilience
+    classification's "unrecoverable" (vs "never placed") split, and
+    the operator's signal that restoring one node would bring
+    fragments back. Deleting it saves nothing: the node's own disk is
+    the truth, and its first self-check on return re-adds every row.
+    The model's GONE is ejection — the node's copies are gone for
+    good — not vote-out and not view decay, both of which are the
+    model's DOWN, under which copies and belief both persist.
+    - S6 decision (2026-09-27), revised the same day: the draft pruned
+      departed rows at ConfirmPlacement apply with "departed" read off
+      the validator record. RFC-CONSENSUS-002 says deactivation ends
+      validator duties only — a voted-out or voluntarily departed node
+      keeps its data and its storage standing — so that prune would
+      have erased a live holder's belief and lost the recovery signal
+      for a dark one. It was removed before release. Ejection (a
+      tombstone on `nodes` plus a consensus transaction whose apply
+      deletes the node's inventory rows) is a node-lifecycle feature
+      for its own RFC; until it exists nothing deletes a registered
+      node's rows. No migration backfill either: the cutover drain
+      re-goals and confirms every recoverable blob, and ghost rows
+      of already-lost blobs survive the crossing as they do afterwards.
+  - Orphan deletion also drops the deleted blobs' inventory rows for
+    every node in the same apply (S6): once the blob's manifest and
+    access rows are gone a row for one of its hashes can support no
+    recovery — live nodes' self-checks would reap their own next
+    cycle, departed nodes' would leak forever. The retention window
+    before deletion is the recovery window; the row after it is not.
+- **The cutover is also the recovery event.**
+  - The migration backfills `desired_placement_height =
+    COALESCE(placement_height, 0)` (riding RFC-020's schema
+    evolution; the provenance column and the suspect state ride
+    S5's step). Placed blobs emerge quiescent; every historically
+    stranded blob carries the sentinel 0, which sorts below every
+    recorded transition, so the first staleness pass declares the
+    whole stranded class forward — enrolled into the new lifecycle
+    by the schema migration plus one batched declare, with no
+    operator action.
+    - S1 decision (2026-09-21): the draft said `current_height`. A
+      chain step must be deterministic on every node (RFC-020
+      contract rule 2) and the epoch crossing prunes
+      `consensus_meta` before fast-forward runs, so no height is
+      readable there. The sentinel makes every stranded blob enter
+      through declare, the one path the model checks.
+  - The first propose-hook check then declares every blob placed
+    against a pre-transition view — the population the starved
+    migration rung never reached. One mesh-wide catch-up drain
+    follows, mostly rubber-stamps by minimal movement, visible in
+    the pane at the documented drain rate.
+  - No pre-cutover view is ever reconstructed: quiescent backfills
+    never need confirmation, and any blob entering flight gets a
+    post-cutover `desired` first. The transition record bootstraps
+    empty with the current view; its prune floor rises to the
+    cutover height as the drain completes.
+
+## Stages
+
+- [x] **S0 — Model extension.** The `(confirmed, target)` pair,
+  `initOriginHeld`, `envDropMark`, the widened `envEvict` guard,
+  declare/confirm rungs, INV-CONVERGE, INV-EVICT-SAFE; CALM_BOUND
+  derived and witnessed tight (pass at bound, fail at bound − 1);
+  safety re-verified from all three inits with drops enabled;
+  `verify_table` and the spec README updated. Gate: every check in
+  the regime table green. All rung-priority decisions are made
+  here, before any Rust.
+  - Done 2026-08-22. Decisions and findings recorded in the Model
+    Extension bullets above: the ladder (view sync > declare >
+    re-encode > pull > belief sync > confirm; sync-below-movers,
+    matching the implementation's batched self-checks; measured 13
+    vs 19 for the alternative), CALM_BOUND = 13 at scaled size
+    (tight both directions, `calmTightnessTest`), the
+    truthful-belief refinement of INV-EVICT-SAFE, the `available`
+    precondition on INV-CONVERGE, the zero-depart budget for
+    the origin-held init (the upload window), the
+    fabricated-attestation exclusion (the phantom-laundered-confirm
+    counterexample that formally justifies S5), and the in-flight
+    epoch set (`pendingViews`): protection covers every
+    declared-but-unconfirmed destination, because the checker showed
+    a supersede-declare stripping the previous destination's only
+    real copy. Falsification method
+    institutionalized as `calmProbeStep`; the fast half of the
+    suite runs in CI (`check-linux.yml`, job `spec`).
+- [x] **S1 — Schema and txs.** The two columns (NOT NULL, backfill),
+  DeclarePlacementTarget and ConfirmPlacement handlers with full
+  apply validation, the transition record memo. Rides RFC-020
+  schema evolution. Gate: snapshotter parity on all touched DB
+  functions; apply-side validation exercised by handler tests.
+  - Done 2026-09-21. Storage chain step 0002 (column + indexes +
+    `storage_view_transitions`), `hopnet_storage::lifecycle` (payloads,
+    canonical `ViewSnapshot`, record reads, `apply_declare` /
+    `apply_confirm` with per-entry skip semantics — an invalid entry
+    never fails the block, because the host's dispatch aborts the
+    whole block on a handler error), thin host shims registered as
+    `declare_placement_target` / `confirm_placement`, and the
+    transition memo derived after every block's txs in both the
+    validation dry-run and the execute pass. Birth stamps the goal:
+    `ApplyCtx` carries the block height and projections obtain it
+    from the handler context (`From<&HandlerCtx>`), so the columns
+    never reach a projection. Two recorded deviations: the backfill
+    sentinel (Cutover) and the replicated record (Handoff Protocol).
+    storage@1 artifacts import through a frozen v1 spec — the first
+    covered-set addition to a released section under RFC-020, by the
+    pre-split consensus precedent. Attestation recency at confirm
+    landed in S5. (A recency window on declare's `to` was deferred
+    here and retired in S4: declares always target T.)
+- [x] **S2 — The protection predicate.** One pure function consuming the
+  transition record's memoized snapshots (confirmed epoch plus every
+  in-flight epoch); evictor and reconciler both consume it; the
+  unconfirmed-blob clause; a parity test pinning it to the model's
+  guard, table_guard-style. Lands
+  before any machinery that could delete: the safety net precedes
+  the acrobatics. Also lands the ITF trace-conformance seam: the
+  predicate evaluated against exported model-witness traces, the
+  first rung of replaying Quint executions against real code.
+  - Done 2026-09-21. `hopnet_storage::protection` holds the memo
+    (`Protection::from_epochs`) and the guard (`protects(class,
+    node, pinned)`), pure over assignments; `lifecycle::epochs_for_blob`
+    resolves a blob's confirmed and in-flight epochs from the record
+    (distinct views in `(placement_height, desired]` plus the view at
+    `desired`). The evictor (`run_watermark_eviction`) now asks the
+    predicate instead of the current view; an unanswerable record
+    (confirmed height below the first row) protects — never evict on
+    an unanswerable question. `spec/traces/` carries seven exported
+    witness traces and `tests/model_conformance.rs` replays them:
+    the Rust memo equals the model's `protectedBy` on every state,
+    `protects` equals `protected`, and the planner's verdict equals
+    `evictable` — the supersede counterexample finally has a fast
+    guard. The reconciler half is S3's: it must call `protects`,
+    never a current-view responsibility.
+- [x] **S3 — Pull machinery.** Pull duties derived at declare-apply;
+  fetch-with-recovery; awaited-send marks (backpressure); the
+  serial worker's deficit-first duty ladder. The push pipeline,
+  threshold, and blind placement batcher retire in the same stage —
+  no period with two distribution paths. The trace-conformance
+  harness completes here: the reconciler's state machine driven by
+  exported witness traces (env actions injected, tick by tick),
+  asserting state agreement after every step — upgrading "the code
+  resembles the model" to "the code refuses to diverge from it on
+  every checked execution".
+  - Done 2026-09-21. The engine is one serial worker per node
+    (urgent re-encode > pull checks > lazy re-encode); `pull_owed`
+    derives the owed classes from `StateReader::pull_target` (the
+    goal's assignment) and the manifest, fetches each from attested
+    holders then any peer, and falls through to `reencode_chunk`
+    for whatever nobody served. `LocalStateSink` is awaited end to
+    end: the host's drain acknowledges after the write, so a
+    finished pull sees its own marks. Kicks: `on_decided` for
+    births, `storage.pull` work scheduled at declare-apply, the tick's
+    bounded re-kick of the in-flight set (`in_flight_blobs`, oldest
+    goal first — the LIMIT-1 rung and `get_data_blocks_for_
+    rebalancing` are gone). Retired: the distribution worker pool,
+    send permits, `FAILURE_THRESHOLD_PERCENT`, `distribute_one`,
+    `repair_one`, the placement batcher and every `PLACEMENT_*`
+    knob, `get_distributable_blob`. `update_placement_heights` stays
+    REGISTERED (catch-up replays old blocks) and the `Store` wire arm
+    stays served (RFC-025 compat); nothing submits or sends them.
+  - Boundary move (decided with the S3 plan): the fulfillment floor
+    lands here, not in S4 — after a pull check on an in-flight blob
+    the node attests promptly (`StateReader::self_check_report`
+    submitted as `self_check_fragments`) and proposes
+    `ConfirmPlacement` when `confirm_ready` says the evidence is
+    complete; the tick also proposes one batched confirm for ready
+    in-flight blobs (`CONFIRM_CHECKS_PER_TICK`). Without it nothing
+    would confirm between S3 and S4. Narrowed 2026-09-27 (rehearsal
+    finding): the worker's prompt attest + confirm is for births
+    (a never-confirmed blob this node holds) and moved bytes (a
+    pull that changed its disk) only. A re-goaled blob already held
+    here submits nothing from the worker — each `submit` awaits a
+    consensus round, and awaiting one per rubber stamp on the
+    serial worker capped the drain at ~30 confirms a minute; those
+    blobs are the fulfillment pass's, in batches. S4 still owes the staleness pass
+    (propose hook + grace rung), random-sampled scaling, retirement
+    of the missing-class scan and of `/maintenance/drain-unplaced`
+    (which now re-kicks the in-flight set).
+  - Harness scope (decided with the S3 plan): `reconcile::plan` is
+    the model's re-encode and pull rungs per node, pure and sans-io;
+    `tests/model_conformance.rs` asserts on every trace state that
+    each up node's pull set equals `pullNeedy` restricted to its
+    classes and its re-encode set equals `reencodeReady` (K-gated as
+    the model's rung is). The full tick-by-tick replay with env
+    actions injected waits for S4, when declare and confirm are the
+    worker's rungs too. The deputy rule below W is not yet
+    implemented (S4, with the scan retirement).
+- [x] **S4 — The two passes.** Propose hook + grace rung (staleness);
+  fulfillment sampling fused with the tick (confirm discovery).
+  The missing-class scan and the LIMIT-1 rebalance rung retire.
+  Gate: orchestrator suite — distribution, departure re-encode,
+  rebalance — green on the new machinery only.
+  - Done 2026-09-27. Staleness: `storage_host::staleness` — the
+    propose hook runs beside the cleanup-nonces candidate in the
+    proposer's NeedValue path (queue-bypassing, signed by the
+    assembler, skipped for the seal block and outside the Normal
+    phase) and appends one `lifecycle::stale_page` of
+    `DECLARE_PAGE_SIZE` targets; the grace rung in the policy tick
+    submits a page directly when the check has gone unobserved for
+    `STALENESS_GRACE_SECS` (a proposal of our own, or anyone's page
+    applying, re-arms it). Fulfillment: `lifecycle::ready_confirmations`
+    over a random in-flight sample, one batched confirm per round,
+    up to `CONFIRM_ROUNDS_PER_TICK` rounds per tick with the sample
+    doubling while ≥ half was ready (cap `CONFIRM_SAMPLE_MAX`) and
+    resting on the first sparse round; pull kicks stay oldest-first.
+    Reordered 2026-09-27 (rehearsal finding): the pass runs before
+    the re-kick, the re-kick is a non-blocking wake-up of the worker
+    (the tick had awaited 64 pull checks, each awaiting up to three
+    consensus rounds, and never reached the pass), and one tick runs
+    at a time per node.
+    The obligation check owns re-encode: for every chunk with a dead
+    class, `reconcile::plan` under the blob's GOAL assignment says
+    what this node owes, plus `reconcile::deputy` below the watermark;
+    `repairer_for_chunk` (the election on the current view) is gone.
+    `hopnet_storage::tick` is `engineTick` in Rust over the production
+    predicates and `tests/model_conformance.rs` replays every trace
+    step: env actions adopted, engine ticks asserted state-for-state.
+  - Decisions (S4 plan): declares target T, the latest transition,
+    not the tip — the view is the same and goals then coincide with
+    record rows, so the S1-deferred recency window on `to` is moot
+    and retired; `/maintenance/drain-unplaced` stays as the operator's
+    re-kick until the Cutover stage.
+- [x] **S5 — Disk-truth attestation.** Existence sweep both directions
+  plus orphan-file fold-in; honest `self_verified_height` with
+  provenance; suspect state; prompt attestation on pull
+  completion.
+  - Done 2026-09-27. Storage chain step 0003 adds the REPLICATED
+    verification record to `fragment_inventory` — `verified_height`
+    (NULL until disk-verified), `provenance` (0 self-scan, 1 remote
+    challenge reserved), `suspect` — stamped only by the new
+    `attest_fragments` transaction (`store::apply_attestation`,
+    authorized to the submitter). The legacy `self_verified_height`
+    stays as the excluded, node-local column, written once at row
+    insert: the blanket restamp in `apply_self_check` is gone, and a
+    wire change to the self-check payload would have broken replay
+    of pre-S5 blocks. The sweep (`hopnet_storage::sweep::diff`, one
+    readdir walk via `fragstore::scan_fragments_detailed`) rides the
+    self-check cron: repair `stored_locally` both ways (awaited
+    marks), delete rowless files past the grace period (the two-call
+    orphan scan/delete API, its process-memory cache and
+    `maintenance.rs` are gone; `GET /maintenance/orphaned-fragments`
+    reports the last sweep, `?run=true` runs one), verify the weekly
+    scrub slice on the same listing, then submit the differential and
+    the attestation. Cadence decision: every 30-minute self-check is
+    disk-backed (the RFC's "daily" was a floor) — belief is dishonest
+    for at most one cycle. Confirmation evidence now requires a row
+    verified within `ATTESTATION_RECENCY_HEIGHTS` (1024) of the
+    deciding height and not suspect; read routing ranks by
+    `verified_height` and skips suspect rows; the obligation check and
+    the eviction belt treat suspect as missing. Prompt attestation on
+    pull completion: the pull path submits its self-check (the rows for
+    what it holds), then content-verifies every fragment of the blob on
+    its disk and attests them, then proposes the confirmation — so the
+    origin's classes are evidence too.
+    Storage@2 artifacts import through a frozen v2 spec (S1's
+    precedent, second use).
+- [x] **S6 — Lifecycle closure.** Data-block cleanup registered on
+  schedule; availability-class branch deleted; inventory rows of
+  deleted blobs dropped with the blob.
+  - Done 2026-09-27. The draft's third item — departed-node row
+    pruning at confirm-apply — was built, then removed the same day:
+    its "departed" oracle read the validator record, which
+    RFC-CONSENSUS-002 says ends validator duties only, so it would
+    have pruned live holders and erased the dark-node recovery
+    signal; the correct trigger is node ejection, which does not
+    exist yet (Handoff Protocol, departed-rows bullet). No backfill
+    step: the cutover drain confirms every recoverable blob.
+    `apply_delete_orphaned` now also deletes the
+    deleted blobs' inventory rows for every node. The orphaned data-
+    block cleanup runs as the `orphaned-data-block-cleanup` worker,
+    randomized daily per node, batch 50, 30-day retention, at most 10
+    consensus transactions per fire; the manual route and both takeout
+    gates are unchanged. The availability-class branch, its DB
+    function and the snapshotter capture are deleted (RFC-007's
+    redundant-copy cleanup is superseded by watermark eviction under
+    the protection predicate, S2).
+- [x] **S7 — Observability.** The pane series (in-flight ages,
+  staleness backlog, converged predicate, verification freshness);
+  transfer-timing histograms; per-tier ETA last, on top of
+  measured throughput.
+  - Done 2026-09-27. `hopnet_storage::observe` holds the pane's
+    reads, each the worker's own predicate: `lifecycle_counts`
+    (three disjoint stages — owed `desired < T`, in flight, confirmed
+    — and `converged()`), `in_flight_age_buckets` (heights since goal,
+    edges 8/64/256/1024, severity warn at 256 and stale at the
+    attestation window, set in the crate), `verification_by_node`
+    (fresh / stale / never / suspect against the recency window,
+    grouped by holder), the fetch histograms (`FETCH_LATENCY_US`,
+    `FETCH_THROUGHPUT_BPS`, hdrhistogram statics fed by the transport
+    wrapper on every fetch, plus a failure counter — the commit-latency
+    shape) and the time-to-conformance model. The reconciler is ONE
+    serial worker, so a tier's ETA is its owed fetches at the measured
+    median fetch (`eta_secs`), not bytes over throughput; tiers are
+    the worker's queues — urgent rebuild (K fetches a chunk), pull (one
+    fetch a class, `owed_pull_fetches` over the in-flight set bounded
+    at 2000), lazy rebuild. The policy tick now keeps its tally
+    (`PolicyTickReport` in `AppState.last_tick`) so the rebuild tiers
+    come from the tick's own scan, not a second one. The resilience
+    view (`StoragePanelView`) gained `lifecycle`, `verification`,
+    `transfers`, `eta` — the indexed reads live per 5-second poll, the
+    in-flight owed pass behind the 60-second cache with the other
+    scans. The pane: a Block Lifecycle card (stage strip + in-flight
+    age histogram, Converged / Draining chip), a Disk Truth card (one
+    stacked bar per holder), a Reconciler card (percentile tiles and
+    the three ETA tiles); `AgeHistogram` and `StageStrip` are the two
+    new generic components, and unplaced-by-age now renders through
+    the former. Everything the pane shows is process-local only where
+    it says so (this node's fetches and owed work); the series are
+    replicated reads. Decided with previews (2026-09-27): strip +
+    histogram over a time series (no client-side history exists and a
+    stuck age tail IS the plateau), per-node bars over a mesh
+    histogram, tiles over a log-bucket chart, ETA now rather than
+    deferred.
+- [ ] **Cutover.** One release: migration backfill enrolls the stranded
+  class, the first propose hook starts the catch-up drain.
+  Validation on the live mesh: watch the drain complete, then the
+  converged predicate hold. The 518-block incident class is the
+  acceptance test.
+  - Rehearsal (2026-09-27): `orchestrator test --test
+    lifecycle-cutover-drain --flags blobs=N` — a mesh born on the
+    deployed release image, populated, crosses into the build under
+    test through the RFC-019 choreography; the pane's `converged`
+    must hold on every node, every inventory row must be
+    disk-verified, every surviving file must download byte-identical.
+    Run at production scale (thousands of blobs) before the tag.
+    The 60-blob run passed; the 500-blob run did not converge and
+    found two defects, both fixed the same day: raw metrics rows in
+    the view snapshot made every metrics heartbeat a transition
+    (Handoff Protocol bullet), and the tick awaited the worker's
+    per-blob consensus rounds ahead of the batched fulfillment pass
+    (S3/S4 records). Runbook consequence: the old regime's inventory
+    rows carry no `verified_height`, so nothing confirms until the
+    first disk-truth sweep after the flip — kick
+    `POST /maintenance/fragment-inventory-self-check` on each node
+    once the crossing is decided (or wait for the 30-minute cron);
+    the rehearsal does the same.
+
+## Out of scope
+
+- **Performance-aware placement** — RFC-STORAGE-004. The weight
+  derivation stays one injected seam, deliberately untouched here;
+  reactive placement needs its own two-timescale model work
+  (no-oscillation under a moving target) and arrives only after
+  this RFC's reconciler provably converges.
+- **External proof-of-possession and retrieval reputation** — the
+  successor to the attestation RFC's other half. The phantom-
+  durability scenario in the perimeter bullet is its problem
+  statement; the provenance column and suspect state are its
+  landing hooks. Deferred with justification recorded there.
+- **Byzantine storage claims** — outside the fault model entirely
+  (perimeter bullet); consensus BFT is trusted, storage honesty is
+  not adjudicated here.
+- **Metrics table pruning and ε(μ)/repair-budget enforcement** —
+  remain on RFC-STORAGE-002's deferred list, untouched: inputs to
+  the view derivation, not part of the block lifecycle.
+- **Site-tag failure diversity** — RFC-STORAGE-001 deferred,
+  unchanged.
+- **Consensus state archival** — RFC-007's remaining non-storage
+  surface, where it stays.

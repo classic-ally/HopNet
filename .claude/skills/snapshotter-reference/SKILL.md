@@ -36,7 +36,7 @@ cargo build --release --bin snapshotter --features skip-frontend
 1. Creates an **ephemeral in-memory SQLite database** (no disk I/O)
 2. Initializes schema via `db::shared::initialize()` with custom SQL functions
 3. Seeds **deterministic fixture data** (users, nodes, blocks, files, metrics, etc.)
-4. Calls **72 DB read functions** with known inputs
+4. Calls **64 DB read functions** with known inputs
 5. Serializes all results to a single JSON snapshot file
 
 ### Fixture Data
@@ -61,7 +61,7 @@ All fixture data is fully deterministic — UUIDs use index-derived bytes, times
 | Committed nonces | 3 | For dedup queries |
 | Modification log | 4 | 3 inserts + 1 move |
 
-### Functions Captured (72 total)
+### Functions Captured (64 total)
 
 Organized by module:
 
@@ -70,7 +70,6 @@ Organized by module:
 - **debug** (1): compute_state_snapshot
 - **resilience** (3): compute_network_resilience_stats, get_node_storage_baselines, generate_fault_tolerance_curve
 - **files** (3): get_files, get_local_fragment_count, get_file_access
-- **fragments** (3): get_node_availability_classification (x3, one per node)
 - **inventory** (5): compute_inventory_differential (x3), batch_query_fragment_inventory
 - **fileprovider** (6): get_folder_contents, get_folder_changes_since_height, get_item_metadata_by_inode_id, get_file_path_by_data_id, get_inode_id_by_path, is_folder_empty
 - **documentprovider** (4): get_item, get_download_metadata, get_path_by_inode_id, get_children
@@ -80,6 +79,7 @@ Organized by module:
 - **devices** (3): get_device_by_id, get_devices_for_user (x2)
 - **takeout** (4): has_active_takeout (x2), calculate_user_data_size, get_takeouts_by_user, get_expired_takeouts_needing_status_update
 - **setup** (1): get_initial_setup
+- **storage lifecycle** (6, `hopnet_storage`): lifecycle::latest_transition_height, transition_in, snapshot_at; observe::lifecycle_counts, in_flight_age_buckets, verification_by_node (height-based, so deterministic; unplaced-by-age is wall-clock and deliberately not captured)
 
 ## Snapshot JSON Format
 
@@ -192,7 +192,6 @@ snapshotter/
       debug.rs         # compute_state_snapshot (proxy struct for HashMap ordering)
       resilience.rs    # ~3 wrappers
       files.rs         # ~3 wrappers (with SIV encryption)
-      fragments.rs     # ~3 wrappers (proxy for AvailabilityClass)
       inventory.rs     # ~5 wrappers
       fileprovider.rs  # ~6 wrappers (proxy for FileProviderEnumerateResult)
       documentprovider.rs  # ~4 wrappers

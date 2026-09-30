@@ -49,10 +49,15 @@ pub struct BlobInsertOp {
     pub access: Vec<BlobAccess>,
 }
 
-/// Apply-time context supplied by the host.
+/// Apply-time context supplied by the host. Projections obtain one from
+/// the handler context (`From<&HandlerCtx>` in hopnet-projection) rather
+/// than assembling it — the substrate decides what an apply needs.
 pub struct ApplyCtx<'a> {
     /// Local fragment store root — used for the stored_locally probe.
     pub fragments_dir: &'a str,
+    /// The block height this apply runs under (RFC-STORAGE-003: a newborn
+    /// blob's goal is stamped with its inserting block).
+    pub height: u64,
 }
 
 pub(crate) fn db_err(what: &'static str) -> impl Fn(rusqlite::Error) -> StorageError {
@@ -74,6 +79,70 @@ pub(crate) fn db_err(what: &'static str) -> impl Fn(rusqlite::Error) -> StorageE
 /// are covered. stored_locally and self_verified_height are node-local
 /// columns of otherwise-replicated tables, excluded from canonical bytes.
 pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionSpec {
+    name: "storage",
+    // v2 (RFC-STORAGE-003 S1): data_blocks.desired_placement_height and
+    // the storage_view_transitions record — both replicated (derived at
+    // apply from replicated inputs on every node).
+    // v3 (RFC-STORAGE-003 S5): fragment_inventory.verified_height /
+    // provenance / suspect — the replicated disk-truth record (stamped by
+    // attest_fragments); the legacy self_verified_height stays excluded.
+    format_version: 3,
+    tables: &[
+        hopnet_common::TableSpec::exported("data_blocks"),
+        hopnet_common::TableSpec::exported("storage_view_transitions"),
+        hopnet_common::TableSpec::exported("blob_access"),
+        hopnet_common::TableSpec::exported("mesh_key"),
+        hopnet_common::TableSpec::exported("mesh_key_access"),
+        hopnet_common::TableSpec {
+            name: "fragment_hashes",
+            role: hopnet_common::TableRole::Exported,
+            excluded_columns: &["stored_locally"],
+        },
+        hopnet_common::TableSpec {
+            name: "fragment_inventory",
+            role: hopnet_common::TableRole::Exported,
+            excluded_columns: &["self_verified_height"],
+        },
+        hopnet_common::TableSpec::exported("hopnet_storage_policy"),
+    ],
+};
+
+/// The storage section as sealed by S1–S4 binaries (ordinal 2): the v3
+/// covered set, columns as of ordinal 2. FROZEN — the import mapping for
+/// storage@2 artifacts (same precedent as the ordinal-1 freeze below).
+pub const PRE_DISK_TRUTH_SNAPSHOT_SECTION: hopnet_common::SectionSpec =
+    hopnet_common::SectionSpec {
+        name: "storage",
+        format_version: 2,
+        tables: &[
+            hopnet_common::TableSpec::exported("data_blocks"),
+            hopnet_common::TableSpec::exported("storage_view_transitions"),
+            hopnet_common::TableSpec::exported("blob_access"),
+            hopnet_common::TableSpec::exported("mesh_key"),
+            hopnet_common::TableSpec::exported("mesh_key_access"),
+            hopnet_common::TableSpec {
+                name: "fragment_hashes",
+                role: hopnet_common::TableRole::Exported,
+                excluded_columns: &["stored_locally"],
+            },
+            hopnet_common::TableSpec {
+                name: "fragment_inventory",
+                role: hopnet_common::TableRole::Exported,
+                excluded_columns: &["self_verified_height"],
+            },
+            hopnet_common::TableSpec::exported("hopnet_storage_policy"),
+        ],
+    };
+
+/// The storage section as sealed by pre-lifecycle binaries (ordinal 1):
+/// the covered set without `storage_view_transitions`. FROZEN — the
+/// import mapping for storage@1 artifacts (every mesh crossing into the
+/// RFC-STORAGE-003 release): the joiner materializes storage at ordinal
+/// 1, imports and verifies with THIS spec, then fast-forwards. Adding a
+/// table to a released section is a covered-set change, which RFC-020
+/// handles by a frozen spec per historical shape (the pre-split
+/// consensus precedent), never by editing the live spec's history.
+pub const PRE_LIFECYCLE_SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionSpec {
     name: "storage",
     format_version: 1,
     tables: &[
@@ -103,11 +172,23 @@ pub const NODE_LOCAL_TABLES: &[&str] = &["hopnet_storage_pins"];
 /// registry tests.
 pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
     module: "storage",
-    steps: &[hopnet_common::Step::sql(
-        1,
-        "init",
-        include_str!("../migrations/storage/0001_init.sql"),
-    )],
+    steps: &[
+        hopnet_common::Step::sql(
+            1,
+            "init",
+            include_str!("../migrations/storage/0001_init.sql"),
+        ),
+        hopnet_common::Step::sql(
+            2,
+            "block_lifecycle",
+            include_str!("../migrations/storage/0002_block_lifecycle.sql"),
+        ),
+        hopnet_common::Step::sql(
+            3,
+            "disk_truth",
+            include_str!("../migrations/storage/0003_disk_truth.sql"),
+        ),
+    ],
 };
 
 /// Seed/overwrite mesh policy rows (genesis apply; later a settings tx).
@@ -135,7 +216,10 @@ pub fn read_policy(
 }
 
 /// Register a blob: data_blocks row + fragment_hashes rows (stored_locally
-/// probed against THIS node's disk) + blob_access wraps.
+/// probed against THIS node's disk) + blob_access wraps. Birth is a
+/// declaration (RFC-STORAGE-003): the goal is stamped with the inserting
+/// block's height, so a newborn blob is already in flight toward the
+/// current view; placement_height starts NULL (never confirmed).
 pub fn apply_blob_insert(
     db_tx: &rusqlite::Transaction,
     op: &BlobInsertOp,
@@ -143,13 +227,14 @@ pub fn apply_blob_insert(
 ) -> Result<(), StorageError> {
     db_tx
         .execute(
-            "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height, file_size) VALUES (?, NULL, ?, ?, ?, NULL, ?)",
+            "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height, file_size, desired_placement_height) VALUES (?, NULL, ?, ?, ?, NULL, ?, ?)",
             params![
                 op.blob_id,
                 op.integrity_hash,
                 op.fragments.len() as i32,
                 op.added_bytes,
-                op.file_size as i64
+                op.file_size as i64,
+                height_to_db(ctx.height)
             ],
         )
         .map_err(db_err("insert data_block"))?;
@@ -261,13 +346,10 @@ pub fn apply_self_check(
             .map_err(db_err("remove inventory fragment"))?;
     }
 
-    db_tx
-        .execute(
-            "UPDATE fragment_inventory SET self_verified_height = ? WHERE node_id = ?",
-            params![height_to_db(self_verified_height), node_id],
-        )
-        .map_err(db_err("update inventory verified height"))?;
-
+    // No blanket restamp (RFC-STORAGE-003 S5): a self-check reads the flag,
+    // not the disk, so it verifies nothing. `verified_height` is stamped
+    // only by disk-verified attestations (`apply_attestation`); the legacy
+    // self_verified_height is written once, at insert.
     for hash in added {
         db_tx
             .execute(
@@ -278,6 +360,53 @@ pub fn apply_self_check(
     }
 
     Ok(())
+}
+
+/// Disk-truth attestation apply (RFC-STORAGE-003 S5): stamp the rows this
+/// node verified on its own disk (`verified_height = height`, provenance
+/// self-scan, suspect cleared) and flag the rows it marks suspect. Only
+/// rows that exist are touched — attestation never creates belief, the
+/// self-check does; unknown hashes are ignored. Idempotent.
+pub fn apply_attestation(
+    db_tx: &rusqlite::Transaction,
+    node_id: i32,
+    height: u64,
+    present: &[Blake3Hash],
+    suspect: &[Blake3Hash],
+) -> Result<usize, StorageError> {
+    let mut stamped = 0usize;
+    let height_db = height_to_db(height);
+    for chunk in present.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let query = format!(
+            "UPDATE fragment_inventory
+             SET verified_height = ?, provenance = 0, suspect = 0
+             WHERE node_id = ? AND fragment_hash IN ({placeholders})"
+        );
+        let mut stmt = db_tx
+            .prepare(&query)
+            .map_err(db_err("prepare attestation stamp"))?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&height_db, &node_id];
+        params.extend(chunk.iter().map(|h| h as &dyn rusqlite::ToSql));
+        stamped += stmt
+            .execute(params.as_slice())
+            .map_err(db_err("stamp attestation"))?;
+    }
+    for chunk in suspect.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let query = format!(
+            "UPDATE fragment_inventory SET suspect = 1
+             WHERE node_id = ? AND fragment_hash IN ({placeholders})"
+        );
+        let mut stmt = db_tx
+            .prepare(&query)
+            .map_err(db_err("prepare suspect mark"))?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&node_id];
+        params.extend(chunk.iter().map(|h| h as &dyn rusqlite::ToSql));
+        stmt.execute(params.as_slice())
+            .map_err(db_err("mark suspect"))?;
+    }
+    Ok(stamped)
 }
 
 /// Read the node's current inventory count and which of `candidates` are
@@ -384,11 +513,16 @@ pub fn compute_inventory_differential(
     })
 }
 
-/// Delete orphaned blobs: fragment_hashes + blob_access + data_blocks rows,
-/// child-first. Returns the locally-stored fragment hashes so the host can
-/// opportunistically remove the files post-commit. LIVENESS GATES (takeout
-/// in flight, reference providers) are the HOST's responsibility — this
-/// deletes unconditionally.
+/// Delete orphaned blobs: the fragment_inventory, fragment_hashes,
+/// blob_access and data_blocks rows, child-first. Returns the locally-
+/// stored fragment hashes so the host can opportunistically remove the
+/// files post-commit. LIVENESS GATES (takeout in flight, reference
+/// providers) are the HOST's responsibility — this deletes unconditionally.
+///
+/// The inventory rows go for every node (S6 closure): once the blob's
+/// manifest and access rows are gone a row for one of its hashes can
+/// support no recovery. A live node's self-check would reap its own rows
+/// next cycle; a departed node's would leak forever.
 pub fn apply_delete_orphaned(
     db_tx: &rusqlite::Transaction,
     blob_ids: &[BlobId],
@@ -416,6 +550,15 @@ pub fn apply_delete_orphaned(
         .map_err(db_err("collect local fragment hashes"))?;
     drop(stmt);
 
+    let inventory_deleted = db_tx
+        .execute(
+            &format!(
+                "DELETE FROM fragment_inventory WHERE fragment_hash IN
+                 (SELECT fragment_hash FROM fragment_hashes WHERE data_block_id IN ({placeholders}))"
+            ),
+            id_params.as_slice(),
+        )
+        .map_err(db_err("delete fragment_inventory"))?;
     let fragments_deleted = db_tx
         .execute(
             &format!("DELETE FROM fragment_hashes WHERE data_block_id IN ({placeholders})"),
@@ -435,8 +578,9 @@ pub fn apply_delete_orphaned(
         )
         .map_err(db_err("delete data_blocks"))?;
 
-    tracing::info!(
-        "Blob deletion applied: {blocks_deleted} blobs, {fragments_deleted} fragments, {access_deleted} access entries"
+    tracing::debug!(
+        "Blob deletion applied: {blocks_deleted} blobs, {fragments_deleted} fragments, \
+         {inventory_deleted} inventory rows, {access_deleted} access entries"
     );
     Ok(local_hashes)
 }
@@ -613,185 +757,15 @@ pub fn row_to_blob_access(row: &rusqlite::Row<'_>) -> Result<BlobAccess, rusqlit
     })
 }
 
-/// A blob this node should distribute: its full local fragment set, ordered
-/// by (chunk_number, local_index).
-#[derive(Debug, Clone)]
-pub struct DistributableBlob {
-    pub blob_id: BlobId,
-    /// (local_index, fragment_hash) per fragment.
-    pub fragments: Vec<(u32, Blake3Hash)>,
-}
-
-/// Origin filter for the distribution engine: return the blob's fragments
-/// IFF it is unplaced (`placement_height IS NULL`) and EVERY fragment is
-/// stored locally — i.e. this node holds the complete set (the origin).
-/// `None` is the cheap common case on non-origin nodes.
-pub fn get_distributable_blob(
-    conn: &rusqlite::Connection,
-    blob_id: &BlobId,
-) -> Result<Option<DistributableBlob>, StorageError> {
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT fh.local_index, fh.fragment_hash
-             FROM data_blocks db
-             JOIN fragment_hashes fh ON db.id = fh.data_block_id
-             WHERE db.id = ?
-               AND db.placement_height IS NULL
-               AND fh.stored_locally = TRUE
-               AND (SELECT COUNT(*) FROM fragment_hashes
-                    WHERE data_block_id = db.id AND stored_locally = TRUE)
-                   = db.fragment_count
-             ORDER BY fh.chunk_number, fh.local_index",
-        )
-        .map_err(db_err("prepare distributable blob query"))?;
-    let fragments: Vec<(u32, Blake3Hash)> = stmt
-        .query_map(params![blob_id], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(db_err("query distributable blob"))?
-        .collect::<Result<_, _>>()
-        .map_err(db_err("read distributable blob row"))?;
-    if fragments.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(DistributableBlob {
-            blob_id: blob_id.clone(),
-            fragments,
-        }))
-    }
-}
-
-/// Blob ids stuck at `placement_height IS NULL` — distribution either never
-/// ran or failed, and nothing retries them: the distribution worker drops a
-/// failed blob (no requeue), and tier-1 repair bails on unplaced blobs by
-/// design (`repair_one` diffs placement against a prior height it does not
-/// have). This is the selection half of the operator drain that recovers
-/// them; `notify_blob_committed` is the other half.
-///
-/// Ordered by `id`, which is a UUIDv7 — its leading 48 bits are a
-/// millisecond timestamp, so lexicographic order IS creation order. Oldest
-/// stranded blobs drain first.
-///
-/// `count_unplaced_blobs` is the unbounded companion: the caller reports
-/// how many remain beyond `limit` so an operator knows how many more passes
-/// are needed.
-pub fn get_unplaced_blob_ids(
-    conn: &rusqlite::Connection,
-    limit: i32,
-) -> Result<Vec<BlobId>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT id FROM data_blocks
-         WHERE placement_height IS NULL
-         ORDER BY id ASC
-         LIMIT ?",
-    )?;
-    // Bound to a local: the MappedRows temporary borrows `stmt`, so
-    // returning the collect() directly outlives the statement.
-    let ids: Result<Vec<BlobId>, _> = stmt.query_map(params![limit], |row| row.get(0))?.collect();
-    ids
-}
-
-/// Total blobs stuck unplaced, ignoring any drain limit. Paired with
-/// [`get_unplaced_blob_ids`] so a drain response can report the remaining
-/// backlog rather than just what it enqueued this pass.
+/// Blobs never confirmed (`placement_height IS NULL`), ignoring any drain
+/// limit — the operator drain's backlog figure and the pane's unplaced
+/// count.
 pub fn count_unplaced_blobs(conn: &rusqlite::Connection) -> Result<i64, rusqlite::Error> {
     conn.query_row(
         "SELECT COUNT(*) FROM data_blocks WHERE placement_height IS NULL",
         [],
         |row| row.get(0),
     )
-}
-
-/// A rebalance candidate: one placed blob with its full fragment layout.
-#[derive(Debug, Clone)]
-pub struct DataBlockRebalanceInfo {
-    pub data_block_id: BlobId,
-    pub placement_height: u64,
-    pub fragments: Vec<FragmentInfo>,
-}
-
-/// One fragment of a rebalance candidate: hash + decoded chunk-type label.
-#[derive(Debug, Clone)]
-pub struct FragmentInfo {
-    pub fragment_hash: Blake3Hash,
-    pub chunk_type: String,
-}
-
-/// Get data blocks that need rebalancing (distributed before a certain
-/// height). Returns data blocks with their fragments, ordered by
-/// placement_height (oldest first); blobs with an incomplete fragment set
-/// are skipped.
-pub fn get_data_blocks_for_rebalancing(
-    conn: &rusqlite::Connection,
-    max_placement_height: u64,
-    limit: i32,
-) -> Result<Vec<DataBlockRebalanceInfo>, rusqlite::Error> {
-    // Get data blocks that were placed before the specified height
-    let query = "SELECT DISTINCT db.id, db.placement_height, db.fragment_count
-         FROM data_blocks db
-         WHERE db.placement_height IS NOT NULL
-           AND db.placement_height < ?
-         ORDER BY db.placement_height ASC
-         LIMIT ?";
-    let mut stmt = conn.prepare(query)?;
-    let data_blocks: Vec<(BlobId, u64, i32)> = stmt
-        .query_map(params![height_to_db(max_placement_height), limit], |row| {
-            Ok((row.get(0)?, row.get(1).map(height_from_db)?, row.get(2)?))
-        })?
-        .collect::<Result<_, _>>()?;
-
-    // For each data block, get all its fragments
-    let fragment_query = "SELECT fragment_hash, chunk_type
-             FROM fragment_hashes
-             WHERE data_block_id = ?
-             ORDER BY chunk_number";
-    let mut fragment_stmt = conn.prepare(fragment_query)?;
-
-    let mut result = Vec::new();
-    for (data_block_id, placement_height, total_fragments) in data_blocks {
-        let fragments: Vec<FragmentInfo> = fragment_stmt
-            .query_map(params![&data_block_id], |row| {
-                let fragment_hash: Blake3Hash = row.get(0)?;
-                // fragment_hashes.chunk_type is the storage schema's 0/1
-                // encoding (see install_schema) — decoded to its label here.
-                let chunk_type = match row.get::<_, i32>(1)? {
-                    0 => "original".to_string(),
-                    1 => "recovery".to_string(),
-                    other => {
-                        return Err(rusqlite::Error::FromSqlConversionFailure(
-                            1,
-                            rusqlite::types::Type::Integer,
-                            format!("invalid chunk_type {other}").into(),
-                        ));
-                    }
-                };
-                Ok(FragmentInfo {
-                    fragment_hash,
-                    chunk_type,
-                })
-            })?
-            .collect::<Result<_, _>>()?;
-
-        // Only include data blocks where we have all fragments
-        if fragments.len() == total_fragments as usize {
-            result.push(DataBlockRebalanceInfo {
-                data_block_id,
-                placement_height,
-                fragments,
-            });
-        } else {
-            tracing::warn!(
-                "Data block {} has {} fragments but expected {}, skipping",
-                data_block_id,
-                fragments.len(),
-                total_fragments
-            );
-        }
-    }
-
-    tracing::info!(
-        "Found {} complete data blocks for rebalancing",
-        result.len()
-    );
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -805,7 +779,8 @@ mod tests {
             "CREATE TABLE data_blocks (
                 id TEXT PRIMARY KEY, modified_at TEXT, file_hash BLOB,
                 fragment_count INTEGER, added_bytes INTEGER,
-                placement_height INTEGER, file_size INTEGER
+                placement_height INTEGER, file_size INTEGER,
+                desired_placement_height INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE fragment_hashes (
                 data_block_id TEXT, chunk_number INTEGER, local_index INTEGER,
@@ -909,19 +884,23 @@ mod tests {
             &op,
             &ApplyCtx {
                 fragments_dir: &dir_s,
+                height: 42,
             },
         )
         .unwrap();
 
-        let (count, placement): (i32, Option<i32>) = tx
+        // Should: stamp the goal with the inserting height (birth is a
+        // declaration) while the confirmed epoch starts NULL.
+        let (count, placement, desired): (i32, Option<i32>, i64) = tx
             .query_row(
-                "SELECT fragment_count, placement_height FROM data_blocks WHERE id = ?",
+                "SELECT fragment_count, placement_height, desired_placement_height FROM data_blocks WHERE id = ?",
                 params![blob_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
         assert_eq!(count, 2);
         assert_eq!(placement, None);
+        assert_eq!(desired, 42);
 
         // stored_locally probed: on-disk fragment true, missing false;
         // recovery flag round-trips as the legacy 0/1 encoding.
@@ -1029,74 +1008,18 @@ mod tests {
 
     /// Insert a bare data_blocks row with the given placement height.
     fn seed_block(conn: &rusqlite::Connection, id: &str, placement: Option<i64>) {
-        seed_block_with_fragments(conn, id, placement, 30);
-    }
-
-    /// As `seed_block`, but pinning `fragment_count` — the distributable
-    /// query compares it against the locally-stored fragment rows.
-    fn seed_block_with_fragments(
-        conn: &rusqlite::Connection,
-        id: &str,
-        placement: Option<i64>,
-        fragment_count: i32,
-    ) {
         conn.execute(
             "INSERT INTO data_blocks
                  (id, modified_at, file_hash, fragment_count, added_bytes,
                   placement_height, file_size)
-             VALUES (?, '', X'00', ?, 0, ?, 0)",
-            params![BlobId::from_str(id).unwrap(), fragment_count, placement],
+             VALUES (?, '', X'00', 30, 0, ?, 0)",
+            params![BlobId::from_str(id).unwrap(), placement],
         )
         .unwrap();
     }
-
-    // Impact: the drain endpoint's selection half. Picking up a placed blob
-    // would re-run distribution for data already committed mesh-wide; missing
-    // an unplaced one leaves it stranded single-copy forever, since nothing
-    // else retries a failed distribution.
-    // Should: return only rows whose placement_height IS NULL.
-    // Should: order oldest-first, so the longest-stranded blobs drain first.
-    // Should: respect the caller's limit.
-    // Should not: include blobs that already carry a placement height.
+    // Should: count every never-confirmed blob, and none once confirmed.
     #[test]
-    fn unplaced_selection_takes_only_null_placement_oldest_first() {
-        let conn = test_conn();
-        // UUIDv7: the leading 48 bits are a ms timestamp, so these are in
-        // creation order. Interleave placed rows to prove the filter bites.
-        seed_block(&conn, "01890a5d-0001-7000-8000-000000000001", None);
-        seed_block(&conn, "01890a5d-0002-7000-8000-000000000002", Some(42));
-        seed_block(&conn, "01890a5d-0003-7000-8000-000000000003", None);
-        seed_block(&conn, "01890a5d-0004-7000-8000-000000000004", Some(7));
-        seed_block(&conn, "01890a5d-0005-7000-8000-000000000005", None);
-
-        let all = get_unplaced_blob_ids(&conn, 100).unwrap();
-        assert_eq!(
-            all,
-            vec![
-                BlobId::from_str("01890a5d-0001-7000-8000-000000000001").unwrap(),
-                BlobId::from_str("01890a5d-0003-7000-8000-000000000003").unwrap(),
-                BlobId::from_str("01890a5d-0005-7000-8000-000000000005").unwrap(),
-            ],
-            "only unplaced blobs, in creation order"
-        );
-
-        let limited = get_unplaced_blob_ids(&conn, 2).unwrap();
-        assert_eq!(
-            limited,
-            all[..2],
-            "limit takes the oldest, not an arbitrary 2"
-        );
-
-        assert_eq!(count_unplaced_blobs(&conn).unwrap(), 3);
-    }
-
-    // Impact: the drain response reports remaining backlog from this count,
-    // so an operator knows whether another pass is needed. If it tracked the
-    // limit it would read as "done" while blobs were still stranded.
-    // Should: count every unplaced blob regardless of any drain limit.
-    // Should: report zero once every blob carries a placement height.
-    #[test]
-    fn unplaced_count_ignores_the_drain_limit() {
+    fn unplaced_count_tracks_never_confirmed_blobs() {
         let conn = test_conn();
         for i in 1..=5 {
             seed_block(
@@ -1105,63 +1028,72 @@ mod tests {
                 None,
             );
         }
-        assert_eq!(get_unplaced_blob_ids(&conn, 2).unwrap().len(), 2);
-        assert_eq!(
-            count_unplaced_blobs(&conn).unwrap(),
-            5,
-            "count is the backlog, not the page"
-        );
+        assert_eq!(count_unplaced_blobs(&conn).unwrap(), 5);
 
         conn.execute("UPDATE data_blocks SET placement_height = 1", [])
             .unwrap();
         assert_eq!(count_unplaced_blobs(&conn).unwrap(), 0);
-        assert!(get_unplaced_blob_ids(&conn, 100).unwrap().is_empty());
     }
 
-    // Impact: this is what makes the operator drain repeatable. The drain
-    // enqueues blob ids fire-and-forget, so the same blob can be kicked while
-    // an earlier kick is still in flight, or after it has since been placed.
-    // The worker's only guard against re-distributing committed data is this
-    // query returning None — if it ever stopped filtering on placement, a
-    // second drain pass would re-push fragments for blobs already committed
-    // mesh-wide.
-    // Should: offer an unplaced blob whose fragments are all held locally.
-    // Should not: offer that same blob once a placement height is committed.
+    // Impact: S6 closure — a row for a hash whose blob no longer exists can
+    // support no recovery, and a departed node never self-checks it away.
+    // Should: delete the deleted blobs' inventory rows on every node and
+    // still return this node's local hashes for file removal.
+    // Should not: touch a surviving blob's rows.
     #[test]
-    fn distributable_blob_stops_offering_a_blob_once_it_is_placed() {
-        let conn = test_conn();
-        let id = "01890a5d-0001-7000-8000-000000000001";
-        let blob_id = BlobId::from_str(id).unwrap();
-        seed_block_with_fragments(&conn, id, None, 2);
-        for idx in 0..2u32 {
-            conn.execute(
-                "INSERT INTO fragment_hashes
-                     (data_block_id, chunk_number, local_index, fragment_id,
-                      fragment_hash, chunk_type, stored_locally)
-                 VALUES (?, 0, ?, '', ?, 0, TRUE)",
-                params![blob_id, idx, Blake3Hash::from_bytes([idx as u8; 32])],
-            )
-            .unwrap();
-        }
-
-        let offered = get_distributable_blob(&conn, &blob_id).unwrap();
-        assert!(
-            offered.is_some(),
-            "unplaced blob with a complete local fragment set is distributable"
-        );
-
-        // A placement commit lands (either from the first kick, or from a
-        // concurrent one) — the blob must drop out of the distributable set.
-        conn.execute(
-            "UPDATE data_blocks SET placement_height = 99 WHERE id = ?",
-            params![blob_id],
+    fn delete_orphaned_removes_inventory_rows_for_every_node() {
+        let mut conn = test_conn();
+        conn.execute_batch(
+            "CREATE TABLE fragment_inventory (
+                fragment_hash BLOB NOT NULL, node_id INTEGER NOT NULL,
+                self_verified_height INTEGER, verified_height INTEGER,
+                provenance INTEGER, suspect INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (fragment_hash, node_id)
+            );",
         )
         .unwrap();
-        assert!(
-            get_distributable_blob(&conn, &blob_id).unwrap().is_none(),
-            "a placed blob must never be re-distributed by a repeat drain"
+        let gone = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap();
+        let kept = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap();
+        for (id, hash, local) in [(&gone, 1u8, true), (&gone, 2, false), (&kept, 3, true)] {
+            conn.execute(
+                "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes, file_size) VALUES (?, X'00', 1, 0, 1)",
+                params![id],
+            )
+            .ok();
+            conn.execute(
+                "INSERT INTO fragment_hashes VALUES (?, 0, ?, 'f', ?, 0, ?)",
+                params![id, hash, vec![hash; 32], local],
+            )
+            .unwrap();
+            for node in [1, 2, 9] {
+                conn.execute(
+                    "INSERT INTO fragment_inventory (fragment_hash, node_id) VALUES (?, ?)",
+                    params![vec![hash; 32], node],
+                )
+                .unwrap();
+            }
+        }
+
+        let tx = conn.transaction().unwrap();
+        let local = apply_delete_orphaned(&tx, std::slice::from_ref(&gone)).unwrap();
+        assert_eq!(local, vec![Blake3Hash::from_bytes([1u8; 32])]);
+        let count = |hash: u8| -> i64 {
+            tx.query_row(
+                "SELECT COUNT(*) FROM fragment_inventory WHERE fragment_hash = ?",
+                params![vec![hash; 32]],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            (count(1), count(2)),
+            (0, 0),
+            "deleted blob's rows gone on every node"
         );
-        // And it is no longer a drain candidate at all.
-        assert!(get_unplaced_blob_ids(&conn, 100).unwrap().is_empty());
+        assert_eq!(count(3), 3, "surviving blob untouched");
+        let blobs: i64 = tx
+            .query_row("SELECT COUNT(*) FROM data_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blobs, 1);
     }
 }

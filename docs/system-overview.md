@@ -506,6 +506,65 @@ apply functions inside consensus handlers.
       repair scan, migration pull, eviction, weekly rolling scrub).
       Orchestrator: tier-membership, eviction-under-pressure,
       re-encode-after-departure (kill → decay → regenerate → download)
+- [~] Block lifecycle convergence — S0–S7 of 7, cutover remains
+      ([RFC-STORAGE-003](../hopnet-storage/spec/block-lifecycle.md),
+      branch `rfc-block-lifecycle`, PR #72): the upload-to-placement
+      pipeline joins the proven model. S0 (2026-08-22): the Quint model
+      gains the `(confirmed, target)` pair, origin-held birth, a
+      lossy-mark adversary, INV-CONVERGE / INV-EVICT-SAFE, CALM_BOUND
+      counted and witnessed tight; fast half of the spec suite in CI.
+      S1 (2026-09-21): storage chain step 0002 — `desired_placement_height`
+      NOT NULL stamped at insert, the replicated `storage_view_transitions`
+      record memoized after every block — plus `declare_placement_target`
+      / `confirm_placement` consensus txs with per-entry apply validation
+      (`hopnet_storage::lifecycle`; the memoized view snapshot is exactly
+      members + quantized weights — narrowed 2026-09-27 after the
+      rehearsal showed raw metrics rows made every heartbeat a
+      transition). S2 (2026-09-21): the protection
+      predicate (`hopnet_storage::protection`) — confirmed epoch plus every
+      in-flight epoch, never-confirmed clause, pins — is the evictor's
+      single guard, and `tests/model_conformance.rs` replays exported Quint
+      witness traces (`spec/traces/`) against it. S3 (2026-09-21): the push
+      pipeline is gone — one serial reconciler per node pulls the classes
+      it owes under the blob's goal (fetch from attested holders, RS-rebuild
+      fallback), marks are awaited end to end, kicks come from decide,
+      declare-apply and the tick's bounded in-flight re-kick, and the
+      fulfillment floor (prompt attestation + ConfirmPlacement when the
+      evidence is complete — for births and moved bytes; re-goaled blobs
+      already held are the batched pass's) replaces the blind placement
+      batcher; the duty ladder (`hopnet_storage::reconcile`) is
+      trace-checked against the model's rungs. S4 (2026-09-27): the two
+      passes — the block proposer's staleness hook declares every blob
+      whose goal predates the latest view transition (grace rung as
+      backstop), fulfillment samples the in-flight set adaptively (rounds
+      within one tick, ahead of a non-blocking re-kick, one tick at a time
+      — the 2026-09-27 rehearsal fix), the missing-class scan folds into the
+      obligation check (ladder + deputy rule under the goal assignment),
+      and `hopnet_storage::tick` replays the model's engine tick against
+      every exported trace, state for state. S5 (2026-09-27): disk truth —
+      storage step 0003 adds the replicated `verified_height` / `provenance`
+      / `suspect` record stamped only by the new `attest_fragments` tx; the
+      sweep (`hopnet_storage::sweep`) rides every 30-minute self-check,
+      repairing `stored_locally` both ways, deleting aged orphans (the
+      two-call orphan API is gone), scrubbing the weekly slice on the same
+      walk and attesting what it saw; the pull path attests the blob's
+      local fragments before proposing; confirmation evidence must be
+      verified within 1024 heights and not suspect. S6 (2026-09-27):
+      lifecycle closure — orphan deletion drops the deleted blobs'
+      inventory rows for every node, the orphaned data-block cleanup runs
+      daily per node (bounded batches), and the availability-class branch
+      is gone; a confirm-time prune of "departed" holders' rows was built
+      and removed the same day (rows persist for every registered node
+      until ejection, which is a future node-lifecycle feature).
+      S7 (2026-09-27): observability — `hopnet_storage::observe` gives the
+      resilience pane the worker's own predicates (stage counts + converged,
+      in-flight ages in heights, verification freshness per holder), fetch
+      histograms in the commit-latency shape, and time-to-conformance per
+      reconciler queue (owed fetches × median fetch); three new cards
+      (Block Lifecycle, Disk Truth, Reconciler). Only the cutover remains;
+      its rehearsal (`lifecycle-cutover-drain`, born on the deployed
+      release image) passed at 60 blobs, failed at 500 on 2026-09-27 and
+      drove the two fixes above; rerun at 500 before the tag.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage
@@ -712,7 +771,7 @@ End-to-end encryption and comprehensive authentication system.
 - [ ] Thin client architecture for mobile/constrained devices
 
 ### 7. Maintenance & Operations System ([RFC-007](specs/maintenance-operations.md))
-**Status**: Orphaned data cleanup and manual rebalancing complete, automated recovery pending
+**Status**: Storage surfaces absorbed by RFC-STORAGE-003 (orphan cleanup scheduled daily, recovery and rebalance triggers = the reconciler); consensus archival pending
 
 Automated background processes ensuring network health and storage efficiency.
 
@@ -722,13 +781,13 @@ Automated background processes ensuring network health and storage efficiency.
 - [x] **NEW**: Manual network rebalancing trigger with placement height consensus updates
 - [x] **NEW**: Atomic data block rebalancing (only update placement_height after all fragments migrate)
 - [x] **NEW**: RPC fragment fetch instructions with dual Ed25519 authentication
-- [ ] Availability-aware cleanup prioritization (redundant vs historical)
+- [x] ~~Availability-aware cleanup prioritization (redundant vs historical)~~ — superseded (RFC-STORAGE-003 S6): watermark eviction under the protection predicate replaces redundant-copy cleanup; the decorative branch is deleted
 - [ ] Automated background network rebalancing for node join/leave events
 - [ ] Lost shard recovery with Reed-Solomon reconstruction
-- [ ] Redundant copy cleanup for download/rebalancing artifacts
+- [x] ~~Redundant copy cleanup for download/rebalancing artifacts~~ — superseded (RFC-STORAGE-003 S2 eviction belt)
 - [ ] Fragment health monitoring and remediation
 - [ ] Consensus state management and archival
-- [ ] Fragment filesystem cleanup for orphaned files
+- [x] Fragment filesystem cleanup for orphaned files — the disk-truth sweep (RFC-STORAGE-003 S5); orphaned data-block cleanup registered daily (S6)
 - [ ] Job coordination using node ID proximity to minimize duplicate work
 
 ### 8. User Data Takeout & Import System ([RFC-010](specs/user-data-takeout.md))

@@ -422,6 +422,10 @@ pub async fn post_drain_unplaced(
 
 #[derive(Deserialize)]
 pub struct OrphanedFragmentsScanParams {
+    /// Run a sweep now instead of reporting the last one.
+    #[serde(default)]
+    run: bool,
+    /// Orphan grace for a `run`, in hours (default 1).
     #[serde(default = "default_grace_period_hours")]
     grace_period_hours: i64,
 }
@@ -431,19 +435,14 @@ fn default_grace_period_hours() -> i64 {
 }
 
 /// GET /maintenance/orphaned-fragments
-/// Scan filesystem for fragments not in database (older than grace_period_hours)
-/// Returns scan results and stores them for subsequent DELETE operation
+/// The last disk-truth sweep's report (RFC-STORAGE-003 S5) — the former
+/// two-call scan/delete API folded into the sweep, which deletes orphans
+/// past the grace period itself. `?run=true` sweeps now and reports that.
 pub async fn get_orphaned_fragments_scan(
     State(app_state): State<AppState>,
     Extension(uid): Extension<i32>,
     Query(params): Query<OrphanedFragmentsScanParams>,
 ) -> impl IntoResponse {
-    tracing::info!(
-        "Orphaned fragments scan triggered by user {} (grace_period_hours: {})",
-        uid,
-        params.grace_period_hours
-    );
-
     if params.grace_period_hours < 0 {
         return (
             StatusCode::BAD_REQUEST,
@@ -454,70 +453,36 @@ pub async fn get_orphaned_fragments_scan(
         )
             .into_response();
     }
-
-    match super::jobs::run_orphaned_fragments_scan(&app_state, params.grace_period_hours).await {
-        Ok(scan_result) => {
-            tracing::info!(
-                "Scan complete: {} orphaned fragments found ({} bytes)",
-                scan_result.orphaned_fragments.len(),
-                scan_result.total_bytes
-            );
-            (StatusCode::OK, Json(scan_result)).into_response()
-        }
-        Err(e) => {
-            tracing::error!("Orphaned fragments scan failed: {:?}", e);
-
-            #[derive(Serialize)]
-            struct ErrorResponse {
-                status: String,
-                error: String,
+    if params.run {
+        tracing::info!(
+            "Disk-truth sweep triggered by user {} (grace_period_hours: {})",
+            uid,
+            params.grace_period_hours
+        );
+        let grace = (params.grace_period_hours as u64).saturating_mul(3600);
+        return match super::jobs::run_disk_truth_sweep(&app_state, grace).await {
+            Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+            Err(e) => {
+                tracing::error!("Disk-truth sweep failed: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "status": "error", "error": format!("{e:?}") })),
+                )
+                    .into_response()
             }
-
-            let response = ErrorResponse {
-                status: "error".to_string(),
-                error: format!("Scan failed: {:?}", e),
-            };
-
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
-        }
+        };
     }
-}
-
-/// DELETE /maintenance/orphaned-fragments
-/// Delete orphaned fragments based on previous scan results
-/// Validates scan exists and isn't stale (> 1 hour old)
-pub async fn delete_orphaned_fragments(
-    State(app_state): State<AppState>,
-    Extension(uid): Extension<i32>,
-) -> impl IntoResponse {
-    tracing::info!("Orphaned fragments cleanup triggered by user {}", uid);
-
-    match super::jobs::run_orphaned_fragments_cleanup(&app_state).await {
-        Ok(result) => {
-            tracing::info!(
-                "Cleanup complete: {} deleted, {} failed, {} bytes freed",
-                result.deleted_count,
-                result.failed_count,
-                result.bytes_freed
-            );
-            (StatusCode::OK, Json(result)).into_response()
-        }
-        Err(e) => {
-            tracing::error!("Orphaned fragments cleanup failed: {:?}", e);
-
-            #[derive(Serialize)]
-            struct ErrorResponse {
-                status: String,
-                error: String,
-            }
-
-            let response = ErrorResponse {
-                status: "error".to_string(),
-                error: format!("{:?}", e),
-            };
-
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
-        }
+    let last = app_state.last_sweep.lock().unwrap().clone();
+    match last {
+        Some(report) => (StatusCode::OK, Json(report)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": "no sweep has run yet on this node; use ?run=true"
+            })),
+        )
+            .into_response(),
     }
 }
 

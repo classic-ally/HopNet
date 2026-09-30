@@ -277,6 +277,12 @@ impl HopNetApplication {
                 },
             )?;
         }
+        // RFC-STORAGE-003: the view-transition memo is part of the block's
+        // apply; derive it in the dry-run too so a later transaction in the
+        // same proposal validates against the state apply will produce. A
+        // derivation failure is node-local (DB), never a verdict.
+        crate::storage_host::substrate_host::record_view_transition(db_tx, candidate_height)
+            .map_err(|e| ValidateFailure::Transient(format!("view transition memo: {e}")))?;
         Ok(())
     }
 }
@@ -352,7 +358,12 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         // time only (execute skips them so sync can replay old blocks).
         let decided_height = height.0;
         process_transactions(&Some(old_txs), &self.app_state, true, decided_height, tx)
-            .map_err(|e| ApplyError(format!("apply at height {}: {e:?}", height.0)))
+            .map_err(|e| ApplyError(format!("apply at height {}: {e:?}", height.0)))?;
+        // RFC-STORAGE-003: memoize the storage view if this block moved it
+        // (same derivation the dry-run performed, so the row matches).
+        crate::storage_host::substrate_host::record_view_transition(tx, decided_height)
+            .map(|_| ())
+            .map_err(|e| ApplyError(format!("view transition at height {}: {e}", height.0)))
     }
 
     fn validator_set(&mut self, height: Height) -> HopNetValidatorSet {

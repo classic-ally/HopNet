@@ -4,6 +4,9 @@
     import { tokenStore, API_BASE_URL } from '../../stores';
     import StoragePanel from './StoragePanel.svelte';
     import ConsensusPanel from './ConsensusPanel.svelte';
+    import LifecycleCard from './LifecycleCard.svelte';
+    import DiskTruthCard from './DiskTruthCard.svelte';
+    import ReconcilerCard from './ReconcilerCard.svelte';
     import Toolbar from '../../primitives/Toolbar.svelte';
     import type { ToolbarItem } from '../../primitives/Toolbar.svelte';
     import PaneHeader from '../../primitives/PaneHeader.svelte';
@@ -103,6 +106,56 @@
         }))
     };
 
+    // RFC-STORAGE-003 S7: the lifecycle's own predicates, disk truth per
+    // holder, and this node's reconciler. Mapped, never computed.
+    $: lifecycleProps = view && {
+        tip: view.storage.lifecycle.tip,
+        transitionHeight: view.storage.lifecycle.transition_height ?? null,
+        owed: view.storage.lifecycle.owed,
+        inFlight: view.storage.lifecycle.in_flight,
+        confirmed: view.storage.lifecycle.confirmed,
+        converged: view.storage.lifecycle.converged,
+        inFlightBuckets: view.storage.lifecycle.in_flight_buckets.map(b => ({
+            label: b.label,
+            blobs: b.blobs,
+            gb: b.gb,
+            severity: b.severity ?? undefined
+        }))
+    };
+
+    $: diskTruthProps = view && {
+        windowHeights: view.storage.verification.window,
+        mesh: {
+            fresh: view.storage.verification.mesh.fresh,
+            stale: view.storage.verification.mesh.stale,
+            never: view.storage.verification.mesh.never,
+            suspect: view.storage.verification.mesh.suspect
+        },
+        nodes: view.storage.verification.nodes.map(n => ({
+            nodeId: n.node_id,
+            name: n.name ?? null,
+            fresh: n.fresh,
+            stale: n.stale,
+            never: n.never,
+            suspect: n.suspect
+        }))
+    };
+
+    $: reconcilerProps = view && {
+        fetches: view.storage.transfers.fetches,
+        failures: view.storage.transfers.failures,
+        latencyUs: view.storage.transfers.latency_us,
+        throughputBps: view.storage.transfers.throughput_bps,
+        p50FetchUs: view.storage.eta.p50_fetch_us ?? null,
+        tiers: view.storage.eta.tiers.map(t => ({
+            tier: t.tier,
+            owedFetches: t.owed_fetches,
+            etaSecs: t.eta_secs ?? null
+        })),
+        partial: view.storage.eta.partial,
+        tickAt: view.storage.eta.tick_at ?? null
+    };
+
     $: rightElements = [
         {
             type: 'action' as const,
@@ -123,11 +176,16 @@
     <div class="text-red bg-surface0 border border-red rounded p-3 my-3">{error}</div>
 {/if}
 
-{#if consensusProps && storageProps}
+{#if consensusProps && storageProps && lifecycleProps && diskTruthProps && reconcilerProps}
     <!-- The panels are Cards; they bring their own surface and border. -->
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <StoragePanel {...storageProps} />
         <ConsensusPanel {...consensusProps} />
+        <LifecycleCard {...lifecycleProps} />
+        <DiskTruthCard {...diskTruthProps} />
+        <div class="lg:col-span-2">
+            <ReconcilerCard {...reconcilerProps} />
+        </div>
     </div>
 {:else if loading}
     <div class="text-subtitle text-sm py-8 text-center">Loading…</div>

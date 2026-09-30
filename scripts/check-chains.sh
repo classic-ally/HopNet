@@ -44,7 +44,10 @@ while IFS=$'\t' read -r status file _; do
             fi
             ;;
     esac
-done < <(git diff --name-status "${TAG}..HEAD" -- "${MIGRATION_PATHS[@]}" | awk '$2 ~ /\.sql$/ || $3 ~ /\.sql$/')
+# Step files only (NNNN_name.sql): the generated schema dump
+# (migrations/schema.sql) is regenerated whenever a step lands and is kept
+# honest by its own replay gate, not by this freeze.
+done < <(git diff --name-status "${TAG}..HEAD" -- "${MIGRATION_PATHS[@]}" | awk '$2 ~ /\/[0-9][0-9][0-9][0-9]_[^\/]*\.sql$/ || $3 ~ /\/[0-9][0-9][0-9][0-9]_[^\/]*\.sql$/')
 
 # --- 2-4. per-folder ordering, against the tag's per-module head ---
 for dir in $(find "${MIGRATION_PATHS[@]}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort); do

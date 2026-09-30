@@ -5,6 +5,7 @@ use rand::rngs::SysRng;
 
 mod authorization;
 mod byzantine;
+mod forward_dedup;
 mod malachite_integration;
 mod regenesis;
 mod signatures;
@@ -492,7 +493,8 @@ fn create_test_app_state_on_manager(
         fragments_dir: "/tmp/test_fragments".to_string(),
         port: 3000,
         test_mode: true,
-        orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
+        last_sweep: Arc::new(std::sync::Mutex::new(None)),
+        last_tick: Arc::new(std::sync::Mutex::new(None)),
         comms,
         setup_complete,
         entered_join_code: Arc::new(std::sync::OnceLock::new()),

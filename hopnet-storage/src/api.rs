@@ -447,11 +447,20 @@ impl StateReader for NullNet {
     fn all_peers(&self) -> Result<Vec<PeerRef>, StorageError> {
         Ok(Vec::new())
     }
-    fn distributable_blob(
+    fn pull_target(
         &self,
         _blob_id: &BlobId,
-    ) -> Result<Option<crate::store::DistributableBlob>, StorageError> {
+    ) -> Result<Option<crate::traits::PullTarget>, StorageError> {
         Ok(None)
+    }
+    fn self_check_report(&self) -> Result<crate::types::SelfCheckFragments, StorageError> {
+        Err(StorageError::Host("null state reader".into()))
+    }
+    fn confirm_ready(&self, _blob_id: &BlobId) -> Result<Option<u64>, StorageError> {
+        Ok(None)
+    }
+    fn current_height(&self) -> Result<u64, StorageError> {
+        Err(StorageError::Host("null state reader".into()))
     }
     fn blob_manifest(&self, _blob_id: &BlobId) -> Result<Option<BlobManifest>, StorageError> {
         Ok(None)
@@ -462,8 +471,8 @@ impl StateReader for NullNet {
 }
 
 impl LocalStateSink for NullNet {
-    fn mark_local(&self, _fragment_hash: Blake3Hash) {}
-    fn mark_remote_batch(&self, _fragment_hashes: Vec<Blake3Hash>) {}
+    async fn mark_local(&self, _fragment_hash: Blake3Hash) {}
+    async fn mark_remote_batch(&self, _fragment_hashes: Vec<Blake3Hash>) {}
 }
 
 /// Local-only reconstruction: no network discovery, fragments must already
@@ -658,8 +667,8 @@ where
     while let Some(result) = success_rx.recv().await {
         match result {
             Ok((index, recovery, fragment_hash)) => {
-                // Queue the stored_locally settlement through the sink
-                net.local_state.mark_local(fragment_hash);
+                // Settle stored_locally through the sink (awaited).
+                net.local_state.mark_local(fragment_hash).await;
 
                 if let Some((originals, recovery_map)) = manifest.chunks.get_mut(&chunk_number) {
                     let bucket = if recovery { recovery_map } else { originals };
@@ -1152,11 +1161,20 @@ mod tests {
                 pubkey: [7u8; 32],
             }])
         }
-        fn distributable_blob(
+        fn pull_target(
             &self,
             _blob_id: &BlobId,
-        ) -> Result<Option<crate::store::DistributableBlob>, StorageError> {
+        ) -> Result<Option<crate::traits::PullTarget>, StorageError> {
             Ok(None)
+        }
+        fn self_check_report(&self) -> Result<crate::types::SelfCheckFragments, StorageError> {
+            Err(StorageError::Host("not used".into()))
+        }
+        fn confirm_ready(&self, _blob_id: &BlobId) -> Result<Option<u64>, StorageError> {
+            Ok(None)
+        }
+        fn current_height(&self) -> Result<u64, StorageError> {
+            Ok(1)
         }
         fn blob_manifest(&self, _blob_id: &BlobId) -> Result<Option<BlobManifest>, StorageError> {
             Ok(None)
@@ -1167,10 +1185,10 @@ mod tests {
     }
 
     impl LocalStateSink for MemNet {
-        fn mark_local(&self, fragment_hash: Blake3Hash) {
+        async fn mark_local(&self, fragment_hash: Blake3Hash) {
             self.marked_local.lock().unwrap().push(fragment_hash);
         }
-        fn mark_remote_batch(&self, _fragment_hashes: Vec<Blake3Hash>) {}
+        async fn mark_remote_batch(&self, _fragment_hashes: Vec<Blake3Hash>) {}
     }
 
     fn manifest_from_outcome(

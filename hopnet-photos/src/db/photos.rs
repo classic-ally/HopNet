@@ -18,18 +18,13 @@ use rusqlite::params;
 pub fn insert_photo_entry(
     db_tx: &rusqlite::Transaction,
     entry: &PhotoAddEntry,
-    fragments_dir: &str,
+    apply: &hopnet_storage::store::ApplyCtx<'_>,
 ) -> Result<(), DatabaseError> {
     // --- Substrate half: register blobs + fragment metadata + per-blob
     //     key wraps. Must run before the photos rows reference the blob
     //     ids (FK integrity, PRAGMA foreign_keys = ON).
     for resource in &entry.resources {
-        hopnet_storage::store::apply_blob_insert(
-            db_tx,
-            &resource.op,
-            &hopnet_storage::store::ApplyCtx { fragments_dir },
-        )
-        .map_err(|e| {
+        hopnet_storage::store::apply_blob_insert(db_tx, &resource.op, apply).map_err(|e| {
             tracing::error!(
                 "photo_add: apply_blob_insert failed for blob {} (resource_type {}): {e}",
                 resource.op.blob_id,
@@ -719,17 +714,12 @@ pub fn get_blob_access_for_user(
 pub fn edit_photo_content(
     db_tx: &rusqlite::Transaction,
     entry: &crate::envelopes::PhotoEditContentEntry,
-    fragments_dir: &str,
+    apply: &hopnet_storage::store::ApplyCtx<'_>,
     performed_by: i32,
 ) -> Result<(), DatabaseError> {
     // Substrate half: register new blobs (primary edit + thumbnails).
     for resource in &entry.resources {
-        hopnet_storage::store::apply_blob_insert(
-            db_tx,
-            &resource.op,
-            &hopnet_storage::store::ApplyCtx { fragments_dir },
-        )
-        .map_err(|e| {
+        hopnet_storage::store::apply_blob_insert(db_tx, &resource.op, apply).map_err(|e| {
             tracing::error!(
                 "photo_edit_content: apply_blob_insert {} failed: {e}",
                 resource.op.blob_id,
@@ -1247,6 +1237,15 @@ mod tests {
     use hopnet_common::Blake3Hash;
     use rusqlite::Connection;
 
+    /// The substrate apply context every blob-writing test hands down
+    /// (production code gets it from the handler context).
+    fn test_apply() -> hopnet_storage::store::ApplyCtx<'static> {
+        hopnet_storage::store::ApplyCtx {
+            fragments_dir: "/tmp/fragments",
+            height: 1,
+        }
+    }
+
     fn fixture() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
@@ -1300,7 +1299,7 @@ mod tests {
             cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
-        insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
+        insert_photo_entry(&tx, &entry, &test_apply()).unwrap();
         tx.commit().unwrap();
 
         // Verify rows exist.
@@ -1344,7 +1343,7 @@ mod tests {
             cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
-        insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
+        insert_photo_entry(&tx, &entry, &test_apply()).unwrap();
         tx.commit().unwrap();
 
         // Delete.
@@ -1411,7 +1410,7 @@ mod tests {
             cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
-        insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
+        insert_photo_entry(&tx, &entry, &test_apply()).unwrap();
         tx.commit().unwrap();
 
         let tx = conn.unchecked_transaction().unwrap();
@@ -1472,7 +1471,7 @@ mod tests {
             cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
-        insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
+        insert_photo_entry(&tx, &entry, &test_apply()).unwrap();
         tx.commit().unwrap();
 
         // First delete.
@@ -1548,7 +1547,7 @@ mod tests {
             cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
-        insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
+        insert_photo_entry(&tx, &entry, &test_apply()).unwrap();
         tx.commit().unwrap();
 
         let tx = conn.unchecked_transaction().unwrap();
@@ -1589,7 +1588,7 @@ mod tests {
             cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
-        insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
+        insert_photo_entry(&tx, &entry, &test_apply()).unwrap();
         tx.commit().unwrap();
 
         // Soft-delete first.
@@ -1676,7 +1675,7 @@ mod tests {
             cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
-        insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
+        insert_photo_entry(&tx, &entry, &test_apply()).unwrap();
         tx.commit().unwrap();
 
         let tx = conn.unchecked_transaction().unwrap();
@@ -1874,7 +1873,7 @@ mod tests {
             cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
-        insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
+        insert_photo_entry(&tx, &entry, &test_apply()).unwrap();
         tx.commit().unwrap();
     }
 

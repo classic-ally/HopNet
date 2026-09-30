@@ -209,6 +209,15 @@ inside the boot transition, before the node is live.
   are not yet supported — the chain records schema history, and the
   joiner path would also need *config* history to consume them (Open
   Questions). CI refuses them until that gap is designed.
+  - Adding a table to a released section IS supported, by the
+    pre-split precedent: the module freezes the previous covered set
+    as a spec at its old `format_version`, and the import plan maps
+    an artifact at that version to the frozen spec and materializes
+    the module at that ordinal before fast-forwarding. First use:
+    storage@1 → `PRE_LIFECYCLE_SNAPSHOT_SECTION` (RFC-STORAGE-003 S1,
+    `storage_view_transitions`); second: storage@2 →
+    `PRE_DISK_TRUTH_SNAPSHOT_SECTION` (S5, the disk-truth columns —
+    a covered-shape change with the same table set).
 
 ## Execution — The Seam
 

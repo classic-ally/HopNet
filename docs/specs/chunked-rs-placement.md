@@ -71,6 +71,7 @@ Replace whole-file Reed-Solomon encoding with rendezvous hashing placement with 
 - [x] Deterministic shuffle using Blake3-based Fisher-Yates with file_hash seed
 - [x] Return top 30 nodes after shuffle
 - [x] **Validation**: 5 unit tests pass - same file_hash → same nodes; different files → different nodes; filters inactive validators
+- [x] **Revised 2026-09-27 (RFC-STORAGE-003):** the >30 stage ranks by the quantized placement weight (16 buckets, ties by node id), not by raw scores — the lifecycle's view snapshot is exactly (members, weights), so selection reads nothing finer than the snapshot records. `hopnet_storage::placement::select_nodes_for_blob(members, &weights, seed)`; the seed is the blob id.
 
 ### Step 8: Implement modulo placement primitive [x]
 - [x] Create `src/files/placement.rs::get_fragment_placement(local_index, selected_nodes) -> Vec<&Node>`

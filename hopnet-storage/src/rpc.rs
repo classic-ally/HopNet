@@ -67,7 +67,7 @@ fn encode<T: Serialize>(msg: &T) -> Vec<u8> {
 /// per-arm serve shells and the [`StoreOutcome`] → wire mapping the host
 /// used to own. No auth needed — mesh connections are already authenticated
 /// by the peer directory's before-registration hook.
-pub fn serve<L: LocalStateSink + ?Sized>(
+pub async fn serve<L: LocalStateSink + ?Sized>(
     fragments_dir: &str,
     sink: &L,
     req: FragmentRequest,
@@ -91,7 +91,7 @@ pub fn serve<L: LocalStateSink + ?Sized>(
         FragmentRequest::Store {
             fragment_hash,
             data,
-        } => match serve::serve_fragment_store(fragments_dir, sink, &fragment_hash, data) {
+        } => match serve::serve_fragment_store(fragments_dir, sink, &fragment_hash, data).await {
             StoreOutcome::Stored => FragmentResponse::Store {
                 success: true,
                 already_existed: false,
@@ -191,26 +191,39 @@ impl<R: hopnet_comms::Rpc> Transport for RpcTransport<R> {
         let payload = encode(&FragmentRequest::Fetch {
             fragment_hash: *fragment_hash,
         });
-        let reply = self
-            .rpc
-            .rpc(peer, SCOPE, payload, FRAGMENT_TRANSFER_TIMEOUT)
-            .await
-            .map_err(classify)?;
-        match decode_response(&reply)? {
-            FragmentResponse::Fetch { found, data } => {
-                if found {
-                    data.ok_or_else(|| {
-                        TransportError::Transport("fragment marked found but data is None".into())
-                    })
-                } else {
-                    Err(TransportError::Peer("fragment not found".into()))
+        // Transfer timing (S7): bytes and elapsed are both in hand here,
+        // so this is where the fetch histograms are fed.
+        let start = std::time::Instant::now();
+        let result = async {
+            let reply = self
+                .rpc
+                .rpc(peer, SCOPE, payload, FRAGMENT_TRANSFER_TIMEOUT)
+                .await
+                .map_err(classify)?;
+            match decode_response(&reply)? {
+                FragmentResponse::Fetch { found, data } => {
+                    if found {
+                        data.ok_or_else(|| {
+                            TransportError::Transport(
+                                "fragment marked found but data is None".into(),
+                            )
+                        })
+                    } else {
+                        Err(TransportError::Peer("fragment not found".into()))
+                    }
                 }
+                FragmentResponse::Error { message } => Err(TransportError::Peer(message)),
+                other => Err(TransportError::Transport(format!(
+                    "unexpected response to Fetch: {other:?}"
+                ))),
             }
-            FragmentResponse::Error { message } => Err(TransportError::Peer(message)),
-            other => Err(TransportError::Transport(format!(
-                "unexpected response to Fetch: {other:?}"
-            ))),
         }
+        .await;
+        match &result {
+            Ok(data) => crate::observe::record_fetch(start.elapsed(), data.len()),
+            Err(_) => crate::observe::record_fetch_failure(),
+        }
+        result
     }
 
     async fn fragment_health(

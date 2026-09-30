@@ -66,6 +66,9 @@ mod tests {
         let internal_submitters = [
             "submit_metrics",
             "self_check_fragments",
+            "attest_fragments",
+            "declare_placement_target",
+            "confirm_placement",
             "node_staged_version",
             "validator_vote_out",
             "validator_activation",

@@ -195,6 +195,76 @@ pub struct ViewHistoryEntry {
     pub block_hash: Option<String>,
 }
 
+/// Query for `GET /consensus/blocks`: an inclusive height range.
+#[derive(serde::Deserialize)]
+pub struct BlockRange {
+    pub from: u64,
+    pub to: u64,
+}
+
+/// One decided height and the consensus functions its block carried.
+#[derive(Serialize)]
+pub struct DecidedFunctions {
+    pub height: u64,
+    pub functions: Vec<String>,
+}
+
+/// Widest range one call answers — a debugging read, never a sync path.
+const MAX_BLOCK_RANGE: u64 = 1000;
+
+/// GET /consensus/blocks?from=H1&to=H2 — the transaction function names
+/// decided at each height in the range (debugging / test-harness read: the
+/// orchestrator attributes heights to the traffic that filled them, so a
+/// batching check can tell its own operations from the storage lifecycle's
+/// follow-up transactions). Heights without a certificate (genesis) are
+/// omitted.
+pub async fn get_decided_functions(
+    State(app_state): State<AppState>,
+    axum::extract::Query(range): axum::extract::Query<BlockRange>,
+) -> impl IntoResponse {
+    if range.to < range.from || range.to - range.from > MAX_BLOCK_RANGE {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("range must be ascending and span at most {MAX_BLOCK_RANGE} heights"),
+        )
+            .into_response();
+    }
+    let Ok(conn) = app_state.db_pool.get() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to get DB connection",
+        )
+            .into_response();
+    };
+    let blocks = match hopnet_consensus::store::decided_range(
+        &conn,
+        hopnet_consensus::context::Height(range.from),
+        hopnet_consensus::context::Height(range.to),
+    ) {
+        Ok(blocks) => blocks,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("decided range read: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let out: Vec<DecidedFunctions> = blocks
+        .iter()
+        .filter_map(|(block, _)| {
+            let txs =
+                crate::consensus::malachite::app::to_old_transactions(&block.data.transactions)
+                    .ok()?;
+            Some(DecidedFunctions {
+                height: block.data.height,
+                functions: txs.iter().map(|tx| tx.rpc.function.clone()).collect(),
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(out)).into_response()
+}
+
 // Get consensus history showing height progression.
 //
 // Malachite compatibility shim: one row per decided height from the crate's

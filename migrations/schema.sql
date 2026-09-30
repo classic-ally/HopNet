@@ -214,7 +214,7 @@ CREATE TABLE data_blocks (
             added_bytes      INTEGER NOT NULL,
             placement_height INTEGER,  -- Consensus height when fragment placement was determined
             file_size        INTEGER NOT NULL  -- Total size of the file in bytes (i64, max ~9.2 EB)
-        );
+        , desired_placement_height INTEGER NOT NULL DEFAULT 0);
 
 CREATE TABLE blob_access (
             blob_id          TEXT NOT NULL,
@@ -258,7 +258,7 @@ CREATE INDEX idx_fragment_hash ON fragment_hashes(fragment_hash);
 CREATE TABLE fragment_inventory (
             fragment_hash           BLOB NOT NULL,
             node_id                 INTEGER NOT NULL,
-            self_verified_height    INTEGER, -- Once every so often we ensure this verification is actual disk check NOT only DB check.
+            self_verified_height    INTEGER, verified_height INTEGER, provenance INTEGER, suspect INTEGER NOT NULL DEFAULT 0, -- Once every so often we ensure this verification is actual disk check NOT only DB check.
 
             PRIMARY KEY (fragment_hash, node_id),
             FOREIGN KEY (node_id) REFERENCES nodes(node_id)
@@ -281,6 +281,17 @@ CREATE TABLE hopnet_storage_pins (
         );
 
 CREATE INDEX idx_hopnet_storage_pins_blob ON hopnet_storage_pins(blob_id);
+
+CREATE INDEX idx_data_blocks_desired ON data_blocks(desired_placement_height);
+
+CREATE INDEX idx_data_blocks_inflight ON data_blocks(placement_height, desired_placement_height);
+
+CREATE TABLE storage_view_transitions (
+    height   INTEGER PRIMARY KEY,
+    snapshot BLOB NOT NULL
+);
+
+CREATE INDEX idx_fragment_inventory_verified ON fragment_inventory (node_id, verified_height);
 
 CREATE TABLE inodes (
             -- stable identifier for FileProvider (UUIDv7 encodes creation time)

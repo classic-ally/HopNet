@@ -76,7 +76,9 @@ vision says they never touch the network.
 connection eviction, SAME id reused so the receiver dedups (response-
 byte cache, rpc scopes only, 300s TTL). `open_call`: multi-frame, no
 auto-retry, no dedup — streamed protocols own idempotency (txforward:
-the nonce table). `broadcast`: spawn-per-peer fire-and-forget, fresh id
+the nonce table across proposers, and the proposer's nonce-unique
+pending pool within one, so a re-forwarded transaction joins its
+pooled copy). `broadcast`: spawn-per-peer fire-and-forget, fresh id
 per send, single ack frame, failures at debug. Timeouts cover stream IO;
 the connect budget is separate (`CallOptions.connect_timeout` carries
 the forward path's tight 2s). Constants unchanged: 8MB frame cap, 10s

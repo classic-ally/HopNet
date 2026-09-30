@@ -64,6 +64,26 @@ impl SelfCheckFragments {
     }
 }
 
+/// Disk-truth attestation (RFC-STORAGE-003 S5): the fragments this node
+/// saw on its own disk this cycle (`present` — existence- or content-
+/// verified, stamped `verified_height = height`, provenance self-scan) and
+/// the rows it marks suspect (never by self-scan; the proof-of-possession
+/// successor's hook). Storage-owned tx payload, function `attest_fragments`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FragmentAttestation {
+    pub node_id: i32,
+    /// Consensus height the verification was performed against.
+    pub height: u64,
+    pub present: Vec<Blake3Hash>,
+    pub suspect: Vec<Blake3Hash>,
+}
+
+impl FragmentAttestation {
+    pub fn is_empty(&self) -> bool {
+        self.present.is_empty() && self.suspect.is_empty()
+    }
+}
+
 /// One wrap of a per-blob key to a recipient X25519 pubkey (v1 format).
 /// Replicated state: rides consensus transactions and lands in the
 /// `blob_access` table. Keyed by pubkey — the substrate is user-agnostic.

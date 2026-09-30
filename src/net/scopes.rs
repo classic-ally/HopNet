@@ -363,7 +363,7 @@ impl RpcHandler for StorageScope {
                             let sink = crate::storage_host::substrate_host::SubstrateHost::new(
                                 app_state.clone(),
                             );
-                            hopnet_storage::rpc::serve(&app_state.fragments_dir, &sink, req)
+                            hopnet_storage::rpc::serve(&app_state.fragments_dir, &sink, req).await
                         }
                         Err(e) => FragmentResponse::Error {
                             message: format!("bad storage request: {e}"),

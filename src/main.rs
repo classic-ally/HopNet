@@ -501,7 +501,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 fragments_dir,
                 port,
                 test_mode: cfg!(debug_assertions) || std::env::var("HOPNET_TEST_MODE").is_ok(),
-                orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
+                last_sweep: Arc::new(std::sync::Mutex::new(None)),
+                last_tick: Arc::new(std::sync::Mutex::new(None)),
                 comms,
                 setup_complete,
                 entered_join_code,
@@ -755,6 +756,29 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 upgrade_worker.run().await;
             });
 
+            // Orphaned data-block cleanup (RFC-STORAGE-003 S6, absorbing
+            // RFC-007's schedule): randomized daily, per node. Deletion
+            // policy on a slow cron — the retention window inside the job
+            // is the recovery window; a collision between nodes costs one
+            // rejected duplicate transaction.
+            let random_second = rand::rng().random_range(5..55);
+            let random_minute = rand::rng().random_range(0..60);
+            let random_hour = rand::rng().random_range(0..24);
+            let orphan_cleanup_cron_expression =
+                format!("{} {} {} * * *", random_second, random_minute, random_hour);
+            let orphan_cleanup_schedule =
+                apalis_cron::Schedule::from_str(&orphan_cleanup_cron_expression).unwrap();
+            let orphan_cleanup_cron_stream = apalis_cron::CronStream::new(orphan_cleanup_schedule);
+
+            let orphan_cleanup_worker = WorkerBuilder::new("orphaned-data-block-cleanup")
+                .data(app_state.clone())
+                .backend(orphan_cleanup_cron_stream)
+                .build_fn(storage_host::jobs::handle_orphaned_data_block_cleanup);
+
+            tokio::spawn(async move {
+                orphan_cleanup_worker.run().await;
+            });
+
             // Boot attestation: converge the committed version claim as
             // soon as the node is set up and the engine is live.
             tokio::spawn(upgrade::jobs::attest_until_converged(app_state.clone()));
@@ -841,8 +865,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .route(
                     "/maintenance/orphaned-fragments",
-                    get(storage_host::routes::get_orphaned_fragments_scan)
-                        .delete(storage_host::routes::delete_orphaned_fragments),
+                    get(storage_host::routes::get_orphaned_fragments_scan),
                 )
                 .route(
                     "/maintenance/watermark-eviction",
@@ -910,6 +933,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     get(consensus::routes::get_consensus_history),
                 )
                 .route("/consensus/view", post(consensus::routes::debug_view_state))
+                .route(
+                    "/consensus/blocks",
+                    get(consensus::routes::get_decided_functions),
+                )
                 .route("/consensus/leave", post(consensus::routes::post_leave))
                 .route(
                     "/consensus/regenesis/start",

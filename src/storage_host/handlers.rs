@@ -14,7 +14,164 @@ pub const TX_FUNCTIONS: &[&str] = &[
     "update_placement_heights",
     "delete_orphaned_data_blocks",
     "self_check_fragments",
+    hopnet_storage::lifecycle::DECLARE_TX_FN,
+    hopnet_storage::lifecycle::CONFIRM_TX_FN,
+    hopnet_storage::engine::policy::ATTEST_FN,
 ];
+
+/// RFC-STORAGE-003 S5 disk-truth attestation: stamp the rows this node
+/// verified on its own disk. A node may attest only for itself.
+pub struct AttestFragmentsHandler;
+
+impl TransactionHandler for AttestFragmentsHandler {
+    fn name(&self) -> &'static str {
+        hopnet_storage::engine::policy::ATTEST_FN
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (report, _) =
+            bincode::serde::decode_from_slice::<hopnet_storage::FragmentAttestation, _>(
+                tx.payload,
+                bincode::config::standard(),
+            )
+            .map_err(|_| DatabaseError::InvalidPayload)?;
+        if report.node_id != tx.submitter_node {
+            tracing::warn!(
+                "Authorization failed: node {} attempted to attest for node {}",
+                tx.submitter_node,
+                report.node_id
+            );
+            return Err(DatabaseError::AuthorizationError);
+        }
+        let stamped = hopnet_storage::store::apply_attestation(
+            db_tx,
+            report.node_id,
+            report.height,
+            &report.present,
+            &report.suspect,
+        )
+        .map_err(storage_err("apply_attestation"))?;
+        tracing::debug!(
+            node = report.node_id,
+            height = report.height,
+            stamped,
+            suspect = report.suspect.len(),
+            "attest_fragments applied"
+        );
+        Ok(())
+    }
+}
+
+inventory::submit! {
+    &AttestFragmentsHandler as &dyn TransactionHandler
+}
+
+/// Storage apply errors → handler errors: SQLite contention stays
+/// transient (validation must surface it as Undetermined, never a
+/// verdict); anything else is a processing failure.
+fn storage_err(what: &'static str) -> impl Fn(hopnet_storage::StorageError) -> DatabaseError {
+    move |e| match e {
+        hopnet_storage::StorageError::Transient(code) => DatabaseError::Transient(code),
+        other => {
+            tracing::error!("{what} failed: {other}");
+            DatabaseError::ProcessingError
+        }
+    }
+}
+
+/// RFC-STORAGE-003 DeclarePlacementTarget: move blobs' goals forward.
+/// Per-entry validation lives in the substrate (`lifecycle::apply_declare`);
+/// invalid entries are skipped, never fail the block — only an undecodable
+/// payload errors.
+pub struct DeclarePlacementTargetHandler;
+
+impl TransactionHandler for DeclarePlacementTargetHandler {
+    fn name(&self) -> &'static str {
+        hopnet_storage::lifecycle::DECLARE_TX_FN
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        execute: bool,
+        ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<
+            hopnet_storage::DeclarePlacementTarget,
+            _,
+        >(tx.payload, bincode::config::standard())
+        .map_err(|_| DatabaseError::InvalidPayload)?;
+        let outcome = hopnet_storage::lifecycle::apply_declare(db_tx, &payload, ctx.height)
+            .map_err(storage_err("apply_declare"))?;
+        tracing::debug!(
+            height = ctx.height,
+            applied = outcome.applied,
+            skipped = outcome.skipped,
+            "declare_placement_target applied"
+        );
+        // Pull duties derive at declare-apply (RFC-STORAGE-003 S3): wake
+        // the reconciler for every moved goal — execute only, validation
+        // must stay pure. Anyone's page applying is the staleness check
+        // observed (S4): it re-arms this node's grace rung.
+        if execute {
+            crate::storage_host::staleness::stamp_observed();
+            for blob_id in &outcome.applied_ids {
+                ctx.work.schedule("storage.pull", blob_id.to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+inventory::submit! {
+    &DeclarePlacementTargetHandler as &dyn TransactionHandler
+}
+
+/// RFC-STORAGE-003 ConfirmPlacement: stamp placement_height once the
+/// attested evidence for the declared goal is complete. Same skip
+/// semantics as declare.
+pub struct ConfirmPlacementHandler;
+
+impl TransactionHandler for ConfirmPlacementHandler {
+    fn name(&self) -> &'static str {
+        hopnet_storage::lifecycle::CONFIRM_TX_FN
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) =
+            bincode::serde::decode_from_slice::<hopnet_storage::ConfirmPlacement, _>(
+                tx.payload,
+                bincode::config::standard(),
+            )
+            .map_err(|_| DatabaseError::InvalidPayload)?;
+        let outcome = hopnet_storage::lifecycle::apply_confirm(db_tx, &payload, ctx.height)
+            .map_err(storage_err("apply_confirm"))?;
+        tracing::debug!(
+            height = ctx.height,
+            applied = outcome.applied,
+            skipped = outcome.skipped,
+            "confirm_placement applied"
+        );
+        Ok(())
+    }
+}
+
+inventory::submit! {
+    &ConfirmPlacementHandler as &dyn TransactionHandler
+}
 
 pub struct UpdatePlacementHeightsHandler;
 

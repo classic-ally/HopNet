@@ -16,6 +16,7 @@ pub mod handlers;
 pub mod jobs;
 pub mod placement;
 pub mod routes;
+pub mod staleness;
 pub mod substrate_host;
 pub mod test_routes;
 

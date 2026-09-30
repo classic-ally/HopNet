@@ -139,6 +139,19 @@ pub fn scan_fragments(
     fragments_dir: &str,
     older_than_unix: u64,
 ) -> Result<Vec<(Blake3Hash, u64)>, StorageError> {
+    Ok(scan_fragments_detailed(fragments_dir)?
+        .into_iter()
+        .filter(|d| d.mtime < older_than_unix)
+        .map(|d| (d.hash, d.size))
+        .collect())
+}
+
+/// The whole store, one file per entry with its mtime — the sweep's walk
+/// (RFC-STORAGE-003 S5), shared by the flag diff (every file) and the
+/// orphan grace (old files only). A missing root directory scans as empty.
+pub fn scan_fragments_detailed(
+    fragments_dir: &str,
+) -> Result<Vec<crate::sweep::DiskFragment>, StorageError> {
     use std::time::SystemTime;
 
     let fragments_path = std::path::Path::new(fragments_dir);
@@ -171,7 +184,6 @@ pub fn scan_fragments(
                     continue;
                 }
 
-                // Only consider files whose modification time is old enough
                 let mtime = metadata
                     .modified()?
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -179,9 +191,6 @@ pub fn scan_fragments(
                         StorageError::Io(io::Error::other("Invalid file modification time"))
                     })?
                     .as_secs();
-                if mtime >= older_than_unix {
-                    continue;
-                }
 
                 // Parse filename as Blake3 hash (64 hex characters)
                 let filename = file_entry.file_name();
@@ -194,7 +203,11 @@ pub fn scan_fragments(
                     Ok(bytes) if bytes.len() == 32 => {
                         let mut array = [0u8; 32];
                         array.copy_from_slice(&bytes);
-                        disk_fragments.push((Blake3Hash::from_bytes(array), metadata.len()));
+                        disk_fragments.push(crate::sweep::DiskFragment {
+                            hash: Blake3Hash::from_bytes(array),
+                            size: metadata.len(),
+                            mtime,
+                        });
                     }
                     _ => {
                         tracing::warn!("Invalid fragment hash filename: {}", filename_str);
@@ -244,21 +257,28 @@ pub fn verify_slice(
     slice: u8,
     slices: u8,
 ) -> Result<Vec<Blake3Hash>, StorageError> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let all = scan_fragments(fragments_dir, now)?;
+    let all = scan_fragments_detailed(fragments_dir)?;
+    Ok(verify_listing(fragments_dir, &all, slice, slices))
+}
+
+/// The scrub over an existing walk (the sweep shares its listing): verify
+/// the content of every file in `slice`, returning the corrupt hashes.
+pub fn verify_listing(
+    fragments_dir: &str,
+    listing: &[crate::sweep::DiskFragment],
+    slice: u8,
+    slices: u8,
+) -> Vec<Blake3Hash> {
     let mut corrupted = Vec::new();
-    for (hash, _) in all {
-        if hash.as_bytes()[0] % slices.max(1) != slice {
+    for d in listing {
+        if d.hash.as_bytes()[0] % slices.max(1) != slice {
             continue;
         }
-        if fetch_and_verify_fragment(&hash, fragments_dir).is_err() {
-            corrupted.push(hash);
+        if fetch_and_verify_fragment(&d.hash, fragments_dir).is_err() {
+            corrupted.push(d.hash);
         }
     }
-    Ok(corrupted)
+    corrupted
 }
 
 #[cfg(test)]

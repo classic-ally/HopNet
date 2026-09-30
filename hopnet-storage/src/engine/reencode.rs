@@ -25,18 +25,6 @@ pub struct ReencodeOutcome {
     pub fetched: usize,
 }
 
-/// Deterministic repairer election: the responsible node of the chunk's
-/// lowest missing class (RFC-STORAGE-001 Repair). Seeded placement shards
-/// the role uniformly across survivors with no coordinator; collisions are
-/// harmless (byte-identical shards, hash dedup at store).
-pub fn repairer_for_chunk(assignment: &[i32], missing_classes: &[u32]) -> Option<i32> {
-    missing_classes
-        .iter()
-        .min()
-        .and_then(|&c| assignment.get(c as usize))
-        .copied()
-}
-
 /// Regenerate missing fragment classes from any ≥ K ciphertext shards.
 ///
 /// Pure over in-memory shards (class index 0..N: 0..K originals, K..N
@@ -254,7 +242,7 @@ where
         let hash = classes[&class].0;
         fragstore::store_fragment(fragments_dir, &hash, bytes.clone())
             .map_err(|e| EngineError::Transfer(format!("re-encode: store class {class}: {e}")))?;
-        local_state.mark_local(hash);
+        local_state.mark_local(hash).await;
     }
 
     tracing::info!(
@@ -350,16 +338,5 @@ mod tests {
         let shards: HashMap<u32, Vec<u8>> =
             (0..9u32).map(|c| (c, all[c as usize].clone())).collect();
         assert!(regenerate_missing(&shards, &[15]).is_err());
-    }
-
-    // Should: elect the responsible node of the LOWEST missing class.
-    // Impact: the election shards repair cost mesh-wide with no
-    // coordinator; a different rule on two nodes would double-repair
-    // (harmless) or orphan chunks (not harmless).
-    #[test]
-    fn repairer_election_lowest_missing() {
-        let assignment: Vec<i32> = (0..30).map(|c| c % 5).collect();
-        assert_eq!(repairer_for_chunk(&assignment, &[12, 7, 29]), Some(7 % 5));
-        assert_eq!(repairer_for_chunk(&assignment, &[]), None);
     }
 }

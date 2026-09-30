@@ -1,91 +1,97 @@
-//! Pure distribution-engine policy: every tunable and batching decision,
-//! separated from the tokio plumbing in `engine::mod` so semantics are
-//! testable without a runtime.
+//! Pure reconciler policy: every tunable, separated from the tokio plumbing
+//! in `engine::mod` so semantics are testable without a runtime.
+//!
+//! RFC-STORAGE-003 S3 retired the push pipeline's knobs (worker pools,
+//! send permits, the failure threshold, the placement batcher): transfer
+//! pacing now lives on the pull side — one serial worker per node, so
+//! concurrency tracks the mesh, not the upload count.
 
-use crate::types::PlacementUpdate;
-use std::collections::HashMap;
+/// In-flight blobs the policy tick re-kicks per run, oldest goal first.
+/// Bounded so a ballooning in-flight set (a catch-up drain after a view
+/// transition) is paced, never refused — the set records need, the tick
+/// works it down.
+pub const PULL_KICKS_PER_TICK: usize = 64;
 
-/// Global distribution workers (RFC-014 engine rule: concurrency tracks the
-/// mesh, not the upload count; actual sends are further bounded by
-/// SEND_PERMITS).
-pub const DISTRIBUTION_WORKERS: usize = 4;
+/// The fulfillment pass's base sample (S4): in-flight blobs checked for
+/// complete confirmation evidence in the tick's first round. Rounds
+/// continue, doubling, while the sample stays dense (`next_fulfillment_sample`).
+pub const CONFIRM_CHECKS_PER_TICK: usize = 256;
 
-/// Process-wide bound on concurrent fragment sends.
-pub const SEND_PERMITS: usize = 16;
+/// Rounds the fulfillment pass may run per tick: from the base sample,
+/// doubling to `CONFIRM_SAMPLE_MAX`, six rounds clear roughly twelve
+/// thousand rubber stamps in one tick — a post-transition balloon of a
+/// small mesh's whole population — at one consensus round each.
+pub const CONFIRM_ROUNDS_PER_TICK: usize = 6;
 
-/// Per-blob fragment-send workers (clamped to the fragment count).
-pub const BLOB_SEND_WORKERS: usize = 4;
-
-/// Fail a blob's distribution if more than this share of fragments could
-/// not be placed on any candidate.
-pub const FAILURE_THRESHOLD_PERCENT: f64 = 10.0;
-
-/// Domain-level retries per fragment send (server-side transient errors).
-pub const SEND_MAX_RETRIES: u32 = 2;
-pub const SEND_RETRY_DELAY_MS: u64 = 1000;
-
-/// How long the placement batcher collects updates before flushing them as
-/// one `update_placement_heights` consensus tx, and the flush size cap
-/// (aligned with the consensus queue's MAX_BATCH_SIZE).
-pub const PLACEMENT_FLUSH_MS: u64 = 750;
-pub const PLACEMENT_FLUSH_MAX: usize = 100;
-/// Flush retry cap for transient submit failures.
-pub const PLACEMENT_FLUSH_ATTEMPTS: u8 = 3;
-
-/// The storage-owned consensus transaction the batcher submits.
-pub const PLACEMENT_COMMIT_FN: &str = "update_placement_heights";
-
-/// Dedup a flush window by blob id, keeping the LATEST placement height for
-/// each blob (a re-distributed blob supersedes its earlier entry). Entries
-/// carry their retry attempt count through the dedup.
-pub fn dedup_window(pending: Vec<(PlacementUpdate, u8)>) -> Vec<(PlacementUpdate, u8)> {
-    let mut seen = HashMap::new();
-    for (u, attempts) in pending {
-        seen.insert(u.blob_id.clone(), (u, attempts));
-    }
-    seen.into_values().collect()
+/// The adaptive sample's step (S4): after a round that sampled `sampled`
+/// blobs and found `ready` of them confirm-ready, the next round's sample
+/// — doubled (capped at `CONFIRM_SAMPLE_MAX`) while at least half were
+/// ready, `None` when the set has gone sparse or empty and the pass
+/// should rest until the next tick. Recurrence over a draining set is
+/// what makes a random sample comprehensive; density is what makes the
+/// doubling safe (a sparse sample means the remaining work is pulls, not
+/// stamps).
+pub fn next_fulfillment_sample(sample: usize, sampled: usize, ready: usize) -> Option<usize> {
+    (sampled > 0 && ready * 2 >= sampled).then(|| (sample * 2).min(CONFIRM_SAMPLE_MAX))
 }
+
+/// Consensus function names the reconciler submits through the
+/// `TxSubmitter` seam.
+pub const SELF_CHECK_FN: &str = "self_check_fragments";
+/// Disk-truth attestation (S5): stamps `verified_height` on the rows this
+/// node has just verified on its own disk.
+pub const ATTEST_FN: &str = "attest_fragments";
+
+/// Confirmation evidence recency (S5) — defined beside the evidence check
+/// in `lifecycle` (feature-free), re-exported here with the other knobs.
+pub use crate::lifecycle::ATTESTATION_RECENCY_HEIGHTS;
+
+/// Blobs per declare page (S4 staleness pass). Pagination for block-size
+/// hygiene, not a cap: the work-list consumes itself, so the next
+/// proposal takes the next page.
+pub const DECLARE_PAGE_SIZE: usize = 500;
+
+/// The staleness pass's grace rung: a node that has not observed the
+/// `desired < T` check (a proposal of its own, or anyone's declare page
+/// applying) for this long submits a page directly. Longer than the
+/// metrics heartbeat, so it never fires while the propose hook is healthy.
+pub const STALENESS_GRACE_SECS: i64 = 900;
+
+/// Upper bound of the adaptive fulfillment sample (S4): the sample doubles
+/// while at least half of it is confirm-ready and resets otherwise.
+pub const CONFIRM_SAMPLE_MAX: usize = 4096;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
 
-    // Should: keep the LAST entry per blob id across a window, preserving
-    // attempt counts of the surviving entry.
-    // Should not: let a retried (older) entry shadow a newer placement.
-    // Impact: duplicate placement commits per window would waste consensus
-    // payload; a stale height surviving dedup would pin placement to an
-    // outdated validator snapshot.
+    // Should: double the sample while at least half of it was ready, hold
+    // at the cap, and stop on a sparse or empty round.
+    // Should not: keep doubling on a round that found fewer than half ready.
     #[test]
-    fn dedup_keeps_latest_per_blob() {
-        let a = crate::CustomUUID::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap();
-        let b = crate::CustomUUID::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap();
-        let out = dedup_window(vec![
-            (
-                PlacementUpdate {
-                    blob_id: a.clone(),
-                    placement_height: 5,
-                },
-                1,
-            ),
-            (
-                PlacementUpdate {
-                    blob_id: b.clone(),
-                    placement_height: 6,
-                },
-                0,
-            ),
-            (
-                PlacementUpdate {
-                    blob_id: a.clone(),
-                    placement_height: 9,
-                },
-                0,
-            ),
-        ]);
-        assert_eq!(out.len(), 2);
-        let a_entry = out.iter().find(|(u, _)| u.blob_id == a).unwrap();
-        assert_eq!((a_entry.0.placement_height, a_entry.1), (9, 0));
+    fn fulfillment_sample_doubles_while_dense_and_stops_when_sparse() {
+        assert_eq!(next_fulfillment_sample(256, 256, 256), Some(512));
+        assert_eq!(
+            next_fulfillment_sample(256, 256, 128),
+            Some(512),
+            "exactly half is dense"
+        );
+        assert_eq!(next_fulfillment_sample(256, 256, 127), None);
+        assert_eq!(
+            next_fulfillment_sample(256, 0, 0),
+            None,
+            "nothing in flight"
+        );
+        assert_eq!(
+            next_fulfillment_sample(4096, 4096, 4096),
+            Some(CONFIRM_SAMPLE_MAX)
+        );
+        assert_eq!(
+            next_fulfillment_sample(3000, 3000, 2000),
+            Some(CONFIRM_SAMPLE_MAX)
+        );
+        // A short final page (fewer in flight than the sample) that is all
+        // ready still reports dense — the next round finds it empty.
+        assert_eq!(next_fulfillment_sample(512, 40, 40), Some(1024));
     }
 }

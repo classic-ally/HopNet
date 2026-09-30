@@ -235,6 +235,14 @@ Non-proposer nodes forward queued transactions to the proposer from the shell's
 height while paused. Undeliverable batches resume the node's own engine (wake
 rule 1 corollary).
 
+Idempotency across a forward's retries (2026-09-27): the proposer's `PendingPool`
+is nonce-unique — a re-forwarded transaction it already holds (staged or in
+flight) joins the pooled entry's waiters instead of becoming a second copy, which
+preflight would have rejected as a semantic duplicate while the first committed.
+On the forwarder, a `Rejected` verdict for a nonce already in the local
+`committed_tx_nonces` resolves as committed: a committed transaction cannot be
+rejected. Across proposers the nonce table still decides.
+
 ## Testing
 
 - **Crate units** (~52): OUR surface only — the engine is upstream-verified.
@@ -254,7 +262,12 @@ rule 1 corollary).
 - **Orchestrator** (Docker meshes, self-hosted iroh relay): consensus-leader-down
   (idle-proposer wake), consensus-lagging-catch-up, consensus-bft-quorum-loss
   (negative control), barrier tests (before_decide, before_publish_proposal),
-  plus the full application suite and divergence checks.
+  plus the full application suite and divergence checks. `GET
+  /api/consensus/blocks?from=&to=` lists the functions decided at each height
+  (debug read, ≤1000 heights) so a check can attribute heights to the traffic
+  that filled them — consensus-queue-burst's batching check counts only the
+  heights carrying its own ten operations, not the storage lifecycle's
+  follow-up transactions.
 
 ## Configuration
 

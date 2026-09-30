@@ -67,6 +67,18 @@ pub struct HostWorkScheduler {
 impl WorkScheduler for HostWorkScheduler {
     fn schedule(&self, subsystem: &'static str, key: String) {
         match subsystem {
+            // RFC-STORAGE-003 S3: a moved goal wakes this node's reconciler
+            // for the blob — a latency hint; the tick's re-kick is the
+            // level-triggered backstop. Non-blocking (unbounded send).
+            "storage.pull" => {
+                let Ok(blob_id) = key.parse::<hopnet_storage::BlobId>() else {
+                    tracing::error!("storage.pull: invalid blob id {key:?}");
+                    return;
+                };
+                if let Some(storage) = self.app_state.storage.get() {
+                    storage.notify_blob_committed(blob_id);
+                }
+            }
             "takeout.materialize" => {
                 let state = self.app_state.clone();
                 self.app_state.runtime.spawn(async move {

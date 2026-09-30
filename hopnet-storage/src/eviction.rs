@@ -1,16 +1,21 @@
-//! Watermark eviction planner (RFC-STORAGE-001 Copy classes / GC).
+//! Watermark eviction planner (RFC-STORAGE-001 Copy classes / GC;
+//! RFC-STORAGE-003 S2 guard).
 //!
 //! Decentralized GC: a local loop under disk pressure evicts SURPLUS
 //! copies, oldest blob first, from the high watermark down to the low.
 //! Pure planning over caller-gathered facts — the invariant carrier is
 //! the guard, never the watermark values:
 //!
-//!   evictable ⇔ not responsible ∧ not pinned ∧ another non-departed
-//!   member attests a copy in the inventory (or the blob is deleted —
-//!   which the orphan flow owns).
+//!   evictable ⇔ not protected ∧ another non-departed member attests a
+//!   copy in the inventory (or the blob is deleted — which the orphan
+//!   flow owns).
 //!
-//! Eviction never touches responsible copies, so a stale inventory view
-//! can forfeit only surplus margin (checked exhaustively in the model).
+//! `protected` is the protection predicate (`crate::protection`): the
+//! confirmed epoch's obligation, every in-flight epoch's, the never-
+//! confirmed clause, and pins — evaluated by the caller per copy. The
+//! attested-other-holder check stays as a second belt: eviction never
+//! touches a protected copy, so a stale inventory view can forfeit only
+//! surplus margin (checked exhaustively in the model).
 
 use hopnet_common::Blake3Hash;
 
@@ -20,10 +25,9 @@ pub struct EvictionCandidate {
     /// Blob id string — UUIDv7, so ascending lexicographic = oldest first.
     pub blob_id: String,
     pub size_bytes: u64,
-    /// This node is the placement-responsible holder of this class.
-    pub responsible: bool,
-    /// Some projection pinned the blob on this node.
-    pub pinned: bool,
+    /// The protection predicate's verdict for this copy on this node
+    /// (`protection::Protection::protects`, pins folded in).
+    pub protected: bool,
     /// Non-departed members (other than this node) attesting a copy.
     pub other_member_holders: usize,
 }
@@ -58,7 +62,7 @@ pub fn plan_evictions(
 
     let mut evictable: Vec<EvictionCandidate> = candidates
         .into_iter()
-        .filter(|c| !c.responsible && !c.pinned && c.other_member_holders >= 1)
+        .filter(|c| !c.protected && c.other_member_holders >= 1)
         .collect();
     // Oldest blob first (UUIDv7 time order); stable within a blob.
     evictable.sort_by(|a, b| a.blob_id.cmp(&b.blob_id));
@@ -88,8 +92,7 @@ mod tests {
             fragment_hash: hash(b),
             blob_id: blob.to_string(),
             size_bytes: size,
-            responsible: false,
-            pinned: false,
+            protected: false,
             other_member_holders: 1,
         }
     }
@@ -113,23 +116,22 @@ mod tests {
         assert!(plan_evictions(vec![candidate(1, "b", 10)], &calm).is_empty());
     }
 
-    // Should not: evict responsible, pinned, or sole-live-holder copies —
-    // under ANY pressure.
-    // Impact: these three exclusions ARE the eviction-safety invariant;
+    // Should not: evict a protected copy (obligation, in-flight, never-
+    // confirmed, or pinned — the predicate's verdict) or a sole-live-
+    // holder copy — under ANY pressure.
+    // Impact: these two exclusions ARE the eviction-safety invariant;
     // the watermark only decides when pressure acts.
     #[test]
     fn never_evicts_protected_copies() {
-        let mut responsible = candidate(1, "a", 10);
-        responsible.responsible = true;
-        let mut pinned = candidate(2, "b", 10);
-        pinned.pinned = true;
+        let mut protected = candidate(1, "a", 10);
+        protected.protected = true;
         let mut sole = candidate(3, "c", 10);
         sole.other_member_holders = 0;
         let full = DiskPressure {
             used_bytes: 100,
             ..PRESSURE
         };
-        assert!(plan_evictions(vec![responsible, pinned, sole], &full).is_empty());
+        assert!(plan_evictions(vec![protected, sole], &full).is_empty());
     }
 
     // Should: evict oldest blobs first and stop once the low watermark is
@@ -148,5 +150,46 @@ mod tests {
             &PRESSURE,
         );
         assert_eq!(planned, vec![hash(1), hash(2)]);
+    }
+
+    // Impact: the watermark arithmetic decides how much surplus a
+    // pressured node sheds; the conformance harness only ever runs the
+    // planner under full pressure, and the 2026-09-27 mutation run
+    // rewrote the byte math three ways unnoticed.
+    // Should: act only above high_pct of total, and free exactly down to
+    // low_pct of total — no more, oldest first — with percentages of a
+    // total that is not 100.
+    #[test]
+    fn watermark_bytes_are_percentages_of_total() {
+        let pressure = DiskPressure {
+            used_bytes: 950,
+            total_bytes: 1000,
+            high_pct: 90,
+            low_pct: 80,
+        };
+        // Free 950 − 800 = 150: two of the 100-byte copies, not three.
+        let planned = plan_evictions(
+            vec![
+                candidate(1, "0170-a", 100),
+                candidate(2, "0180-b", 100),
+                candidate(3, "0190-c", 100),
+            ],
+            &pressure,
+        );
+        assert_eq!(planned, vec![hash(1), hash(2)]);
+
+        // 850 used is below 900 = 90% of 1000: nothing.
+        let calm = DiskPressure {
+            used_bytes: 850,
+            ..pressure
+        };
+        assert!(plan_evictions(vec![candidate(1, "0170-a", 100)], &calm).is_empty());
+
+        // Exactly at the high mark is not above it.
+        let edge = DiskPressure {
+            used_bytes: 900,
+            ..pressure
+        };
+        assert!(plan_evictions(vec![candidate(1, "0170-a", 100)], &edge).is_empty());
     }
 }

@@ -945,6 +945,7 @@ async fn handle_need_value(
     let propose_seal = regenesis_phase == Some(crate::db::regenesis::RegenesisPhase::Moratorium)
         && candidates.is_empty()
         && pool.inflight_len() == 0;
+    let hook_allowed = regenesis_phase == Some(crate::db::regenesis::RegenesisPhase::Normal);
 
     // Dedicated build connection: proposal building must never lose a pool
     // checkout race under load (a failed build wastes the whole round — the
@@ -968,6 +969,18 @@ async fn handle_need_value(
                 // A failed recompute wastes this round only — the drain
                 // watcher keeps nudging and the next NeedValue retries.
                 Err(e) => tracing::warn!("regenesis commit candidate failed: {e}"),
+            }
+        } else if hook_allowed {
+            // RFC-STORAGE-003 S4 propose hook: whoever assembles a block
+            // runs the staleness check and appends an owed declare page
+            // (proposer-injected, queue-bypassing — the cleanup_nonces
+            // precedent). Appended AFTER the queue entries so candidate
+            // indices still line up with `entries`. A failed check costs
+            // this proposal nothing; the grace rung backstops it.
+            match crate::storage_host::staleness::propose_hook(&build_state, &conn) {
+                Ok(Some(tx)) => candidates.push(tx),
+                Ok(None) => {}
+                Err(e) => tracing::warn!("staleness propose hook skipped: {e}"),
             }
         }
         let result = build_value(&build_state, &mut conn, height, round, candidates);

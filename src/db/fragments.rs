@@ -53,85 +53,6 @@ pub fn find_orphaned_data_blocks(
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub enum AvailabilityClass {
-    BelowAverage, // Clean historical first, keep redundant copies
-    AboveAverage, // Clean redundant first, keep historical data
-}
-
-/// Get node's availability and classify it relative to network average
-/// Returns (node_availability, classification)
-///
-/// Stays host: reads the host-owned metrics table.
-pub fn get_node_availability_classification(
-    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
-    node_id: i32,
-    days: i32,
-) -> Result<(f64, AvailabilityClass), DatabaseError> {
-    match db_connection {
-        Ok(conn) => {
-            // First try to get network average
-            let network_mean = conn
-                .prepare(
-                    "SELECT AVG(CAST(available AS REAL)) as network_mean
-                 FROM metrics
-                 WHERE start_time > datetime('now', '-' || ? || ' days')",
-                )
-                .and_then(|mut stmt| {
-                    stmt.query_row(rusqlite::params![days], |row| {
-                        let mean: Option<f64> = row.get(0)?;
-                        Ok(mean)
-                    })
-                })
-                .unwrap_or(None);
-
-            // Then try to get node availability
-            let node_availability = conn
-                .prepare(
-                    "SELECT AVG(CAST(available AS REAL)) as node_availability
-                 FROM metrics
-                 WHERE to_node = ? AND start_time > datetime('now', '-' || ? || ' days')",
-                )
-                .and_then(|mut stmt| {
-                    stmt.query_row(rusqlite::params![node_id, days], |row| {
-                        let avail: Option<f64> = row.get(0)?;
-                        Ok(avail)
-                    })
-                })
-                .unwrap_or(None);
-
-            // Use defaults if no metrics available
-            let node_availability = node_availability.unwrap_or_else(|| {
-                tracing::warn!(
-                    "No metrics found for node {}, using default availability 0.8",
-                    node_id
-                );
-                0.8
-            });
-            let network_mean = network_mean.unwrap_or_else(|| {
-                tracing::warn!("No network metrics found, using default network mean 0.8");
-                0.8
-            });
-
-            tracing::debug!(
-                "Node {} availability: {:.1}%, network mean: {:.1}%",
-                node_id,
-                node_availability * 100.0,
-                network_mean * 100.0
-            );
-
-            let classification = if node_availability < network_mean {
-                AvailabilityClass::BelowAverage
-            } else {
-                AvailabilityClass::AboveAverage
-            };
-
-            Ok((node_availability, classification))
-        }
-        Err(_) => Err(DatabaseError::LockError),
-    }
-}
-
 // delete_orphaned_data_blocks_consensus moved to
 // crate::storage_host::db_apply (RFC-016 Stage 6) — it lives beside its
 // consensus-handler caller.
@@ -222,8 +143,29 @@ pub struct DiskFragmentInfo {
     pub local_index: u32,
 }
 
+/// Every fragment row's hash and this node's `stored_locally` flag — the
+/// disk-truth sweep's table side (RFC-STORAGE-003 S5). A full-table read
+/// once per sweep; the walk it is diffed against is the same size.
+pub fn all_fragment_flags(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<(crate::types::Blake3Hash, bool)>, DatabaseError> {
+    let mut stmt = conn
+        .prepare("SELECT fragment_hash, stored_locally FROM fragment_hashes")
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, crate::types::Blake3Hash>(0)?,
+                row.get::<_, Option<bool>>(1)?.unwrap_or(false),
+            ))
+        })
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))
+}
+
 /// Look up (blob, class) for on-disk fragment hashes. Hashes absent from
-/// fragment_hashes are orphans — the orphan GC flow owns those, not
+/// fragment_hashes are orphans — the disk-truth sweep owns those, not
 /// eviction.
 pub fn lookup_disk_fragments(
     conn: &rusqlite::Connection,
@@ -281,7 +223,7 @@ pub fn member_holder_counts(
         let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let query = format!(
             "SELECT fragment_hash, node_id FROM fragment_inventory
-             WHERE fragment_hash IN ({placeholders})"
+             WHERE fragment_hash IN ({placeholders}) AND suspect = 0"
         );
         let mut stmt = conn
             .prepare(&query)

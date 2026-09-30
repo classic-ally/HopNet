@@ -18,14 +18,19 @@ pub mod engine;
 pub mod error;
 pub mod eviction;
 pub mod fragstore;
-pub mod maintenance;
+pub mod lifecycle;
 pub mod membership;
+pub mod observe;
 pub mod pins;
 pub mod placement;
+pub mod protection;
+pub mod reconcile;
 pub mod rpc;
 pub mod rs;
 pub mod serve;
 pub mod store;
+pub mod sweep;
+pub mod tick;
 pub mod traits;
 pub mod types;
 
@@ -33,8 +38,13 @@ pub use error::StorageError;
 pub use hopnet_common::Blake3Hash;
 pub use hopnet_common::CustomUUID;
 pub use types::{
-    BlobAccess, BlobId, DeleteOrphanedDataBlocksPayload, MeshKeyGrant, PlacementUpdate,
-    SelfCheckFragments,
+    BlobAccess, BlobId, DeleteOrphanedDataBlocksPayload, FragmentAttestation, MeshKeyGrant,
+    PlacementUpdate, SelfCheckFragments,
+};
+// RFC-STORAGE-003 lifecycle tx payloads (storage-owned; the host registers
+// the handlers, projections never see them).
+pub use lifecycle::{
+    ConfirmPlacement, DeclarePlacementTarget, PlacementConfirmation, PlacementTarget,
 };
 
 // Public crypto seam — consumers (photos-core, future projections) wrap
