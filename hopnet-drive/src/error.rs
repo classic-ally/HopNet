@@ -67,6 +67,10 @@ impl From<hopnet_storage::StorageError> for FileError {
             hopnet_storage::StorageError::Transient(code) => FileError::StorageError(
                 std::io::Error::other(format!("transient database contention: {code:?}")),
             ),
+            // Ingest admission refusal: surfaces as a storage-full I/O error.
+            e @ hopnet_storage::StorageError::InsufficientSpace { .. } => FileError::StorageError(
+                std::io::Error::new(std::io::ErrorKind::StorageFull, e.to_string()),
+            ),
         }
     }
 }

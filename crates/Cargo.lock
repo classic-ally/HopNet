@@ -775,6 +775,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs4"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8640e34b88f7652208ce9e88b1a37a2ae95227d84abec377ccd3c5cfeb141ed4"
+dependencies = [
+ "rustix",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -950,6 +960,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdrhistogram"
+version = "7.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d1053f4708f0af3cf9fc5bffc7e68a914a3c45becb231c80068c9c3f78bea"
+dependencies = [
+ "byteorder",
+ "num-traits",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -981,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-common"
-version = "2026.8.6"
+version = "2026.10.3"
 dependencies = [
  "bincode",
  "blake3",
@@ -995,11 +1015,11 @@ dependencies = [
 
 [[package]]
 name = "hopnet-comms"
-version = "2026.8.6"
+version = "2026.10.3"
 
 [[package]]
 name = "hopnet-photos"
-version = "2026.8.6"
+version = "2026.10.3"
 dependencies = [
  "bincode",
  "hopnet-common",
@@ -1009,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-photos-core"
-version = "2026.8.6"
+version = "2026.10.3"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1026,11 +1046,13 @@ dependencies = [
 
 [[package]]
 name = "hopnet-storage"
-version = "2026.8.6"
+version = "2026.10.3"
 dependencies = [
  "bincode",
  "blake3",
  "chacha20poly1305",
+ "fs4",
+ "hdrhistogram",
  "hex",
  "hopnet-common",
  "hopnet-comms",
@@ -3095,6 +3117,15 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]

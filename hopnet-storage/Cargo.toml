@@ -23,6 +23,7 @@ hdrhistogram = { version = "7.5.4", default-features = false }
 tracing = "0.1"
 
 reed-solomon-simd = "3.0.1"
+fs4 = "0.13.1"
 
 # Engine feature: async substrate surfaces (api::put, api::get, the
 # distribution engine). Pure modules never need a runtime; the engine owns

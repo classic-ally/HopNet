@@ -24,7 +24,7 @@ use ingress_core::publish::{
     Responsibility, TombstoneOp,
 };
 
-use crate::dispatch::{CommitProbe, HttpDispatch, UNREACHABLE_PREFIX};
+use crate::dispatch::{AdmitProbe, CommitProbe, HttpDispatch, UNREACHABLE_PREFIX};
 
 pub struct NodePublisher {
     dispatch: HttpDispatch,
@@ -65,6 +65,19 @@ impl Publisher for NodePublisher {
             .map(parse_fingerprint)
             .transpose()
             .map_err(PublishError::Rejected)?;
+
+        // 2b. Admission: ask the node whether these blobs fit above its
+        //     free-space floor before streaming any of them. A node at its
+        //     floor parks the pass (no attempt burned); its refusal mid-body
+        //     would otherwise surface as a transport error.
+        let sizes: Vec<u64> = item
+            .resources
+            .iter()
+            .map(|r| r.size_bytes.max(0) as u64)
+            .collect();
+        if let AdmitProbe::Unreachable(msg) = self.dispatch.check_admission(&sizes).await {
+            return Err(PublishError::NodeUnreachable(msg));
+        }
 
         // 3. Open blob files as streaming byte sources. The unix fd survives
         //    a concurrent unlink; state races are excluded anyway — the

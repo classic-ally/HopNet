@@ -57,6 +57,8 @@ pub async fn put<R: AsyncRead + Unpin>(
     if file_size == 0 {
         return Err(StorageError::Rs);
     }
+    // Held for the whole ingest: concurrent puts see each other's footprint.
+    let _reservation = crate::admission::reserve_ingest(fragments_dir, file_size)?;
 
     const READ_BUF_SIZE: usize = 64 * 1024;
 

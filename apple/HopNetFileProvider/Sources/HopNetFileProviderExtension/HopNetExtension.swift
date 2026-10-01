@@ -374,6 +374,8 @@ open class HopNetFileProviderExtensionBase: NSObject, NSFileProviderReplicatedEx
                     fileProviderError = NSFileProviderError(.notAuthenticated)
                 case .upgradeRequired:
                     fileProviderError = NSFileProviderError(.notAuthenticated)
+                case .insufficientStorage:
+                    fileProviderError = NSFileProviderError(.insufficientQuota)
                 case .notReady:
                     fileProviderError = NSFileProviderError(.serverUnreachable)
                 default:
@@ -485,6 +487,8 @@ open class HopNetFileProviderExtensionBase: NSObject, NSFileProviderReplicatedEx
                         fileProviderError = NSFileProviderError(.notAuthenticated)
                     case .upgradeRequired:
                         fileProviderError = NSFileProviderError(.notAuthenticated)
+                    case .insufficientStorage:
+                        fileProviderError = NSFileProviderError(.insufficientQuota)
                     case .notReady:
                         fileProviderError = NSFileProviderError(.serverUnreachable)
                     case .serverError(let message) where message.contains("not yet implemented"):
@@ -593,6 +597,8 @@ open class HopNetFileProviderExtensionBase: NSObject, NSFileProviderReplicatedEx
                     fileProviderError = NSFileProviderError(.notAuthenticated)
                 case .upgradeRequired:
                     fileProviderError = NSFileProviderError(.notAuthenticated)
+                case .insufficientStorage:
+                    fileProviderError = NSFileProviderError(.insufficientQuota)
                 case .notReady:
                     fileProviderError = NSFileProviderError(.serverUnreachable)
                 case .serverError(let message) where message.contains("not yet implemented"):

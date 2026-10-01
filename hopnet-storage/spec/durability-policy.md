@@ -42,6 +42,17 @@ exhausted → honest capacity metric falls → placement assigns nothing
 new → new stores refuse; freeing pinned space is an unpin, owned by
 the projection's own (user-facing, manual) flow.
 
+"New stores refuse" is ingest admission (`admission.rs`): `api::put`
+reserves its local footprint (every fragment class, ~3x the payload)
+and refuses with `InsufficientSpace` when that would leave the
+fragments filesystem at or below a free-space floor, counting other
+in-flight ingests. The host enables the floor (10 GiB by default,
+`HOPNET_STORAGE_MIN_FREE_BYTES`) and maps the refusal to HTTP 507;
+thin clients can ask first (`/api/photos/client/admit`), since a
+refusal sent before the body is read reaches them as a broken
+connection. Placement and repair traffic (peer stores, pulls,
+re-encode) is not gated.
+
 Durability counts both classes. GC is decentralized: eviction is a
 local watermark loop under disk pressure (surplus oldest-first above
 the high watermark, stop at the low), guarded by the inventory
