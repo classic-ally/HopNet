@@ -904,7 +904,8 @@ async fn handle_need_value(
         .await;
     }
 
-    let entries = pool.take_for_proposal(MAX_BATCH_SIZE);
+    let entries =
+        pool.take_for_proposal(MAX_BATCH_SIZE, crate::consensus::queue::BATCH_BYTE_BUDGET);
     let mut candidates: Vec<crate::consensus::types::Transaction> =
         entries.iter().map(|e| e.transaction().clone()).collect();
 
