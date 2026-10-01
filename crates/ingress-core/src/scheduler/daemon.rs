@@ -386,15 +386,20 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 .earliest_next_retry_at
                 .and_then(|t| (t - Utc::now()).to_std().ok())
                 .unwrap_or(std::time::Duration::from_secs(3600));
-            let time_to = |last: Option<std::time::Instant>, interval: std::time::Duration| {
-                last.map(|t| interval.saturating_sub(t.elapsed()))
-                    .unwrap_or_default()
-            };
             let mut next_retry =
                 next_retry.min(time_to(last_cleanup, self.shared.config.cleanup_interval));
-            if self.publisher.is_some() {
-                next_retry =
-                    next_retry.min(time_to(last_publish, self.shared.config.publish.interval));
+            // Snapshotted once: the same value gates the publish-task arm
+            // below, so a pass finishing in between still wakes the loop
+            // (awaiting a finished handle is immediately ready).
+            let pass_alive = publish_task.as_ref().is_some_and(|t| !t.is_finished());
+            if self.publisher.is_some()
+                && let Some(wake) = publish_wake_in(
+                    last_publish,
+                    self.shared.config.publish.interval,
+                    pass_alive,
+                )
+            {
+                next_retry = next_retry.min(wake);
             }
             tokio::select! {
                 event = rx.recv() => {
@@ -411,7 +416,7 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 // the slot: this await consumed the handle's output, and the
                 // shutdown join would panic re-polling it.
                 _ = async { let _ = publish_task.as_mut().expect("guarded").await; },
-                    if publish_task.as_ref().is_some_and(|t| !t.is_finished()) => {
+                    if pass_alive => {
                     publish_task = None;
                 }
                 _ = handle.wake.notified() => {}
@@ -554,6 +559,25 @@ impl<F: ResourceFetcher> Scheduler<F> {
     }
 }
 
+/// Time until `interval` has elapsed since `last` (zero if it already has,
+/// or if there was no previous run).
+fn time_to(last: Option<std::time::Instant>, interval: std::time::Duration) -> std::time::Duration {
+    last.map(|t| interval.saturating_sub(t.elapsed()))
+        .unwrap_or_default()
+}
+
+/// How long the idle loop may sleep before the next publish tick is due, or
+/// `None` while a pass is still running. A running pass wakes the loop
+/// through its own select arm when it finishes; an overdue deadline here
+/// would make the sleep zero and spin the loop for the rest of the pass.
+fn publish_wake_in(
+    last_publish: Option<std::time::Instant>,
+    interval: std::time::Duration,
+    pass_alive: bool,
+) -> Option<std::time::Duration> {
+    (!pass_alive).then(|| time_to(last_publish, interval))
+}
+
 fn classification_photo_id(c: &crate::classify::Classification) -> Option<&PhotoId> {
     use crate::classify::Classification;
     use crate::resolve::SeedOutcome;
@@ -566,5 +590,45 @@ fn classification_photo_id(c: &crate::classify::Classification) -> Option<&Photo
             | SeedOutcome::MintedPending { photo_id, .. }
             | SeedOutcome::Unmapped { photo_id },
         ) => Some(photo_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    // Impact: regression guard. The idle loop used to fold an overdue
+    // publish deadline into its sleep while a pass was still running, so a
+    // pass longer than the interval turned the loop into a zero-sleep spin
+    // re-querying the single-connection store until the pass ended.
+    // Should: leave the idle sleep to the pass's own wake while it runs,
+    // even when the interval has long elapsed.
+    #[test]
+    fn running_pass_contributes_no_publish_deadline() {
+        let overdue = Instant::now() - Duration::from_secs(120);
+        assert_eq!(
+            publish_wake_in(Some(overdue), Duration::from_secs(15), true),
+            None
+        );
+        assert_eq!(publish_wake_in(None, Duration::from_secs(15), true), None);
+    }
+
+    // Should: wake for the next tick once the remaining interval has passed
+    // when no pass is running.
+    // Should: wake immediately when the tick is overdue or has never run.
+    #[test]
+    fn idle_publisher_wakes_at_the_next_tick() {
+        let interval = Duration::from_secs(15);
+        let wake = publish_wake_in(Some(Instant::now()), interval, false).unwrap();
+        assert!(wake > Duration::from_secs(14) && wake <= interval);
+
+        let overdue = Instant::now() - Duration::from_secs(120);
+        assert_eq!(
+            publish_wake_in(Some(overdue), interval, false),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(publish_wake_in(None, interval, false), Some(Duration::ZERO));
     }
 }
