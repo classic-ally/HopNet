@@ -36,6 +36,7 @@ pub const STORAGE_SAFETY_MARGIN_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// a projection-agnostic service whose state (exporters collected from
 /// OTHER projections, host SQL hooks) is not expressible from generic
 /// capabilities.
+// website-excerpt:start (shown on hopnet.app; keep it compiling as-is)
 pub struct TakeoutProjection;
 
 impl hopnet_projection::Projection for TakeoutProjection {
@@ -59,6 +60,7 @@ impl hopnet_projection::Projection for TakeoutProjection {
         db::NODE_LOCAL_TABLES
     }
 }
+// website-excerpt:end
 
 /// Takeout/import test barriers. The name registry lives here with the
 /// runtime; the host keeps the HTTP test routes + the `BarrierRegistration`

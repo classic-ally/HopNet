@@ -12,7 +12,8 @@
     "test:watch": "vitest --project=unit",
     "test:stories": "vitest run --project=storybook",
     "storybook": "storybook dev -p 6006",
-    "build-storybook": "storybook build"
+    "build-storybook": "storybook build",
+    "shots": "storybook build --quiet && node scripts/website-shots.ts"
   },
   "devDependencies": {
     "@chromatic-com/storybook": "^4.1.1",

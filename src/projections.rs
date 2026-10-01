@@ -12,6 +12,7 @@ use hopnet_projection::Projection;
 /// Registration order = schema install order = FK direction (drive FKs
 /// users/data_blocks; photos FKs users/data_blocks/shared_libraries;
 /// takeout's work tables reference nothing forward).
+// website-excerpt:start (shown on hopnet.app)
 pub fn manifests() -> &'static [&'static dyn Projection] {
     &[
         &hopnet_drive::DriveProjection,
@@ -19,6 +20,7 @@ pub fn manifests() -> &'static [&'static dyn Projection] {
         &hopnet_takeout::TakeoutProjection,
     ]
 }
+// website-excerpt:end
 
 /// DeviceToken-authed surfaces the host mounts OUTSIDE the manifest
 /// system (RFC-023): (full prefix, min_client). The named sibling of
