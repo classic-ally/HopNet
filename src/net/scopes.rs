@@ -101,6 +101,37 @@ pub fn build_registry(app_state: &AppState) -> ScopeRegistry {
 /// Largest decided-range chunk the fetch server returns per request.
 const DECIDED_FETCH_MAX: u64 = 100;
 
+/// Encoded bytes of (block, certificate) pairs one decided-fetch reply may
+/// carry. Pagination by bytes, not a cap: the client accepts a contiguous
+/// prefix of what it asked for and continues from wherever the reply left
+/// it. The transport refuses frames over 8 MB on receive only (the sender
+/// writes them happily), and bincode's envelope adds a tag byte and a few
+/// varint lengths, so 6 MB on the raw pair sum leaves ample headroom. Born
+/// of 2026-10-01: fifty post-crossing blocks — 270 KB attestation pages,
+/// 500-blob declare pages — encoded to 10.9 MB, every peer's reply was
+/// refused at the lagging node, and it never advanced past its join height.
+const DECIDED_FETCH_BYTE_BUDGET: usize = 6 * 1024 * 1024;
+
+/// How many leading encoded pairs fit under `budget`: the longest prefix
+/// whose summed lengths stay within it, and never fewer than one when there
+/// is anything to send — a zero-pair reply reads as "the peer has nothing",
+/// which would end a tip-mode sync as satisfied. A lone pair over the budget
+/// still ships; only one that alone exceeds the frame itself is unservable,
+/// and no block comes near that today.
+fn take_within_budget(items: &[(Vec<u8>, Vec<u8>)], budget: usize) -> usize {
+    let mut total = 0usize;
+    let mut kept = 0usize;
+    for (block, cert) in items {
+        let next = total + block.len() + cert.len();
+        if kept > 0 && next > budget {
+            break;
+        }
+        total = next;
+        kept += 1;
+    }
+    kept
+}
+
 pub struct ConsensusScope {
     pub(crate) app_state: AppState,
 }
@@ -218,6 +249,16 @@ async fn serve_decided_fetch(
                     (Ok(b), Ok(c)) => items.push((b, c)),
                     _ => break,
                 }
+            }
+            let fit = take_within_budget(&items, DECIDED_FETCH_BYTE_BUDGET);
+            if fit < items.len() {
+                tracing::debug!(
+                    from_height,
+                    served = fit,
+                    of = items.len(),
+                    "decided fetch bounded by bytes"
+                );
+                items.truncate(fit);
             }
             ConsensusNetResponse::Decided { items }
         }
@@ -462,6 +503,42 @@ impl RpcHandler for SetupScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pairs(sizes: &[usize]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        sizes
+            .iter()
+            .map(|n| (vec![0u8; *n], vec![0u8; 16]))
+            .collect()
+    }
+
+    // Should: keep every pair when they all fit under the budget.
+    #[test]
+    fn budget_keeps_everything_that_fits() {
+        let items = pairs(&[100, 100, 100]);
+        assert_eq!(take_within_budget(&items, 1000), 3);
+        assert_eq!(take_within_budget(&[], 1000), 0);
+    }
+
+    // Impact: a lagging node's fetch is refused by the transport when the
+    // reply crosses the frame cap, and refused on every peer alike — it
+    // never advanced past its join height (macbook, 2026-10-01, 10.9 MB).
+    // Should: stop before the pair that would cross the budget and drop
+    // everything after it, keeping the reply a contiguous prefix.
+    #[test]
+    fn budget_cuts_before_the_crossing_pair() {
+        let items = pairs(&[400, 400, 400, 400]);
+        // 416 + 416 = 832 fits; 1248 does not.
+        assert_eq!(take_within_budget(&items, 1000), 2);
+    }
+
+    // Should: serve a lone first pair even when it alone exceeds the budget.
+    // Should not: answer with zero pairs — the client reads that as "nothing
+    // to serve" and a tip-mode sync would end satisfied.
+    #[test]
+    fn budget_never_serves_nothing() {
+        let items = pairs(&[5000, 10]);
+        assert_eq!(take_within_budget(&items, 1000), 1);
+    }
 
     // Impact: the §Scope Classes table (RFC-025) is enacted HERE and
     // nowhere else — a scope registered under the wrong class either

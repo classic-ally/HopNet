@@ -11,6 +11,7 @@ mod preflight_budget;
 mod regenesis;
 mod signatures;
 mod stale_proposal;
+mod sync_fetch;
 mod transient_restage;
 mod upgrade;
 

@@ -192,7 +192,10 @@ so votes cast after a restart were published without a durable entry.
 The malachite `sync` crate is libp2p-flavored and unused; HopNet rolls its own
 decided-block transfer over iroh (`src/consensus/malachite/sync.rs`).
 
-- Client fetches `(block, certificate)` pairs in chunks of 50 via
+- Client fetches `(block, certificate)` pairs in chunks of 50 (the server
+  bounds each reply by bytes — `DECIDED_FETCH_BYTE_BUDGET`, 6 MB — so a
+  reply may be a shorter contiguous prefix; the client continues from the
+  last height fed) via
   `IrohRequest::DecidedFetch{from,to}`, hint-peer first, rotating on failure.
 - Structural checks client-side (height contiguity, block hash, cert/value-id
   match); CRYPTOGRAPHIC verification is the engine's

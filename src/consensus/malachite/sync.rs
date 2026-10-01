@@ -7,6 +7,11 @@
 //! are verified by the ENGINE against the validator set (a lying peer cannot
 //! forge history without quorum keys); this client only performs structural
 //! checks and peer rotation.
+//!
+//! A reply may be SHORTER than the range asked for: the server bounds each
+//! reply by bytes (`DECIDED_FETCH_BYTE_BUDGET`) so fat blocks never cross
+//! the transport's frame cap, and this client simply continues from the
+//! last height it was fed.
 
 use std::time::Duration;
 

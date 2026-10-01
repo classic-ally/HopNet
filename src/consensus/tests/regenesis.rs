@@ -25,7 +25,7 @@ fn abort_payload() -> Vec<u8> {
 }
 
 /// Register the mock node (and its owning user) — FKs are ON.
-fn register_node(node: &MockNode) {
+pub(crate) fn register_node(node: &MockNode) {
     let conn = node.app_state.db_pool.get().unwrap();
     conn.execute(
         "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
