@@ -73,7 +73,8 @@ pub fn device_router<S: Clone + Send + Sync + 'static>(app_state: AppState) -> R
         .route("/membership", get(get_client_membership))
         .route("/transaction", post(post_client_transaction))
         .route("/committed/{photo_id}", get(get_client_committed))
-        .route("/resolve", post(post_client_resolve));
+        .route("/resolve", post(post_client_resolve))
+        .route("/admit", post(post_client_admit));
     let upload = Router::new()
         .route("/data-block/{blob_id}", post(post_client_data_block))
         .layer(axum::extract::DefaultBodyLimit::max(DATA_BLOCK_BODY_LIMIT));
@@ -235,8 +236,22 @@ struct IngestResponse {
     operation_id: String,
 }
 
+/// True when the node refused the ingest for lack of disk (ingest
+/// admission), directly or as the cause of a partial publish.
+fn is_insufficient_space(e: &hopnet_photos_core::PhotosCoreError) -> bool {
+    use hopnet_photos_core::PhotosCoreError as E;
+    match e {
+        E::Storage(hopnet_storage::StorageError::InsufficientSpace { .. }) => true,
+        E::PartialPublish { source, .. } => is_insufficient_space(source),
+        _ => false,
+    }
+}
+
 fn map_publish_error(e: hopnet_photos_core::PhotosCoreError) -> (StatusCode, String) {
     use hopnet_photos_core::PhotosCoreError as E;
+    if is_insufficient_space(&e) {
+        return (StatusCode::INSUFFICIENT_STORAGE, e.to_string());
+    }
     match &e {
         E::InvalidAsset(_) | E::InvalidPublishRequest(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
@@ -958,10 +973,14 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ExactBody<R> {
     }
 }
 
-/// Upload failures split three ways: a length mismatch our wrapper caught is
+/// Upload failures split four ways: a length mismatch our wrapper caught is
 /// the client's declaration being wrong (422), any other read error is the
-/// client's stream breaking (400), and everything else is the substrate (500).
+/// client's stream breaking (400), a refusal for lack of disk is 507 (the
+/// client backs off), and everything else is the substrate (500).
 fn map_upload_error(e: hopnet_photos_core::PhotosCoreError) -> (StatusCode, String) {
+    if is_insufficient_space(&e) {
+        return (StatusCode::INSUFFICIENT_STORAGE, e.to_string());
+    }
     if let hopnet_photos_core::PhotosCoreError::Storage(hopnet_storage::StorageError::Read(
         ref io_err,
     )) = e
@@ -1297,6 +1316,35 @@ async fn post_client_resolve(
 struct CommittedResponse {
     photo_id: String,
     uploaded_by: i32,
+}
+
+#[derive(Deserialize)]
+struct AdmitBody {
+    /// Byte size of each blob the client is about to upload.
+    sizes: Vec<u64>,
+}
+
+/// Ingest admission probe: 204 if blobs of these sizes fit above the
+/// node's free-space floor right now, 507 if not. Clients ask before
+/// streaming a body because a refusal sent before the body is read reaches
+/// them as a broken connection rather than a status. Advisory: nothing is
+/// reserved, and the upload itself can still be refused.
+async fn post_client_admit(
+    State(state): State<AppState>,
+    Json(body): Json<AdmitBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let dir = state.fragments_dir.clone();
+    let sizes: Vec<usize> = body.sizes.into_iter().map(|s| s as usize).collect();
+    match tokio::task::spawn_blocking(move || hopnet_storage::admission::check_ingest(&dir, &sizes))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(e @ hopnet_storage::StorageError::InsufficientSpace { .. }) => {
+            Err((StatusCode::INSUFFICIENT_STORAGE, e.to_string()))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
 }
 
 /// Confirm probe for the publisher's idempotency contract: after an
@@ -1908,6 +1956,8 @@ mod tests {
     // length mismatch surfacing as 500 would look retryable forever.
     // Should: map a declared-length violation to 422, other body-read
     // failures to 400, and substrate errors to 500.
+    // Should: map an ingest refused at the free-space floor to 507, also when
+    // it is the cause of a partial publish.
     #[test]
     fn upload_errors_split_client_and_server_status() {
         let len_err = hopnet_photos_core::PhotosCoreError::Storage(
@@ -1933,5 +1983,24 @@ mod tests {
             "engine".into(),
         ));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let at_floor = || {
+            hopnet_photos_core::PhotosCoreError::Storage(
+                hopnet_storage::StorageError::InsufficientSpace {
+                    free: 1,
+                    needed: 2,
+                    floor: 3,
+                },
+            )
+        };
+        let (status, _) = map_upload_error(at_floor());
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        let partial = hopnet_photos_core::PhotosCoreError::PartialPublish {
+            photo_id: hopnet_common::CustomUUID::new(None),
+            uploaded_blob_ids: Vec::new(),
+            source: Box::new(at_floor()),
+        };
+        let (status, _) = map_publish_error(partial);
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
     }
 }

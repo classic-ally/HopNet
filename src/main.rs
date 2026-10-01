@@ -144,6 +144,11 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         ephemeral = _ephemeral.is_some(),
         "node storage locations resolved"
     );
+    let ingest_floor = storage_host::functions::configure_ingest_floor();
+    tracing::info!(
+        min_free_bytes = ingest_floor,
+        "ingest admission: new blobs refused below this free space"
+    );
 
     // Pinned-HTTPS listener: the node's only network surface. Bound BEFORE
     // the plaintext listener so a kernel-assigned loopback port can never
@@ -870,6 +875,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .route(
                     "/maintenance/watermark-eviction",
                     post(storage_host::routes::post_watermark_eviction),
+                )
+                .route(
+                    "/maintenance/surplus-release",
+                    post(storage_host::routes::post_surplus_release),
                 )
                 .route(
                     "/maintenance/policy-tick",

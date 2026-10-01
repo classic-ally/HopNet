@@ -7,8 +7,8 @@
 //! only after a pass observed the node unreachable, so the steady state does
 //! zero keychain traffic.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ingress_core::publish::{
     EditItem, PublishError, PublishItem, PublishOutcome, Publisher, ResolveOutcome, TombstoneOp,
@@ -41,8 +41,11 @@ type RebuildFn<P> = Box<dyn Fn(&FfiPublishCredentials) -> Result<P, String> + Se
 pub(crate) struct RefreshingPublisher<P: Publisher> {
     provider: Arc<dyn PublishCredentialsProvider>,
     rebuild: RebuildFn<P>,
-    /// The inner publisher plus the credentials it was built from.
-    state: tokio::sync::Mutex<(P, FfiPublishCredentials)>,
+    /// The inner publisher plus the credentials it was built from. Held
+    /// only to clone or swap the `Arc`, never across a call: the daemon runs
+    /// publishes concurrently, and a guard held over `.await` would
+    /// serialize them all behind one lock.
+    state: Mutex<(Arc<P>, FfiPublishCredentials)>,
     /// Set when a call returns NodeUnreachable; consumed (and cleared) by
     /// the next call's refresh probe. Every pass opens with `resolve`, so
     /// the probe naturally runs at tick start.
@@ -59,29 +62,38 @@ impl<P: Publisher> RefreshingPublisher<P> {
         Self {
             provider,
             rebuild: Box::new(rebuild),
-            state: tokio::sync::Mutex::new((inner, built_from)),
+            state: Mutex::new((Arc::new(inner), built_from)),
             stale: AtomicBool::new(false),
         }
     }
 
     /// One refresh probe per unreachable observation: clear the flag first
     /// so a still-unreachable node re-arms it rather than looping reads.
-    async fn refresh_if_stale(&self) {
+    fn refresh_if_stale(&self) {
         if !self.stale.swap(false, Ordering::AcqRel) {
             return;
         }
         let Some(fresh) = self.provider.current() else {
             return;
         };
-        let mut state = self.state.lock().await;
+        let mut state = self.state.lock().expect("publisher state mutex");
         if fresh == state.1 {
             return;
         }
         // A malformed credential set cannot beat the working-but-stale one;
-        // on Err keep the old client and let the pass park again.
+        // on Err keep the old client and let the pass park again. Calls
+        // already in flight keep their clone of the old client and finish on
+        // it.
         if let Ok(inner) = (self.rebuild)(&fresh) {
-            *state = (inner, fresh);
+            *state = (Arc::new(inner), fresh);
         }
+    }
+
+    /// Refresh if an earlier call found the node unreachable, then hand out
+    /// the current client.
+    fn current(&self) -> Arc<P> {
+        self.refresh_if_stale();
+        self.state.lock().expect("publisher state mutex").0.clone()
     }
 
     fn note<T>(&self, result: &Result<T, PublishError>) {
@@ -94,8 +106,7 @@ impl<P: Publisher> RefreshingPublisher<P> {
 #[async_trait::async_trait]
 impl<P: Publisher> Publisher for RefreshingPublisher<P> {
     async fn publish(&self, item: PublishItem) -> Result<PublishOutcome, PublishError> {
-        self.refresh_if_stale().await;
-        let result = self.state.lock().await.0.publish(item).await;
+        let result = self.current().publish(item).await;
         self.note(&result);
         result
     }
@@ -105,8 +116,7 @@ impl<P: Publisher> Publisher for RefreshingPublisher<P> {
         library_id: Option<&str>,
         cloud_ids: &[String],
     ) -> Result<ResolveOutcome, PublishError> {
-        self.refresh_if_stale().await;
-        let result = self.state.lock().await.0.resolve(library_id, cloud_ids).await;
+        let result = self.current().resolve(library_id, cloud_ids).await;
         self.note(&result);
         result
     }
@@ -116,12 +126,8 @@ impl<P: Publisher> Publisher for RefreshingPublisher<P> {
         consensus_photo_id: &str,
         op: TombstoneOp,
     ) -> Result<(), PublishError> {
-        self.refresh_if_stale().await;
         let result = self
-            .state
-            .lock()
-            .await
-            .0
+            .current()
             .propagate_tombstone(consensus_photo_id, op)
             .await;
         self.note(&result);
@@ -129,8 +135,7 @@ impl<P: Publisher> Publisher for RefreshingPublisher<P> {
     }
 
     async fn publish_edit(&self, item: EditItem) -> Result<(), PublishError> {
-        self.refresh_if_stale().await;
-        let result = self.state.lock().await.0.publish_edit(item).await;
+        let result = self.current().publish_edit(item).await;
         self.note(&result);
         result
     }
@@ -145,11 +150,18 @@ mod tests {
 
     use super::*;
 
+    /// One scripted resolve: its result, and optionally a gate the call
+    /// holds on (inside the inner publisher) until a permit is added.
+    type Step = (
+        Result<(), PublishError>,
+        Option<Arc<tokio::sync::Semaphore>>,
+    );
+
     /// Inner mock: scripted resolve results, records which credential set
     /// it was built from.
     struct MockInner {
         built_from: String,
-        results: Arc<Mutex<Vec<Result<(), PublishError>>>>,
+        results: Arc<Mutex<Vec<Step>>>,
         calls: Arc<Mutex<Vec<String>>>,
     }
 
@@ -177,7 +189,11 @@ mod tests {
             _cloud_ids: &[String],
         ) -> Result<ResolveOutcome, PublishError> {
             self.calls.lock().unwrap().push(self.built_from.clone());
-            match self.results.lock().unwrap().remove(0) {
+            let (result, gate) = self.results.lock().unwrap().remove(0);
+            if let Some(gate) = gate {
+                let _permit = gate.acquire().await.unwrap();
+            }
+            match result {
                 Ok(()) => Ok(ResolveOutcome {
                     responsibility: Responsibility::Holder,
                     entries: Vec::new(),
@@ -217,6 +233,13 @@ mod tests {
     }
 
     fn fixture(scripted: Vec<Result<(), PublishError>>, provider_creds: Option<&str>) -> Fixture {
+        gated_fixture(
+            scripted.into_iter().map(|r| (r, None)).collect(),
+            provider_creds,
+        )
+    }
+
+    fn gated_fixture(scripted: Vec<Step>, provider_creds: Option<&str>) -> Fixture {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let results = Arc::new(Mutex::new(scripted));
         let provider = Arc::new(MockProvider {
@@ -312,5 +335,76 @@ mod tests {
         resolve(&f).await.unwrap_err();
         resolve(&f).await.unwrap();
         assert_eq!(f.provider.queries.load(Ordering::SeqCst), 0);
+    }
+
+    /// Wait (bounded) until the inner publisher has been entered `n` times.
+    async fn entered(f: &Fixture, n: usize) -> bool {
+        for _ in 0..200 {
+            if f.calls.lock().unwrap().len() >= n {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    // Impact: regression guard. The wrapper used to hold its lock across the
+    // inner call, so the daemon's concurrent publish window ran one photo at
+    // a time in production even though the unwrapped publisher tests showed
+    // it concurrent.
+    // Should: let concurrent calls run inside the inner publisher at the same
+    // time.
+    #[tokio::test]
+    async fn concurrent_calls_overlap_inside_the_inner_publisher() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let f = Arc::new(gated_fixture(
+            vec![(Ok(()), Some(gate.clone())), (Ok(()), Some(gate.clone()))],
+            None,
+        ));
+        let a = tokio::spawn({
+            let f = f.clone();
+            async move { resolve(&f).await }
+        });
+        let b = tokio::spawn({
+            let f = f.clone();
+            async move { resolve(&f).await }
+        });
+
+        let both_inside = entered(&f, 2).await;
+        gate.add_permits(2);
+        a.await.unwrap().unwrap();
+        b.await.unwrap().unwrap();
+        assert!(both_inside, "second call never reached the inner publisher");
+    }
+
+    // Should: rebuild the client for new calls while an earlier call is still
+    // in flight, and let that call finish on the client it started with.
+    #[tokio::test]
+    async fn refresh_does_not_wait_for_in_flight_calls() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let f = Arc::new(gated_fixture(
+            vec![
+                (Ok(()), Some(gate.clone())),
+                (unreachable_err(), None),
+                (Ok(()), None),
+            ],
+            Some("fresh"),
+        ));
+        let held = tokio::spawn({
+            let f = f.clone();
+            async move { resolve(&f).await }
+        });
+        assert!(entered(&f, 1).await);
+
+        resolve(&f).await.unwrap_err();
+        resolve(&f).await.unwrap();
+        assert_eq!(
+            *f.calls.lock().unwrap(),
+            vec!["initial", "initial", "fresh"]
+        );
+
+        gate.add_permits(1);
+        held.await.unwrap().unwrap();
+        assert_eq!(f.provider.queries.load(Ordering::SeqCst), 1);
     }
 }

@@ -76,6 +76,28 @@ pub async fn post_watermark_eviction(
     }
 }
 
+#[derive(Deserialize)]
+pub struct SurplusReleaseParams {
+    grace_secs: Option<u64>,
+}
+
+/// POST /maintenance/surplus-release — run one prompt surplus release now
+/// (the policy tick runs the same body). `grace_secs` overrides the file-age
+/// grace for this run (test hook).
+pub async fn post_surplus_release(
+    State(app_state): State<AppState>,
+    Query(params): Query<SurplusReleaseParams>,
+) -> impl IntoResponse {
+    match super::jobs::run_surplus_release(&app_state, params.grace_secs).await {
+        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("surplus release: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /maintenance/policy-tick — run one storage policy tick now
 /// (RFC-STORAGE-002 S6 test hook; the cron runs the same body ~5-min).
 pub async fn post_policy_tick(State(app_state): State<AppState>) -> impl IntoResponse {

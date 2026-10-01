@@ -10,6 +10,7 @@
 //! the `engine` feature (Stage E) adds the tokio distribution engine, whose
 //! decisions delegate back to the pure modules.
 
+pub mod admission;
 #[cfg(feature = "engine")]
 pub mod api;
 pub mod crypto;

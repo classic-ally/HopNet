@@ -57,6 +57,13 @@ pub async fn put<R: AsyncRead + Unpin>(
     if file_size == 0 {
         return Err(StorageError::Rs);
     }
+    // Bounds concurrent ingests (memory, CPU); held for the whole put.
+    let _permit = put_permits()
+        .acquire()
+        .await
+        .map_err(|_| StorageError::Io(std::io::Error::other("put permits closed")))?;
+    // Held for the whole ingest: concurrent puts see each other's footprint.
+    let _reservation = crate::admission::reserve_ingest(fragments_dir, file_size)?;
 
     const READ_BUF_SIZE: usize = 64 * 1024;
 
@@ -104,28 +111,33 @@ pub async fn put<R: AsyncRead + Unpin>(
 
         while logical_chunk_buffer.len() >= CHUNK_SIZE {
             let chunk_data: Vec<u8> = logical_chunk_buffer.drain(..CHUNK_SIZE).collect();
-            last_chunk_padding = process_logical_chunk(
-                &mut encoder,
-                &chunk_data,
+            let (returned, chunk_fragments, padding) = process_chunk_blocking(
+                encoder,
+                chunk_data,
                 current_chunk_number,
                 per_blob_key,
                 fragments_dir,
-                &mut fragments,
-            )?;
+            )
+            .await?;
+            encoder = returned;
+            fragments.extend(chunk_fragments);
+            last_chunk_padding = padding;
             current_chunk_number += 1;
         }
     }
 
     // Process final partial chunk (if any remaining data < 40MB)
     if !logical_chunk_buffer.is_empty() {
-        last_chunk_padding = process_logical_chunk(
-            &mut encoder,
-            &logical_chunk_buffer,
+        let (_, chunk_fragments, padding) = process_chunk_blocking(
+            encoder,
+            logical_chunk_buffer,
             current_chunk_number,
             per_blob_key,
             fragments_dir,
-            &mut fragments,
-        )?;
+        )
+        .await?;
+        fragments.extend(chunk_fragments);
+        last_chunk_padding = padding;
     }
 
     let integrity_hash = Blake3Hash::new(full_hasher.finalize());
@@ -141,6 +153,55 @@ pub async fn put<R: AsyncRead + Unpin>(
         integrity_hash,
         fragments,
         added_bytes: last_chunk_padding as u8,
+    })
+}
+
+/// Run [`process_logical_chunk`] on the blocking pool. Padding, encryption,
+/// RS encoding and thirty synchronous fragment writes per 40MB chunk are
+/// CPU and disk work; inline on an async worker, a handful of concurrent
+/// uploads would hold every worker of the host's main runtime and starve
+/// its API and peer serving. The encoder moves in and back out so its
+/// buffers are reused across chunks.
+async fn process_chunk_blocking(
+    mut encoder: ReedSolomonEncoder,
+    chunk_data: Vec<u8>,
+    chunk_number: u32,
+    per_blob_key: &chacha20poly1305::Key,
+    fragments_dir: &str,
+) -> Result<(ReedSolomonEncoder, Vec<PutFragment>, usize), StorageError> {
+    let key = *per_blob_key;
+    let dir = fragments_dir.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut fragments = Vec::new();
+        let padding = process_logical_chunk(
+            &mut encoder,
+            &chunk_data,
+            chunk_number,
+            &key,
+            &dir,
+            &mut fragments,
+        )?;
+        Ok((encoder, fragments, padding))
+    })
+    .await
+    .map_err(|e| StorageError::Io(std::io::Error::other(format!("chunk task: {e}"))))?
+}
+
+/// Concurrent `put`s allowed per process. Each holds a 40MB logical chunk,
+/// its padded copy, ten encrypted fragments and the RS work area — a few
+/// hundred MB at peak — so an unbounded fan-in of uploads is unbounded
+/// memory. `HOPNET_STORAGE_PUT_PERMITS` overrides the default, read once.
+pub const DEFAULT_PUT_PERMITS: usize = 4;
+
+fn put_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let n = std::env::var("HOPNET_STORAGE_PUT_PERMITS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_PUT_PERMITS);
+        tokio::sync::Semaphore::new(n)
     })
 }
 
@@ -1377,5 +1438,86 @@ mod tests {
         assert_eq!(got, &plaintext[1000..5000]);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A slow plaintext source that records how many sources are being
+    /// read at once (started, not yet at EOF) across all instances.
+    struct SlowSource {
+        remaining: usize,
+        started: bool,
+        delay: std::pin::Pin<Box<tokio::time::Sleep>>,
+        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl tokio::io::AsyncRead for SlowSource {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            use std::future::Future;
+            use std::sync::atomic::Ordering;
+            if !self.started {
+                self.started = true;
+                let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+            }
+            if self.remaining == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            std::task::ready!(self.delay.as_mut().poll(cx));
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(5);
+            self.delay.as_mut().reset(deadline);
+            let n = self.remaining.min(1024).min(buf.remaining());
+            buf.put_slice(&vec![7u8; n]);
+            self.remaining -= n;
+            if self.remaining == 0 {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    // Impact: each in-flight put holds a 40MB chunk, its copies and the RS
+    // work area; with concurrent publishing an unbounded number of them is
+    // unbounded memory on the node.
+    // Should: never let more puts read their source at once than there are
+    // put permits, and still complete every put.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_are_bounded_by_permits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("hopnet-put-permits-{}", std::process::id()));
+        let dir = dir.to_str().unwrap().to_string();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let size = 16 * 1024;
+
+        let mut tasks = Vec::new();
+        for _ in 0..(2 * DEFAULT_PUT_PERMITS) {
+            let source = SlowSource {
+                remaining: size,
+                started: false,
+                delay: Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),
+                active: active.clone(),
+                peak: peak.clone(),
+            };
+            let dir = dir.clone();
+            tasks.push(tokio::spawn(async move {
+                let key: chacha20poly1305::Key = [0x11u8; 32].into();
+                put(source, size, CustomUUID::new(None), &key, &dir).await
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            (1..=DEFAULT_PUT_PERMITS).contains(&peak),
+            "peak concurrent puts {peak}"
+        );
     }
 }

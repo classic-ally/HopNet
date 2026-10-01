@@ -132,6 +132,27 @@ pub struct SweepReport {
     /// `attest_fragments` transactions this sweep committed (0 when nothing
     /// was on disk).
     pub attested_pages: usize,
+    /// Surplus copies the prompt release deleted on this walk (before the
+    /// self-check, so this pass carried their removal to consensus).
+    pub surplus_released: usize,
+    pub surplus_bytes_freed: u64,
+}
+
+/// The surplus release's input, picked from the sweep's own walk: files
+/// that have a table row (`present`) and are older than `grace_cutoff`, as
+/// `(hash, size)`. Orphans belong to the orphan step and young files may
+/// be in-flight stores; neither is offered.
+pub fn release_listing(
+    listing: &[DiskFragment],
+    present: &[Blake3Hash],
+    grace_cutoff: u64,
+) -> Vec<(Blake3Hash, u64)> {
+    let present: HashSet<&Blake3Hash> = present.iter().collect();
+    listing
+        .iter()
+        .filter(|d| d.mtime < grace_cutoff && present.contains(&d.hash))
+        .map(|d| (d.hash, d.size))
+        .collect()
 }
 
 #[cfg(test)]
@@ -148,6 +169,21 @@ mod tests {
             size: 10,
             mtime,
         }
+    }
+
+    // Should: offer the surplus release only files that have a table row
+    // and are older than the grace cutoff, with their sizes.
+    // Should not: offer orphans (no row) or young files (possible in-flight
+    // stores), whatever their age or row.
+    #[test]
+    fn release_listing_is_present_rows_past_the_grace() {
+        let listing = [file(1, 100), file(2, 100), file(3, 900), file(4, 100)];
+        let present = [h(1), h(3), h(4)];
+        assert_eq!(
+            release_listing(&listing, &present, 500),
+            vec![(h(1), 10), (h(4), 10)]
+        );
+        assert!(release_listing(&listing, &[], 500).is_empty());
     }
 
     // Should: classify each file by its row and flag — present-and-
