@@ -254,8 +254,11 @@ enum StepDisposition {
     /// the effect — a shell-less node is a zombie (HTTP up, chain dead), and
     /// a swallowed decide is worse: a node that believes it decided while
     /// its database never advanced. Transient contention is classified at
-    /// the validation sites (`StoreError::is_transient`) or retried inside
-    /// the decide, and never reaches here.
+    /// the validation sites (`StoreError::is_transient`) or retried under
+    /// the host's bounded budget inside every durability effect (≈ 41 s
+    /// worst case); only contention that outlives the budget reaches here.
+    /// Once one effect of an input has failed, the host executes no further
+    /// effect for that input, so nothing is published past a failed append.
     Fatal,
 }
 

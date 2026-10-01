@@ -16,6 +16,11 @@
 //! During replay the phase is `Recovering`: WAL appends are suppressed
 //! (replayed entries must not re-append) and value-build requests are
 //! dropped (the replayed value already provides them).
+//!
+//! Durability effects (WAL append/fetch/reset, decide) retry transient
+//! storage contention under one bounded budget (`retry_transient`) before an
+//! error becomes fatal; once an effect has failed, no later effect of the
+//! same input runs.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -144,23 +149,66 @@ pub struct HostCore<A, S: Storage, G, T> {
     /// database never advanced (the 2026-09-27 desktop wedge: four days at one
     /// height). The handler parks the error here instead and `drive_once`
     /// returns it after the macro — the shell's fatal path then restarts the
-    /// process, whose WAL replay re-decides the height.
+    /// process, whose WAL replay re-decides the height. While an error is
+    /// parked, every later effect of the same input is refused unexecuted:
+    /// the engine must not sign and publish a vote whose WAL entry failed.
     effect_error: Option<HostError<S::Error>>,
 }
 
 /// What `process!` sees when an effect handler fails: a marker, because the
 /// real error has already been parked in `HostCore::effect_error` (the macro
-/// only logs and continues). Never leaves `drive_once`.
+/// only logs and continues). Also what every later effect of the same input
+/// gets, without running — the marker short-circuits the rest of the input.
+/// Never leaves `drive_once`.
 #[derive(Debug)]
 struct EffectFailed;
 
-/// Decide retries for transient storage errors (SQLITE_BUSY after the 5 s
-/// connection busy_timeout, a commit-time BUSY, or contention inside a
-/// handler). Each attempt re-BEGINs the IMMEDIATE transaction; the shell is a
-/// synchronous thread, so the backoff is a blocking sleep — short enough not
-/// to stall vote processing, long enough for the other writer to finish.
-const DECIDE_RETRIES: u32 = 3;
-const DECIDE_RETRY_BACKOFF_MS: u64 = 100;
+/// Retry budget for the durability effects — WAL append, WAL fetch/reset at
+/// height start, decide — on transient storage errors (SQLITE_BUSY after the
+/// connection busy_timeout, a commit-time BUSY, contention inside a handler).
+/// The shell is a synchronous thread, so the backoff is a blocking sleep.
+/// Sized to outlast a proposer's cold-cache preflight, which holds the write
+/// lock for the whole dry-run of its candidate block (observed > 15 s on
+/// 2026-10-01, when a 5 s busy wait with no retry made the vote WAL append
+/// fatal and one validator crash-looped at a single height): 7 attempts, each
+/// waiting out the 5 s busy_timeout, with 100·2^(n-1) ms between them capped
+/// at 3200 ms (6.3 s in all) — worst case ≈ 41 s of shell blocking before the
+/// error is fatal. Blocking votes for that long is strictly better than
+/// aborting: consensus is stalled on the same lock either way.
+const STORAGE_TRANSIENT_RETRIES: u32 = 6;
+const STORAGE_RETRY_BACKOFF_MS: u64 = 100;
+const STORAGE_RETRY_BACKOFF_CAP_MS: u64 = 3200;
+
+/// Run a storage operation under the transient-retry budget. `op` is rebuilt
+/// per attempt by the caller's closure (it may borrow the app mutably); a
+/// non-transient error, or contention that outlives the budget, is returned
+/// as `HostError::Storage` — and `drive_once` makes that fatal.
+fn retry_transient<S: Storage, R>(
+    what: &'static str,
+    height: Option<Height>,
+    mut op: impl FnMut() -> Result<R, S::Error>,
+) -> Result<R, HostError<S::Error>> {
+    let mut attempt = 0u32;
+    loop {
+        match op() {
+            Ok(r) => return Ok(r),
+            Err(e) if attempt < STORAGE_TRANSIENT_RETRIES && S::error_is_transient(&e) => {
+                attempt += 1;
+                let backoff_ms =
+                    (STORAGE_RETRY_BACKOFF_MS << (attempt - 1)).min(STORAGE_RETRY_BACKOFF_CAP_MS);
+                tracing::warn!(
+                    what,
+                    height = height.map(|h| h.0),
+                    attempt,
+                    backoff_ms,
+                    "transient storage contention, retrying: {e:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+            }
+            Err(e) => return Err(HostError::Storage(e)),
+        }
+    }
+}
 
 /// How far ahead of the current height a wire proposal may be stashed, and
 /// the total stash bound. One height of lookahead is the common race (peer
@@ -274,10 +322,10 @@ where
         let valset = self.app.validator_set(height);
 
         let entries: Vec<WireWalEntry> = if is_restart {
-            self.storage.wal_reset().map_err(HostError::Storage)?;
+            retry_transient::<S, _>("wal_reset", Some(height), || self.storage.wal_reset())?;
             Vec::new()
         } else {
-            self.storage.wal_fetch(height).map_err(HostError::Storage)?
+            retry_transient::<S, _>("wal_fetch", Some(height), || self.storage.wal_fetch(height))?
         };
 
         if !entries.is_empty() {
@@ -338,7 +386,8 @@ where
             self.start_height(height, false)?;
             return Ok(true);
         }
-        let entries = self.storage.wal_fetch(height).map_err(HostError::Storage)?;
+        let entries =
+            retry_transient::<S, _>("wal_fetch", Some(height), || self.storage.wal_fetch(height))?;
         if entries.is_empty() {
             self.deferred_start = Some(height);
             Ok(false)
@@ -685,31 +734,40 @@ where
         let metrics = ();
         // The macro swallows a handler error (logs it, resumes the engine), so
         // the handler parks the first one here and it is returned below —
-        // a failed effect is never silently "done".
+        // a failed effect is never silently "done". Once one is parked, the
+        // engine is being resumed only so the macro can return: nothing
+        // further executes (a vote whose WAL append failed must not be
+        // signed and published), every later effect just gets the marker.
         let result: Result<(), malachitebft_core_consensus::Error<HopNetContext>> = process!(
             input: input,
             state: state,
             metrics: &metrics,
-            with: effect => handle_effect(HandlerCtx {
-                chain_id,
-                signer,
-                app,
-                storage,
-                gossip,
-                timers,
-                phase: *phase,
-                wal_seq,
-                blocks,
-                pending_inputs,
-                outputs,
-                last_decided,
-                on_demand: *on_demand,
-                deferred_start,
-                profile: *profile,
-            }, effect).map_err(|e| {
-                effect_error.get_or_insert(e);
-                EffectFailed
-            })
+            with: effect => {
+                if effect_error.is_some() {
+                    Err(EffectFailed)
+                } else {
+                    handle_effect(HandlerCtx {
+                        chain_id,
+                        signer,
+                        app,
+                        storage,
+                        gossip,
+                        timers,
+                        phase: *phase,
+                        wal_seq,
+                        blocks,
+                        pending_inputs,
+                        outputs,
+                        last_decided,
+                        on_demand: *on_demand,
+                        deferred_start,
+                        profile: *profile,
+                    }, effect).map_err(|e| {
+                        effect_error.get_or_insert(e);
+                        EffectFailed
+                    })
+                }
+            }
         );
         if let Some(e) = effect_error.take() {
             return Err(e);
@@ -873,11 +931,15 @@ where
         Effect::WalAppend(height, entry, r) => {
             if ctx.phase != Phase::Recovering {
                 let wire = WireWalEntry::from(&entry);
+                // The sequence number advances only once the row is in: an
+                // INSERT that came back BUSY inserted nothing, so the retry
+                // reuses it. Should a retried append ever hit the (height,
+                // seq) key, that is not transient — fatal, then replay.
                 let seq = *ctx.wal_seq;
+                retry_transient::<S, _>("wal_append", Some(height), || {
+                    ctx.storage.wal_append(height, seq, &wire)
+                })?;
                 *ctx.wal_seq += 1;
-                ctx.storage
-                    .wal_append(height, seq, &wire)
-                    .map_err(HostError::Storage)?;
             }
             Ok(r.resume_with(()))
         }
@@ -892,37 +954,22 @@ where
             let wire_cert = WireCommitCertificate::from(&cert);
 
             // The whole decide re-runs on transient contention (the closure
-            // is rebuilt per attempt: it borrows the app mutably). A failure
-            // that survives the retries — or any non-transient one — is
-            // returned, and `drive_once` makes it fatal: a decide this node
-            // cannot persist must never be reported as done.
-            let mut attempt = 0u32;
-            loop {
+            // is rebuilt per attempt: it borrows the app mutably, and each
+            // attempt re-BEGINs the IMMEDIATE transaction). A failure that
+            // survives the budget — or any non-transient one — is returned,
+            // and `drive_once` makes it fatal: a decide this node cannot
+            // persist must never be reported as done.
+            retry_transient::<S, _>("decide", Some(height), || {
                 let app = &mut *ctx.app;
-                let outcome = ctx.storage.decide_atomically(|tx| {
+                ctx.storage.decide_atomically(|tx| {
                     app.apply_block(height, &block, tx)
                         .map_err(S::apply_error)?;
                     S::store_decided_tx(tx, &block, &wire_cert)?;
                     S::truncate_wal_tx(tx, height)?;
                     S::set_last_decided_tx(tx, height)?;
                     Ok(())
-                });
-                match outcome {
-                    Ok(()) => break,
-                    Err(e) if attempt < DECIDE_RETRIES && S::error_is_transient(&e) => {
-                        attempt += 1;
-                        tracing::warn!(
-                            %height,
-                            attempt,
-                            "decide hit transient storage contention, retrying: {e:?}"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            DECIDE_RETRY_BACKOFF_MS << (attempt - 1),
-                        ));
-                    }
-                    Err(e) => return Err(HostError::Storage(e)),
-                }
-            }
+                })
+            })?;
 
             *ctx.last_decided = Some(height);
             ctx.app.on_decided(height, &block, &wire_cert);

@@ -68,8 +68,10 @@ pub trait Storage {
 
     /// Whether `e` is transient node-local contention — safe for the host to
     /// absorb as [`ValidationVerdict::Undetermined`] on validation dry-run
-    /// paths — rather than a durability failure. Default: never; storages
-    /// without contention semantics keep every error fatal.
+    /// paths, and to retry under its bounded budget on the durability
+    /// effects (WAL append/fetch/reset, decide) — rather than a durability
+    /// failure. Default: never; storages without contention semantics keep
+    /// every error fatal.
     fn error_is_transient(_e: &Self::Error) -> bool {
         false
     }

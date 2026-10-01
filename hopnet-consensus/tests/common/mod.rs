@@ -5,11 +5,13 @@ use ed25519_dalek::SigningKey;
 use malachitebft_core_consensus::Params;
 use malachitebft_core_types::{Round, ValuePayload};
 
-use hopnet_consensus::codec::WireCommitCertificate;
+use hopnet_consensus::codec::{WireCommitCertificate, WireWalEntry};
 use hopnet_consensus::config::{MalachiteThresholds, QuorumProfile};
 use hopnet_consensus::context::{Address, Height, HopNetContext, Validator};
-use hopnet_consensus::store::SqliteStorage;
-use hopnet_consensus::traits::{Application, ApplyError, ValidationOrigin, ValidationVerdict};
+use hopnet_consensus::store::{SqliteStorage, StoreError};
+use hopnet_consensus::traits::{
+    Application, ApplyError, Storage, ValidationOrigin, ValidationVerdict,
+};
 use hopnet_consensus::types::{Blake3Hash, Block, BlockData, PrivKey, PubKey, Transactions};
 use hopnet_consensus::HopNetValidatorSet;
 
@@ -138,7 +140,13 @@ impl Application<SqliteStorage> for FlakyApp {
         tx: &mut rusqlite::Transaction<'_>,
         origin: ValidationOrigin,
     ) -> ValidationVerdict {
-        self.inner.validate_block(height, block, tx, origin)
+        <SqlApp as Application<SqliteStorage>>::validate_block(
+            &mut self.inner,
+            height,
+            block,
+            tx,
+            origin,
+        )
     }
 
     fn apply_block(
@@ -156,11 +164,11 @@ impl Application<SqliteStorage> for FlakyApp {
                 ApplyError::permanent("injected: handler refused the block")
             });
         }
-        self.inner.apply_block(height, block, tx)
+        <SqlApp as Application<SqliteStorage>>::apply_block(&mut self.inner, height, block, tx)
     }
 
     fn validator_set(&mut self, height: Height) -> HopNetValidatorSet {
-        self.inner.validator_set(height)
+        <SqlApp as Application<SqliteStorage>>::validator_set(&mut self.inner, height)
     }
 
     fn on_decided(&mut self, _height: Height, _block: &Block, _cert: &WireCommitCertificate) {}
@@ -174,14 +182,162 @@ impl Application<SqliteStorage> for FlakyApp {
 /// instead of failing. Only the validation dry-run paths bound their own
 /// wait below it.
 pub fn contended_db(name: &str) -> (PathBuf, SqliteStorage) {
+    contended_db_with_busy_timeout(name, 5000)
+}
+
+/// `contended_db` with an explicit busy_timeout. A short one lets a test
+/// make a WAL append or decide actually see SQLITE_BUSY from a write lock
+/// held longer than the connection waits — the case the host's retry budget
+/// exists for — without holding the lock for seconds of wall time.
+pub fn contended_db_with_busy_timeout(name: &str, busy_ms: u32) -> (PathBuf, SqliteStorage) {
     let path = temp_db(name);
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;
-         CREATE TABLE IF NOT EXISTS victim_probe (id INTEGER);",
-    )
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = {busy_ms};
+         CREATE TABLE IF NOT EXISTS victim_probe (id INTEGER);"
+    ))
     .unwrap();
     (path, storage_from_conn(conn))
+}
+
+/// Shared tally of a `FlakyStorage`'s `wal_append` calls, readable after the
+/// core has taken ownership of the storage.
+pub type CallCount = std::rc::Rc<std::cell::Cell<u32>>;
+
+/// SqliteStorage whose `wal_append` fails the next `failures` calls —
+/// transient (SQLITE_BUSY-shaped) or permanent — before delegating. Injects
+/// the WAL-append failure classes the host must retry or make fatal, without
+/// a real lock holder; every other operation is SqliteStorage's own.
+pub struct FlakyStorage {
+    pub inner: SqliteStorage,
+    pub failures: u32,
+    pub transient: bool,
+    pub wal_append_calls: CallCount,
+}
+
+impl FlakyStorage {
+    pub fn new(inner: SqliteStorage, failures: u32, transient: bool) -> (Self, CallCount) {
+        let calls = CallCount::default();
+        (
+            Self {
+                inner,
+                failures,
+                transient,
+                wal_append_calls: calls.clone(),
+            },
+            calls,
+        )
+    }
+}
+
+impl Storage for FlakyStorage {
+    type Tx<'a> = rusqlite::Transaction<'a>;
+    type Error = StoreError;
+
+    fn wal_append(
+        &mut self,
+        height: Height,
+        seq: u64,
+        entry: &WireWalEntry,
+    ) -> Result<(), StoreError> {
+        self.wal_append_calls.set(self.wal_append_calls.get() + 1);
+        if self.failures > 0 {
+            self.failures -= 1;
+            return Err(if self.transient {
+                StoreError::ApplyTransient("injected: database is locked".into())
+            } else {
+                StoreError::Apply("injected: append refused".into())
+            });
+        }
+        self.inner.wal_append(height, seq, entry)
+    }
+
+    fn wal_fetch(&mut self, height: Height) -> Result<Vec<WireWalEntry>, StoreError> {
+        self.inner.wal_fetch(height)
+    }
+
+    fn wal_reset(&mut self) -> Result<(), StoreError> {
+        self.inner.wal_reset()
+    }
+
+    fn decide_atomically<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self::Tx<'_>) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        self.inner.decide_atomically(f)
+    }
+
+    fn with_rollback<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self::Tx<'_>) -> R,
+    ) -> Result<R, StoreError> {
+        self.inner.with_rollback(f)
+    }
+
+    fn with_rollback_immediate<R>(
+        &mut self,
+        busy_timeout_ms: u32,
+        f: impl FnOnce(&mut Self::Tx<'_>) -> R,
+    ) -> Result<R, StoreError> {
+        self.inner.with_rollback_immediate(busy_timeout_ms, f)
+    }
+
+    fn error_is_transient(e: &StoreError) -> bool {
+        <SqliteStorage>::error_is_transient(e)
+    }
+
+    fn store_decided_tx(
+        tx: &mut Self::Tx<'_>,
+        block: &Block,
+        cert: &WireCommitCertificate,
+    ) -> Result<(), StoreError> {
+        <SqliteStorage>::store_decided_tx(tx, block, cert)
+    }
+
+    fn truncate_wal_tx(tx: &mut Self::Tx<'_>, up_to: Height) -> Result<(), StoreError> {
+        <SqliteStorage>::truncate_wal_tx(tx, up_to)
+    }
+
+    fn set_last_decided_tx(tx: &mut Self::Tx<'_>, height: Height) -> Result<(), StoreError> {
+        <SqliteStorage>::set_last_decided_tx(tx, height)
+    }
+
+    fn last_decided(&mut self) -> Result<Option<Height>, StoreError> {
+        self.inner.last_decided()
+    }
+
+    fn apply_error(e: ApplyError) -> StoreError {
+        <SqliteStorage>::apply_error(e)
+    }
+}
+
+/// SqlApp drives a `FlakyStorage` core unchanged: the transaction type is
+/// SqliteStorage's own, so every method delegates to the SqliteStorage impl.
+impl Application<FlakyStorage> for SqlApp {
+    fn validate_block(
+        &mut self,
+        height: Height,
+        block: &Block,
+        tx: &mut rusqlite::Transaction<'_>,
+        origin: ValidationOrigin,
+    ) -> ValidationVerdict {
+        <SqlApp as Application<SqliteStorage>>::validate_block(self, height, block, tx, origin)
+    }
+
+    fn apply_block(
+        &mut self,
+        height: Height,
+        block: &Block,
+        tx: &mut rusqlite::Transaction<'_>,
+    ) -> Result<(), ApplyError> {
+        <SqlApp as Application<SqliteStorage>>::apply_block(self, height, block, tx)
+    }
+
+    fn validator_set(&mut self, height: Height) -> HopNetValidatorSet {
+        <SqlApp as Application<SqliteStorage>>::validator_set(self, height)
+    }
+
+    fn on_decided(&mut self, _height: Height, _block: &Block, _cert: &WireCommitCertificate) {}
 }
 
 /// Hold the database's write lock from a second connection for `hold`, then
@@ -249,11 +405,11 @@ impl Application<SqliteStorage> for ContendedApp {
         block: &Block,
         tx: &mut rusqlite::Transaction<'_>,
     ) -> Result<(), ApplyError> {
-        self.inner.apply_block(height, block, tx)
+        <SqlApp as Application<SqliteStorage>>::apply_block(&mut self.inner, height, block, tx)
     }
 
     fn validator_set(&mut self, height: Height) -> HopNetValidatorSet {
-        self.inner.validator_set(height)
+        <SqlApp as Application<SqliteStorage>>::validator_set(&mut self.inner, height)
     }
 
     fn on_decided(&mut self, _height: Height, _block: &Block, _cert: &WireCommitCertificate) {}
