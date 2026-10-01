@@ -26,9 +26,17 @@ pub fn apply_self_check_updates(
         &report.fragments_added,
         &report.fragments_removed,
     )
-    .map_err(|e| {
-        tracing::error!("apply_self_check failed for node {}: {e}", report.node_id);
-        DatabaseError::ProcessingError
+    .map_err(|e| match e {
+        // Contention is not a verdict on the report: the dry-run surfaces it
+        // as Undetermined / a restage, the decide retries it.
+        hopnet_storage::StorageError::Transient(code) => DatabaseError::Transient(code),
+        other => {
+            tracing::error!(
+                "apply_self_check failed for node {}: {other}",
+                report.node_id
+            );
+            DatabaseError::ProcessingError
+        }
     })
 }
 

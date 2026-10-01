@@ -247,38 +247,68 @@ pub fn fragment_exists_and_valid(fragments_dir: &str, fragment_hash: &Blake3Hash
     fetch_and_verify_fragment(fragment_hash, fragments_dir).is_ok()
 }
 
+/// What the scrub found over one slice. Only `corrupt` is a verdict on the
+/// bytes: the file was read whole and its content does not hash to its
+/// name. A file that vanished between the walk and the read (deleted by
+/// the sweep's own orphan pass, eviction, or an orphaned-block apply) is
+/// not corruption, and neither is a read the operating system refused —
+/// EMFILE, EIO, a permission change — which says nothing about the bytes.
+/// The live scrub of 2026-10-01 reported 5,525 "corrupt" fragments that
+/// were all orphans the same sweep had just deleted.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ScrubOutcome {
+    /// Content hash mismatches — the caller deletes these and the
+    /// lifecycle re-pulls them from attested holders.
+    pub corrupt: Vec<Blake3Hash>,
+    /// Listed files that no longer existed when read.
+    pub vanished: usize,
+    /// Listed files the read failed on for any other reason (logged).
+    pub unreadable: usize,
+}
+
 /// Deep-verify one slice of the local fragment store (rolling scrub,
 /// RFC-STORAGE-001 scrub period): slices selected by the first hash byte,
-/// so a full walk completes every `slices` calls. Returns the hashes whose
-/// on-disk bytes no longer match — the caller deletes them and lets the
-/// self-check attest the loss; the repair loop regenerates.
+/// so a full walk completes every `slices` calls.
 pub fn verify_slice(
     fragments_dir: &str,
     slice: u8,
     slices: u8,
-) -> Result<Vec<Blake3Hash>, StorageError> {
+) -> Result<ScrubOutcome, StorageError> {
     let all = scan_fragments_detailed(fragments_dir)?;
     Ok(verify_listing(fragments_dir, &all, slice, slices))
 }
 
 /// The scrub over an existing walk (the sweep shares its listing): verify
-/// the content of every file in `slice`, returning the corrupt hashes.
+/// the content of every file in `slice`.
 pub fn verify_listing(
     fragments_dir: &str,
     listing: &[crate::sweep::DiskFragment],
     slice: u8,
     slices: u8,
-) -> Vec<Blake3Hash> {
-    let mut corrupted = Vec::new();
+) -> ScrubOutcome {
+    let mut outcome = ScrubOutcome::default();
     for d in listing {
         if d.hash.as_bytes()[0] % slices.max(1) != slice {
             continue;
         }
-        if fetch_and_verify_fragment(&d.hash, fragments_dir).is_err() {
-            corrupted.push(d.hash);
+        match fetch_and_verify_fragment(&d.hash, fragments_dir) {
+            Ok(_) => {}
+            Err(StorageError::HashMismatch) => outcome.corrupt.push(d.hash),
+            Err(StorageError::Io(e)) | Err(StorageError::Read(e))
+                if e.kind() == std::io::ErrorKind::NotFound =>
+            {
+                outcome.vanished += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "scrub: could not read fragment {} ({e}); not a verdict on its bytes",
+                    d.hash.to_hex()
+                );
+                outcome.unreadable += 1;
+            }
         }
     }
-    corrupted
+    outcome
 }
 
 #[cfg(test)]
@@ -316,6 +346,49 @@ mod tests {
         delete_fragment(&dir, &hash).unwrap();
         delete_fragment(&dir, &hash).unwrap(); // idempotent
         assert!(!fragment_exists_and_valid(&dir, &hash));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Impact: the 2026-10-01 live scrub reported 5,525 corrupt fragments
+    // that were orphans the same sweep had deleted moments earlier — a
+    // vanished file read back as an error and the error read as corruption.
+    // Should: report only content hash mismatches as corrupt, and count a
+    // file that disappeared after the walk as vanished.
+    // Should not: report an intact or a vanished file as corrupt.
+    #[test]
+    fn scrub_reports_only_hash_mismatches() {
+        let dir = std::env::temp_dir().join(format!("hopnet-scrub-test-{}", std::process::id()));
+        let dir = dir.to_str().unwrap().to_string();
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut listing = Vec::new();
+        let mut hashes = Vec::new();
+        for i in 0u8..3 {
+            let data = vec![i; 64];
+            let hash = Blake3Hash::new(blake3::hash(&data));
+            store_fragment(&dir, &hash, data).unwrap();
+            listing.push(crate::sweep::DiskFragment {
+                hash,
+                size: 64,
+                mtime: 0,
+            });
+            hashes.push(hash);
+        }
+        // One corrupted in place, one deleted after the walk, one intact.
+        let corrupt_path = format!(
+            "{}/{}",
+            create_fragment_path(&dir, &hashes[1]).unwrap(),
+            hashes[1].to_hex()
+        );
+        fs::write(&corrupt_path, b"corrupted").unwrap();
+        delete_fragment(&dir, &hashes[2]).unwrap();
+
+        // One slice covering every hash.
+        let outcome = verify_listing(&dir, &listing, 0, 1);
+        assert_eq!(outcome.corrupt, vec![hashes[1]]);
+        assert_eq!(outcome.vanished, 1);
+        assert_eq!(outcome.unreadable, 0);
 
         let _ = fs::remove_dir_all(&dir);
     }

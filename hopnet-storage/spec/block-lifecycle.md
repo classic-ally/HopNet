@@ -1041,6 +1041,25 @@ optimization and carries no proof obligation.
     origin's classes are evidence too.
     Storage@2 artifacts import through a frozen v2 spec (S1's
     precedent, second use).
+  - Live finding (2026-10-01, the 2026.10.1 crossing): the sweep
+    attested in ONE `attest_fragments` transaction carrying every
+    on-disk hash. At 196k fragments that is 6.5 MB against the 8 MB
+    wire frame and it never cleared the queue's 120 s deadline, so no
+    row was ever verified and nothing could confirm. The attestation
+    is now paged (`sweep::attestation_pages`, `ATTEST_PAGE_SIZE` 8192
+    hashes ≈ 270 KB), one awaited transaction per page; a page that
+    commits stays committed (the apply is idempotent) and the report
+    counts `attested_pages`. In the same hour the applies hit
+    "database is locked" under the sweep's re-flag load: the
+    self-check apply collapsed that into `ProcessingError` — a
+    permanent verdict on contention — and now keeps it `Transient`,
+    like the attest apply always did (the host's decide retries it,
+    malachite-consensus.md "One-transaction decide"). Known race, not
+    fixed here: the prompt self-check's differential is a whole-node
+    snapshot whose exact count the apply re-checks, so a pull landing
+    between build and preflight rejects it (`ProcessingError`); the
+    sweep cron rebuilds the report, nothing is lost. A durable fix
+    pages the differential with monotone additions-only pages.
 - [x] **S6 — Lifecycle closure.** Data-block cleanup registered on
   schedule; availability-class branch deleted; inventory rows of
   deleted blobs dropped with the blob.
@@ -1098,11 +1117,24 @@ optimization and carries no proof obligation.
     stuck age tail IS the plateau), per-node bars over a mesh
     histogram, tiles over a log-bucket chart, ETA now rather than
     deferred.
-- [ ] **Cutover.** One release: migration backfill enrolls the stranded
+- [~] **Cutover.** One release: migration backfill enrolls the stranded
   class, the first propose hook starts the catch-up drain.
   Validation on the live mesh: watch the drain complete, then the
   converged predicate hold. The 518-block incident class is the
   acceptance test.
+  - Crossed 2026-10-01 (2026.10.1 → epoch 6, sealed at 81,039; all
+    three seated validators flipped within a minute). The drain did
+    not start: the live mesh is 41,175 blobs, ~700k inventory rows
+    per node, 196k fragments on one node — eighty times the 500-blob
+    rehearsal — and that scale surfaced four defects the rehearsal
+    could not: the one-transaction attestation (S5 live finding),
+    contention treated as a verdict in the self-check apply (S5 live
+    finding), a decide effect's storage error swallowed by the engine
+    macro (consensus-bugs.md 11 — one node had been wedged four days
+    before the crossing by the same path), and the scrub counting a
+    file deleted earlier in the same sweep as corrupt (5,525 false
+    positives; S5 scrub bullet). 2026.10.2 carries the fixes; the
+    drain's convergence on the pane is still the acceptance test.
   - Rehearsal (2026-09-27): `orchestrator test --test
     lifecycle-cutover-drain --flags blobs=N` — a mesh born on the
     deployed release image, populated, crosses into the build under

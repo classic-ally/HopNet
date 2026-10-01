@@ -577,4 +577,105 @@ mod lifecycle_handlers {
             );
         }
     }
+
+    /// Run `handler` against a file-backed database whose write lock another
+    /// connection holds for the whole call, with a short busy timeout so the
+    /// handler's first write hits SQLITE_BUSY instead of waiting it out.
+    fn run_contended(
+        handler: &dyn TransactionHandler,
+        function: &str,
+        payload: &[u8],
+    ) -> crate::handlers::HandlerResult {
+        let path = std::env::temp_dir().join(format!(
+            "hopnet-storage-host-contended-{function}-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
+            .build(r2d2_sqlite::SqliteConnectionManager::file(&path))
+            .unwrap();
+        crate::db::chains::install(&pool.get().unwrap()).unwrap();
+
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        holder
+            .execute_batch(
+                "CREATE TABLE lock_probe (id INTEGER); \
+                 BEGIN IMMEDIATE; INSERT INTO lock_probe (id) VALUES (1);",
+            )
+            .unwrap();
+
+        let meta = TxMeta {
+            function,
+            payload,
+            submitter_node: 1,
+            user_id: None,
+        };
+        let notifier = NullNotifier;
+        let scheduler = NullScheduler;
+        let ctx = HandlerCtx {
+            fragments_dir: "",
+            node_id: Some(1),
+            height: 0,
+            notifier: &notifier,
+            work: &scheduler,
+        };
+        let mut conn = pool.get().unwrap();
+        conn.execute_batch("PRAGMA busy_timeout = 50").unwrap();
+        let db_tx = conn.transaction().unwrap();
+        let result = handler.process(&meta, false, &ctx, &db_tx);
+        drop(db_tx);
+        holder.execute_batch("COMMIT").unwrap();
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    // Impact: the live crossing hit "database is locked" inside these two
+    // applies under the disk-truth sweep's write load; a lock surfaced as a
+    // permanent verdict rejects the block (or, at decide time, wedges the
+    // node), while a transient one restages or retries.
+    // Should: surface SQLITE_BUSY from the attestation apply as a transient
+    // handler error.
+    // Should not: turn contention into a processing failure.
+    #[test]
+    fn attest_handler_keeps_contention_transient() {
+        let payload = encode(&hopnet_storage::FragmentAttestation {
+            node_id: 1,
+            height: 5,
+            present: vec![hopnet_storage::Blake3Hash::from_bytes([9u8; 32])],
+            suspect: Vec::new(),
+        });
+        let result = run_contended(
+            &crate::storage_host::handlers::AttestFragmentsHandler,
+            hopnet_storage::engine::policy::ATTEST_FN,
+            &payload,
+        );
+        assert!(
+            matches!(result, Err(crate::db::DatabaseError::Transient(_))),
+            "expected Transient, got {result:?}"
+        );
+    }
+
+    // Should: surface SQLITE_BUSY from the self-check differential apply as
+    // a transient handler error, not a processing failure.
+    #[test]
+    fn self_check_handler_keeps_contention_transient() {
+        let payload = encode(&hopnet_storage::SelfCheckFragments {
+            node_id: 1,
+            self_verified_height: 5,
+            previous_count: 0,
+            fragments_added: vec![hopnet_storage::Blake3Hash::from_bytes([9u8; 32])],
+            fragments_removed: Vec::new(),
+        });
+        let result = run_contended(
+            &crate::storage_host::handlers::SelfCheckFragmentsHandler,
+            hopnet_storage::engine::policy::SELF_CHECK_FN,
+            &payload,
+        );
+        assert!(
+            matches!(result, Err(crate::db::DatabaseError::Transient(_))),
+            "expected Transient, got {result:?}"
+        );
+    }
 }

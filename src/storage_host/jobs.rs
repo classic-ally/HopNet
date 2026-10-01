@@ -486,31 +486,48 @@ pub async fn run_disk_truth_sweep(
         }
     }
 
-    // (3) The weekly scrub slice shares the walk.
+    // (3) The weekly scrub slice shares the walk — minus the orphans step
+    // (2) just deleted, which would otherwise read back as missing. Only
+    // a content hash mismatch is corruption; a file that vanished or a
+    // read the OS refused is counted, never deleted or un-flagged.
     let day = (now_unix / 86400) as i64;
     let mut corrupt_deleted = 0usize;
+    let mut scrub_unreadable = 0usize;
     let mut present = diff.present.clone();
     if LAST_SCRUB_DAY.swap(day, std::sync::atomic::Ordering::SeqCst) != day {
         let slice = (day % 7) as u8;
         let dir = fragments_dir.clone();
-        let listing_for_scrub = listing.clone();
-        let corrupted = tokio::task::spawn_blocking(move || {
+        let deleted: std::collections::HashSet<_> = diff.orphans.iter().map(|(h, _)| *h).collect();
+        let listing_for_scrub: Vec<_> = listing
+            .iter()
+            .filter(|d| !deleted.contains(&d.hash))
+            .copied()
+            .collect();
+        let outcome = tokio::task::spawn_blocking(move || {
             hopnet_storage::fragstore::verify_listing(&dir, &listing_for_scrub, slice, 7)
         })
         .await
         .map_err(|e| Error::Failed(Arc::new(format!("scrub join: {e}").into())))?;
-        if !corrupted.is_empty() {
+        if outcome.vanished > 0 || outcome.unreadable > 0 {
+            tracing::debug!(
+                "scrub: slice {slice}: {} vanished since the walk, {} unreadable",
+                outcome.vanished,
+                outcome.unreadable
+            );
+        }
+        scrub_unreadable = outcome.unreadable;
+        if !outcome.corrupt.is_empty() {
             tracing::warn!(
                 "scrub: {} corrupt fragments on slice {slice}",
-                corrupted.len()
+                outcome.corrupt.len()
             );
-            for hash in &corrupted {
+            for hash in &outcome.corrupt {
                 let _ = hopnet_storage::fragstore::delete_fragment(&fragments_dir, hash);
             }
-            host.mark_remote_batch(corrupted.clone()).await;
-            let gone: std::collections::HashSet<_> = corrupted.iter().collect();
+            let gone: std::collections::HashSet<_> = outcome.corrupt.iter().collect();
             present.retain(|h| !gone.contains(h));
-            corrupt_deleted = corrupted.len();
+            corrupt_deleted = outcome.corrupt.len();
+            host.mark_remote_batch(outcome.corrupt).await;
         }
     }
 
@@ -528,8 +545,10 @@ pub async fn run_disk_truth_sweep(
             .map_err(|e| Error::Failed(Arc::new(format!("self-check submit: {e:?}").into())))?;
     }
 
-    // (5) Truth: attest everything seen on disk this cycle.
-    let mut attested = false;
+    // (5) Truth: attest everything seen on disk this cycle, one awaited
+    // page at a time (ATTEST_PAGE_SIZE): a page that commits stays
+    // committed, so a failure part-way leaves the next sweep less to do.
+    let mut attested_pages = 0usize;
     if !present.is_empty() {
         let height = {
             let conn = app_state
@@ -539,18 +558,29 @@ pub async fn run_disk_truth_sweep(
             crate::db::consensus::get_current_consensus_height(&conn)
                 .map_err(|e| Error::Failed(Arc::new(format!("height: {e:?}").into())))?
         };
-        let attestation = hopnet_storage::FragmentAttestation {
+        let pages = hopnet_storage::sweep::attestation_pages(
             node_id,
             height,
-            present: present.clone(),
-            suspect: Vec::new(),
-        };
-        let payload = bincode::serde::encode_to_vec(&attestation, bincode::config::standard())
-            .map_err(|e| Error::Failed(Arc::new(format!("attestation encode: {e}").into())))?;
-        host.submit(hopnet_storage::engine::policy::ATTEST_FN, payload)
-            .await
-            .map_err(|e| Error::Failed(Arc::new(format!("attestation submit: {e:?}").into())))?;
-        attested = true;
+            &present,
+            hopnet_storage::engine::policy::ATTEST_PAGE_SIZE,
+        );
+        let total = pages.len();
+        for (i, attestation) in pages.into_iter().enumerate() {
+            let payload = bincode::serde::encode_to_vec(&attestation, bincode::config::standard())
+                .map_err(|e| Error::Failed(Arc::new(format!("attestation encode: {e}").into())))?;
+            host.submit(hopnet_storage::engine::policy::ATTEST_FN, payload)
+                .await
+                .map_err(|e| {
+                    Error::Failed(Arc::new(
+                        format!("attestation submit (page {} of {total}): {e:?}", i + 1).into(),
+                    ))
+                })?;
+            attested_pages += 1;
+        }
+        tracing::info!(
+            "sweep: attested {} fragments in {attested_pages} pages",
+            present.len()
+        );
     }
 
     let report = hopnet_storage::sweep::SweepReport {
@@ -563,7 +593,8 @@ pub async fn run_disk_truth_sweep(
         orphan_bytes_freed,
         young_orphans: diff.young_orphans,
         corrupt_deleted,
-        attested,
+        scrub_unreadable,
+        attested_pages,
     };
     tracing::info!(
         "sweep: {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} corrupt deleted",

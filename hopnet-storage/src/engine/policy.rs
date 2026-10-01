@@ -51,6 +51,13 @@ pub use crate::lifecycle::ATTESTATION_RECENCY_HEIGHTS;
 /// proposal takes the next page.
 pub const DECLARE_PAGE_SIZE: usize = 500;
 
+/// Fragment hashes per disk-truth attestation page (S5 sweep). Pagination
+/// for block-size hygiene, not a cap: the sweep attests everything it saw,
+/// one awaited `attest_fragments` per page. 8192 hashes ≈ 270 KB on the
+/// wire; the live mesh's 196k-fragment node attests in 24 pages where one
+/// 6.5 MB transaction timed out in the queue (2026-10-01).
+pub const ATTEST_PAGE_SIZE: usize = 8192;
+
 /// The staleness pass's grace rung: a node that has not observed the
 /// `desired < T` check (a proposal of its own, or anyone's declare page
 /// applying) for this long submits a page directly. Longer than the

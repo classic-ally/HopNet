@@ -410,9 +410,17 @@ where
                 .map_err(|e| EngineError::Transfer(format!("self-check encode: {e}")))?;
             match seams.submitter.submit(policy::SELF_CHECK_FN, encoded).await {
                 Ok(()) => outcome.attested = true,
-                Err(SubmitError::Rejected(r)) => tracing::warn!("prompt attestation rejected: {r}"),
+                // The differential is a whole-node snapshot whose exact
+                // count the apply re-checks; a pull landing between build
+                // and preflight fails it. Routine under load — the sweep
+                // cron rebuilds the report; nothing here is lost.
+                Err(SubmitError::Rejected(r)) => {
+                    tracing::warn!(
+                        "prompt self-check rejected (differential raced the inventory): {r}"
+                    )
+                }
                 Err(SubmitError::Transient(e)) => {
-                    tracing::debug!("prompt attestation deferred to the self-check cron: {e}")
+                    tracing::debug!("prompt self-check deferred to the self-check cron: {e}")
                 }
             }
         }

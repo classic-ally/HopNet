@@ -89,6 +89,30 @@ pub fn diff(disk: &[DiskFragment], rows: &[(Blake3Hash, bool)], grace_cutoff: u6
     out
 }
 
+/// The sweep's disk-truth attestation, split into `page`-sized
+/// `attest_fragments` payloads (RFC-STORAGE-003 S5). One transaction per
+/// page keeps every page under the wire frame and the queue's deadline
+/// whatever the store's size; `apply_attestation` is idempotent, so a page
+/// that commits before a later one fails is simply re-covered by the next
+/// sweep. Every hash lands in exactly one page; an empty `present` yields
+/// no pages.
+pub fn attestation_pages(
+    node_id: i32,
+    height: u64,
+    present: &[Blake3Hash],
+    page: usize,
+) -> Vec<crate::types::FragmentAttestation> {
+    present
+        .chunks(page.max(1))
+        .map(|chunk| crate::types::FragmentAttestation {
+            node_id,
+            height,
+            present: chunk.to_vec(),
+            suspect: Vec::new(),
+        })
+        .collect()
+}
+
 /// What one sweep did — the operator's report (the former two-call orphan
 /// scan/delete API collapses into this).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,7 +126,12 @@ pub struct SweepReport {
     pub orphan_bytes_freed: u64,
     pub young_orphans: usize,
     pub corrupt_deleted: usize,
-    pub attested: bool,
+    /// Scrub-slice files the read failed on for a reason other than
+    /// absence (logged, kept — not a verdict on the bytes).
+    pub scrub_unreadable: usize,
+    /// `attest_fragments` transactions this sweep committed (0 when nothing
+    /// was on disk).
+    pub attested_pages: usize,
 }
 
 #[cfg(test)]
@@ -151,5 +180,28 @@ mod tests {
         let empty = diff(&[], &rows, 0);
         assert!(empty.present.is_empty());
         assert_eq!(empty.flagged_missing, vec![h(1), h(2)]);
+    }
+
+    // Impact: the live mesh's 196k-fragment node attested in one 6.5 MB
+    // transaction that never cleared the queue, so no row was ever verified.
+    // Should: split the present list into page-sized attestations that
+    // together cover every hash exactly once, the last page short.
+    // Should not: emit a page for an empty store.
+    #[test]
+    fn attestation_pages_cover_every_hash_once() {
+        let present: Vec<Blake3Hash> = (0u8..10).map(h).collect();
+        let pages = attestation_pages(2, 77, &present, 4);
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[2].present.len(), 2, "the last page is short");
+        let mut seen: Vec<Blake3Hash> = pages
+            .iter()
+            .flat_map(|p| p.present.iter().copied())
+            .collect();
+        seen.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(seen, present);
+        assert!(pages
+            .iter()
+            .all(|p| p.node_id == 2 && p.height == 77 && p.suspect.is_empty()));
+        assert!(attestation_pages(2, 77, &[], 4).is_empty());
     }
 }
