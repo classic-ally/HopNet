@@ -76,7 +76,10 @@ pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
     .await
     .map_err(|e| match e {
         hopnet_storage::StorageError::Read(_) => StatusCode::UNPROCESSABLE_ENTITY,
-        hopnet_storage::StorageError::Io(_) => StatusCode::INSUFFICIENT_STORAGE,
+        hopnet_storage::StorageError::Io(_)
+        | hopnet_storage::StorageError::InsufficientSpace { .. } => {
+            StatusCode::INSUFFICIENT_STORAGE
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
 

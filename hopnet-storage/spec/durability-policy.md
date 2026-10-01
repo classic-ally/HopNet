@@ -42,15 +42,28 @@ exhausted → honest capacity metric falls → placement assigns nothing
 new → new stores refuse; freeing pinned space is an unpin, owned by
 the projection's own (user-facing, manual) flow.
 
+"New stores refuse" is ingest admission (`admission.rs`): `api::put`
+reserves its local footprint (every fragment class, ~3x the payload)
+and refuses with `InsufficientSpace` when that would leave the
+fragments filesystem at or below a free-space floor, counting other
+in-flight ingests. The host enables the floor (10 GiB by default,
+`HOPNET_STORAGE_MIN_FREE_BYTES`) and maps the refusal to HTTP 507;
+thin clients can ask first (`/api/photos/client/admit`), since a
+refusal sent before the body is read reaches them as a broken
+connection. Placement and repair traffic (peer stores, pulls,
+re-encode) is not gated.
+
 Durability counts both classes. GC is decentralized, in two local
 loops sharing one guard (the inventory claiming another holder — or
-the blob being deleted). The surplus release runs every policy tick
-without pressure: it frees confirmed surplus (an origin's non-assigned
-classes, a departed holder's copies) as soon as another member's copy
-has been disk-verified within the confirmation recency window, oldest
-blob first, bounded per tick. The watermark loop acts under disk
-pressure (surplus oldest-first above the high watermark, stop at the
-low) on belief alone. A returning
+the blob being deleted). The surplus release rides every disk-truth
+sweep, on the sweep's own walk and without pressure: it frees confirmed
+surplus (an origin's non-assigned classes, a departed holder's copies)
+as soon as another member's copy has been disk-verified within the
+confirmation recency window, oldest blob first, bounded per sweep. It
+runs before the sweep's self-check, so the same pass carries the
+removals to consensus and never attests a file it deleted. The
+watermark loop acts under disk pressure (surplus oldest-first above
+the high watermark, stop at the low) on belief alone. A returning
 node's copies re-enter inventory via self-check and count as surplus;
 catch-up never commands deletion.
 
