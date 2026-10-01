@@ -14,9 +14,9 @@
     <key>CFBundleName</key>
     <string>photo-ingress</string>
     <key>CFBundleShortVersionString</key>
-    <string>2026.10.3</string>
+    <string>2026.10.4</string>
     <key>CFBundleVersion</key>
-    <string>20261003</string>
+    <string>20261004</string>
     <key>NSPhotoLibraryUsageDescription</key>
     <string>HopNet photo ingress: archives your Photos library to storage you control.</string>
 </dict>
