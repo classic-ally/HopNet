@@ -281,12 +281,13 @@ impl PendingPool {
         self.inflight.lock().unwrap().len()
     }
 
-    /// Take up to `max` staged transactions for a proposal at `height`.
+    /// Take up to `max` staged transactions, and at most `max_bytes` of
+    /// them by [`tx_wire_bytes`] (never fewer than one), for a proposal.
     /// Returns the bare transactions for `build_value`; entries are parked
     /// in a caller-held ticket to be resolved by [`Self::settle`].
-    pub fn take_for_proposal(&self, max: usize) -> Vec<QueuedTransaction> {
+    pub fn take_for_proposal(&self, max: usize, max_bytes: usize) -> Vec<QueuedTransaction> {
         let mut queued = self.queued.lock().unwrap();
-        let n = queued.len().min(max);
+        let n = budgeted_prefix_len(queued.iter().map(|q| tx_wire_bytes(&q.tx)), max, max_bytes);
         queued.drain(..n).collect()
     }
 
@@ -572,6 +573,14 @@ impl ConsensusQueue {
     /// moratorium). Full preflight (execute=false dry-run) happens on
     /// the leader.
     fn pre_validate(&self, transaction: &Transaction) -> Result<(), ConsensusSubmitError> {
+        if transaction.rpc.payload.len() > MAX_TX_PAYLOAD_BYTES {
+            return Err(ConsensusSubmitError::Rejected(format!(
+                "transaction too large: {} payload is {} bytes (limit {})",
+                transaction.rpc.function,
+                transaction.rpc.payload.len(),
+                MAX_TX_PAYLOAD_BYTES
+            )));
+        }
         if DISPATCH_TABLE
             .get(transaction.rpc.function.as_str())
             .is_none()
@@ -645,6 +654,57 @@ async fn await_result(rx: oneshot::Receiver<ConsensusResult>) -> Result<u64, Con
 const MAX_BATCH_SIZE: usize = 100;
 const RETRY_DELAY_SECS: u64 = 5;
 
+/// Byte budget for one proposal's queue entries and for one forward batch.
+/// A proposal travels as a single gossip frame and a forward batch as a
+/// single RPC frame; the transport refuses frames over 8 MiB on RECEIVE
+/// only, so an oversized one is silently dropped by every peer and retried
+/// forever. Count caps alone allowed it: a hundred photo_add / attestation
+/// pages of a few hundred KB each is tens of MB. 5 MiB leaves room for the
+/// transactions `build_value` appends after the queue entries (nonce
+/// cleanup, staleness declare pages) and for the block envelope.
+pub(crate) const BATCH_BYTE_BUDGET: usize = 5 * 1024 * 1024;
+
+/// Largest transaction payload admitted. One transaction must always fit a
+/// proposal on its own; today's largest (a multi-GB video's photo_add, an
+/// attestation page) are a few hundred KB.
+pub(crate) const MAX_TX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
+// Admission and proposal limits must agree: one maximum-size transaction,
+// plus room for what build_value appends, fits a proposal, and a proposal
+// fits the transport's 8 MiB receive limit.
+const _: () = assert!(MAX_TX_PAYLOAD_BYTES + 512 * 1024 <= BATCH_BYTE_BUDGET);
+const _: () = assert!(BATCH_BYTE_BUDGET < 8 * 1024 * 1024);
+
+/// Allowance per transaction for everything but the payload: function name,
+/// two signed identities, nonce, and bincode framing. Generous on purpose.
+const TX_OVERHEAD_BYTES: usize = 512;
+
+/// Bytes a transaction contributes to an encoded block or forward frame.
+pub(crate) fn tx_wire_bytes(tx: &Transaction) -> usize {
+    tx.rpc.payload.len() + tx.rpc.function.len() + TX_OVERHEAD_BYTES
+}
+
+/// Length of the longest prefix of `sizes` with at most `max_count` items
+/// and at most `budget` bytes — never fewer than one item when there is
+/// any, so a lone oversized entry still moves (and is judged) rather than
+/// wedging the queue behind it.
+pub(crate) fn budgeted_prefix_len(
+    sizes: impl Iterator<Item = usize>,
+    max_count: usize,
+    budget: usize,
+) -> usize {
+    let mut total = 0usize;
+    let mut kept = 0usize;
+    for size in sizes {
+        if kept >= max_count || (kept > 0 && total + size > budget) {
+            break;
+        }
+        total += size;
+        kept += 1;
+    }
+    kept
+}
+
 /// Outcome from a dispatch attempt, determines how the batch processor gates
 /// before the next drain cycle.
 pub(crate) enum DispatchOutcome {
@@ -716,10 +776,29 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
             batch.push(first);
         }
 
+        // Bound the batch by bytes as well as count: a forward is one RPC
+        // frame. Held-back retries beyond the budget wait for the next cycle,
+        // ahead of anything newer.
+        let keep = budgeted_prefix_len(
+            batch.iter().map(|q| tx_wire_bytes(&q.tx)),
+            usize::MAX,
+            BATCH_BYTE_BUDGET,
+        );
+        let mut overflow = batch.split_off(keep);
+        let mut batch_bytes: usize = batch.iter().map(|q| tx_wire_bytes(&q.tx)).sum();
+
         // Drain any additional queued transactions (non-blocking)
-        while batch.len() < MAX_BATCH_SIZE {
+        while overflow.is_empty() && batch.len() < MAX_BATCH_SIZE {
             match rx.try_recv() {
-                Ok(queued) => batch.push(queued),
+                Ok(queued) => {
+                    let size = tx_wire_bytes(&queued.tx);
+                    if !batch.is_empty() && batch_bytes + size > BATCH_BYTE_BUDGET {
+                        overflow.push(queued);
+                        break;
+                    }
+                    batch_bytes += size;
+                    batch.push(queued);
+                }
                 Err(_) => break,
             }
         }
@@ -734,6 +813,7 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
                         .notifier
                         .send(ConsensusResult::Failed("node not initialized".into()));
                 }
+                retry_holdback = overflow;
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
@@ -742,6 +822,7 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
         // Engine not started yet (setup or join bootstrap in progress) —
         // hold the batch and re-check shortly.
         let Some(engine) = app_state.malachite.get().cloned() else {
+            batch.append(&mut overflow);
             retry_holdback = batch;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
@@ -749,6 +830,7 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
 
         let Some((height, round, proposer)) = super::malachite::engine::proposal_target(&app_state)
         else {
+            batch.append(&mut overflow);
             retry_holdback = batch;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
@@ -768,7 +850,9 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
             )
             .await
         };
+        // Failed entries retry first, then whatever the budget held back.
         retry_holdback = holdback;
+        retry_holdback.append(&mut overflow);
 
         // ── Gate before the next cycle ──
         match outcome {
@@ -1193,7 +1277,7 @@ mod preflight_resolution_tests {
             "the retry joined; the other nonce did not"
         );
 
-        let mut taken = pool.take_for_proposal(10);
+        let mut taken = pool.take_for_proposal(10, usize::MAX);
         assert_eq!(taken.len(), 2);
         let joined = taken.remove(0);
         assert_eq!(joined.notifier.len(), 2);
@@ -1338,8 +1422,47 @@ mod preflight_resolution_tests {
         let marker = restaged.tx.nonce.to_string();
         pool.push(queued_first);
         pool.restage(vec![restaged]);
-        let taken = pool.take_for_proposal(2);
+        let taken = pool.take_for_proposal(2, usize::MAX);
         assert_eq!(taken.len(), 2);
         assert_eq!(taken[0].tx.nonce.to_string(), marker);
+    }
+
+    fn entry_with_payload(bytes: usize) -> QueuedTransaction {
+        let (mut queued, _rx) = entry();
+        queued.tx.rpc.payload = vec![0u8; bytes];
+        queued
+    }
+
+    // Should: keep the longest prefix within both the count and the byte
+    // budget.
+    // Should: keep a lone oversized first item rather than nothing, so one
+    // big entry is judged instead of wedging everything behind it.
+    #[test]
+    fn budgeted_prefix_respects_count_and_bytes() {
+        assert_eq!(budgeted_prefix_len([3, 3, 3].into_iter(), 10, 7), 2);
+        assert_eq!(budgeted_prefix_len([3, 3, 3].into_iter(), 1, 100), 1);
+        assert_eq!(budgeted_prefix_len([50, 1].into_iter(), 10, 7), 1);
+        assert_eq!(budgeted_prefix_len(std::iter::empty(), 10, 7), 0);
+    }
+
+    // Impact: a proposal travels as one gossip frame that every peer
+    // refuses above 8 MiB on receive; a count-only take let a hundred
+    // multi-hundred-KB entries build an unsendable block, re-proposed
+    // forever.
+    // Should: take staged entries only up to the byte budget, in order,
+    // leaving the rest staged for the next height.
+    #[test]
+    fn proposal_take_stops_at_the_byte_budget() {
+        let pool = PendingPool::default();
+        for _ in 0..3 {
+            pool.push(entry_with_payload(2 * 1024 * 1024));
+        }
+        let taken = pool.take_for_proposal(MAX_BATCH_SIZE, BATCH_BYTE_BUDGET);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(pool.staged_len(), 1);
+        assert!(
+            taken.iter().map(|q| tx_wire_bytes(&q.tx)).sum::<usize>() <= BATCH_BYTE_BUDGET,
+            "taken entries exceed the budget"
+        );
     }
 }

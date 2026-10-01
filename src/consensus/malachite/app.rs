@@ -566,6 +566,19 @@ pub(crate) fn build_value_with_budget(
     for (i, tx) in candidates.iter().enumerate() {
         if committed.contains(&tx.nonce.to_string()) {
             rejected.push((i, crate::consensus::queue::RejectReason::AlreadyCommitted));
+        } else if tx.rpc.payload.len() > crate::consensus::queue::MAX_TX_PAYLOAD_BYTES {
+            // Admission refuses these at submit; a forwarded one (forwarding
+            // skips admission) or one from an older node must still never
+            // be proposed — no block carrying it fits a frame.
+            rejected.push((
+                i,
+                crate::consensus::queue::RejectReason::Permanent(format!(
+                    "transaction too large: {} payload is {} bytes (limit {})",
+                    tx.rpc.function,
+                    tx.rpc.payload.len(),
+                    crate::consensus::queue::MAX_TX_PAYLOAD_BYTES
+                )),
+            ));
         } else if let Some(age) = tx
             .nonce
             .extract_timestamp()
