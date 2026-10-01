@@ -243,6 +243,17 @@ branch's wire breaks force a re-formation anyway.
   release. The advisory fires, nodes auto-stage and attest, the
   operator submits `regenesis_start`, and the mesh crosses unattended
   — the release publication IS the end-to-end validation.
+  - Done 2026-10-01 (v2026.10.1 → epoch 6, three seated validators).
+    Operator notes from the crossing: a node's boot attestation used to
+    run before its first provider poll and so attested "nothing
+    staged", erasing the committed staged claim after every restart —
+    the boot task now polls first and a node that can stage never
+    claims without an observation (`staged_claim`); the manual tick
+    (`POST /maintenance/upgrade-tick`) blocks for the whole `nix build`
+    when it has to stage, so run it in the background with a long
+    client timeout; a node's API tokens are per process (the JWT key is
+    rolled at start), so every restart — the seal's exit 75 included —
+    means a fresh sign-in before the status views answer again.
 
 ## Open questions
 

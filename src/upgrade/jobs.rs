@@ -127,6 +127,42 @@ pub async fn poll_provider(app_state: &AppState) -> bool {
     true
 }
 
+/// The node has no provider observation to base a staged claim on.
+#[derive(Debug, PartialEq, Eq)]
+pub struct StagedClaimUnknown;
+
+/// The staged version this node may attest, from its last provider poll.
+/// A node that can stage (an activation contract is declared) must not
+/// claim "nothing staged" before it has looked — right after a restart
+/// `last` is empty, and attesting `None` then erased the staged claim the
+/// previous process had made (seen live 2026-10-01: a node showed
+/// `staged: null` until a manual tick). Likewise after a failed poll: no
+/// observation, no claim. Without an activation contract nothing can be
+/// staged, so `None` is simply the truth.
+pub fn staged_claim(
+    last: Option<&ProviderStatus>,
+    can_stage: bool,
+    running_code: u32,
+) -> Result<Option<u32>, StagedClaimUnknown> {
+    let report = match last {
+        Some(status) => match &status.result {
+            Ok(report) => Some(report),
+            Err(_) if can_stage => return Err(StagedClaimUnknown),
+            Err(_) => None,
+        },
+        None if can_stage => return Err(StagedClaimUnknown),
+        None => None,
+    };
+    Ok(report.and_then(|report| {
+        report
+            .available
+            .iter()
+            .filter(|v| v.staged)
+            .filter_map(|v| crate::version::parse_code(&v.version))
+            .find(|&code| code != running_code)
+    }))
+}
+
 /// Reconcile the committed attestation with reality. Desired state is
 /// the running version plus whatever the provider reports as staged —
 /// under the v1 git-release provider that is nothing, so attestations
@@ -147,16 +183,11 @@ pub async fn run_version_attestation(app_state: &AppState) -> AttestationOutcome
         Some(_) => None,
         None => {
             let last = app_state.upgrade.last.read().await;
-            last.as_ref()
-                .and_then(|status| status.result.as_ref().ok())
-                .and_then(|report| {
-                    report
-                        .available
-                        .iter()
-                        .filter(|v| v.staged)
-                        .filter_map(|v| crate::version::parse_code(&v.version))
-                        .find(|&code| code != running_code)
-                })
+            let can_stage = crate::upgrade::ActivationEnv::from_env().is_some();
+            match staged_claim(last.as_ref(), can_stage, running_code) {
+                Ok(code) => code,
+                Err(StagedClaimUnknown) => return AttestationOutcome::NotReady,
+            }
         }
     };
 
@@ -257,6 +288,12 @@ pub async fn handle_upgrade_tick(
 /// divergence gate the tx's standing e2e. Caps out after ~1h; the cron
 /// takes over from there.
 pub async fn attest_until_converged(app_state: AppState) {
+    // Observe before claiming: a node that can stage attests nothing until
+    // its first poll (`staged_claim`), and the poll is what fills `last`.
+    // Off the orchestrator path this is one releases fetch (plus a build
+    // only when a newer release is already out, which the tick would run
+    // anyway); in test mode without a release URL it returns at once.
+    poll_provider(&app_state).await;
     for _ in 0..240 {
         match run_version_attestation(&app_state).await {
             AttestationOutcome::Converged => return,
@@ -265,4 +302,75 @@ pub async fn attest_until_converged(app_state: AppState) {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
     }
     tracing::warn!("boot version attestation never converged; cron will keep trying");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::upgrade::{AvailableVersion, ProviderReport};
+
+    fn status(result: Result<ProviderReport, String>) -> ProviderStatus {
+        ProviderStatus {
+            provider: "test",
+            fetched_at: Utc::now(),
+            result,
+        }
+    }
+
+    fn report(staged: &str) -> ProviderReport {
+        ProviderReport {
+            available: vec![
+                AvailableVersion {
+                    version: staged.into(),
+                    staged: true,
+                    prerelease: false,
+                },
+                AvailableVersion {
+                    version: "2026.8.6".into(),
+                    staged: false,
+                    prerelease: false,
+                },
+            ],
+        }
+    }
+
+    // Impact: the boot attestation loop runs before any provider poll; a
+    // node that could stage attested "nothing staged" on no evidence and
+    // erased its committed staged claim after every restart (live,
+    // 2026-10-01), which is the regenesis_start precondition.
+    // Should: refuse a staged claim before the first observation, and
+    // after a failed one, when the node can stage.
+    // Should not: block a node that cannot stage — nothing staged is the
+    // truth there, observation or not.
+    #[test]
+    fn staged_claim_needs_an_observation_when_the_node_can_stage() {
+        let running = crate::version::parse_code("2026.8.6").unwrap();
+        assert_eq!(staged_claim(None, true, running), Err(StagedClaimUnknown));
+        assert_eq!(
+            staged_claim(Some(&status(Err("timeout".into()))), true, running),
+            Err(StagedClaimUnknown)
+        );
+        assert_eq!(staged_claim(None, false, running), Ok(None));
+        assert_eq!(
+            staged_claim(Some(&status(Err("timeout".into()))), false, running),
+            Ok(None)
+        );
+    }
+
+    // Should: claim the newest staged version the provider reports that
+    // differs from the running one, and nothing when only the running
+    // version is staged.
+    #[test]
+    fn staged_claim_follows_the_provider_report() {
+        let running = crate::version::parse_code("2026.8.6").unwrap();
+        let staged = crate::version::parse_code("2026.10.1").unwrap();
+        assert_eq!(
+            staged_claim(Some(&status(Ok(report("2026.10.1")))), true, running),
+            Ok(Some(staged))
+        );
+        assert_eq!(
+            staged_claim(Some(&status(Ok(report("2026.8.6")))), true, running),
+            Ok(None)
+        );
+    }
 }
