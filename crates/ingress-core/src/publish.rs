@@ -53,7 +53,9 @@ use crate::store::StateStore;
 /// Publish-tick configuration (daemon loop cadence + retry policy).
 #[derive(Debug, Clone)]
 pub struct PublishConfig {
-    /// Tick cadence; same class as sidecar replication.
+    /// Minimum spacing between pass starts. Passes never overlap: one that
+    /// outlasts the interval is followed as soon as it finishes, so this
+    /// only adds idle time when passes are short.
     pub interval: std::time::Duration,
     /// Photos claimed per pass. Held at `concurrency * 2` so the in-flight
     /// window stays full without deferring more PhotoKit events than a pass
@@ -75,7 +77,7 @@ pub struct PublishConfig {
 impl Default for PublishConfig {
     fn default() -> Self {
         Self {
-            interval: std::time::Duration::from_secs(60),
+            interval: std::time::Duration::from_secs(15),
             batch: 32,
             concurrency: 16,
             retry_cap: 5,
