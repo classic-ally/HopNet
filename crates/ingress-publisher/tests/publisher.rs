@@ -282,6 +282,10 @@ struct Stub {
     tx_statuses: Mutex<VecDeque<u16>>,
     /// Scripted status for the next data-block posts (default 201 + JSON).
     upload_statuses: Mutex<VecDeque<u16>>,
+    /// Scripted status for the next `/admit` probes (default 204).
+    admit_statuses: Mutex<VecDeque<u16>>,
+    /// The blob sizes each `/admit` probe carried.
+    admit_sizes: Mutex<Vec<Vec<u64>>>,
     uploads: Mutex<Vec<UploadRecord>>,
     /// Raw transaction bodies as received (tx_type + payload bytes).
     tx_bodies: Mutex<Vec<serde_json::Value>>,
@@ -440,12 +444,31 @@ async fn start_stub() -> (Arc<Stub>, String) {
         }
     }
 
+    async fn admit(
+        State(stub): State<Arc<Stub>>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::response::Response {
+        let sizes = body["sizes"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+            .unwrap_or_default();
+        stub.admit_sizes.lock().unwrap().push(sizes);
+        let status = stub
+            .admit_statuses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(204);
+        (StatusCode::from_u16(status).unwrap(), "scripted").into_response()
+    }
+
     let app = axum::Router::new()
         .route("/api/photos/client/membership", get(membership))
         .route("/api/photos/client/data-block/{blob_id}", post(data_block))
         .route("/api/photos/client/transaction", post(transaction))
         .route("/api/photos/client/committed/{photo_id}", get(committed))
         .route("/api/photos/client/resolve", post(resolve))
+        .route("/api/photos/client/admit", post(admit))
         .with_state(stub.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -578,10 +601,11 @@ async fn connection_refused_is_unreachable() {
     );
 }
 
-// Impact: a 503 is the node's shed gate (down-adjacent, client owns the
-// retry) but a 422 is a length/validation bug — treating the latter as
-// unreachable would park the whole queue forever on one bad photo.
-// Should: classify upload 503 as NodeUnreachable.
+// Impact: a 503 is the node's shed gate and a 507 its free-space floor
+// (down-adjacent, client owns the retry) but a 422 is a length/validation
+// bug — treating the latter as unreachable would park the whole queue
+// forever on one bad photo.
+// Should: classify upload 503 and 507 as NodeUnreachable.
 // Should not: classify upload 422 as NodeUnreachable (Transient instead).
 #[tokio::test(flavor = "multi_thread")]
 async fn shedding_parks_but_client_errors_do_not() {
@@ -590,6 +614,16 @@ async fn shedding_parks_but_client_errors_do_not() {
     let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
 
     stub.upload_statuses.lock().unwrap().push_back(503);
+    let err = publisher
+        .publish(simple_item(dir.path()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, PublishError::NodeUnreachable(_)),
+        "got {err:?}"
+    );
+
+    stub.upload_statuses.lock().unwrap().push_back(507);
     let err = publisher
         .publish(simple_item(dir.path()))
         .await
@@ -912,4 +946,33 @@ async fn propagate_error_classification() {
         matches!(err, PublishError::Rejected(_)),
         "malformed id is permanent, got {err:?}"
     );
+}
+
+// Impact: a node at its free-space floor refuses uploads before reading the
+// body, which an HTTP client sees as a broken connection — a transient error
+// that burns attempts. Asking first turns the refusal into a clean park.
+// Should: probe admission with every resource's size before uploading.
+// Should: park (NodeUnreachable) on a 507 from the probe.
+// Should not: upload any bytes when admission is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_admission_parks_before_any_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stub, base_url) = start_stub().await;
+    let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
+
+    stub.admit_statuses.lock().unwrap().push_back(507);
+    let err = publisher
+        .publish(simple_item(dir.path()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, PublishError::NodeUnreachable(m) if m.contains("low on disk")),
+        "got {err:?}"
+    );
+    assert_eq!(*stub.admit_sizes.lock().unwrap(), vec![vec![4096u64]]);
+    assert!(stub.uploads.lock().unwrap().is_empty());
+
+    // Admitted: the same photo then publishes normally.
+    publisher.publish(simple_item(dir.path())).await.unwrap();
+    assert_eq!(stub.uploads.lock().unwrap().len(), 1);
 }

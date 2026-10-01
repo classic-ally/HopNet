@@ -23,6 +23,10 @@ pub enum StorageError {
     /// and node-local — consumers must not turn this into a verdict on the
     /// data or the operation.
     Transient(rusqlite::ErrorCode),
+    /// Ingest refused: storing the blob would leave the fragments
+    /// filesystem at or below the free-space floor (`admission`). Nothing was
+    /// written; the caller should back off and retry later.
+    InsufficientSpace { free: u64, needed: u64, floor: u64 },
 }
 
 impl std::fmt::Display for StorageError {
@@ -37,6 +41,14 @@ impl std::fmt::Display for StorageError {
             StorageError::Transient(code) => {
                 write!(f, "transient database contention: {:?}", code)
             }
+            StorageError::InsufficientSpace {
+                free,
+                needed,
+                floor,
+            } => write!(
+                f,
+                "insufficient storage: {needed} bytes needed, {free} free, floor {floor}"
+            ),
         }
     }
 }

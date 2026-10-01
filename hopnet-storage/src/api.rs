@@ -62,6 +62,8 @@ pub async fn put<R: AsyncRead + Unpin>(
         .acquire()
         .await
         .map_err(|_| StorageError::Io(std::io::Error::other("put permits closed")))?;
+    // Held for the whole ingest: concurrent puts see each other's footprint.
+    let _reservation = crate::admission::reserve_ingest(fragments_dir, file_size)?;
 
     const READ_BUF_SIZE: usize = 64 * 1024;
 

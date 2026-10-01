@@ -15,13 +15,14 @@ use common::{
     build_block, contended_db_with_busy_timeout, decided_heights, hold_write_lock, open_storage,
     temp_db, CallCount, FlakyStorage, SqlApp,
 };
-use hopnet_consensus::codec::WireConsensusMsg;
+use hopnet_consensus::codec::{SignedVote, WireConsensusMsg};
 use hopnet_consensus::config::QuorumProfile;
-use hopnet_consensus::context::{Address, Height};
+use hopnet_consensus::context::{Address, Height, HopNetContext};
 use hopnet_consensus::host::{HostCore, HostError, HostOutput};
+use hopnet_consensus::signing::sign_vote;
 use hopnet_consensus::sim::{MemGossip, MemTimers};
 use hopnet_consensus::store::{SqliteStorage, StoreError};
-use malachitebft_core_types::Round;
+use malachitebft_core_types::{Context, NilOrVal, Round};
 
 type SqlCore = HostCore<SqlApp, SqliteStorage, MemGossip, MemTimers>;
 type FlakyCore = HostCore<SqlApp, FlakyStorage, MemGossip, MemTimers>;
@@ -198,5 +199,77 @@ fn height_start_retries_wal_reset_under_contention() {
     holder.join().unwrap();
 
     drop(core);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// WAL sequence numbers persisted for `height`, straight from the DB file.
+fn wal_seqs(path: &std::path::Path, height: u64) -> Vec<i64> {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT seq FROM consensus_wal WHERE height = ? ORDER BY seq")
+        .unwrap();
+    let rows = stmt.query_map([height as i64], |row| row.get(0)).unwrap();
+    rows.collect::<Result<_, _>>().unwrap()
+}
+
+// Should: continue the WAL sequence past the rows appended while StartHeight
+// replayed the votes buffered for the resumed height, so the first live
+// append after an on-demand resume lands on a fresh (height, seq) key and the
+// height decides.
+// Should not: reset the counter over rows the replay already persisted.
+// Impact: thor, 2026-10-01, on v2026.10.3 — lagging a chain running 24
+// heights a minute, it held the next height's votes before deciding the
+// current one; every resume replayed them, the counter snapped back to 0,
+// the next vote's append hit the UNIQUE key and the process aborted — 17
+// times in 22 minutes.
+#[test]
+fn resume_counts_the_appends_made_while_replaying_buffered_votes() {
+    let path = temp_db("wal-resume-seq");
+    let mut core = sql_core(open_storage(&path)).on_demand();
+    core.start_height(Height::INITIAL, false).unwrap();
+    let block1 = build_block(Height::INITIAL, Round::new(0), 0, None);
+    core.propose(Height::INITIAL, Round::new(0), block1.clone())
+        .unwrap();
+    assert_eq!(decided_outputs(core.take_outputs()), vec![1]);
+    assert_eq!(
+        core.paused_at(),
+        Some(Height(2)),
+        "on-demand: paused before 2"
+    );
+
+    // A vote for the pending height arrives while the engine still sits at
+    // height 1: the engine buffers it (no WAL row yet).
+    let block2 = build_block(Height(2), Round::new(0), 0, Some(block1.block_hash));
+    let vote = HopNetContext.new_prevote(
+        Height(2),
+        Round::new(0),
+        NilOrVal::Val(block2.block_hash),
+        Address(0),
+    );
+    let signed = SignedVote::new(
+        vote.clone(),
+        sign_vote(&common::chain_id(), &common::key(0), &vote),
+    );
+    core.on_wire(WireConsensusMsg::Vote((&signed).into()))
+        .unwrap();
+    assert!(
+        wal_seqs(&path, 2).is_empty(),
+        "a buffered vote is not yet persisted"
+    );
+
+    // Resume: StartHeight(2) replays the buffered vote, which appends seq 0.
+    core.resume_height().unwrap();
+    assert_eq!(
+        wal_seqs(&path, 2),
+        vec![0],
+        "the replayed vote was persisted"
+    );
+
+    // The live append that follows must take seq 1, not collide on seq 0.
+    core.propose(Height(2), Round::new(0), block2)
+        .expect("the live append after a resume continues past the replayed rows");
+    assert_eq!(decided_outputs(core.take_outputs()), vec![2]);
+    drop(core);
+    assert_eq!(decided_heights(&path).len(), 2);
     let _ = std::fs::remove_file(&path);
 }

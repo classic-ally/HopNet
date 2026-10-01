@@ -44,6 +44,8 @@ public enum ApiError: Error, CustomStringConvertible {
     /// RFC-023: the node's version gate refused this build (426).
     /// Only an extension update clears it — never a credential fix.
     case upgradeRequired(minClient: UInt32, nodeVersion: UInt32)
+    /// The node refused the upload at its free-space floor (507).
+    case insufficientStorage
     case serverError(String)
     case parseError(String)
     case invalidUrl
@@ -60,6 +62,8 @@ public enum ApiError: Error, CustomStringConvertible {
             return "HopNet not ready - sign in to main app required"
         case .upgradeRequired(let minClient, let nodeVersion):
             return "HopNet update required - node \(nodeVersion) accepts clients >= \(minClient)"
+        case .insufficientStorage:
+            return "HopNet node is low on disk space"
         case .serverError(let message):
             return "Server error: \(message)"
         case .parseError(let message):
@@ -515,6 +519,8 @@ public class HopNetApiClient {
                 throw ApiError.serverError("Item already exists")
             case 426:
                 throw upgradeRequired(from: data)
+            case 507:
+                throw ApiError.insufficientStorage
             case 428:
                 throw ApiError.notReady
             default:
@@ -615,6 +621,8 @@ public class HopNetApiClient {
                 throw upgradeRequired(from: data)
             case 428:
                 throw ApiError.notReady
+            case 507:
+                throw ApiError.insufficientStorage
             case 501:
                 throw ApiError.serverError("Content modification not yet implemented")
             default:

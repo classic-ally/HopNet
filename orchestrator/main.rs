@@ -1204,9 +1204,16 @@ pub(crate) async fn create_hopnet_container(
                     || k.starts_with("HOPNET_GENESIS_")
                     || k.starts_with("HOPNET_UPGRADE_")
                     || k.starts_with("HOPNET_RESTART_")
+                    || k.starts_with("HOPNET_STORAGE_")
                 {
                     e.push(format!("{}={}", k, v));
                 }
+            }
+            // Ingest admission off by default: test containers share the
+            // host's disk, and a host with under 10 GiB free would refuse
+            // every upload. Tests that exercise the floor set their own.
+            if std::env::var("HOPNET_STORAGE_MIN_FREE_BYTES").is_err() {
+                e.push("HOPNET_STORAGE_MIN_FREE_BYTES=0".to_string());
             }
             // Default consensus-policy seed (RFC-CONSENSUS-002 S5): mesh
             // FORMATION under mesh-initiated seating needs a small s_full
