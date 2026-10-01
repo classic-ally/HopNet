@@ -348,6 +348,60 @@ impl TestScenario for LifecycleCutoverDrain {
             },
         );
 
+        // 5b. The attestation that settled those rows was paged: every
+        //     holder carries more rows than one page holds (the live mesh's
+        //     one-transaction attestation never cleared the queue at 196k
+        //     hashes), and every holder's rows are verified — the per-node
+        //     series, read from one node since it is a replicated GROUP BY.
+        let page = hopnet_storage::engine::policy::ATTEST_PAGE_SIZE as u64;
+        let per_node = get_json(&fresh_nodes[0], "/api/views/network-resilience").await?;
+        let holders: Vec<(i64, u64, u64, u64, u64)> = per_node["storage"]["verification"]["nodes"]
+            .as_array()
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .map(|n| {
+                        (
+                            n["node_id"].as_i64().unwrap_or(-1),
+                            n["fresh"].as_u64().unwrap_or(0),
+                            n["stale"].as_u64().unwrap_or(u64::MAX),
+                            n["never"].as_u64().unwrap_or(u64::MAX),
+                            n["suspect"].as_u64().unwrap_or(u64::MAX),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let every_holder_verified = holders.len() == fresh_nodes.len()
+            && holders
+                .iter()
+                .all(|(_, _, stale, never, suspect)| *stale == 0 && *never == 0 && *suspect == 0);
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Every holder's rows are verified (per-node series)".to_string(),
+                passed: every_holder_verified,
+                detail: Some(format!("(node, fresh, stale, never, suspect): {holders:?}")),
+            },
+        );
+        // The paging clause binds only at the manual scale gate: at blobs=500
+        // the origin holds 15k rows (two pages) and the other holders 5k
+        // (one), so SOME holder must have paged; the CI default of 60 blobs
+        // fits one page everywhere.
+        if blobs >= 500 {
+            let paged = holders
+                .iter()
+                .any(|(_, fresh, stale, never, suspect)| fresh + stale + never + suspect > page);
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: format!("A holder attested across more than one {page}-hash page"),
+                    passed: paged,
+                    detail: Some(format!("page {page}; holders {holders:?}")),
+                },
+            );
+        }
+
         // 6. The bytes crossed: every surviving file, from every node,
         //    byte-identical to what was written under the old regime.
         let mut intact = 0usize;

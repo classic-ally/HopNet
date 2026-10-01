@@ -1152,7 +1152,14 @@ optimization and carries no proof obligation.
     first disk-truth sweep after the flip — kick
     `POST /maintenance/fragment-inventory-self-check` on each node
     once the crossing is decided (or wait for the 30-minute cron);
-    the rehearsal does the same.
+    the rehearsal does the same. Since 2026-10-01 the rehearsal also
+    reads the per-holder verification series and, at the 500-blob
+    gate, requires a holder to carry more rows than one attestation
+    page (the origin holds 15k rows, two pages; the others 5k) — the
+    one-transaction attestation that the live mesh exposed could pass
+    at 60 blobs and never at scale. Re-run 2026-10-01 on the fixes:
+    converged in 26 s (92 s on 2026-09-27), 25k rows verified per
+    node, the origin attesting in two pages.
 
 ## Out of scope
 

@@ -506,9 +506,9 @@ apply functions inside consensus handlers.
       repair scan, migration pull, eviction, weekly rolling scrub).
       Orchestrator: tier-membership, eviction-under-pressure,
       re-encode-after-departure (kill → decay → regenerate → download)
-- [~] Block lifecycle convergence — S0–S7 of 7, cutover remains
-      ([RFC-STORAGE-003](../hopnet-storage/spec/block-lifecycle.md),
-      branch `rfc-block-lifecycle`, PR #72): the upload-to-placement
+- [~] Block lifecycle convergence — S0–S7 of 7 merged (PR #72), crossed
+      live 2026-10-01 (2026.10.1 → epoch 6), drain pending 2026.10.2
+      ([RFC-STORAGE-003](../hopnet-storage/spec/block-lifecycle.md)): the upload-to-placement
       pipeline joins the proven model. S0 (2026-08-22): the Quint model
       gains the `(confirmed, target)` pair, origin-held birth, a
       lossy-mark adversary, INV-CONVERGE / INV-EVICT-SAFE, CALM_BOUND
@@ -561,10 +561,18 @@ apply functions inside consensus handlers.
       in-flight ages in heights, verification freshness per holder), fetch
       histograms in the commit-latency shape, and time-to-conformance per
       reconciler queue (owed fetches × median fetch); three new cards
-      (Block Lifecycle, Disk Truth, Reconciler). Only the cutover remains;
-      its rehearsal (`lifecycle-cutover-drain`, born on the deployed
-      release image) passed at 60 blobs, failed at 500 on 2026-09-27 and
-      drove the two fixes above; rerun at 500 before the tag.
+      (Block Lifecycle, Disk Truth, Reconciler). Cutover: the rehearsal
+      (`lifecycle-cutover-drain`, born on the deployed release image)
+      passed at 60 and 500 blobs; the live crossing (2026-10-01, 41k blobs,
+      ~700k inventory rows per node) sealed and flipped cleanly but the
+      drain could not start — the sweep's one-transaction attestation
+      timed out at 196k hashes, contention in the applies was treated as a
+      verdict, a decide effect's storage error was swallowed by the engine
+      macro (consensus-bugs.md 11), and the scrub counted same-sweep
+      orphan deletions as corruption. 2026.10.2 carries the fixes (paged
+      attestation, transient-safe applies, fatal effects with a retried
+      decide, hash-mismatch-only scrub, boot attestation after the first
+      provider poll); the drain's convergence remains the acceptance test.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage
