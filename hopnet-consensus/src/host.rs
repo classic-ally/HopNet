@@ -318,7 +318,6 @@ where
         height: Height,
         is_restart: bool,
     ) -> Result<(), HostError<S::Error>> {
-        self.wal_seq = 0;
         let valset = self.app.validator_set(height);
 
         let entries: Vec<WireWalEntry> = if is_restart {
@@ -332,6 +331,16 @@ where
             self.phase = Phase::Recovering;
         }
 
+        // Live appends resume AFTER the persisted entries: the WAL's
+        // (height, seq) key is unique and `wal_fetch` leaves the table
+        // holding exactly `entries.len()` rows for this height. The counter
+        // is set BEFORE StartHeight is fed: the engine replays the inputs it
+        // buffered for this height inside StartHeight (a lagging node holds
+        // the next height's votes before it decides the current one), and
+        // every replayed vote appends a live row. Setting the counter after
+        // the feed snapped it back over those rows — the next append reused
+        // seq 0, and the UNIQUE key made it fatal (thor, 2026-10-01, 10.3).
+        self.wal_seq = entries.len() as u64;
         self.feed_strict(Input::StartHeight(height, valset, is_restart, None))?;
 
         // Replay persisted entries as ordinary inputs, in order (strict).
@@ -360,13 +369,6 @@ where
             self.outputs
                 .retain(|o| !matches!(o, HostOutput::NeedValue { .. }));
         }
-        // Live appends resume AFTER the replayed entries: the WAL's
-        // (height, seq) key is unique and `wal_fetch` leaves the table
-        // holding exactly `entries.len()` rows for this height. Restarting
-        // at 0 collided with the persisted rows, and because the engine
-        // macro swallowed the handler error, every post-restart vote at
-        // the height was published without its durable entry.
-        self.wal_seq = entries.len() as u64;
         self.phase = Phase::Running;
         // A proposal for this height may have arrived while it was deferred
         // (on-demand) or before the previous height finished — validate it
