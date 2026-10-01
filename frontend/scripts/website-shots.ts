@@ -53,6 +53,11 @@ const SHOTS: Shot[] = [
         story: 'website--export',
         ready: (page) => page.getByText('Ready', { exact: true }).first().waitFor(),
     },
+    {
+        slot: 'web-login',
+        story: 'website--sign-in',
+        ready: (page) => page.getByRole('button', { name: 'Log in' }).first().waitFor(),
+    },
 ];
 
 // Code shown on the website's "build your own app" tile, in this order.

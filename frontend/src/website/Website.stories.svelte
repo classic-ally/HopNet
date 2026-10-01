@@ -5,6 +5,8 @@
   import { defineMeta } from '@storybook/addon-svelte-csf';
   import { expect, userEvent, waitFor, within } from 'storybook/test';
   import WebsiteShell from './WebsiteShell.svelte';
+  import LoginPane from '../lib/panes/setup/LoginPane.svelte';
+  import { mockSetupApi } from '../lib/api/setup.mock';
   import { SHARE_TARGET, filesRoutes, photosRoutes, takeoutRoutes } from './fixtures';
 
   const { Story } = defineMeta({
@@ -44,5 +46,15 @@
 <Story name="Export">
   {#snippet template()}
     <WebsiteShell path="/settings/takeout" routes={takeoutRoutes} />
+  {/snippet}
+</Story>
+
+<!-- What another device sees when it opens any node's web app: the same
+     centred login App.svelte renders before a session exists. -->
+<Story name="Sign in">
+  {#snippet template()}
+    <div class="flex justify-center items-center min-h-screen min-w-screen">
+      <LoginPane username="robin" api={mockSetupApi()} />
+    </div>
   {/snippet}
 </Story>
