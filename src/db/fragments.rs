@@ -218,12 +218,47 @@ pub fn member_holder_counts(
     member_nodes: &std::collections::HashSet<i32>,
     my_node_id: i32,
 ) -> Result<std::collections::HashMap<crate::types::Blake3Hash, usize>, DatabaseError> {
+    holder_counts(conn, hashes, member_nodes, my_node_id, None)
+}
+
+/// `member_holder_counts`, counting only rows disk-verified at or after
+/// `min_verified_height`: belief alone (a never-verified row, or one verified
+/// long ago) does not count. The prompt surplus release demands this — it
+/// deletes without disk pressure, so it trusts only recent attestations.
+pub fn recent_member_holder_counts(
+    conn: &rusqlite::Connection,
+    hashes: &[crate::types::Blake3Hash],
+    member_nodes: &std::collections::HashSet<i32>,
+    my_node_id: i32,
+    min_verified_height: u64,
+) -> Result<std::collections::HashMap<crate::types::Blake3Hash, usize>, DatabaseError> {
+    holder_counts(
+        conn,
+        hashes,
+        member_nodes,
+        my_node_id,
+        Some(min_verified_height),
+    )
+}
+
+fn holder_counts(
+    conn: &rusqlite::Connection,
+    hashes: &[crate::types::Blake3Hash],
+    member_nodes: &std::collections::HashSet<i32>,
+    my_node_id: i32,
+    min_verified_height: Option<u64>,
+) -> Result<std::collections::HashMap<crate::types::Blake3Hash, usize>, DatabaseError> {
+    // NULL verified_height (never disk-verified) fails `>=`, so it never counts.
+    let recency = match min_verified_height {
+        Some(h) => format!(" AND verified_height >= {h}"),
+        None => String::new(),
+    };
     let mut out = std::collections::HashMap::new();
     for chunk in hashes.chunks(500) {
         let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let query = format!(
             "SELECT fragment_hash, node_id FROM fragment_inventory
-             WHERE fragment_hash IN ({placeholders}) AND suspect = 0"
+             WHERE fragment_hash IN ({placeholders}) AND suspect = 0{recency}"
         );
         let mut stmt = conn
             .prepare(&query)

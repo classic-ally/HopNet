@@ -53,10 +53,17 @@ refusal sent before the body is read reaches them as a broken
 connection. Placement and repair traffic (peer stores, pulls,
 re-encode) is not gated.
 
-Durability counts both classes. GC is decentralized: eviction is a
-local watermark loop under disk pressure (surplus oldest-first above
-the high watermark, stop at the low), guarded by the inventory
-claiming another holder — or the blob being deleted. A returning
+Durability counts both classes. GC is decentralized, in two local
+loops sharing one guard (the inventory claiming another holder — or
+the blob being deleted). The surplus release rides every disk-truth
+sweep, on the sweep's own walk and without pressure: it frees confirmed
+surplus (an origin's non-assigned classes, a departed holder's copies)
+as soon as another member's copy has been disk-verified within the
+confirmation recency window, oldest blob first, bounded per sweep. It
+runs before the sweep's self-check, so the same pass carries the
+removals to consensus and never attests a file it deleted. The
+watermark loop acts under disk pressure (surplus oldest-first above
+the high watermark, stop at the low) on belief alone. A returning
 node's copies re-enter inventory via self-check and count as surplus;
 catch-up never commands deletion.
 

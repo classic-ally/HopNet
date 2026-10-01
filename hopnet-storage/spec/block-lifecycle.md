@@ -207,9 +207,12 @@ surface per-urgency-tier time-to-conformance in the resilience pane.
     a stale row. Protection lapses only at confirm, exactly as
     obligations do;
   - the copy is pinned.
-  Everything else is surplus: evictable, lazily, under the normal
-  pressure-driven watermark rules, with the attested-other-holder
-  belief check retained as a second belt. This predicate is one pure
+  Everything else is surplus: evictable, with the attested-other-holder
+  belief check retained as a second belt. Two loops act on it: the
+  prompt surplus release (every disk-truth sweep, on the sweep's own
+  walk, no pressure needed, and only on another member's copy
+  disk-verified within the confirmation recency window) and the
+  pressure-driven watermark rules. This predicate is one pure
   function in hopnet-storage, consumed by both the reconciler and
   the evictor, and it is the model's `envEvict` guard verbatim —
   eviction timing stays adversarial in the model, so scheduling is
@@ -493,7 +496,8 @@ state to converged, with obligations never dropped in between.
       need stays recorded and the next pass re-proposes.
   - Effect: `placement_height = height`. Old holders' obligations
     lapse — their copies become surplus, protected now only by the
-    attested-successor belt, reclaimed lazily under pressure.
+    attested-successor belt, released by the next disk-truth sweep's
+    surplus release (or the watermark loop under pressure).
   - This is the sole writer of `placement_height` after
     `apply_blob_insert`'s NULL. It retires the blind-stamping
     `update_placement_heights` (the batcher emits ConfirmPlacement

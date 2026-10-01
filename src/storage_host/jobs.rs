@@ -531,6 +531,33 @@ pub async fn run_disk_truth_sweep(
         }
     }
 
+    // (3b) Surplus release on this walk's listing: copies the guard calls
+    //      surplus (placement confirmed elsewhere, another member's copy
+    //      disk-verified within the recency window) go now. Before the
+    //      differential and the attestation on purpose: the self-check
+    //      below carries the removals to consensus in this same pass, and
+    //      the attestation never stamps a file this pass deleted — no
+    //      stale attested row, no exact-count rejection window. A failure
+    //      here must not cost the sweep its belief and truth steps.
+    let mut surplus_released = 0usize;
+    let mut surplus_bytes_freed = 0u64;
+    let release_input = hopnet_storage::sweep::release_listing(
+        &listing,
+        &present,
+        now_unix.saturating_sub(SURPLUS_RELEASE_GRACE_SECS),
+    );
+    match release_surplus(app_state, &fragments_dir, release_input).await {
+        Ok(outcome) => {
+            if !outcome.released.is_empty() {
+                let gone: std::collections::HashSet<_> = outcome.released.iter().collect();
+                present.retain(|h| !gone.contains(h));
+            }
+            surplus_released = outcome.released.len();
+            surplus_bytes_freed = outcome.bytes_freed;
+        }
+        Err(e) => tracing::warn!("sweep: surplus release failed: {e}"),
+    }
+
     // (4) Belief: the differential over repaired flags.
     let differential =
         crate::db::inventory::compute_inventory_differential(app_state.db_pool.get(), node_id)
@@ -595,15 +622,18 @@ pub async fn run_disk_truth_sweep(
         corrupt_deleted,
         scrub_unreadable,
         attested_pages,
+        surplus_released,
+        surplus_bytes_freed,
     };
     tracing::info!(
-        "sweep: {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} corrupt deleted",
+        "sweep: {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} corrupt deleted, {} surplus released",
         report.files_on_disk,
         report.present,
         report.reflagged,
         report.unflagged,
         report.orphans_deleted,
-        report.corrupt_deleted
+        report.corrupt_deleted,
+        report.surplus_released
     );
     *app_state.last_sweep.lock().unwrap() = Some(report.clone());
     Ok(report)
@@ -617,94 +647,45 @@ pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(
         .map(|_| ())
 }
 
-/// Watermark eviction (RFC-STORAGE-001 GC, RFC-STORAGE-002 S5): under
-/// disk pressure, evict SURPLUS fragments oldest-blob-first from the high
-/// watermark down to the low. The guard — never responsible, never
-/// pinned, another member must attest a copy — carries the safety
-/// invariant; watermarks only decide when pressure acts.
-///
-/// `override_watermarks` is a test hook replacing the this_node settings
-/// for one run (e.g. (0, 0) forces maximal eviction of evictable surplus).
-pub async fn run_watermark_eviction(
+/// Grace before a fragment file is considered by the prompt surplus
+/// release. Shorter than the watermark path's hour: the release only ever
+/// touches copies the guard calls surplus (placement confirmed, not this
+/// node's obligation, a recent attestation elsewhere), so the in-flight-store
+/// race the grace exists for cannot apply to them.
+pub const SURPLUS_RELEASE_GRACE_SECS: u64 = 600;
+
+/// Most fragments one prompt surplus release deletes. The release rides
+/// the disk-truth sweep (20–90 min apart, not the 5-min tick): an origin
+/// that ingested a library holds ~100k surplus files, and a few thousand
+/// per sweep would take a day to drain. 10k unlinks is seconds, and the
+/// self-check differential that carries them is one hash list (~320 KB),
+/// well under the per-transaction payload limit.
+pub const SURPLUS_RELEASE_MAX_PER_SWEEP: usize = 10_000;
+
+/// The guard's facts for the given on-disk fragments (`(hash, size)`,
+/// already filtered by the caller's grace): one candidate per fragment
+/// with a known blob. `min_verified_height` tightens the other-holder
+/// count to attestations disk-verified at or after that height.
+async fn gather_eviction_candidates(
     app_state: &AppState,
-    override_watermarks: Option<(u8, u8)>,
-    grace_secs: Option<u64>,
-) -> Result<serde_json::Value, Error> {
-    use hopnet_storage::eviction::{DiskPressure, EvictionCandidate, plan_evictions};
-    use hopnet_storage::traits::{LocalStateSink, StateReader};
+    disk: &[(crate::types::Blake3Hash, u64)],
+    min_verified_height: Option<u64>,
+) -> Result<Vec<hopnet_storage::eviction::EvictionCandidate>, Error> {
+    use hopnet_storage::eviction::EvictionCandidate;
+    use hopnet_storage::traits::StateReader;
 
-    let fragments_dir = crate::storage_host::functions::get_fragments_dir()
-        .map_err(|e| Error::Failed(Arc::new(format!("fragments dir: {e:?}").into())))?;
-
-    // Disk pressure from the filesystem itself (statvfs).
-    let dir = fragments_dir.clone();
-    let (total_bytes, used_bytes) = tokio::task::spawn_blocking(move || {
-        let stats = fs4::statvfs(&dir)?;
-        Ok::<_, std::io::Error>((
-            stats.total_space(),
-            stats.total_space() - stats.available_space(),
-        ))
-    })
-    .await
-    .map_err(|e| Error::Failed(Arc::new(format!("statvfs join: {e}").into())))?
-    .map_err(|e| Error::Failed(Arc::new(format!("statvfs: {e}").into())))?;
-
+    if disk.is_empty() {
+        return Ok(Vec::new());
+    }
     let my_node_id = app_state
         .get_node_id()
         .map_err(|_| Error::Failed(Arc::new("node id not set".to_string().into())))?;
 
-    let (high_pct, low_pct) = match override_watermarks {
-        Some(marks) => marks,
-        None => {
-            let conn = app_state
-                .db_pool
-                .get()
-                .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-            let settings = crate::db::shared::read_storage_node_settings(&conn)
-                .map_err(|e| Error::Failed(Arc::new(format!("settings: {e:?}").into())))?;
-            (settings.gc_high_pct, settings.gc_low_pct)
-        }
-    };
-
-    let pressure = DiskPressure {
-        used_bytes,
-        total_bytes,
-        high_pct,
-        low_pct,
-    };
-    let high_bytes = total_bytes / 100 * high_pct as u64;
-    if used_bytes <= high_bytes {
-        return Ok(serde_json::json!({
-            "evicted": 0, "bytes_freed": 0,
-            "used_bytes": used_bytes, "total_bytes": total_bytes,
-            "high_pct": high_pct, "low_pct": low_pct,
-            "reason": "below high watermark",
-        }));
-    }
-
-    // Member view + on-disk fragments (grace period avoids racing
-    // in-flight stores, mirroring the orphan scan).
     let host = SubstrateHost::new(app_state.clone());
     let view = tokio::task::spawn_blocking(move || host.storage_view())
         .await
         .map_err(|e| Error::Failed(Arc::new(format!("view join: {e}").into())))?
         .map_err(|e| Error::Failed(Arc::new(format!("storage view: {e}").into())))?;
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let disk = hopnet_storage::fragstore::scan_fragments(
-        &fragments_dir,
-        now_unix - grace_secs.unwrap_or(3600),
-    )
-    .map_err(|e| Error::Failed(Arc::new(format!("disk scan: {e}").into())))?;
-    if disk.is_empty() {
-        return Ok(serde_json::json!({
-            "evicted": 0, "bytes_freed": 0,
-            "used_bytes": used_bytes, "total_bytes": total_bytes,
-            "reason": "no eligible on-disk fragments",
-        }));
-    }
 
     let member_ids: std::collections::HashSet<i32> =
         view.members.iter().map(|p| p.node_id).collect();
@@ -718,9 +699,19 @@ pub async fn run_watermark_eviction(
             .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
         let info = crate::db::fragments::lookup_disk_fragments(&conn, &hashes)
             .map_err(|e| Error::Failed(Arc::new(format!("fragment lookup: {e:?}").into())))?;
-        let holder_counts =
-            crate::db::fragments::member_holder_counts(&conn, &hashes, &member_ids, my_node_id)
-                .map_err(|e| Error::Failed(Arc::new(format!("holder counts: {e:?}").into())))?;
+        let holder_counts = match min_verified_height {
+            Some(floor) => crate::db::fragments::recent_member_holder_counts(
+                &conn,
+                &hashes,
+                &member_ids,
+                my_node_id,
+                floor,
+            ),
+            None => {
+                crate::db::fragments::member_holder_counts(&conn, &hashes, &member_ids, my_node_id)
+            }
+        }
+        .map_err(|e| Error::Failed(Arc::new(format!("holder counts: {e:?}").into())))?;
         let pinned = hopnet_storage::pins::pinned_blob_ids(&conn)
             .map_err(|e| Error::Failed(Arc::new(format!("pins: {e}").into())))?;
 
@@ -758,7 +749,7 @@ pub async fn run_watermark_eviction(
     };
 
     let mut candidates = Vec::new();
-    for (hash, size) in &disk {
+    for (hash, size) in disk {
         // Not in fragment_hashes = orphan; the orphan GC flow owns it.
         let Some(frag) = info.get(hash) else { continue };
         let protected = protection
@@ -773,13 +764,25 @@ pub async fn run_watermark_eviction(
             other_member_holders: holder_counts.get(hash).copied().unwrap_or(0),
         });
     }
+    Ok(candidates)
+}
 
-    let planned = plan_evictions(candidates, &pressure);
+/// Delete planned fragments and flip them to not-stored-locally. Consensus
+/// learns of the removals from a disk-truth sweep's self-check (the same
+/// sweep's, for the surplus release). Returns (fragments deleted, bytes
+/// freed).
+async fn delete_and_mark(
+    app_state: &AppState,
+    fragments_dir: &str,
+    planned: &[crate::types::Blake3Hash],
+    sizes: &std::collections::HashMap<crate::types::Blake3Hash, u64>,
+) -> (Vec<crate::types::Blake3Hash>, u64) {
+    use hopnet_storage::traits::LocalStateSink;
+
     let mut bytes_freed = 0u64;
-    let sizes: std::collections::HashMap<_, _> = disk.into_iter().collect();
     let mut deleted = Vec::new();
-    for hash in &planned {
-        match hopnet_storage::fragstore::delete_fragment(&fragments_dir, hash) {
+    for hash in planned {
+        match hopnet_storage::fragstore::delete_fragment(fragments_dir, hash) {
             Ok(()) => {
                 bytes_freed += sizes.get(hash).copied().unwrap_or(0);
                 deleted.push(*hash);
@@ -791,19 +794,190 @@ pub async fn run_watermark_eviction(
         let host = SubstrateHost::new(app_state.clone());
         host.mark_remote_batch(deleted.clone()).await;
     }
+    (deleted, bytes_freed)
+}
+
+/// Watermark eviction (RFC-STORAGE-001 GC, RFC-STORAGE-002 S5): under
+/// disk pressure, evict SURPLUS fragments oldest-blob-first from the high
+/// watermark down to the low. The guard — never responsible, never
+/// pinned, another member must attest a copy — carries the safety
+/// invariant; watermarks only decide when pressure acts.
+///
+/// `override_watermarks` is a test hook replacing the this_node settings
+/// for one run (e.g. (0, 0) forces maximal eviction of evictable surplus).
+pub async fn run_watermark_eviction(
+    app_state: &AppState,
+    override_watermarks: Option<(u8, u8)>,
+    grace_secs: Option<u64>,
+) -> Result<serde_json::Value, Error> {
+    use hopnet_storage::eviction::{DiskPressure, plan_evictions};
+
+    let fragments_dir = crate::storage_host::functions::get_fragments_dir()
+        .map_err(|e| Error::Failed(Arc::new(format!("fragments dir: {e:?}").into())))?;
+
+    // Disk pressure from the filesystem itself (statvfs).
+    let dir = fragments_dir.clone();
+    let (total_bytes, used_bytes) = tokio::task::spawn_blocking(move || {
+        let stats = fs4::statvfs(&dir)?;
+        Ok::<_, std::io::Error>((
+            stats.total_space(),
+            stats.total_space() - stats.available_space(),
+        ))
+    })
+    .await
+    .map_err(|e| Error::Failed(Arc::new(format!("statvfs join: {e}").into())))?
+    .map_err(|e| Error::Failed(Arc::new(format!("statvfs: {e}").into())))?;
+
+    let (high_pct, low_pct) = match override_watermarks {
+        Some(marks) => marks,
+        None => {
+            let conn = app_state
+                .db_pool
+                .get()
+                .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
+            let settings = crate::db::shared::read_storage_node_settings(&conn)
+                .map_err(|e| Error::Failed(Arc::new(format!("settings: {e:?}").into())))?;
+            (settings.gc_high_pct, settings.gc_low_pct)
+        }
+    };
+
+    let pressure = DiskPressure {
+        used_bytes,
+        total_bytes,
+        high_pct,
+        low_pct,
+    };
+    let high_bytes = total_bytes / 100 * high_pct as u64;
+    if used_bytes <= high_bytes {
+        return Ok(serde_json::json!({
+            "evicted": 0, "bytes_freed": 0,
+            "used_bytes": used_bytes, "total_bytes": total_bytes,
+            "high_pct": high_pct, "low_pct": low_pct,
+            "reason": "below high watermark",
+        }));
+    }
+
+    // On-disk fragments past the grace (avoids racing in-flight stores,
+    // mirroring the orphan scan). Walked only here, above the watermark.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let disk = hopnet_storage::fragstore::scan_fragments(
+        &fragments_dir,
+        now_unix - grace_secs.unwrap_or(3600),
+    )
+    .map_err(|e| Error::Failed(Arc::new(format!("disk scan: {e}").into())))?;
+    if disk.is_empty() {
+        return Ok(serde_json::json!({
+            "evicted": 0, "bytes_freed": 0,
+            "used_bytes": used_bytes, "total_bytes": total_bytes,
+            "reason": "no eligible on-disk fragments",
+        }));
+    }
+
+    let candidates = gather_eviction_candidates(app_state, &disk, None).await?;
+    let sizes: std::collections::HashMap<_, _> = disk.into_iter().collect();
+    let planned = plan_evictions(candidates, &pressure);
+    let (evicted, bytes_freed) = delete_and_mark(app_state, &fragments_dir, &planned, &sizes).await;
+    let evicted = evicted.len();
 
     tracing::info!(
         "watermark eviction: {} fragments evicted, {} bytes freed ({}% used, high {}%, low {}%)",
-        deleted.len(),
+        evicted,
         bytes_freed,
         used_bytes * 100 / total_bytes.max(1),
         high_pct,
         low_pct
     );
     Ok(serde_json::json!({
-        "evicted": deleted.len(), "bytes_freed": bytes_freed,
+        "evicted": evicted, "bytes_freed": bytes_freed,
         "used_bytes": used_bytes, "total_bytes": total_bytes,
         "high_pct": high_pct, "low_pct": low_pct,
+    }))
+}
+
+/// What one prompt surplus release did.
+struct SurplusRelease {
+    /// The copies deleted (and flipped to not-stored-locally).
+    released: Vec<crate::types::Blake3Hash>,
+    bytes_freed: u64,
+    /// The per-sweep cap bit; the rest waits for the next walk.
+    capped: bool,
+}
+
+/// Prompt surplus release over `disk` (`(hash, size)` of on-disk files past
+/// the grace): delete every copy the eviction guard calls surplus, without
+/// waiting for disk pressure. Placement confirmation is what turns an
+/// origin's (or a departed holder's) copies into surplus, so this frees an
+/// ingesting node's local fragments a sweep or so after its blobs are
+/// confirmed elsewhere — a non-member origin ends up holding nothing.
+/// Stricter than the watermark path on evidence: another member's copy
+/// must have been disk-verified within the confirmation recency window.
+/// Bounded per call. Rides the disk-truth sweep's walk; the operator route
+/// pays for its own.
+async fn release_surplus(
+    app_state: &AppState,
+    fragments_dir: &str,
+    disk: Vec<(crate::types::Blake3Hash, u64)>,
+) -> Result<SurplusRelease, Error> {
+    use hopnet_storage::eviction::plan_surplus_release;
+    use hopnet_storage::traits::StateReader;
+
+    if disk.is_empty() {
+        return Ok(SurplusRelease {
+            released: Vec::new(),
+            bytes_freed: 0,
+            capped: false,
+        });
+    }
+    let host = SubstrateHost::new(app_state.clone());
+    let tip = tokio::task::spawn_blocking(move || host.current_height())
+        .await
+        .map_err(|e| Error::Failed(Arc::new(format!("height join: {e}").into())))?
+        .map_err(|e| Error::Failed(Arc::new(format!("current height: {e}").into())))?;
+    let recent = tip.saturating_sub(hopnet_storage::lifecycle::ATTESTATION_RECENCY_HEIGHTS);
+
+    let candidates = gather_eviction_candidates(app_state, &disk, Some(recent)).await?;
+    let sizes: std::collections::HashMap<_, _> = disk.into_iter().collect();
+    let planned = plan_surplus_release(candidates, SURPLUS_RELEASE_MAX_PER_SWEEP);
+    let capped = planned.len() >= SURPLUS_RELEASE_MAX_PER_SWEEP;
+    let (released, bytes_freed) = delete_and_mark(app_state, fragments_dir, &planned, &sizes).await;
+    if !released.is_empty() {
+        tracing::info!(
+            "surplus release: {} fragments released, {bytes_freed} bytes freed",
+            released.len()
+        );
+    }
+    Ok(SurplusRelease {
+        released,
+        bytes_freed,
+        capped,
+    })
+}
+
+/// Manual trigger for the prompt surplus release (`POST
+/// /maintenance/surplus-release`): walks the store itself, which the
+/// scheduled release never does — it rides the disk-truth sweep's walk.
+pub async fn run_surplus_release(
+    app_state: &AppState,
+    grace_secs: Option<u64>,
+) -> Result<serde_json::Value, Error> {
+    let fragments_dir = crate::storage_host::functions::get_fragments_dir()
+        .map_err(|e| Error::Failed(Arc::new(format!("fragments dir: {e:?}").into())))?;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let disk = hopnet_storage::fragstore::scan_fragments(
+        &fragments_dir,
+        now_unix - grace_secs.unwrap_or(SURPLUS_RELEASE_GRACE_SECS),
+    )
+    .map_err(|e| Error::Failed(Arc::new(format!("disk scan: {e}").into())))?;
+    let outcome = release_surplus(app_state, &fragments_dir, disk).await?;
+    Ok(serde_json::json!({
+        "released": outcome.released.len(), "bytes_freed": outcome.bytes_freed,
+        "capped": outcome.capped,
     }))
 }
 
@@ -1060,7 +1234,9 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
         0
     });
 
-    // (4) Eviction check (statvfs no-op below the high watermark).
+    // (4) Eviction check (statvfs no-op below the high watermark). The
+    //     prompt surplus release is not here: it rides the disk-truth
+    //     sweep's walk (`run_disk_truth_sweep`, step 3b).
     let eviction = run_watermark_eviction(app_state, None, None).await?;
 
     let report = PolicyTickReport {
