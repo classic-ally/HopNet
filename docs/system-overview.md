@@ -52,7 +52,7 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       (2026-07-16, Quint/Apalache) specifies the policy;
       [RFC-CONSENSUS-002](../hopnet-consensus/spec/implementation-plan.md)
       (2026-07-17, S0–S6) implements it: voluntary leave, a per-peer
-      evidence layer (deadline probes, cert-participation refresh),
+      evidence layer (deadline + catch-up probes, cert-participation refresh),
       unreachability vote-out with Live-origin subjective attestation,
       mesh-initiated batch seating (parity/posture/proven-quorum
       ceiling), and the AUTO quorum profile (per-height thresholds via

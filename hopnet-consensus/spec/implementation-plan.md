@@ -214,6 +214,13 @@ engine-touching stage.
   steady-state probe circularity leaves one probe direction per pair,
   and quorum-only cert signatures would leave the third validator's
   height unknown forever.
+- **S3**: approvers also probe live pool members on stale catch-up
+  evidence (issue #80) — height-triggered at half the tolerance,
+  floored at probe_base/2. Inbound dials refresh contact without a
+  height, so a chatty voted-out member never hit the deadline and
+  was rejected "not caught up by my evidence" indefinitely. The
+  trigger is in blocks because the tolerance is: ~8 blocks/min live
+  makes it ~75 s, shorter than the lazy deadline.
 
 ## Risks
 
