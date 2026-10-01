@@ -24,6 +24,8 @@ const FIXED_TIME = new Date('2026-06-15T10:00:00Z');
 interface Shot {
     slot: string;
     story: string;
+    /** Defaults to VIEWPORT; keep 16:10 so every slot frames the same way. */
+    viewport?: { width: number; height: number };
     /** Resolves once the story shows what the screenshot is meant to show. */
     ready: (page: Page) => Promise<unknown>;
 }
@@ -56,6 +58,8 @@ const SHOTS: Shot[] = [
     {
         slot: 'web-login',
         story: 'website--sign-in',
+        // The login card is small; a tighter viewport lets it fill the frame.
+        viewport: { width: 880, height: 550 },
         ready: (page) => page.getByRole('button', { name: 'Log in' }).first().waitFor(),
     },
 ];
@@ -123,7 +127,7 @@ async function main() {
     try {
         for (const shot of SHOTS) {
             const context = await browser.newContext({
-                viewport: VIEWPORT,
+                viewport: shot.viewport ?? VIEWPORT,
                 deviceScaleFactor: 2,
                 locale: 'en-US',
                 timezoneId: 'UTC',
