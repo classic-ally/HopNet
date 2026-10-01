@@ -516,6 +516,36 @@ pub fn build_value(
     round: Round,
     candidates: Vec<crate::consensus::types::Transaction>,
 ) -> Result<BuiltValue, String> {
+    build_value_with_budget(
+        app_state,
+        conn,
+        height,
+        round,
+        candidates,
+        PREFLIGHT_LOCK_BUDGET,
+    )
+}
+
+/// How long the preflight may hold the database's write lock before it stops
+/// admitting candidates. The dry-run runs inside an IMMEDIATE transaction on
+/// this connection, and every other writer on the node — the consensus
+/// shell's own WAL appends first among them — waits behind it; on a cold cache
+/// a single large page took the hold past 15 s (2026-10-01). Past the budget
+/// the remaining candidates are deferred to the next block, exactly like a
+/// solo-block deferral: proposer-local block shaping, validation untouched.
+/// The first candidate is always admitted, so a block still forms.
+const PREFLIGHT_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `build_value` with an explicit preflight lock budget (tests drive the
+/// time-box with a zero budget).
+pub(crate) fn build_value_with_budget(
+    app_state: &AppState,
+    conn: &mut r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>,
+    height: Height,
+    round: Round,
+    candidates: Vec<crate::consensus::types::Transaction>,
+    lock_budget: std::time::Duration,
+) -> Result<BuiltValue, String> {
     let mut rejected = Vec::new();
 
     // Committed-nonce dedup: already-committed transactions are DONE, not
@@ -582,6 +612,8 @@ pub fn build_value(
     }
 
     // SAVEPOINT preflight (dry run, rolled back wholesale).
+    let preflight_started = std::time::Instant::now();
+    let mut deferred_by_budget: Vec<usize> = Vec::new();
     {
         let _wg = app_state.write_gate.guard();
         let db_tx = conn
@@ -589,6 +621,13 @@ pub fn build_value(
             .map_err(|e| format!("preflight tx: {e}"))?;
         let mut failed = Vec::new();
         for (slot, (i, tx)) in survivors.iter().enumerate() {
+            // Time-box: once the lock has been held past the budget, the
+            // rest of the candidates wait for the next block rather than
+            // extend the hold (see PREFLIGHT_LOCK_BUDGET).
+            if slot > 0 && preflight_started.elapsed() > lock_budget {
+                deferred_by_budget.push(*i);
+                continue;
+            }
             // Proposer-side subjective membership guard (RFC-CONSENSUS-002
             // S4): the proposer never re-validates its own block through
             // validate_inner, so this is its Live attestation — and it
@@ -688,8 +727,23 @@ pub fn build_value(
         // db_tx drops here — the whole preflight rolls back.
         let failed_set: Vec<usize> = failed.iter().map(|(i, _)| *i).collect();
         rejected.extend(failed);
-        survivors.retain(|(i, _)| !failed_set.contains(i));
+        survivors.retain(|(i, _)| !failed_set.contains(i) && !deferred_by_budget.contains(i));
     }
+    // The hold duration is the measurement the 2026-10-01 incident lacked:
+    // the lock is released at the end of the block above, so this is it.
+    let held_ms = preflight_started.elapsed().as_millis() as u64;
+    if preflight_started.elapsed() > lock_budget {
+        tracing::warn!(
+            height = height.0,
+            held_ms,
+            admitted = survivors.len(),
+            deferred_by_budget = deferred_by_budget.len(),
+            "preflight held the write lock past its budget"
+        );
+    } else {
+        tracing::debug!(height = height.0, held_ms, "preflight lock hold");
+    }
+    deferred.extend(deferred_by_budget);
 
     // Parent = decided tip (None before the first decide / genesis).
     let parent: Option<Vec<u8>> = conn

@@ -743,7 +743,9 @@ Cross-platform desktop application providing file management and network adminis
       v2026.10.2 incident (thor crash-looping on a fatal WAL-append busy while
       the fix needed the quorum the defect was denying). H1 identity, H2
       providers, H3 activation policy, H4 CI gate, H5 same-code rollback, H6
-      first use (the WAL-append retry) — all not started.
+      first use (the WAL-append retry) — all not started. First use deferred:
+      the 2026-10-01 fix shipped as v2026.10.3 through a normal crossing once the
+      mesh resumed deciding.
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
       Network Resilience pane reports margins to the model-checked invariants rather than

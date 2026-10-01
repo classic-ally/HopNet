@@ -396,7 +396,10 @@ temptation fails in CI rather than on the mesh.
 - [ ] H6 — first use: `v2026.10.2a` carries the WAL-append retry (the
       Decide retry generalized to every storage effect, a bounded
       budget long enough to outlast a preflight) and ships through
-      the lane end to end on the live mesh.
+      the lane end to end on the live mesh. (Superseded for the 2026-10-01
+      incident: the mesh resumed deciding before the lane existed, so that
+      fix crossed as v2026.10.3; the lane's first use is the next same-code
+      defect.)
 
 ## Open questions
 

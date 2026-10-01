@@ -7,6 +7,7 @@ mod authorization;
 mod byzantine;
 mod forward_dedup;
 mod malachite_integration;
+mod preflight_budget;
 mod regenesis;
 mod signatures;
 mod stale_proposal;
