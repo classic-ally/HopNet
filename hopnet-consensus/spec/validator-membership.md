@@ -193,7 +193,13 @@ evidence — mechanism belongs to the implementation RFC:
   cycles synchronized probe rounds and stays calm. Classification
   must be a pure function of recorded evidence (ages and probe
   attempts), never of in-flight probe state; the attestation floor
-  is two probe attempts since last contact.
+  is two probe attempts since last contact. One trigger rides beside
+  the deadline: a seated validator also probes a LIVE pool member
+  whose observed height trails the tip by more than half the
+  catch-up tolerance, at most once per B/2. Contact carries no
+  height, so a candidate that keeps dialing an approver — never
+  voting, never syncing from it — would otherwise never answer the
+  "live probe now" floor below, and its readmission starves.
 - **Corroboration is optional, never sufficient** — replicated
   signals toward darkness exist for free (commit certificates record
   the commit round, and the round-0 proposer is deterministic, so

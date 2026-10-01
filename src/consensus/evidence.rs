@@ -13,7 +13,10 @@
 //! probe is a DEADLINE, not a schedule: it fires when evidence age reaches
 //! T_probe(band), so a busy mesh probes almost never. Suspicion attaches
 //! to the unanswered probe (T_unresponsive = T_probe + g), never to the
-//! deadline itself.
+//! deadline itself. One exception rides beside the deadline: a seated
+//! validator also probes a live pool member whose observed height trails
+//! the tip (`catch_up_due`) — contact carries no height, so a chatty
+//! non-voting candidate would otherwise never prove it is caught up.
 //!
 //! The map is in-memory by design: restart loss is correct semantics — a
 //! window you have not probed you cannot attest, so a rebooted observer
@@ -816,6 +819,56 @@ fn jitter(node_id: i32) -> f64 {
     0.85 + 0.1 * f64::from(h % 1024) / 1024.0
 }
 
+/// The liveness deadline: evidence age — measured from the newer of the
+/// last contact and the last probe attempt (origin for a never-seen
+/// peer) — has reached `deadline`.
+fn deadline_due(
+    view: Option<&PeerEvidenceView>,
+    origin: Instant,
+    now: Instant,
+    deadline: Duration,
+) -> bool {
+    let anchor = match view {
+        Some(v) => match v.last_probe_at {
+            Some(p) if p > v.last_contact => p,
+            _ => v.last_contact,
+        },
+        None => origin,
+    };
+    now.saturating_duration_since(anchor) >= deadline
+}
+
+/// The catch-up trigger (issue #80): a LIVE pool member whose observed
+/// height trails the tip by more than half the activation tolerance.
+/// Contact alone never proves a height, so a member that keeps dialing
+/// us — but neither votes nor syncs from us — would otherwise never be
+/// probed, and the activation guard's catch-up check starves. The
+/// trigger is height-driven because the tolerance is in blocks: at
+/// observed rates it spans ~75 s, shorter than the lazy deadline. Dark
+/// members are left to the deadline; the floor bounds a lagging member
+/// to one probe per probe_base/2.
+fn catch_up_due(
+    view: Option<&PeerEvidenceView>,
+    origin: Instant,
+    now: Instant,
+    policy: &ConsensusPolicy,
+    band: Band,
+    pending: u64,
+) -> bool {
+    let Some(v) = view else {
+        return false;
+    };
+    if contact_age(view, origin, now) > policy.t_unresponsive(band) {
+        return false;
+    }
+    let threshold = pending.saturating_sub(hopnet_consensus::membership::CATCH_UP_TOLERANCE / 2);
+    if v.last_known_height.is_some_and(|h| h >= threshold) {
+        return false;
+    }
+    v.last_probe_at
+        .is_none_or(|p| now.saturating_duration_since(p) >= policy.probe_base / 2)
+}
+
 pub fn spawn_probe_scheduler(app_state: crate::AppState) {
     crate::consensus::queue::queue_rt().spawn(async move {
         // Vote-out proposal cooldown anchor (RFC-CONSENSUS-002 S4).
@@ -902,6 +955,11 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
             );
             let t_probe = policy.t_probe(est.band);
             let my_epoch = app_state.epoch.load(Ordering::Relaxed);
+            let origin = app_state.evidence.origin();
+            // Only approvers run the activation guard, so only they need
+            // fresh catch-up evidence on candidates.
+            let seated_self = seated.contains(&my_id);
+            let pending = decided.saturating_add(1);
 
             // Targets = every registered node except self (pool nodes are
             // probed too — reputation for candidates, spec Decisions).
@@ -912,19 +970,20 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                     .binary_search_by_key(&peer.node_id, |(k, _)| *k)
                     .ok()
                     .map(|i| snap[i].1);
-                let anchor = match view {
-                    Some(v) => {
-                        let contact = v.last_contact;
-                        match v.last_probe_at {
-                            Some(p) if p > contact => p,
-                            _ => contact,
-                        }
-                    }
-                    None => app_state.evidence.origin(),
-                };
+                let catch_up = seated_self
+                    && pool.iter().any(|(id, _)| *id == peer.node_id)
+                    && catch_up_due(view.as_ref(), origin, now, &policy, est.band, pending);
                 let deadline = t_probe.mul_f64(jitter(peer.node_id));
-                if now.saturating_duration_since(anchor) < deadline {
+                if !catch_up && !deadline_due(view.as_ref(), origin, now, deadline) {
                     continue;
+                }
+                if catch_up {
+                    tracing::debug!(
+                        peer = peer.node_id,
+                        known = ?view.and_then(|v| v.last_known_height),
+                        pending,
+                        "catch-up probe: candidate's observed height trails the tip"
+                    );
                 }
                 // The record IS the attempt — before the send, so
                 // classification never depends on in-flight state.
@@ -1849,6 +1908,99 @@ mod tests {
         map.record_at(1, Some(5), t0);
         map.record_at(1, None, t0 + Duration::from_secs(1));
         assert_eq!(map.snapshot()[0].1.last_known_height, Some(5));
+    }
+
+    // Impact: regression guard for issue #80 — a pool member that keeps
+    // dialing a validator (fresh contact, no height) must still be able
+    // to prove it is caught up, or its readmission starves forever.
+    // Should: probe a live pool member whose observed height trails the
+    // tip by more than half the catch-up tolerance, even with contact
+    // one second old.
+    // Should: probe a live member whose height was never observed.
+    #[test]
+    fn catch_up_probe_fires_for_a_chatty_member_with_a_stale_height() {
+        let origin = Instant::now();
+        let now = origin + Duration::from_secs(1000);
+        let p = policy();
+        let mut v = view(now - Duration::from_secs(1));
+        v.last_known_height = Some(94);
+        assert!(catch_up_due(Some(&v), origin, now, &p, Band::Lazy, 100));
+        v.last_known_height = None;
+        assert!(catch_up_due(Some(&v), origin, now, &p, Band::Lazy, 100));
+    }
+
+    // Should not: probe a member whose observed height is within half
+    // the catch-up tolerance of the tip.
+    #[test]
+    fn catch_up_probe_is_quiet_when_the_height_is_fresh() {
+        let origin = Instant::now();
+        let now = origin + Duration::from_secs(1000);
+        let mut v = view(now - Duration::from_secs(1));
+        v.last_known_height = Some(95);
+        assert!(!catch_up_due(
+            Some(&v),
+            origin,
+            now,
+            &policy(),
+            Band::Lazy,
+            100
+        ));
+    }
+
+    // Should not: re-probe a stale member within half a probe base of
+    // the previous attempt.
+    // Should: probe it again once that floor has passed.
+    #[test]
+    fn catch_up_probe_respects_its_rate_floor() {
+        let origin = Instant::now();
+        let now = origin + Duration::from_secs(1000);
+        let p = policy();
+        let mut v = view(now - Duration::from_secs(1));
+        v.last_known_height = Some(50);
+        v.last_probe_at = Some(now - p.probe_base / 2 + Duration::from_secs(1));
+        assert!(!catch_up_due(Some(&v), origin, now, &p, Band::Lazy, 100));
+        v.last_probe_at = Some(now - p.probe_base / 2);
+        assert!(catch_up_due(Some(&v), origin, now, &p, Band::Lazy, 100));
+    }
+
+    // Should not: fire the catch-up probe for a dark member (past
+    // T_unresponsive) or one with no evidence at all — those stay on
+    // the liveness deadline.
+    #[test]
+    fn catch_up_probe_leaves_dark_members_to_the_deadline() {
+        let origin = Instant::now();
+        let now = origin + Duration::from_secs(1000);
+        let p = policy();
+        let mut v = view(now - p.t_unresponsive(Band::Lazy) - Duration::from_secs(1));
+        v.last_known_height = Some(50);
+        assert!(!catch_up_due(Some(&v), origin, now, &p, Band::Lazy, 100));
+        assert!(!catch_up_due(None, origin, now, &p, Band::Lazy, 100));
+    }
+
+    // Should: measure the liveness deadline from the newer of the last
+    // contact and the last probe attempt, and from origin for a peer
+    // with no evidence.
+    #[test]
+    fn deadline_due_anchors_on_the_newer_of_contact_and_probe() {
+        let origin = Instant::now();
+        let now = origin + Duration::from_secs(1000);
+        let deadline = Duration::from_secs(100);
+
+        let mut v = view(now - Duration::from_secs(150));
+        assert!(deadline_due(Some(&v), origin, now, deadline));
+        v.last_probe_at = Some(now - Duration::from_secs(50));
+        assert!(!deadline_due(Some(&v), origin, now, deadline));
+
+        let v = view(now - Duration::from_secs(50));
+        assert!(!deadline_due(Some(&v), origin, now, deadline));
+
+        assert!(deadline_due(None, origin, now, deadline));
+        assert!(!deadline_due(
+            None,
+            origin,
+            origin + Duration::from_secs(50),
+            deadline
+        ));
     }
 
     // Should: bright_span read zero for currently-dark nodes and for
