@@ -178,6 +178,11 @@ fn torn_final_wal_entry_dropped_mid_corruption_errors() {
     let mut s = open_storage(&path);
     let entries = s.wal_fetch(Height(2)).unwrap();
     assert_eq!(entries.len(), 2, "torn tail dropped, prefix recovered");
+    // The torn row is gone with it, so the host's next live append — at
+    // seq == entries.len() — lands instead of colliding with garbage.
+    s.wal_append(Height(2), entries.len() as u64, &wal_entry(2))
+        .expect("the seq the host resumes at is free");
+    assert_eq!(s.wal_fetch(Height(2)).unwrap().len(), 3);
 
     // Corrupt a MIDDLE entry: fetch must error, not skip.
     let conn = rusqlite::Connection::open(&path).unwrap();
@@ -311,6 +316,10 @@ fn single_node_decides_heights_over_sqlite() {
 // Should: recover from a mid-height crash via SQLite WAL replay WITHOUT
 // equivocating — the restarted node re-publishes only what it already signed,
 // and consensus completes on the original value.
+// Should: resume WAL sequence numbers after the replayed entries, so the
+// votes cast after the restart are durably logged too (a collision used to
+// be swallowed by the engine macro — the post-restart votes were simply
+// never written).
 // Should not: sign a second value for a (height, round, type) it voted in
 // before the crash, or corrupt the decided history.
 // Impact: risk #1 (post-restart equivocation) exercised over the REAL storage

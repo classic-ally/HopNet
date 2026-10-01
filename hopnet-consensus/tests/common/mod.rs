@@ -96,12 +96,71 @@ impl Application<SqliteStorage> for SqlApp {
             "INSERT INTO applied (height, hash) VALUES (?, ?)",
             rusqlite::params![height.as_db(), block.block_hash],
         )
-        .map_err(|e| ApplyError(e.to_string()))?;
+        .map_err(|e| ApplyError::permanent(e.to_string()))?;
         Ok(())
     }
 
     fn validator_set(&mut self, _height: Height) -> HopNetValidatorSet {
         self.valset.clone()
+    }
+
+    fn on_decided(&mut self, _height: Height, _block: &Block, _cert: &WireCommitCertificate) {}
+}
+
+/// SqlApp whose `apply_block` fails the next `failures` calls — transient
+/// (SQLITE_BUSY-shaped) or permanent — before behaving like SqlApp. Injects
+/// the decide-time failure classes without a second storage implementation:
+/// the host sees them through `Storage::apply_error`, exactly as a handler's
+/// error reaches it in production.
+pub struct FlakyApp {
+    pub inner: SqlApp,
+    pub failures: u32,
+    pub transient: bool,
+    pub attempts: u32,
+}
+
+impl FlakyApp {
+    pub fn new(valset: HopNetValidatorSet, failures: u32, transient: bool) -> Self {
+        Self {
+            inner: SqlApp { valset },
+            failures,
+            transient,
+            attempts: 0,
+        }
+    }
+}
+
+impl Application<SqliteStorage> for FlakyApp {
+    fn validate_block(
+        &mut self,
+        height: Height,
+        block: &Block,
+        tx: &mut rusqlite::Transaction<'_>,
+        origin: ValidationOrigin,
+    ) -> ValidationVerdict {
+        self.inner.validate_block(height, block, tx, origin)
+    }
+
+    fn apply_block(
+        &mut self,
+        height: Height,
+        block: &Block,
+        tx: &mut rusqlite::Transaction<'_>,
+    ) -> Result<(), ApplyError> {
+        self.attempts += 1;
+        if self.failures > 0 {
+            self.failures -= 1;
+            return Err(if self.transient {
+                ApplyError::transient("injected: database is locked")
+            } else {
+                ApplyError::permanent("injected: handler refused the block")
+            });
+        }
+        self.inner.apply_block(height, block, tx)
+    }
+
+    fn validator_set(&mut self, height: Height) -> HopNetValidatorSet {
+        self.inner.validator_set(height)
     }
 
     fn on_decided(&mut self, _height: Height, _block: &Block, _cert: &WireCommitCertificate) {}

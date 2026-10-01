@@ -71,6 +71,18 @@ commit (through the app-provided commit callback, so commit latency lands in the
 `/debug/db-stats` histogram). App state and decided history cannot diverge across
 a crash. No awaits occur while the transaction is open.
 
+A decide that cannot be persisted is never reported as done. Malachite's
+`process!` macro logs a failed effect and resumes the engine as if it had
+succeeded, so the host parks the first effect error on `HostCore` and returns it
+after the macro — the shell's fatal path aborts the process and the WAL replay
+re-runs the decide (2026-10-01: a swallowed SQLITE_BUSY inside `Effect::Decide`
+had left one production node believing a height decided while its database sat
+below it for four days). Transient contention inside the decide — a handler's
+`DatabaseError::Transient`, lifted through `ApplyError::transient` /
+`StoreError::ApplyTransient`, or the IMMEDIATE lock / commit hitting BUSY — is
+retried `DECIDE_RETRIES` (3) times with a short blocking backoff before it is
+fatal; anything else is fatal on the first attempt.
+
 ### Proposals: PartsOnly + Rule-8 validation
 
 `ValuePayload::PartsOnly` — the engine's own Proposal message never hits the wire.
@@ -170,7 +182,10 @@ suppressed (replayed entries must not re-append) and value-build requests are
 dropped; publishes are NOT suppressed (harmless republish, matches upstream).
 Replayed Proposal/ProposedValue entries re-populate the host's block map — a
 decide immediately after restart must find its block. A torn final WAL entry is
-dropped; corruption mid-log is an error.
+dropped (and its row deleted); corruption mid-log is an error. Live appends
+resume at `seq == replayed entries`, never at 0: the `(height, seq)` key is
+unique, and until 2026-10-01 the collision was swallowed by the engine macro,
+so votes cast after a restart were published without a durable entry.
 
 ## Decided-value sync
 

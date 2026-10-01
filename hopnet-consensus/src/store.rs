@@ -56,6 +56,10 @@ pub enum StoreError {
     /// Application apply failure lifted into the decide transaction's error
     /// channel (rolls the whole decide back).
     Apply(String),
+    /// Application apply failure that was node-local contention inside a
+    /// handler (SQLITE_BUSY while stamping rows): the decide rolls back and
+    /// the host retries it — a lock is not a verdict on the block.
+    ApplyTransient(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -64,6 +68,7 @@ impl std::fmt::Display for StoreError {
             StoreError::Db(e) => write!(f, "db: {e}"),
             StoreError::Codec(e) => write!(f, "codec: {e}"),
             StoreError::Apply(msg) => write!(f, "apply: {msg}"),
+            StoreError::ApplyTransient(msg) => write!(f, "apply (transient): {msg}"),
         }
     }
 }
@@ -87,6 +92,7 @@ impl StoreError {
                 e.sqlite_error_code(),
                 Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
             ),
+            StoreError::ApplyTransient(_) => true,
             StoreError::Codec(_) | StoreError::Apply(_) => false,
         }
     }
@@ -415,23 +421,33 @@ impl<C: DerefMut<Target = Connection> + 'static> Storage for SqliteStorage<C> {
     }
 
     fn wal_fetch(&mut self, height: Height) -> Result<Vec<WireWalEntry>, StoreError> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT entry FROM consensus_wal WHERE height = ? ORDER BY seq ASC")?;
-        let rows: Vec<Vec<u8>> = stmt
-            .query_map([height.as_db()], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
+        let rows: Vec<(i64, Vec<u8>)> = {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT seq, entry FROM consensus_wal WHERE height = ? ORDER BY seq ASC",
+            )?;
+            let rows = stmt
+                .query_map([height.as_db()], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            rows
+        };
 
         let mut entries = Vec::with_capacity(rows.len());
         let last = rows.len().saturating_sub(1);
-        for (i, bytes) in rows.iter().enumerate() {
+        for (i, (seq, bytes)) in rows.iter().enumerate() {
             match codec::decode::<WireWalEntry>(bytes) {
                 Ok(e) => entries.push(e),
                 // A final entry that fails to decode is treated as torn and
                 // dropped (recover with what we have); an earlier one is real
-                // corruption and must not be silently skipped.
+                // corruption and must not be silently skipped. The torn row
+                // is deleted so the table holds exactly the entries returned
+                // and the host's live appends resume at `entries.len()`
+                // without colliding with it.
                 Err(e) if i == last => {
                     tracing::warn!("dropping torn final WAL entry at height {height}: {e}");
+                    self.conn.execute(
+                        "DELETE FROM consensus_wal WHERE height = ? AND seq = ?",
+                        rusqlite::params![height.as_db(), seq],
+                    )?;
                 }
                 Err(e) => return Err(StoreError::Codec(e)),
             }
@@ -553,7 +569,11 @@ impl<C: DerefMut<Target = Connection> + 'static> Storage for SqliteStorage<C> {
     }
 
     fn apply_error(e: ApplyError) -> StoreError {
-        StoreError::Apply(e.0)
+        if e.transient {
+            StoreError::ApplyTransient(e.message)
+        } else {
+            StoreError::Apply(e.message)
+        }
     }
 }
 
@@ -756,6 +776,21 @@ mod tests {
         assert!(!StoreError::Apply("handler failure".into()).is_transient());
         let torn = codec::decode::<Block>(&[0xDE, 0xAD]).unwrap_err();
         assert!(!StoreError::Codec(torn).is_transient());
+    }
+
+    // Impact: a handler's SQLITE_BUSY used to be lifted out of its transient
+    // class by `StoreError::Apply`, turning routine contention inside a decide
+    // into a hard host error (and, swallowed by the engine macro, a wedge).
+    // Should: classify a transient apply failure as transient and a permanent
+    // one as not, through the Storage::apply_error mapping.
+    #[test]
+    fn apply_transient_is_transient() {
+        let transient = <SqliteStorage>::apply_error(ApplyError::transient("database is locked"));
+        assert!(matches!(transient, StoreError::ApplyTransient(_)));
+        assert!(transient.is_transient());
+        let permanent = <SqliteStorage>::apply_error(ApplyError::permanent("handler refused"));
+        assert!(matches!(permanent, StoreError::Apply(_)));
+        assert!(!permanent.is_transient());
     }
 
     // Should: keep the fresh-mesh path byte-for-byte — a height-0 genesis

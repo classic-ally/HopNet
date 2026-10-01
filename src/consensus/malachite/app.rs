@@ -352,18 +352,36 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         block: &engine::Block,
         tx: &mut rusqlite::Transaction<'_>,
     ) -> Result<(), ApplyError> {
-        let old_txs = to_old_transactions(&block.data.transactions).map_err(ApplyError)?;
+        let old_txs =
+            to_old_transactions(&block.data.transactions).map_err(ApplyError::permanent)?;
         // execute=true: dispatch-table application + nonce insertion, in the
         // host's decide transaction. Staleness/dedup checks are validation-
         // time only (execute skips them so sync can replay old blocks).
+        // A handler's SQLITE_BUSY is contention, not a verdict on the block:
+        // the host rolls the decide back and retries it.
         let decided_height = height.0;
-        process_transactions(&Some(old_txs), &self.app_state, true, decided_height, tx)
-            .map_err(|e| ApplyError(format!("apply at height {}: {e:?}", height.0)))?;
+        process_transactions(&Some(old_txs), &self.app_state, true, decided_height, tx).map_err(
+            |e| {
+                let message = format!("apply at height {}: {e:?}", height.0);
+                if matches!(e, crate::db::DatabaseError::Transient(_)) {
+                    ApplyError::transient(message)
+                } else {
+                    ApplyError::permanent(message)
+                }
+            },
+        )?;
         // RFC-STORAGE-003: memoize the storage view if this block moved it
         // (same derivation the dry-run performed, so the row matches).
         crate::storage_host::substrate_host::record_view_transition(tx, decided_height)
             .map(|_| ())
-            .map_err(|e| ApplyError(format!("view transition at height {}: {e}", height.0)))
+            .map_err(|e| {
+                let message = format!("view transition at height {}: {e}", height.0);
+                if matches!(e, hopnet_storage::StorageError::Transient(_)) {
+                    ApplyError::transient(message)
+                } else {
+                    ApplyError::permanent(message)
+                }
+            })
     }
 
     fn validator_set(&mut self, height: Height) -> HopNetValidatorSet {

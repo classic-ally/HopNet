@@ -164,8 +164,32 @@ pub trait Application<S: Storage> {
     }
 }
 
+/// An application apply failure inside the decide transaction. `transient`
+/// marks node-local contention (SQLITE_BUSY under another writer): the host
+/// re-runs the whole decide a bounded number of times before giving up.
+/// Anything else is a determinism failure — a quorum committed a value this
+/// node cannot apply — and is fatal on the first attempt.
 #[derive(Debug)]
-pub struct ApplyError(pub String);
+pub struct ApplyError {
+    pub message: String,
+    pub transient: bool,
+}
+
+impl ApplyError {
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: false,
+        }
+    }
+
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: true,
+        }
+    }
+}
 
 /// Outbound consensus traffic. `broadcast` is fire-and-forget and must not
 /// block: production spawns per-peer sends; the simulator enqueues.

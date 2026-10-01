@@ -93,7 +93,7 @@ pub enum HostError<E> {
 
 /// The consensus host. Generic over the four seams so the simulator and
 /// production share this exact driver.
-pub struct HostCore<A, S, G, T> {
+pub struct HostCore<A, S: Storage, G, T> {
     state: State<HopNetContext>,
     /// Quorum profile (RFC-CONSENSUS-002 S6). Under AUTO the effective
     /// thresholds are a per-height function of the committed set size; this
@@ -137,7 +137,30 @@ pub struct HostCore<A, S, G, T> {
     /// record, wedging the height when we get there. Drained by
     /// `drain_stashed_proposals` at every height entry.
     stashed_proposals: BTreeMap<u64, Vec<codec::WireProposedValue>>,
+    /// The first error an effect handler returned while the engine was
+    /// processing one input. Malachite's `process!` logs a handler error and
+    /// resumes the engine as if the effect had succeeded, so a failed Decide
+    /// used to leave the engine believing the height decided while the
+    /// database never advanced (the 2026-09-27 desktop wedge: four days at one
+    /// height). The handler parks the error here instead and `drive_once`
+    /// returns it after the macro — the shell's fatal path then restarts the
+    /// process, whose WAL replay re-decides the height.
+    effect_error: Option<HostError<S::Error>>,
 }
+
+/// What `process!` sees when an effect handler fails: a marker, because the
+/// real error has already been parked in `HostCore::effect_error` (the macro
+/// only logs and continues). Never leaves `drive_once`.
+#[derive(Debug)]
+struct EffectFailed;
+
+/// Decide retries for transient storage errors (SQLITE_BUSY after the 5 s
+/// connection busy_timeout, a commit-time BUSY, or contention inside a
+/// handler). Each attempt re-BEGINs the IMMEDIATE transaction; the shell is a
+/// synchronous thread, so the backoff is a blocking sleep — short enough not
+/// to stall vote processing, long enough for the other writer to finish.
+const DECIDE_RETRIES: u32 = 3;
+const DECIDE_RETRY_BACKOFF_MS: u64 = 100;
 
 /// How far ahead of the current height a wire proposal may be stashed, and
 /// the total stash bound. One height of lookahead is the common race (peer
@@ -207,6 +230,7 @@ where
             on_demand: false,
             deferred_start: None,
             stashed_proposals: BTreeMap::new(),
+            effect_error: None,
         }
     }
 
@@ -288,6 +312,13 @@ where
             self.outputs
                 .retain(|o| !matches!(o, HostOutput::NeedValue { .. }));
         }
+        // Live appends resume AFTER the replayed entries: the WAL's
+        // (height, seq) key is unique and `wal_fetch` leaves the table
+        // holding exactly `entries.len()` rows for this height. Restarting
+        // at 0 collided with the persisted rows, and because the engine
+        // macro swallowed the handler error, every post-restart vote at
+        // the height was published without its durable entry.
+        self.wal_seq = entries.len() as u64;
         self.phase = Phase::Running;
         // A proposal for this height may have arrived while it was deferred
         // (on-demand) or before the previous height finished — validate it
@@ -648,9 +679,13 @@ where
             stashed_proposals: _,
             profile,
             last_val_count: _,
+            effect_error,
         } = self;
 
         let metrics = ();
+        // The macro swallows a handler error (logs it, resumes the engine), so
+        // the handler parks the first one here and it is returned below —
+        // a failed effect is never silently "done".
         let result: Result<(), malachitebft_core_consensus::Error<HopNetContext>> = process!(
             input: input,
             state: state,
@@ -671,8 +706,14 @@ where
                 on_demand: *on_demand,
                 deferred_start,
                 profile: *profile,
-            }, effect)
+            }, effect).map_err(|e| {
+                effect_error.get_or_insert(e);
+                EffectFailed
+            })
         );
+        if let Some(e) = effect_error.take() {
+            return Err(e);
+        }
         result.map_err(|e| HostError::Engine(Box::new(e)))
     }
 }
@@ -850,17 +891,38 @@ where
                 .ok_or(HostError::MissingBlock(height))?;
             let wire_cert = WireCommitCertificate::from(&cert);
 
-            let app = &mut *ctx.app;
-            ctx.storage
-                .decide_atomically(|tx| {
+            // The whole decide re-runs on transient contention (the closure
+            // is rebuilt per attempt: it borrows the app mutably). A failure
+            // that survives the retries — or any non-transient one — is
+            // returned, and `drive_once` makes it fatal: a decide this node
+            // cannot persist must never be reported as done.
+            let mut attempt = 0u32;
+            loop {
+                let app = &mut *ctx.app;
+                let outcome = ctx.storage.decide_atomically(|tx| {
                     app.apply_block(height, &block, tx)
                         .map_err(S::apply_error)?;
                     S::store_decided_tx(tx, &block, &wire_cert)?;
                     S::truncate_wal_tx(tx, height)?;
                     S::set_last_decided_tx(tx, height)?;
                     Ok(())
-                })
-                .map_err(HostError::Storage)?;
+                });
+                match outcome {
+                    Ok(()) => break,
+                    Err(e) if attempt < DECIDE_RETRIES && S::error_is_transient(&e) => {
+                        attempt += 1;
+                        tracing::warn!(
+                            %height,
+                            attempt,
+                            "decide hit transient storage contention, retrying: {e:?}"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            DECIDE_RETRY_BACKOFF_MS << (attempt - 1),
+                        ));
+                    }
+                    Err(e) => return Err(HostError::Storage(e)),
+                }
+            }
 
             *ctx.last_decided = Some(height);
             ctx.app.on_decided(height, &block, &wire_cert);

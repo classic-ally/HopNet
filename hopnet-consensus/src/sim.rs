@@ -188,7 +188,7 @@ impl Storage for MemStorage {
         Ok(self.0.borrow().last_decided)
     }
     fn apply_error(e: ApplyError) -> MemError {
-        MemError(e.0)
+        MemError(e.message)
     }
 }
 

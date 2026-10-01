@@ -247,10 +247,15 @@ where
 enum StepDisposition {
     Continue,
     CleanShutdown,
-    /// Storage/host-invariant failure. The process must die loudly so
-    /// supervision restarts it — a shell-less node is a zombie (HTTP up,
-    /// chain dead). Transient contention is classified at the validation
-    /// sites (`StoreError::is_transient`) and never reaches here.
+    /// Storage/host-invariant failure, including one raised inside an
+    /// effect (a decide or WAL append that could not be persisted — the
+    /// host parks it past malachite's log-and-continue macro). The process
+    /// must die loudly so supervision restarts it and the WAL replay re-runs
+    /// the effect — a shell-less node is a zombie (HTTP up, chain dead), and
+    /// a swallowed decide is worse: a node that believes it decided while
+    /// its database never advanced. Transient contention is classified at
+    /// the validation sites (`StoreError::is_transient`) or retried inside
+    /// the decide, and never reaches here.
     Fatal,
 }
 
