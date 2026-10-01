@@ -872,6 +872,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     post(storage_host::routes::post_watermark_eviction),
                 )
                 .route(
+                    "/maintenance/surplus-release",
+                    post(storage_host::routes::post_surplus_release),
+                )
+                .route(
                     "/maintenance/policy-tick",
                     post(storage_host::routes::post_policy_tick),
                 )

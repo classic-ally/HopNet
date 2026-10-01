@@ -679,3 +679,50 @@ mod lifecycle_handlers {
         );
     }
 }
+
+// Impact: the prompt surplus release deletes without disk pressure, so its
+// other-holder belt must rest on recent disk-verified evidence, not on
+// belief rows that were never (or long ago) checked against a disk.
+// Should: count only other members' non-suspect rows verified at or after
+// the floor for the recent count.
+// Should not: count this node's own row, a never-verified row, or a stale
+// one toward the recent count (the plain count keeps them, as before).
+#[test]
+fn recent_holder_counts_demand_fresh_verification() {
+    let pool = setup_test_db();
+    let conn = pool.get().unwrap();
+    insert_dummy_user(&conn, 1);
+    conn.execute_batch(
+        "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES
+            (1, 'n1', 1, x'01'), (2, 'n2', 1, x'02'), (3, 'n3', 1, x'03');",
+    )
+    .unwrap();
+    let fresh = Blake3Hash::new(blake3::hash(b"fresh"));
+    let stale = Blake3Hash::new(blake3::hash(b"stale"));
+    for (hash, node, verified, suspect) in [
+        (&fresh, 1, Some(1000i64), 0),
+        (&fresh, 2, Some(990), 0),
+        (&fresh, 3, None, 0),
+        (&stale, 2, Some(100), 0),
+        (&stale, 3, Some(1000), 1),
+    ] {
+        conn.execute(
+            "INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height, suspect)
+             VALUES (?, ?, ?, ?)",
+            params![hash, node, verified, suspect],
+        )
+        .unwrap();
+    }
+    let members: std::collections::HashSet<i32> = [1, 2, 3].into();
+    let hashes = [fresh, stale];
+
+    let recent =
+        crate::db::fragments::recent_member_holder_counts(&conn, &hashes, &members, 1, 500)
+            .unwrap();
+    assert_eq!(recent.get(&fresh), Some(&1));
+    assert_eq!(recent.get(&stale), None);
+
+    let plain = crate::db::fragments::member_holder_counts(&conn, &hashes, &members, 1).unwrap();
+    assert_eq!(plain.get(&fresh), Some(&2));
+    assert_eq!(plain.get(&stale), Some(&1));
+}

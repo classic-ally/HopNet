@@ -42,6 +42,32 @@ pub struct DiskPressure {
     pub low_pct: u8,
 }
 
+/// The guard alone: every candidate that is neither protected nor the last
+/// attested member copy, oldest blob first (UUIDv7 time order; stable
+/// within a blob). Both planners share it, so the invariant has one home.
+fn evictable_surplus(candidates: Vec<EvictionCandidate>) -> Vec<EvictionCandidate> {
+    let mut evictable: Vec<EvictionCandidate> = candidates
+        .into_iter()
+        .filter(|c| !c.protected && c.other_member_holders >= 1)
+        .collect();
+    evictable.sort_by(|a, b| a.blob_id.cmp(&b.blob_id));
+    evictable
+}
+
+/// Plan the prompt release of surplus, regardless of disk pressure: up to
+/// `max` evictable copies, oldest blob first. Surplus is evictable any time
+/// (durability-policy); the model leaves eviction timing adversarial, so
+/// releasing it as soon as placement is confirmed needs only the same
+/// guard. Callers feed it candidates whose holder count already demands a
+/// recent attestation (stricter than the watermark path).
+pub fn plan_surplus_release(candidates: Vec<EvictionCandidate>, max: usize) -> Vec<Blake3Hash> {
+    evictable_surplus(candidates)
+        .into_iter()
+        .take(max)
+        .map(|c| c.fragment_hash)
+        .collect()
+}
+
 /// Plan which fragments to evict. Empty below the high watermark; above
 /// it, evictable surplus oldest-first until the projected fill reaches the
 /// low watermark (or evictable surplus runs out — the escalation ladder
@@ -60,16 +86,9 @@ pub fn plan_evictions(
     let low_bytes = pressure.total_bytes / 100 * pressure.low_pct as u64;
     let target_free = pressure.used_bytes.saturating_sub(low_bytes);
 
-    let mut evictable: Vec<EvictionCandidate> = candidates
-        .into_iter()
-        .filter(|c| !c.protected && c.other_member_holders >= 1)
-        .collect();
-    // Oldest blob first (UUIDv7 time order); stable within a blob.
-    evictable.sort_by(|a, b| a.blob_id.cmp(&b.blob_id));
-
     let mut planned = Vec::new();
     let mut freed = 0u64;
-    for c in evictable {
+    for c in evictable_surplus(candidates) {
         if freed >= target_free {
             break;
         }
@@ -191,5 +210,45 @@ mod tests {
             ..pressure
         };
         assert!(plan_evictions(vec![candidate(1, "0170-a", 100)], &edge).is_empty());
+    }
+
+    // Impact: an origin (above all a non-member one, like an ingesting
+    // laptop) holds every class of every blob it ingested; waiting for disk
+    // pressure to shed that surplus is what let ingest fill the disk.
+    // Should: release every evictable surplus copy regardless of pressure,
+    // oldest blob first, up to the cap.
+    #[test]
+    fn surplus_release_ignores_pressure_and_caps() {
+        let planned = plan_surplus_release(
+            vec![
+                candidate(3, "0190-newest", 10),
+                candidate(1, "0170-oldest", 10),
+                candidate(2, "0180-middle", 10),
+            ],
+            usize::MAX,
+        );
+        assert_eq!(planned, vec![hash(1), hash(2), hash(3)]);
+
+        let capped = plan_surplus_release(
+            vec![candidate(2, "0180-b", 10), candidate(1, "0170-a", 10)],
+            1,
+        );
+        assert_eq!(capped, vec![hash(1)]);
+    }
+
+    // Should not: release a protected copy (never-confirmed, responsible,
+    // in-flight, pinned) or the last attested member copy, even when
+    // releasing promptly.
+    #[test]
+    fn surplus_release_keeps_the_guard() {
+        let mut protected = candidate(1, "a", 10);
+        protected.protected = true;
+        let mut sole = candidate(2, "b", 10);
+        sole.other_member_holders = 0;
+        let free = candidate(3, "c", 10);
+        assert_eq!(
+            plan_surplus_release(vec![protected, sole, free], usize::MAX),
+            vec![hash(3)]
+        );
     }
 }

@@ -190,6 +190,11 @@ proven pieces. S1–S2 are dark (no production call sites).
 - Metrics table pruning (unbounded growth today).
 - Inventory-row pruning for departed nodes.
 - Site tags / correlated-failure diversity.
-- Pre-GC surplus handoff optimization.
+- ~~Pre-GC surplus handoff optimization.~~ Done as the prompt surplus
+  release (`run_surplus_release`, policy tick step 4): confirmed surplus
+  goes as soon as another member's copy is recently disk-verified,
+  instead of waiting for the high watermark. Removals still reach
+  consensus through the disk-truth sweep, so risk 5 (exact-count
+  self-check rejections) gets more exercise; watch it.
 - ε(μ) derivation + repair-budget enforcement (stubs: ε=0, budget
   field unenforced).

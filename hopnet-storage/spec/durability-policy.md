@@ -42,10 +42,15 @@ exhausted → honest capacity metric falls → placement assigns nothing
 new → new stores refuse; freeing pinned space is an unpin, owned by
 the projection's own (user-facing, manual) flow.
 
-Durability counts both classes. GC is decentralized: eviction is a
-local watermark loop under disk pressure (surplus oldest-first above
-the high watermark, stop at the low), guarded by the inventory
-claiming another holder — or the blob being deleted. A returning
+Durability counts both classes. GC is decentralized, in two local
+loops sharing one guard (the inventory claiming another holder — or
+the blob being deleted). The surplus release runs every policy tick
+without pressure: it frees confirmed surplus (an origin's non-assigned
+classes, a departed holder's copies) as soon as another member's copy
+has been disk-verified within the confirmation recency window, oldest
+blob first, bounded per tick. The watermark loop acts under disk
+pressure (surplus oldest-first above the high watermark, stop at the
+low) on belief alone. A returning
 node's copies re-enter inventory via self-check and count as surplus;
 catch-up never commands deletion.
 
