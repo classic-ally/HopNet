@@ -255,6 +255,149 @@ branch's wire breaks force a re-formation anyway.
     rolled at start), so every restart — the seal's exit 75 included —
     means a fresh sign-in before the status views answer again.
 
+## Addendum: the hotfix lane (same-code releases)
+
+**Status**: Draft (2026-10-01, written during the v2026.10.2 incident)
+
+**Motivation.** A crossing can be blocked by a defect in the release
+every validator is already running. On 2026-10-01 the mesh crossed into
+v2026.10.2, whose fatal-effect rule (a storage error in a consensus
+effect aborts the process instead of being swallowed) met a proposer
+whose preflight held the write lock longer than the busy budget: thor's
+vote WAL append got `database is locked`, the host aborted, systemd
+restarted it, the same height reproduced it — fourteen cores in twenty
+minutes, the mesh stalled at 82752 with one validator left. The fix
+was twenty lines of host plumbing, but every route to deploying it
+needed a quorum that the defect itself was denying: a v2026.10.3
+crossing needs thor's votes, and thor lived thirty seconds per boot.
+The operator's only move was the manual one — build the patched
+binary elsewhere, copy the closure, swap the profile symlink — which
+is exactly the action this RFC's wrapper performs, minus the policy
+that would let it do so unprompted.
+
+The lane makes that policy explicit: a **hotfix release** carries new
+bytes under an UNCHANGED application version, so it interoperates
+with the running release by construction and may be applied node by
+node, without a boundary.
+
+**The one invariant.** Two nodes on `2026.10.2` and `2026.10.2a`
+decide the same blocks, so their apply must stay byte-identical. A
+hotfix may change host plumbing (effect retries, WAL handling, queue
+pacing), reconciler and storage-job pacing, logging, views, the
+daemon, the wrapper itself — anything whose output never reaches
+committed state. A hotfix may NOT change transaction validation,
+`apply`, the schema or its ordinals, snapshot sections and their
+hashes, the RS layout, the wire ALPN class scheme, or any constant a
+validator uses to judge a block (block shape, staleness horizon, tx
+size limits). The rule is enforced, not trusted: for a hotfix tag the
+release workflow runs the RFC-020 chain tripwires and the RFC-025
+compat-freeze tripwires against the BASE tag, not the latest release,
+and refuses the publish on any kernel-hash or frozen-step delta. A
+hotfix that needs to touch the kernel is not a hotfix; it is the next
+point release and crosses the ordinary way.
+
+**Identity.** The tag is the base CalVer with a single lowercase
+letter: `v2026.10.2a`, then `b`. The workspace version stays
+`2026.10.2`, so the version code, the locked ALPN, the agreed-version
+marker and every RFC-025 clamp are untouched without any new rule.
+Two things become visible that are not today:
+
+- a compile-time **build id** — `2026.10.2a` — baked from the tag at
+  release time (`HOPNET_BUILD_ID`, `option_env!`, defaults to the bare
+  version for local builds). `hopnet --version` keeps answering the
+  bare version, because the seed wrapper, the providers' honest-bytes
+  checks and RFC-025 all compare on it; `--build` answers the build id,
+  and the readiness view's `mesh[]` rows and the boot banner show it.
+  Without this nobody can tell which bytes a node runs, which is how
+  the incident went undiagnosed for an hour.
+- the macOS `CFBundleVersion` gains the letter as a trailing component
+  (`20261002.1` for `a`) so Finder and SMAppService see a newer
+  bundle; `CFBundleShortVersionString` stays `2026.10.2` and the
+  honest-bytes check compares the staged binary's `--version` to the
+  tag's BASE.
+
+**Seed guard.** `hopnet seed-guard --candidate 2026.10.2a` parses the
+suffix, compares on the base code, and allows when base == agreed
+(the equality case that today reads as "nothing to do"). The module's
+newest-wins arm is already correct: GNU `sort -V` orders `2026.10.2a`
+after `2026.10.2`, so a flake pin bumped to the hotfix re-seeds a
+profile on the base, and never the reverse.
+
+**Providers.** Both staging strategies stage by tag today and pick
+"newest stable strictly newer than running" — a hotfix is never
+strictly newer. The selection gains a second lane: within the RUNNING
+point release, prefer the highest letter whose bytes are not the
+running build id. `report()` learns to say `staged: 2026.10.2`,
+`build: 2026.10.2a`; the attestation pipeline carries the bare version
+as before (the mesh agrees on versions, never on builds), so nothing
+in committed state or the readiness quorum changes.
+
+**Activation: locally authorized.** Contract rule 2 stands for a
+version change — the quorum-decided target and the node's own staged
+bytes. A same-code hotfix is authorized by local policy alone, because
+there is no boundary to coordinate: the node restarts into bytes that
+speak the same version, resumes at the same height, and nothing it
+decides is distinguishable from its neighbours' decisions. Mechanics:
+
+- the hook is the tick, not the seal: once `report()` shows a staged
+  hotfix, `auto_activate_hotfix` (a third knob, default on) flips the
+  profile and exits 75 on the next tick that finds the node idle;
+- **stagger** — a per-node delay drawn from `[0, 5 min)` by node id,
+  so three validators never restart in the same second and blip
+  quorum; a node skips the restart while it is the pending proposer,
+  while a regenesis phase is in flight, or while an epoch join is
+  staged (the boundary path owns those restarts);
+- the crash-loop guard applies unchanged: profile already on the
+  staged generation with the running build id still wrong → refuse
+  and park with the reason.
+
+**Rollback (same-code only).** This RFC excludes automatic rollback
+across an epoch boundary, and that exclusion stands — reverting a
+version re-opens the divergence the forward-only rule kills. A
+same-code generation is different: both generations decide
+identically, so reverting one node's BYTES cannot diverge state. The
+wrapper therefore keeps the previous generation link beside the
+profile (`profile.prev`) and, when the supervisor records N aborts
+within a minute of a hotfix flip, moves the profile back, records the
+rollback in the boundary-error status, and stops auto-activating that
+build id. The incident of 2026-10-01 is the case this protects
+against: a hotfix that is itself wrong must degrade to the known-good
+bytes, not to a crash loop.
+
+**What the lane does not do.** It does not shorten a point release's
+path — a crossing is still the only way to change what the mesh
+agrees on. It does not let a node run ahead of the mesh: the
+agreed-version clamp, the ALPN lock and the boot gates see the same
+version before and after. And it is not a channel for schema or
+state fixes, however small; the tripwire gate exists so that
+temptation fails in CI rather than on the mesh.
+
+### Slices
+
+- [ ] H1 — identity: build id from the tag (`HOPNET_BUILD_ID`,
+      `--build`, readiness rows, boot banner); `CFBundleVersion`
+      trailing component via `scripts/macos/version.sh`; seed-guard
+      suffix parsing with `Should:` tests for allow-on-equal-base and
+      hold-on-newer-base.
+- [ ] H2 — providers: hotfix-lane selection within the running point
+      release for `build-from-source` and `certified-artifact`;
+      `report()` build id; honest-bytes compares the base.
+- [ ] H3 — activation policy: `auto_activate_hotfix`, tick-driven flip
+      with stagger and the proposer / boundary / staged-join skips;
+      orchestrator scenario (two nodes on `X`, one staged `Xa`,
+      restarts land apart, heights keep deciding throughout).
+- [ ] H4 — CI gate: `release-macos.yml` and the Linux checks run the
+      RFC-020 and RFC-025 tripwires against the base tag for hotfix
+      tags; a kernel delta fails the publish with the diff named.
+- [ ] H5 — same-code rollback: `profile.prev`, abort counting in the
+      module's wrapper, the rollback record in boundary-error status,
+      VM test (hotfix generation aborts on boot → profile falls back →
+      node runs the base bytes, status names the rolled-back build).
+- [ ] H6 — first use: `v2026.10.2a` carries the WAL-append retry (the
+      Decide retry generalized to every storage effect, a bounded
+      budget long enough to outlast a preflight) and ships through
+      the lane end to end on the live mesh.
+
 ## Open questions
 
 1. **Release provenance.** Stage-time provenance pinning is specified;

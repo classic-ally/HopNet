@@ -733,6 +733,17 @@ Cross-platform desktop application providing file management and network adminis
       certified 2026.8.99 artifact, regenesis_start → seal → unattended
       flip → exit 75 → epoch 2 decided on the new bundle, 3.4 s seal-to-
       cross; crash-loop probe clean. Remaining: S4 pin-bump automation.
+- [ ] Hotfix lane — same-code releases
+      ([RFC-021 addendum](specs/nix-upgrade-provider.md#addendum-the-hotfix-lane-same-code-releases),
+      Draft 2026-10-01): a `v2026.10.2a` tag carries new bytes under an
+      unchanged application version, so it interoperates with the running
+      release by construction and is applied node by node with a staggered
+      restart — no boundary. Kernel-identical apply is enforced by running the
+      RFC-020/025 tripwires against the base tag in CI. Written during the
+      v2026.10.2 incident (thor crash-looping on a fatal WAL-append busy while
+      the fix needed the quorum the defect was denying). H1 identity, H2
+      providers, H3 activation policy, H4 CI gate, H5 same-code rollback, H6
+      first use (the WAL-append retry) — all not started.
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
       Network Resilience pane reports margins to the model-checked invariants rather than
