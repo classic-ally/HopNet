@@ -36,6 +36,18 @@ pub enum CommitProbe {
     Failed(String),
 }
 
+/// Outcome of the ingest admission probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmitProbe {
+    /// Room for the uploads (or a node too old to answer, or an answer we
+    /// could not read — the probe is advisory and the upload can still be
+    /// refused).
+    Admitted,
+    /// The node is at its free-space floor (507), shedding (503), or
+    /// unreachable — park class.
+    Unreachable(String),
+}
+
 /// Wire shape of the node's `POST /api/photos/client/resolve` response.
 #[derive(Debug, serde::Deserialize)]
 pub struct ResolveResponseWire {
@@ -105,6 +117,13 @@ impl HttpDispatch {
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             // The node's shed gates own the retry (Retry-After) — park class.
             PhotosCoreError::Dispatch(format!("{UNREACHABLE_PREFIX}node shedding load (503)"))
+        } else if status == reqwest::StatusCode::INSUFFICIENT_STORAGE {
+            // Ingest admission: the node is at its free-space floor. Nothing
+            // about this photo is wrong, and retrying before the node frees
+            // space cannot help — park, burning no attempts.
+            PhotosCoreError::Dispatch(format!(
+                "{UNREACHABLE_PREFIX}node low on disk (507): {body}"
+            ))
         } else if status == reqwest::StatusCode::UPGRADE_REQUIRED {
             // RFC-023 gate refusal: retrying cannot help — park with the
             // versions named so the operator knows the remedy.
@@ -151,6 +170,34 @@ impl HttpDispatch {
             .json::<ResolveResponseWire>()
             .await
             .map_err(|e| PhotosCoreError::Dispatch(format!("resolve response: {e}")))
+    }
+
+    /// Ingest admission probe (`POST /admit`): asks whether blobs of these
+    /// sizes fit above the node's free-space floor before any body is
+    /// streamed — a refusal mid-upload reaches reqwest as a broken
+    /// connection, which would classify as transient and burn an attempt.
+    /// Not part of the `PhotoDispatch` trait — publish-flow only.
+    pub async fn check_admission(&self, sizes: &[u64]) -> AdmitProbe {
+        let result = self
+            .client
+            .post(self.url("/admit"))
+            .bearer_auth(&self.device_token)
+            .json(&serde_json::json!({ "sizes": sizes }))
+            .timeout(SMALL_TIMEOUT)
+            .send()
+            .await;
+        match result {
+            Ok(r) if r.status() == reqwest::StatusCode::INSUFFICIENT_STORAGE => {
+                let body = r.text().await.unwrap_or_default();
+                AdmitProbe::Unreachable(format!("node low on disk (507): {}", body.trim()))
+            }
+            Ok(r) if r.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
+                AdmitProbe::Unreachable("node shedding load (503)".into())
+            }
+            Ok(_) => AdmitProbe::Admitted,
+            Err(e) if Self::unreachable(&e) => AdmitProbe::Unreachable(e.to_string()),
+            Err(_) => AdmitProbe::Admitted,
+        }
     }
 
     /// Confirm probe (`GET /committed/{photo_id}`) for the idempotency

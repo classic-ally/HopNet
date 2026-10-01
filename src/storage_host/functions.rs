@@ -27,6 +27,25 @@ pub fn get_fragments_dir() -> Result<String, FileError> {
     hopnet_storage::fragstore::get_fragments_dir().map_err(FileError::from)
 }
 
+/// Enable ingest admission (`hopnet_storage::admission`): new blobs are
+/// refused once storing them would leave the fragments filesystem at or
+/// below the floor. `HOPNET_STORAGE_MIN_FREE_BYTES` overrides the 10 GiB
+/// default; `0` disables the check. Returns the floor in force.
+pub fn configure_ingest_floor() -> u64 {
+    let default = hopnet_storage::admission::DEFAULT_MIN_FREE_BYTES;
+    let floor = match std::env::var("HOPNET_STORAGE_MIN_FREE_BYTES") {
+        Ok(v) => v.trim().parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(
+                "ignoring invalid HOPNET_STORAGE_MIN_FREE_BYTES={v} (must be a byte count); using default {default}"
+            );
+            default
+        }),
+        Err(_) => default,
+    };
+    hopnet_storage::admission::set_min_free_bytes(floor);
+    floor
+}
+
 pub fn create_fragment_path(
     fragments_dir: &str,
     fragment_hash: &Blake3Hash,
