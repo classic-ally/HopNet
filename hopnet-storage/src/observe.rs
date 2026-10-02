@@ -273,12 +273,31 @@ fn lock(h: &Mutex<Histogram<u64>>) -> std::sync::MutexGuard<'_, Histogram<u64>> 
     h.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// When this process recorded its first fetch — the start of the wall
+/// clock the drain rate is measured against.
+static FETCH_FIRST_SEEN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 /// Record one successful fetch: how long it took and how many bytes came.
 pub fn record_fetch(elapsed: Duration, bytes: usize) {
+    FETCH_FIRST_SEEN.get_or_init(std::time::Instant::now);
     let us = (elapsed.as_micros() as u64).max(1);
     let bps = (bytes as f64 / elapsed.as_secs_f64().max(1e-6)) as u64;
     let _ = lock(&FETCH_LATENCY_US).record(us);
     let _ = lock(&FETCH_THROUGHPUT_BPS).record(bps.max(1));
+}
+
+/// Wall time per fetch this process has actually sustained: elapsed since
+/// the first fetch over fetches recorded. The transfer itself is a small
+/// part of what the serial worker spends per class (the belief and
+/// attestation rounds, the rehash, the write-gate ack), so this is the
+/// honest drain rate; `None` until two fetches have been seen.
+pub fn mean_wall_us_per_fetch() -> Option<u64> {
+    let since = FETCH_FIRST_SEEN.get()?.elapsed();
+    let fetches = lock(&FETCH_LATENCY_US).len();
+    if fetches < 2 {
+        return None;
+    }
+    Some((since.as_micros() / fetches as u128).max(1) as u64)
 }
 
 /// Record one fetch that yielded nothing.
@@ -320,6 +339,9 @@ pub struct TransferSnapshot {
     pub failures: u64,
     pub latency_us: HistogramSnapshot,
     pub throughput_bps: HistogramSnapshot,
+    /// Sustained wall time per fetch since the first one (see
+    /// `mean_wall_us_per_fetch`); `None` until two fetches.
+    pub wall_us_per_fetch: Option<u64>,
 }
 
 pub fn transfers() -> TransferSnapshot {
@@ -330,6 +352,7 @@ pub fn transfers() -> TransferSnapshot {
         failures: FETCH_FAILURES.load(Ordering::Relaxed),
         latency_us,
         throughput_bps,
+        wall_us_per_fetch: mean_wall_us_per_fetch(),
     }
 }
 
@@ -341,11 +364,18 @@ pub fn transfers() -> TransferSnapshot {
 pub const ETA_SCAN_LIMIT: usize = 2000;
 
 /// The reconciler is one serial worker, so a tier's time to conformance is
-/// its owed fetches at the measured median fetch. `None` until the
-/// histogram has a sample (or when nothing is owed, `Some(0)`).
-pub fn eta_secs(fetches: u64, p50_us: Option<u64>) -> Option<u64> {
-    let p50 = p50_us.filter(|p| *p > 0)?;
-    Some((fetches as u128 * p50 as u128).div_ceil(1_000_000) as u64)
+/// its owed fetches at the slower of two per-fetch figures: the measured
+/// median transfer and the sustained wall time per fetch. The median alone
+/// read 31 seconds for 2,894 owed fetches on a node draining three fetches
+/// every five minutes (2026-10-02). `None` until there is a sample (or
+/// when nothing is owed, `Some(0)`).
+pub fn eta_secs(fetches: u64, p50_us: Option<u64>, wall_us: Option<u64>) -> Option<u64> {
+    let per_fetch = p50_us
+        .filter(|p| *p > 0)
+        .into_iter()
+        .chain(wall_us.filter(|w| *w > 0))
+        .max()?;
+    Some((fetches as u128 * per_fetch as u128).div_ceil(1_000_000) as u64)
 }
 
 /// Fetches this node owes under its goals across the in-flight set (the
@@ -418,16 +448,20 @@ pub struct OwedFetches {
 }
 
 impl OwedFetches {
-    /// Per-tier ETAs at the measured median fetch, in the fixed order
-    /// urgent / pull / lazy.
-    pub fn etas(&self, p50_us: Option<u64>) -> BTreeMap<&'static str, (u64, Option<u64>)> {
+    /// Per-tier ETAs at the slower of the median fetch and the sustained
+    /// wall time per fetch, in the fixed order urgent / pull / lazy.
+    pub fn etas(
+        &self,
+        p50_us: Option<u64>,
+        wall_us: Option<u64>,
+    ) -> BTreeMap<&'static str, (u64, Option<u64>)> {
         [
             ("urgent", self.urgent),
             ("pull", self.pull),
             ("lazy", self.lazy),
         ]
         .into_iter()
-        .map(|(tier, fetches)| (tier, (fetches, eta_secs(fetches, p50_us))))
+        .map(|(tier, fetches)| (tier, (fetches, eta_secs(fetches, p50_us, wall_us))))
         .collect()
     }
 }
@@ -660,19 +694,36 @@ mod tests {
     // round the serial-worker product up to whole seconds.
     #[test]
     fn eta_is_owed_fetches_at_the_median() {
-        assert_eq!(eta_secs(10, None), None);
-        assert_eq!(eta_secs(10, Some(0)), None);
-        assert_eq!(eta_secs(0, Some(42_000)), Some(0));
-        assert_eq!(eta_secs(100, Some(42_000)), Some(5)); // 4.2s → 5
+        assert_eq!(eta_secs(10, None, None), None);
+        assert_eq!(eta_secs(10, Some(0), None), None);
+        assert_eq!(eta_secs(0, Some(42_000), None), Some(0));
+        assert_eq!(eta_secs(100, Some(42_000), None), Some(5)); // 4.2s → 5
         let owed = OwedFetches {
             urgent: 0,
             pull: 100,
             lazy: 30,
         };
-        let etas = owed.etas(Some(1_000_000));
+        let etas = owed.etas(Some(1_000_000), None);
         assert_eq!(etas["urgent"], (0, Some(0)));
         assert_eq!(etas["pull"], (100, Some(100)));
         assert_eq!(etas["lazy"], (30, Some(30)));
+    }
+
+    // Impact: the median transfer is a sliver of what the serial worker
+    // spends per class; a node draining three fetches in five minutes
+    // showed a 31-second ETA for 2,894 owed fetches.
+    // Should: take the slower of the median fetch and the sustained wall
+    // time per fetch, and fall back to whichever one exists.
+    #[test]
+    fn eta_prefers_the_slower_observed_rate() {
+        // 100 fetches at 11 ms median but 24 s of wall each → 2400 s.
+        assert_eq!(eta_secs(100, Some(11_000), Some(24_000_000)), Some(2400));
+        // A fast wall clock never shortens the median estimate.
+        assert_eq!(eta_secs(100, Some(42_000), Some(1_000)), Some(5));
+        // Wall alone, median alone.
+        assert_eq!(eta_secs(10, None, Some(500_000)), Some(5));
+        assert_eq!(eta_secs(10, Some(500_000), Some(0)), Some(5));
+        assert_eq!(eta_secs(10, None, Some(0)), None);
     }
 
     // Should: snapshot an empty histogram as zeros and a recorded one with

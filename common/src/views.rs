@@ -248,6 +248,11 @@ pub struct EtaView {
     /// The median fetch this node has measured; absent until a sample.
     #[typeshare(serialized_as = "number")]
     pub p50_fetch_us: Option<u64>,
+    /// Sustained wall time per fetch since this process's first one — the
+    /// drain rate the ETAs use when it is slower than the median transfer;
+    /// absent until two fetches.
+    #[typeshare(serialized_as = "number")]
+    pub wall_us_per_fetch: Option<u64>,
     /// urgent / pull / lazy, in that order.
     pub tiers: Vec<EtaTierView>,
     /// The pull tier's scan hit its bound: owed is a floor.

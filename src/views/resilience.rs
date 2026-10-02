@@ -529,9 +529,10 @@ fn eta_view(
         lazy: tick.as_ref().map_or(0, |t| t.lazy_chunks_owed as u64 * k),
     };
     let p50_fetch_us = (transfers.fetches > 0).then_some(transfers.latency_us.p50);
-    let etas = owed.etas(p50_fetch_us);
+    let etas = owed.etas(p50_fetch_us, transfers.wall_us_per_fetch);
     EtaView {
         p50_fetch_us,
+        wall_us_per_fetch: transfers.wall_us_per_fetch,
         tiers: ["urgent", "pull", "lazy"]
             .into_iter()
             .map(|tier| {
