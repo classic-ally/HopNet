@@ -60,13 +60,16 @@ pub struct ApplyCtx<'a> {
     pub height: u64,
 }
 
+/// Storage infrastructure codes (contention, disk full, unopenable file,
+/// I/O) become `StorageError::Transient` so the host keeps them out of
+/// consensus verdicts; everything else is a real I/O-shaped failure.
 pub(crate) fn db_err(what: &'static str) -> impl Fn(rusqlite::Error) -> StorageError {
     move |e| {
         tracing::error!("apply: failed to {what}: {e:?}");
         match e.sqlite_error_code() {
-            Some(
-                code @ (rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked),
-            ) => StorageError::Transient(code),
+            Some(code) if hopnet_common::db_impl::sqlite_code_is_infrastructure(code) => {
+                StorageError::Transient(code)
+            }
             _ => StorageError::Io(std::io::Error::other(format!("{what}: {e}"))),
         }
     }

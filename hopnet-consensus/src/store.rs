@@ -82,16 +82,15 @@ impl From<rusqlite::Error> for StoreError {
 }
 
 impl StoreError {
-    /// Retryable node-local lock contention (SQLITE_BUSY / SQLITE_LOCKED) —
-    /// never a verdict on durability. Same classification shape as
-    /// `DatabaseError::classified` in hopnet-projection; duplicated rather
-    /// than imported because this crate has no dependency edge to it.
+    /// Retryable node-local storage infrastructure failure (lock contention,
+    /// disk full, unopenable file, I/O) — never a verdict on durability. The
+    /// code set is shared with `DatabaseError::classified` through
+    /// `hopnet_common::db_impl::sqlite_error_is_infrastructure`. A
+    /// persistent condition (a disk that stays full) still goes fatal: the
+    /// durability effects retry under a bounded budget and then abort.
     pub fn is_transient(&self) -> bool {
         match self {
-            StoreError::Db(e) => matches!(
-                e.sqlite_error_code(),
-                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
-            ),
+            StoreError::Db(e) => hopnet_common::db_impl::sqlite_error_is_infrastructure(e),
             StoreError::ApplyTransient(_) => true,
             StoreError::Codec(_) | StoreError::Apply(_) => false,
         }
@@ -745,12 +744,19 @@ mod tests {
     // predicate is the boundary. The 2026-08-17 wedge was a BUSY crossing it.
     // Should: classify lock contention (BUSY, BUSY_SNAPSHOT, LOCKED) as
     // transient.
+    // Should: classify a full disk, an unopenable database file and an I/O
+    // error as transient too — storage availability, not a verdict (the
+    // 2026-10-02 full-disk node nil-voted and rejected synced values on
+    // exactly these codes).
     #[test]
     fn lock_contention_is_transient() {
         for code in [
             rusqlite::ffi::SQLITE_BUSY,
             rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
             rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_CANTOPEN,
+            rusqlite::ffi::SQLITE_IOERR,
         ] {
             let e = StoreError::Db(sqlite_failure(code));
             assert!(e.is_transient(), "{code} must classify as transient");
@@ -758,15 +764,15 @@ mod tests {
     }
 
     // Impact: the classification must not swallow real durability failures —
-    // corruption or I/O errors during validation must still stop the node
-    // loudly rather than degrade into an Undetermined vote.
-    // Should: keep corruption, I/O, constraint, non-SQLite, codec, and apply
-    // errors non-transient.
+    // corruption or constraint violations during validation must still stop
+    // the node loudly rather than degrade into an Undetermined vote.
+    // Should: keep corruption, constraint, not-a-database, non-SQLite,
+    // codec, and apply errors non-transient.
     #[test]
     fn durability_failures_are_not_transient() {
         for code in [
             rusqlite::ffi::SQLITE_CORRUPT,
-            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_NOTADB,
             rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE,
         ] {
             let e = StoreError::Db(sqlite_failure(code));

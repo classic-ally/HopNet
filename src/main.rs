@@ -830,7 +830,11 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             if app_state.node_id.get().is_some()
                 && let Err(e) = consensus::malachite::engine::spawn_engine(&app_state)
             {
-                tracing::error!("failed to start consensus engine: {e}");
+                // A node without its engine must not keep serving as if it
+                // were healthy — leave with the restart code so supervision
+                // re-execs it (the 2026-08-17 zombie shape, at boot).
+                tracing::error!("failed to start consensus engine — restarting: {e}");
+                std::process::exit(EXIT_CODE_RESTART);
             }
 
             // Host capabilities (RFC-016): one seam bundle handed to every

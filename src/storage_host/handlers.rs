@@ -198,12 +198,8 @@ impl TransactionHandler for UpdatePlacementHeightsHandler {
                     .into_iter()
                     .map(|u| (u.blob_id, u.placement_height))
                     .collect();
-                hopnet_storage::store::apply_placement_commit(db_tx, &crate_updates).map_err(
-                    |e| {
-                        tracing::error!("apply_placement_commit failed: {e}");
-                        DatabaseError::ProcessingError
-                    },
-                )?;
+                hopnet_storage::store::apply_placement_commit(db_tx, &crate_updates)
+                    .map_err(storage_err("apply_placement_commit"))?;
                 Ok(())
             }
             Err(_) => Err(DatabaseError::InvalidPayload),
