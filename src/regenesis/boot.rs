@@ -927,7 +927,10 @@ fn staged_join_transition(
     // Post-swap, pre-engine: the fragment store survived untouched but
     // the inventory it is measured against was just replaced. Log-only —
     // a reconcile failure must never strand a node that just rejoined.
-    match rusqlite::Connection::open(db_path) {
+    match rusqlite::Connection::open(db_path).and_then(|fresh| {
+        crate::db::shared::apply_connection_pragmas(&fresh)?;
+        Ok(fresh)
+    }) {
         Ok(fresh) => {
             let fragments_dir =
                 hopnet_storage::fragstore::get_fragments_dir().unwrap_or_else(|_| String::new());
@@ -1152,6 +1155,7 @@ fn install_epoch_genesis(
 /// state-C recovery where the genesis record is not in hand).
 fn read_epoch_of(db_path: &str) -> Result<u64, String> {
     let conn = rusqlite::Connection::open(db_path).map_err(|e| format!("open: {e}"))?;
+    crate::db::shared::apply_connection_pragmas(&conn).map_err(|e| format!("pragmas: {e}"))?;
     Ok(genesis::current_epoch(&conn))
 }
 

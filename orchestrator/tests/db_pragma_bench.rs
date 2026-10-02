@@ -23,6 +23,7 @@ struct DbStatsClient {
     cache_size_raw: i64,
     cache_bytes: i64,
     mmap_size: i64,
+    journal_size_limit: i64,
     temp_store: String,
     busy_timeout_ms: i64,
     counters: CounterSnapshot,
