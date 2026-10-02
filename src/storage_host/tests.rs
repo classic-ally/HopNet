@@ -678,6 +678,67 @@ mod lifecycle_handlers {
             "expected Transient, got {result:?}"
         );
     }
+
+    // Impact: the host fails the WHOLE block on any handler error, so a
+    // self-check that collided with an earlier one (same hash already
+    // inventoried) used to drop the transaction as Permanent and, on
+    // validation, nil-vote the block carrying it.
+    // Should: process the same self-check payload twice against one
+    // transaction, returning Ok both times and leaving one inventory row.
+    // Should not: surface ProcessingError for a duplicate assertion.
+    #[test]
+    fn self_check_handler_applies_the_same_report_twice() {
+        let hash = hopnet_storage::Blake3Hash::from_bytes([11u8; 32]);
+        let payload = encode(&hopnet_storage::SelfCheckFragments {
+            node_id: 1,
+            self_verified_height: 5,
+            previous_count: 0,
+            fragments_added: vec![hash],
+            fragments_removed: Vec::new(),
+        });
+        let pool = super::setup_test_db();
+        let meta = TxMeta {
+            function: hopnet_storage::engine::policy::SELF_CHECK_FN,
+            payload: &payload,
+            submitter_node: 1,
+            user_id: None,
+        };
+        let notifier = NullNotifier;
+        let scheduler = NullScheduler;
+        let ctx = HandlerCtx {
+            fragments_dir: "",
+            node_id: Some(1),
+            height: 5,
+            notifier: &notifier,
+            work: &scheduler,
+        };
+        let mut conn = pool.get().unwrap();
+        // fragment_inventory.node_id references nodes: seed the attesting node.
+        super::insert_dummy_user(&conn, 1);
+        let node_key = ed25519_dalek::SigningKey::from_bytes(&[101u8; 32]);
+        let node_pubkey = crate::db::PubKey(node_key.verifying_key());
+        conn.execute(
+            "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (1, 'n1', 1, ?)",
+            rusqlite::params![&node_pubkey],
+        )
+        .unwrap();
+        let db_tx = conn.transaction().unwrap();
+        let handler = crate::storage_host::handlers::SelfCheckFragmentsHandler;
+        handler
+            .process(&meta, true, &ctx, &db_tx)
+            .expect("first apply");
+        handler
+            .process(&meta, true, &ctx, &db_tx)
+            .expect("second apply of the same report");
+        let rows: i64 = db_tx
+            .query_row(
+                "SELECT COUNT(*) FROM fragment_inventory WHERE node_id = 1 AND fragment_hash = ?",
+                [hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
 }
 
 // Impact: the prompt surplus release deletes without disk pressure, so its

@@ -874,11 +874,11 @@ pub async fn epoch_join_bootstrap_with(
 /// - a fragment on disk that the new inventory does not back at all is
 ///   an orphan and is deleted.
 ///
-/// Direct SQL, deliberately NOT the attestation path: `apply_self_check`
-/// guards on an exact previous count, which is right for a live
-/// attestation and wrong for a wholesale post-import reconciliation.
-/// `self_verified_height` is left NULL — the existing self-check cron
-/// re-attests over time, at its own pace.
+/// Direct SQL, deliberately NOT the attestation path: a self-check rides a
+/// consensus round, and at boot there is no engine yet to carry a
+/// wholesale post-import reconciliation. `self_verified_height` is left
+/// NULL — the existing self-check cron re-attests over time, at its own
+/// pace.
 ///
 /// Runs at boot before the engine starts, so the zero grace period on
 /// the orphan scan is safe: there are no in-flight stores to race. The

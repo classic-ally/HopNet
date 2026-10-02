@@ -42,6 +42,29 @@ pub fn compute_inventory_differential(
     }
 }
 
+/// Blob-scoped belief for the prompt path after a pull: this node's held
+/// classes of `blob_id` with no inventory row yet (the pulled, rebuilt and
+/// origin classes). One indexed query under a consistent snapshot; the
+/// whole-node differential above stays the sweep's.
+pub fn compute_blob_inventory_differential(
+    db_connection: Result<PooledConnection<SqliteConnectionManager>, r2d2::Error>,
+    node_id: i32,
+    blob_id: &hopnet_storage::BlobId,
+) -> Result<SelfCheckFragments, DatabaseError> {
+    let mut conn = db_connection.map_err(|_| DatabaseError::LockError)?;
+    let tx = conn.transaction().map_err(|_| DatabaseError::LockError)?;
+    let self_verified_height = crate::db::consensus::get_current_consensus_height(&tx)?;
+    let report = hopnet_storage::store::compute_blob_inventory_differential(
+        &tx,
+        node_id,
+        blob_id,
+        self_verified_height,
+    )
+    .map_err(|_| DatabaseError::RecallError)?;
+    drop(tx);
+    Ok(report)
+}
+
 /// Batch query fragment inventory to find nodes that claim to have specific fragments
 /// Returns a map from fragment hash to list of nodes, ordered by verification recency
 /// Optimized for minimal database round-trips when looking up many fragments at once

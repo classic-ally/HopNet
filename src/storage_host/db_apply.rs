@@ -16,9 +16,9 @@ pub fn apply_self_check_updates(
     db_tx: &rusqlite::Transaction,
     report: &SelfCheckFragments,
 ) -> Result<(), DatabaseError> {
-    // Substrate-owned apply (RFC-014): count verification + remove /
-    // re-height / add, in-crate.
-    hopnet_storage::store::apply_self_check(
+    // Substrate-owned apply (RFC-014): idempotent remove-then-assert,
+    // in-crate. The counters it returns are observability only.
+    let applied = hopnet_storage::store::apply_self_check(
         db_tx,
         report.node_id,
         report.previous_count,
@@ -37,7 +37,16 @@ pub fn apply_self_check_updates(
             );
             DatabaseError::ProcessingError
         }
-    })
+    })?;
+    if applied.kept > 0 {
+        tracing::debug!(
+            node = report.node_id,
+            kept = applied.kept,
+            removed = applied.removed,
+            "self-check: stale removals skipped (rows re-verified since the report was built)"
+        );
+    }
+    Ok(())
 }
 
 /// Delete orphaned data blocks and their associated fragment_hashes records

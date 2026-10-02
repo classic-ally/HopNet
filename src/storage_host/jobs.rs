@@ -537,8 +537,8 @@ pub async fn run_disk_truth_sweep(
     //      differential and the attestation on purpose: the self-check
     //      below carries the removals to consensus in this same pass, and
     //      the attestation never stamps a file this pass deleted — no
-    //      stale attested row, no exact-count rejection window. A failure
-    //      here must not cost the sweep its belief and truth steps.
+    //      stale attested row. A failure here must not cost the sweep its
+    //      belief and truth steps.
     let mut surplus_released = 0usize;
     let mut surplus_bytes_freed = 0u64;
     let release_input = hopnet_storage::sweep::release_listing(

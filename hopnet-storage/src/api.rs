@@ -517,6 +517,12 @@ impl StateReader for NullNet {
     fn self_check_report(&self) -> Result<crate::types::SelfCheckFragments, StorageError> {
         Err(StorageError::Host("null state reader".into()))
     }
+    fn blob_self_check_report(
+        &self,
+        _blob_id: &BlobId,
+    ) -> Result<crate::types::SelfCheckFragments, StorageError> {
+        Err(StorageError::Host("null state reader".into()))
+    }
     fn confirm_ready(&self, _blob_id: &BlobId) -> Result<Option<u64>, StorageError> {
         Ok(None)
     }
@@ -1229,6 +1235,12 @@ mod tests {
             Ok(None)
         }
         fn self_check_report(&self) -> Result<crate::types::SelfCheckFragments, StorageError> {
+            Err(StorageError::Host("not used".into()))
+        }
+        fn blob_self_check_report(
+            &self,
+            _blob_id: &BlobId,
+        ) -> Result<crate::types::SelfCheckFragments, StorageError> {
             Err(StorageError::Host("not used".into()))
         }
         fn confirm_ready(&self, _blob_id: &BlobId) -> Result<Option<u64>, StorageError> {
