@@ -445,12 +445,13 @@ pub async fn run_disk_truth_sweep(
 
     // (1) The walk (blocking IO off the async thread) and the table.
     let dir = fragments_dir.clone();
-    let listing = tokio::task::spawn_blocking(move || {
-        hopnet_storage::fragstore::scan_fragments_detailed(&dir)
+    let walk = tokio::task::spawn_blocking(move || {
+        hopnet_storage::fragstore::scan_fragments_with_temps(&dir)
     })
     .await
     .map_err(|e| Error::Failed(Arc::new(format!("sweep join: {e}").into())))?
     .map_err(|e| Error::Failed(Arc::new(format!("sweep walk: {e}").into())))?;
+    let listing = walk.fragments;
     let rows = {
         let conn = app_state
             .db_pool
@@ -481,7 +482,19 @@ pub async fn run_disk_truth_sweep(
         host.mark_remote_batch(diff.flagged_missing.clone()).await;
     }
 
-    // (2) Orphans past grace.
+    // (2) Orphans past grace — and the temp files of interrupted stores,
+    //     which have no row to be judged by and were never reaped before.
+    let mut temps_deleted = 0usize;
+    for path in hopnet_storage::sweep::stale_temps(
+        &walk.temps,
+        now_unix.saturating_sub(orphan_grace_secs),
+    ) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => temps_deleted += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => temps_deleted += 1,
+            Err(e) => tracing::warn!("sweep: delete temp file {} failed: {e}", path.display()),
+        }
+    }
     let mut orphans_deleted = 0usize;
     let mut orphan_bytes_freed = 0u64;
     for (hash, size) in &diff.orphans {
@@ -632,16 +645,18 @@ pub async fn run_disk_truth_sweep(
         attested_pages,
         surplus_released,
         surplus_bytes_freed,
+        temps_deleted,
     };
     tracing::info!(
-        "sweep: {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} corrupt deleted, {} surplus released",
+        "sweep: {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} corrupt deleted, {} surplus released, {} temp files deleted",
         report.files_on_disk,
         report.present,
         report.reflagged,
         report.unflagged,
         report.orphans_deleted,
         report.corrupt_deleted,
-        report.surplus_released
+        report.surplus_released,
+        report.temps_deleted
     );
     *app_state.last_sweep.lock().unwrap() = Some(report.clone());
     Ok(report)
