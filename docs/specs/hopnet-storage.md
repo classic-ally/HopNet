@@ -116,7 +116,7 @@ ciphers, or wrap formats — they express access as sets of X25519 pubkeys.
 | `placement_commit` | `Vec<(blob_id, placement_height)>` | **batched**: one tx per settling window, never per blob |
 | `blob_access_add` / `remove` | wrap rows | sharing = add_recipients; rides the projection's share tx |
 | `delete_orphaned` | blob ids | mark-and-sweep via the `DataBlockReferenceProvider` seam (v1 ownership model; attach/release refcounts later) |
-| `self_check_fragments` | fragment attestations | inventory/attestation family (existing; substrate-owned) |
+| `self_check_fragments` | fragment belief (added / removed hashes) | inventory family (substrate-owned). Apply is idempotent: additions upsert, removals are a per-row CAS on the replicated `verified_height` (never on node-local `self_verified_height`); `previous_count` is informational. The sweep sends the whole-node differential, the pull path a blob-scoped one (`compute_blob_inventory_differential`) |
 | mesh key grant | wrapped mesh privkey for a new member | rides `insert_user` |
 
 Substrate state tables are replicated through the ordinary

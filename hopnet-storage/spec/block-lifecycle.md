@@ -1139,6 +1139,27 @@ optimization and carries no proof obligation.
     file deleted earlier in the same sweep as corrupt (5,525 false
     positives; S5 scrub bullet). 2026.10.2 carries the fixes; the
     drain's convergence on the pane is still the acceptance test.
+  - 2026-10-02, 24 h into 2026.10.4: 0 of 68,689 blobs confirmed and
+    49 GB at fault tolerance 0. Diagnosis on the live nodes: one
+    validator filled its disk and, with `DiskFull`/`CannotOpen`
+    classified as semantic verdicts, went silent (consensus-bugs.md
+    16); the self-check apply's exact-count guard and plain INSERT
+    dropped 201 belief txs a day (17); the per-pull whole-node
+    differential bounded pull throughput; the tick's GROUP_CONCAT scan
+    ran past 15 min on a 5-min cron; SQLite ran on a 2 MB page cache.
+    Fixed on `worktree-mesh-stall-fixes` (unreleased): infrastructure
+    codes are Undetermined/restaged everywhere; the apply is an
+    idempotent upsert with a removal CAS on `verified_height`; the pull
+    submits a blob-scoped belief (S3 record stands, the report is
+    narrower); the scan is two indexed passes on the blocking pool with
+    its wall time in the tick report; storage step 0004 indexes held
+    fragments (section format 4, covered set unchanged); connections
+    default to a 256 MiB cache and 1 GiB WAL limit; the sweep reaps
+    `.tmp.` leftovers; the ETA uses the sustained drain rate. Left for
+    design: a free-space floor on pulls (the admission floor covers
+    ingest only), the 1024-height recency window against a 30–90 min
+    sweep cadence, unseating a validator that stops voting, and paging
+    the sweep's walk.
   - Rehearsal (2026-09-27): `orchestrator test --test
     lifecycle-cutover-drain --flags blobs=N` — a mesh born on the
     deployed release image, populated, crosses into the build under

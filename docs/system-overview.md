@@ -573,6 +573,23 @@ apply functions inside consensus handlers.
       attestation, transient-safe applies, fatal effects with a retried
       decide, hash-mismatch-only scrub, boot attestation after the first
       provider poll); the drain's convergence remains the acceptance test.
+      2026-10-02, 24 h into 2026.10.4: 0 of 68,689 blobs confirmed. The
+      macbook filled its disk and, with DiskFull/CannotOpen classified as
+      semantic verdicts, nil-voted and rejected synced values for 13 hours;
+      `apply_self_check`'s exact-count guard and plain INSERT dropped 201
+      self-check txs a day; the per-pull whole-node differential and the
+      tick's full GROUP_CONCAT scan (>15 min on a 5-min cron) bounded
+      pulls and delayed fulfillment. Fixed on `worktree-mesh-stall-fixes`
+      (unreleased): infrastructure codes are Undetermined/restaged
+      everywhere (consensus-bugs.md 16), the self-check apply is an
+      idempotent upsert + CAS on `verified_height` and the pull's prompt
+      belief is blob-scoped (17), the tick scan is two indexed passes on
+      the blocking pool (storage step 0004), SQLite defaults to a 256 MiB
+      cache and a 1 GiB WAL limit, temp fragments are reaped, the ETA uses
+      the sustained drain rate, 507s log at debug, the ingress daemon backs
+      off while parked. Still open for design: a free-space floor on pulls,
+      the 1024-height recency window vs sweep cadence, unseating a
+      validator that stops voting, a paged sweep.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage
