@@ -240,14 +240,18 @@ pub async fn propose_ready_confirmations(
     let mut proposed = 0usize;
     for round in 0..CONFIRM_ROUNDS_PER_TICK {
         let (ready, sampled) = {
-            let conn = app_state
-                .db_pool
-                .get()
-                .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-            let tip = crate::db::consensus::get_current_consensus_height(&conn)
-                .map_err(|e| Error::Failed(Arc::new(format!("height: {e:?}").into())))?;
-            hopnet_storage::lifecycle::ready_confirmations(&conn, sample_n, tip)
-                .map_err(|e| Error::Failed(Arc::new(format!("fulfillment read: {e}").into())))?
+            // One evidence probe per sampled blob — blocking-pool work.
+            let pool = app_state.db_pool.clone();
+            tokio::task::spawn_blocking(move || {
+                let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+                let tip = crate::db::consensus::get_current_consensus_height(&conn)
+                    .map_err(|e| format!("height: {e:?}"))?;
+                hopnet_storage::lifecycle::ready_confirmations(&conn, sample_n, tip)
+                    .map_err(|e| format!("fulfillment read: {e}"))
+            })
+            .await
+            .map_err(|e| Error::Failed(Arc::new(format!("fulfillment join: {e}").into())))?
+            .map_err(|e| Error::Failed(Arc::new(e.into())))?
         };
         let count = ready.len();
         let next = next_fulfillment_sample(sample_n, sampled, count);
@@ -280,15 +284,19 @@ pub async fn propose_ready_confirmations(
 /// pulls (and attests, and proposes for births and moved bytes) on its own
 /// time; the tick never waits on a consensus round it did not submit.
 /// Level-triggered: any blob a hint missed is found here next tick.
-fn kick_in_flight(app_state: &AppState, limit: usize) -> Result<usize, Error> {
-    // Scoped checkout, dropped before the engine is touched.
+async fn kick_in_flight(app_state: &AppState, limit: usize) -> Result<usize, Error> {
+    // Scoped checkout on the blocking pool, dropped before the engine is
+    // touched.
     let blob_ids = {
-        let conn = app_state
-            .db_pool
-            .get()
-            .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-        hopnet_storage::lifecycle::in_flight_blobs(&conn, limit)
-            .map_err(|e| Error::Failed(Arc::new(format!("in-flight page: {e}").into())))?
+        let pool = app_state.db_pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+            hopnet_storage::lifecycle::in_flight_blobs(&conn, limit)
+                .map_err(|e| format!("in-flight page: {e}"))
+        })
+        .await
+        .map_err(|e| Error::Failed(Arc::new(format!("in-flight join: {e}").into())))?
+        .map_err(|e| Error::Failed(Arc::new(e.into())))?
     };
     let Some(storage) = app_state.storage.get() else {
         return Err(Error::Failed(Arc::new(
@@ -1019,6 +1027,9 @@ pub struct PolicyTickReport {
     pub confirms_proposed: usize,
     pub grace_declared: usize,
     pub eviction: serde_json::Value,
+    /// Wall time of the repair scan (plus its goal lookups), so a tick that
+    /// overruns its 5-minute cron is visible without a profiler.
+    pub scan_ms: u64,
 }
 
 /// The engine policy tick (RFC-STORAGE-001 Repair; RFC-STORAGE-002 S6):
@@ -1091,41 +1102,65 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
     // holder is merely asleep inside its tier); below the watermark the
     // deputy rule has the lowest live class's responsible cover a down
     // responsible. Urgent items preempt pulls; one lazy pick per tick.
+    // Every DB read in this tick runs on the blocking pool: the scan below
+    // walks the whole fragment table, and the tick shares its runtime with
+    // the consensus host and the HTTP surface.
     let settings = {
-        let conn = app_state
-            .db_pool
-            .get()
-            .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-        crate::db::shared::read_storage_node_settings(&conn)
-            .map_err(|e| Error::Failed(Arc::new(format!("settings: {e:?}").into())))?
+        let pool = app_state.db_pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+            crate::db::shared::read_storage_node_settings(&conn)
+                .map_err(|e| format!("settings: {e:?}"))
+        })
+        .await
+        .map_err(|e| Error::Failed(Arc::new(format!("settings join: {e}").into())))?
+        .map_err(|e| Error::Failed(Arc::new(e.into())))?
     };
     let mut urgent_enqueued = 0usize;
     let mut lazy_enqueued = 0usize;
     let mut lazy_owed = 0usize;
+    let mut scan_ms = 0u64;
     if settings.reencode_enabled {
         let online: std::collections::HashSet<i32> = view.online.iter().copied().collect();
         let members: std::collections::HashSet<i32> = member_ids.iter().copied().collect();
-        let (candidates, goals) = {
-            let conn = app_state
-                .db_pool
-                .get()
-                .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-            let candidates =
-                crate::db::inventory::find_chunks_with_missing_classes(&conn, &online, &members)
-                    .map_err(|e| Error::Failed(Arc::new(format!("repair scan: {e:?}").into())))?;
-            // Goal assignments, memoized per blob (many chunks share one).
-            let mut goals: std::collections::HashMap<hopnet_storage::BlobId, Option<Vec<i32>>> =
-                Default::default();
-            for cand in &candidates {
-                if !goals.contains_key(&cand.blob_id) {
-                    let assignment = hopnet_storage::lifecycle::pull_target(&conn, &cand.blob_id)
-                        .map_err(|e| Error::Failed(Arc::new(format!("pull target: {e}").into())))?
-                        .map(|t| t.assignment);
-                    goals.insert(cand.blob_id.clone(), assignment);
+        let (candidates, goals, elapsed) = {
+            let pool = app_state.db_pool.clone();
+            let (online, members) = (online.clone(), members.clone());
+            tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+                let candidates = crate::db::inventory::find_chunks_with_missing_classes(
+                    &conn, &online, &members,
+                )
+                .map_err(|e| format!("repair scan: {e:?}"))?;
+                // Goal assignments, memoized per blob (many chunks share one).
+                let mut goals: std::collections::HashMap<
+                    hopnet_storage::BlobId,
+                    Option<Vec<i32>>,
+                > = Default::default();
+                for cand in &candidates {
+                    if !goals.contains_key(&cand.blob_id) {
+                        let assignment =
+                            hopnet_storage::lifecycle::pull_target(&conn, &cand.blob_id)
+                                .map_err(|e| format!("pull target: {e}"))?
+                                .map(|t| t.assignment);
+                        goals.insert(cand.blob_id.clone(), assignment);
+                    }
                 }
-            }
-            (candidates, goals)
+                Ok::<_, String>((candidates, goals, started.elapsed()))
+            })
+            .await
+            .map_err(|e| Error::Failed(Arc::new(format!("repair scan join: {e}").into())))?
+            .map_err(|e| Error::Failed(Arc::new(e.into())))?
         };
+        scan_ms = elapsed.as_millis() as u64;
+        if elapsed > std::time::Duration::from_secs(60) {
+            tracing::warn!(
+                scan_ms,
+                candidates = candidates.len(),
+                "policy tick: repair scan is slow"
+            );
+        }
         if let Some(engine) = app_state.storage.get() {
             let up: std::collections::BTreeSet<i32> = online.iter().copied().collect();
             let mut lazy_pick: Option<ReencodeCmd> = None;
@@ -1229,6 +1264,7 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
         app_state,
         hopnet_storage::engine::policy::PULL_KICKS_PER_TICK,
     )
+    .await
     .unwrap_or_else(|e| {
         tracing::warn!("in-flight re-kick failed: {e}");
         0
@@ -1252,6 +1288,7 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
         confirms_proposed,
         grace_declared,
         eviction,
+        scan_ms,
     };
     *app_state.last_tick.lock().unwrap() = Some(report.clone());
     Ok(report)

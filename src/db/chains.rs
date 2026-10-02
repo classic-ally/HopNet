@@ -959,6 +959,32 @@ mod tests {
     const STEP_FIXTURE_STORAGE_0003_HASH: &str =
         "bd97c09ecda981e83097518932b770706a4ac18c3a9396de27ccb4c447f6245e";
 
+    // Should: add the partial held-fragment index over an existing table
+    // without touching its rows.
+    // Impact: the sweep's whole-node differential and the tick's repair
+    // scan get an index; the step is pure DDL and must replay identically.
+    #[test]
+    fn step_fixture_storage_0004_scan_indexes() {
+        let hash = run_step_fixture(
+            "storage",
+            4,
+            "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes, file_size)
+             VALUES ('01890a5d-ac96-774b-b9aa-9f8b24f0c9a1', X'00', 1, 0, 1);
+             INSERT INTO fragment_hashes (data_block_id, chunk_number, local_index,
+                 fragment_id, fragment_hash, chunk_type, stored_locally)
+             VALUES ('01890a5d-ac96-774b-b9aa-9f8b24f0c9a1', 0, 0, 'f', X'F1', 0, 1);",
+        );
+        assert_eq!(
+            hash, STEP_FIXTURE_STORAGE_0004_HASH,
+            "storage/0004 output moved — a released step may never change \
+             (contract rules 1-2); if this is an intentional pre-release \
+             redefinition, re-pin in the same commit"
+        );
+    }
+
+    const STEP_FIXTURE_STORAGE_0004_HASH: &str =
+        "5e27cb2c3b7cf731a98b443cb3ecc9b4fb24753fff9d494e6934201e7cc46343";
+
     // Should: land the documented backfill values, not just a stable hash.
     #[test]
     fn storage_0002_backfill_values() {

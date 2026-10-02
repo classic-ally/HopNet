@@ -175,45 +175,75 @@ pub struct RepairCandidate {
 /// the availability view, never raw inventory rows — departed nodes' rows
 /// linger forever (pruning deferred).
 ///
-/// Full-scan aggregation (fragment_hashes LEFT JOIN fragment_inventory);
-/// fine at current mesh scale, revisit with an index if the tick shows up
-/// in db-stats.
+/// Two passes, both indexed. First, the chunks that have at least one
+/// class with no non-suspect ONLINE holder — one walk of `fragment_hashes`
+/// with a primary-key probe per row, emitting only the chunks that need
+/// classifying (a handful, not every chunk-class in the mesh). Then, for
+/// those chunks only, every class's raw holders. The previous shape — a
+/// GROUP_CONCAT over the full join, filtered in Rust — returned 2.1M rows
+/// and ran past 15 minutes on a 5-minute cron (2026-10-02).
 pub fn find_chunks_with_missing_classes(
     conn: &rusqlite::Connection,
     online_nodes: &std::collections::HashSet<i32>,
     member_nodes: &std::collections::HashSet<i32>,
 ) -> Result<Vec<RepairCandidate>, DatabaseError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT fh.data_block_id, fh.chunk_number, fh.local_index,
-                    COALESCE(GROUP_CONCAT(fi.node_id), '')
-             FROM fragment_hashes fh
-             LEFT JOIN fragment_inventory fi
-               ON fi.fragment_hash = fh.fragment_hash AND fi.suspect = 0
-             GROUP BY fh.data_block_id, fh.chunk_number, fh.local_index",
-        )
+    // The online set is bound inline; `IN (NULL)` matches nothing, so with
+    // no one online every class is missing — which is the truth.
+    let mut online_sorted: Vec<i32> = online_nodes.iter().copied().collect();
+    online_sorted.sort_unstable();
+    let placeholders = if online_sorted.is_empty() {
+        "NULL".to_string()
+    } else {
+        vec!["?"; online_sorted.len()].join(",")
+    };
+    let chunk_sql = format!(
+        "SELECT DISTINCT fh.data_block_id, fh.chunk_number
+         FROM fragment_hashes fh
+         WHERE NOT EXISTS (SELECT 1 FROM fragment_inventory o
+                           WHERE o.fragment_hash = fh.fragment_hash
+                             AND o.suspect = 0
+                             AND o.node_id IN ({placeholders}))
+         ORDER BY fh.data_block_id, fh.chunk_number"
+    );
+    let mut chunk_stmt = conn
+        .prepare(&chunk_sql)
         .map_err(|_| DatabaseError::RecallError)?;
-    let rows: Vec<(String, u32, u32, String)> = stmt
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    let chunk_keys: Vec<(String, u32)> = chunk_stmt
+        .query_map(rusqlite::params_from_iter(online_sorted.iter()), |row| {
+            Ok((row.get(0)?, row.get(1)?))
         })
         .map_err(|_| DatabaseError::RecallError)?
         .collect::<Result<_, _>>()
         .map_err(|_| DatabaseError::ProcessingError)?;
 
-    use std::collections::BTreeMap;
-    type MissingByChunk = BTreeMap<(String, u32), Vec<(u32, Vec<i32>)>>;
-    let mut chunks: MissingByChunk = BTreeMap::new();
-    for (blob, chunk, class, holders) in rows {
-        let holder_ids: Vec<i32> = holders.split(',').filter_map(|s| s.parse().ok()).collect();
-        chunks
-            .entry((blob, chunk))
-            .or_default()
-            .push((class, holder_ids));
-    }
+    let mut classes_stmt = conn
+        .prepare_cached(
+            "SELECT fh.local_index, COALESCE(GROUP_CONCAT(fi.node_id), '')
+             FROM fragment_hashes fh
+             LEFT JOIN fragment_inventory fi
+               ON fi.fragment_hash = fh.fragment_hash AND fi.suspect = 0
+             WHERE fh.data_block_id = ? AND fh.chunk_number = ?
+             GROUP BY fh.local_index",
+        )
+        .map_err(|_| DatabaseError::RecallError)?;
 
     let mut candidates = Vec::new();
-    for ((blob, chunk_number), mut classes) in chunks {
+    for (blob, chunk_number) in chunk_keys {
+        let rows: Vec<(u32, String)> = classes_stmt
+            .query_map(rusqlite::params![&blob, chunk_number], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|_| DatabaseError::RecallError)?
+            .collect::<Result<_, _>>()
+            .map_err(|_| DatabaseError::ProcessingError)?;
+        let mut classes: Vec<(u32, Vec<i32>)> = rows
+            .into_iter()
+            .map(|(class, holders)| {
+                let holder_ids: Vec<i32> =
+                    holders.split(',').filter_map(|s| s.parse().ok()).collect();
+                (class, holder_ids)
+            })
+            .collect();
         let mut live = 0usize;
         let mut missing = Vec::new();
         for (class, holders) in &classes {
@@ -335,5 +365,85 @@ mod tests {
             c.classes,
             vec![(0, vec![1]), (1, vec![2]), (2, vec![3]), (3, vec![])]
         );
+    }
+
+    // Impact: the scan used to return every chunk-class row in the mesh
+    // (2.1M) and filter in Rust, running past 15 minutes on a 5-minute
+    // cron; it must emit only what needs repair and treat a suspect row as
+    // no holder at all.
+    // Should: return only the chunks with at least one class lacking a
+    // non-suspect online holder, with live_classes and classes intact.
+    // Should not: return a chunk whose every class has an online holder,
+    // nor count a suspect row as live.
+    #[test]
+    fn repair_scan_returns_only_chunks_with_a_missing_class() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
+            .build(manager)
+            .unwrap();
+        crate::db::chains::install(&pool.get().unwrap()).unwrap();
+        let conn = pool.get().unwrap();
+
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let pubkey = crate::db::PubKey(key.verifying_key());
+        conn.execute(
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+             VALUES (1, 'u', ?, ?, ?, ?)",
+            params![&pubkey, &vec![0u8; 32], &vec![0u8; 44], &vec![0u8; 16]],
+        )
+        .unwrap();
+        for n in 1..=2 {
+            let node_key = ed25519_dalek::SigningKey::from_bytes(&[100 + n as u8; 32]);
+            let node_pubkey = crate::db::PubKey(node_key.verifying_key());
+            conn.execute(
+                "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, 1, ?)",
+                params![n, format!("n{n}"), &node_pubkey],
+            )
+            .unwrap();
+        }
+        let blob = "01890a5d-ac96-774b-b9aa-9f8b24f0c9a1";
+        conn.execute(
+            "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes, file_size)
+             VALUES (?, X'00', 4, 0, 100)",
+            params![blob],
+        )
+        .unwrap();
+        // Chunk 0: both classes held by online node 1 → fully live.
+        // Chunk 1: class 0 held by node 1; class 1 held only as a SUSPECT
+        //          row by node 1 → missing (hopeless: no member holds it).
+        for (chunk, class, suspect) in [(0i64, 0i64, 0i64), (0, 1, 0), (1, 0, 0), (1, 1, 1)] {
+            let hash = vec![(chunk * 10 + class) as u8; 32];
+            conn.execute(
+                "INSERT INTO fragment_hashes (data_block_id, chunk_number, local_index,
+                 fragment_id, fragment_hash, chunk_type, stored_locally)
+                 VALUES (?, ?, ?, ?, ?, 0, 0)",
+                params![blob, chunk, class, format!("f{chunk}{class}"), &hash],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fragment_inventory (fragment_hash, node_id, self_verified_height, suspect)
+                 VALUES (?, 1, 1, ?)",
+                params![&hash, suspect],
+            )
+            .unwrap();
+        }
+
+        let online = std::collections::HashSet::from([1]);
+        let members = std::collections::HashSet::from([1, 2]);
+        let candidates = find_chunks_with_missing_classes(&conn, &online, &members).unwrap();
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        let c = &candidates[0];
+        assert_eq!(c.chunk_number, 1);
+        assert_eq!(c.live_classes, 1);
+        assert_eq!(c.missing, vec![(1, MissingHolderState::Hopeless)]);
+        assert_eq!(c.classes, vec![(0, vec![1]), (1, vec![])]);
+
+        // Nobody online: every class of every chunk is missing.
+        let nobody = std::collections::HashSet::new();
+        let all = find_chunks_with_missing_classes(&conn, &nobody, &members).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].live_classes, 0);
     }
 }

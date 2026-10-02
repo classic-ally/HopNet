@@ -89,7 +89,10 @@ pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionS
     // v3 (RFC-STORAGE-003 S5): fragment_inventory.verified_height /
     // provenance / suspect — the replicated disk-truth record (stamped by
     // attest_fragments); the legacy self_verified_height stays excluded.
-    format_version: 3,
+    // v4 (operational fixes 2026-10): storage step 0004 adds an index only;
+    // the covered set is unchanged, so a storage@3 artifact imports with
+    // this spec at ordinal 3 and fast-forwards (no frozen copy needed).
+    format_version: 4,
     tables: &[
         hopnet_common::TableSpec::exported("data_blocks"),
         hopnet_common::TableSpec::exported("storage_view_transitions"),
@@ -190,6 +193,11 @@ pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
             3,
             "disk_truth",
             include_str!("../migrations/storage/0003_disk_truth.sql"),
+        ),
+        hopnet_common::Step::sql(
+            4,
+            "scan_indexes",
+            include_str!("../migrations/storage/0004_scan_indexes.sql"),
         ),
     ],
 };

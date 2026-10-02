@@ -493,7 +493,7 @@ pub(crate) mod tests {
         assert_eq!(report.manifest.top_hash.to_hex(), EMPTY_TOP_HASH);
     }
 
-    const EMPTY_TOP_HASH: &str = "c24bc5aa4197b5db6446090740892c16da95b2aac34dc1068b132229e5a5722f";
+    const EMPTY_TOP_HASH: &str = "c2992bfe87d1b69c62687129dbd110f8c199425fcfc35976aa5d8884931e5d7f";
     const EMPTY_SECTION_HASHES: &[(&str, &str)] = &[
         (
             "identity",
@@ -512,7 +512,7 @@ pub(crate) mod tests {
             // the covered set and data_blocks gained a column. v3 (S5):
             // fragment_inventory gained the disk-truth columns.
             "storage",
-            "42446bf68a066064557ec7f93b2e15f259210bcd14b907a42050957d22b36a6f",
+            "efa15e42233987125239101d540df307f172da1ffb7611006ae0879d3307d69a",
         ),
         (
             "drive",
@@ -548,9 +548,9 @@ pub(crate) mod tests {
     }
 
     const SEEDED_TOP_HASH: &str =
-        "83d775e1a337cc76ba8f84176f0adf08443a32debf0b76b373df80bfff2508ef";
+        "c5543c40744c9148c0fce43759e6d886642e54cd9b0a406bf9b5088f5097e382";
     const SEEDED_ARTIFACT_HASH: &str =
-        "5583484c291194293f80d04f37306123aa208bc38d9bda1b5c7c24d77059a378";
+        "98ce4e21dac2933b59d0f11856418ba36b50d9f057c81e1d4d66444ad16663c4";
     // 5159 pre-split + 25: the "host" section header (16 bytes) became
     // identity (20) + telemetry (21) headers. Row bytes unchanged — the
     // delta being exactly the header arithmetic is the cheap proof the
