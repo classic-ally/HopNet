@@ -136,6 +136,10 @@ impl<F: ResourceFetcher> Scheduler<F> {
         // a time — the tick is gated on the previous task having finished).
         let publish_totals = Arc::new(Mutex::new(crate::publish::PublishReport::default()));
         let publish_state = Arc::new(Mutex::new(crate::publish::PublishState::default()));
+        // Consecutive passes that parked on an unreachable node: the tick
+        // backs off exponentially while it grows, resets on the first pass
+        // that did not park.
+        let parked_streak = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let mut publish_task: Option<tokio::task::JoinHandle<()>> = None;
 
         fn due(last: Option<std::time::Instant>, interval: std::time::Duration) -> bool {
@@ -187,7 +191,11 @@ impl<F: ResourceFetcher> Scheduler<F> {
             // stall event routing for the duration.
             if let Some(publisher) = &self.publisher {
                 let alive = publish_task.as_ref().is_some_and(|t| !t.is_finished());
-                if !alive && due(last_publish, self.shared.config.publish.interval) {
+                let publish_interval = parked_interval(
+                    self.shared.config.publish.interval,
+                    parked_streak.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                if !alive && due(last_publish, publish_interval) {
                     let skip = self.shared.inflight.lock().expect("inflight mutex").clone();
                     // All three work lists are claimed together so one pass
                     // covers uploads, tombstone propagation and edits under
@@ -273,6 +281,7 @@ impl<F: ResourceFetcher> Scheduler<F> {
                             let publisher = publisher.clone();
                             let totals = publish_totals.clone();
                             let state_slot = publish_state.clone();
+                            let streak = parked_streak.clone();
                             publish_task = Some(tokio::spawn(async move {
                                 let mut state =
                                     state_slot.lock().expect("publish state").clone();
@@ -292,6 +301,12 @@ impl<F: ResourceFetcher> Scheduler<F> {
                                 *state_slot.lock().expect("publish state") = state;
                                 match result {
                                     Ok(r) => {
+                                        use std::sync::atomic::Ordering;
+                                        if r.parked {
+                                            streak.fetch_add(1, Ordering::Relaxed);
+                                        } else {
+                                            streak.store(0, Ordering::Relaxed);
+                                        }
                                         totals.lock().expect("publish totals").absorb(&r)
                                     }
                                     Err(e) => {
@@ -395,7 +410,10 @@ impl<F: ResourceFetcher> Scheduler<F> {
             if self.publisher.is_some()
                 && let Some(wake) = publish_wake_in(
                     last_publish,
-                    self.shared.config.publish.interval,
+                    parked_interval(
+                        self.shared.config.publish.interval,
+                        parked_streak.load(std::sync::atomic::Ordering::Relaxed),
+                    ),
                     pass_alive,
                 )
             {
@@ -578,6 +596,19 @@ fn publish_wake_in(
     (!pass_alive).then(|| time_to(last_publish, interval))
 }
 
+/// The longest a parked publisher waits between passes.
+const PARKED_INTERVAL_CAP: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// The publish interval after `streak` consecutive parked passes: the
+/// configured interval doubled per parked pass, capped. A streak of zero
+/// is the configured interval itself.
+fn parked_interval(base: std::time::Duration, streak: u32) -> std::time::Duration {
+    let factor = 1u32.checked_shl(streak.min(31)).unwrap_or(u32::MAX);
+    base.checked_mul(factor)
+        .unwrap_or(PARKED_INTERVAL_CAP)
+        .min(PARKED_INTERVAL_CAP)
+}
+
 fn classification_photo_id(c: &crate::classify::Classification) -> Option<&PhotoId> {
     use crate::classify::Classification;
     use crate::resolve::SeedOutcome;
@@ -630,5 +661,21 @@ mod tests {
             Some(Duration::ZERO)
         );
         assert_eq!(publish_wake_in(None, interval, false), Some(Duration::ZERO));
+    }
+
+    // Impact: a parked publisher re-probed a node refusing admission every
+    // 15 seconds for 13 hours (2026-10-02); the retry cadence must widen
+    // while the node stays away and snap back when it answers.
+    // Should: return the configured interval at streak 0, double it per
+    // parked pass, and cap at fifteen minutes however long the streak.
+    #[test]
+    fn parked_passes_back_off_to_a_cap() {
+        let base = Duration::from_secs(15);
+        assert_eq!(parked_interval(base, 0), base);
+        assert_eq!(parked_interval(base, 1), Duration::from_secs(30));
+        assert_eq!(parked_interval(base, 4), Duration::from_secs(240));
+        assert_eq!(parked_interval(base, 6), PARKED_INTERVAL_CAP);
+        assert_eq!(parked_interval(base, 40), PARKED_INTERVAL_CAP);
+        assert_eq!(parked_interval(Duration::from_secs(3600), 3), PARKED_INTERVAL_CAP);
     }
 }
