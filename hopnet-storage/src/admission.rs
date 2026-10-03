@@ -321,7 +321,24 @@ pub type SpaceProbe = dyn Fn(&Path) -> std::io::Result<(u64, u64)> + Send + Sync
 
 fn statvfs_probe(path: &Path) -> std::io::Result<(u64, u64)> {
     let stats = fs4::statvfs(path)?;
-    Ok((stats.available_space(), stats.total_space()))
+    let ceiling = TEST_FREE_CEILING.load(Ordering::Relaxed);
+    let free = if ceiling == 0 {
+        stats.available_space()
+    } else {
+        stats.available_space().min(ceiling)
+    };
+    Ok((free, stats.total_space()))
+}
+
+/// Test meshes only: report at most this much free space (0 = off). The
+/// orchestrator's containers share the host disk, so a "full" node can
+/// only be staged by capping what the probe sees.
+static TEST_FREE_CEILING: AtomicU64 = AtomicU64::new(0);
+
+/// Cap the process probe's free space (`HOPNET_PULL_TEST_FREE_BYTES`,
+/// honoured by the host only under `HOPNET_TEST_MODE`).
+pub fn set_test_free_ceiling(bytes: u64) {
+    TEST_FREE_CEILING.store(bytes, Ordering::Relaxed);
 }
 
 #[derive(Debug, Default)]

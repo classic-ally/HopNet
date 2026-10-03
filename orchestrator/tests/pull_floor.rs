@@ -5,13 +5,16 @@ use crate::NodeInfo;
 use crate::tests::files::{download_file_with_timeout, get_fragment_distribution, upload_file};
 use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 
-/// A pull floor above any real disk: the node is "full" for replica writes.
-const FULL: &str = "1125899906842624"; // 1 PiB
+/// The default 20 GiB pull floor, over a probe that sees 1 GiB free.
+const FLOOR: &str = "21474836480";
+const FREE: &str = "1073741824";
 
 /// A node below its pull floor takes on no copies but keeps serving, and
 /// pulls its share once it is back above it (2026-10-03: the macbook filled
 /// its disk pulling; RFC-STORAGE-003 pull floor). Node 2 of a 3-node mesh
-/// is recreated with a 1 PiB floor, a file is uploaded on node 0, node 1
+/// is recreated seeing 1 GiB free under a 20 GiB floor (the floor is
+/// clamped to the volume, so a huge floor alone no longer stages "full"
+/// on a roomy host), a file is uploaded on node 0, node 1
 /// pulls its classes while node 2 holds back (paused in its tick report,
 /// the blob unconfirmed, the file still readable through it); node 2 is
 /// then recreated without the override and the blob confirms.
@@ -64,10 +67,13 @@ impl TestScenario for PullFloorHoldsBack {
             mesh_id,
             2,
             None,
-            &[("HOPNET_PULL_MIN_FREE_BYTES", FULL)],
+            &[
+                ("HOPNET_PULL_MIN_FREE_BYTES", FLOOR),
+                ("HOPNET_PULL_TEST_FREE_BYTES", FREE),
+            ],
         )
         .await
-        .context("recreate node 2 with a 1 PiB pull floor")?;
+        .context("recreate node 2 below its pull floor")?;
         let node2 = super::regenesis::reauth_node(&docker, mesh_id, &nodes[2])
             .await
             .context("reauth node 2")?;

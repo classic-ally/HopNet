@@ -162,6 +162,17 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         enabled = pull_floor.enabled(),
         "pull floor: replica writes held back below max(bytes, share of the volume)"
     );
+    if std::env::var("HOPNET_TEST_MODE").is_ok()
+        && let Some(ceiling) = std::env::var("HOPNET_PULL_TEST_FREE_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        hopnet_storage::admission::set_test_free_ceiling(ceiling);
+        tracing::warn!(
+            ceiling,
+            "test mode: the pull floor sees at most this much free space"
+        );
+    }
     if let Ok(dir) = storage_host::functions::get_fragments_dir() {
         hopnet_storage::admission::log_pull_floor_marks(&dir);
     }
