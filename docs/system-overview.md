@@ -594,8 +594,16 @@ apply functions inside consensus handlers.
       (consensus-bugs.md 18). The disk-truth sweep is rolling: one shard
       per step, a 60-minute rotation, honest per-shard heights, a
       node-local cursor (storage@5), and a required cross-release gate
-      before every tag (`release-crossing`, CLAUDE.md "Releases"). Still
-      open for design: a free-space floor on pulls, unseating a validator
+      before every tag (`release-crossing`, CLAUDE.md "Releases"). The
+      pull pipeline (2026.10.8): a planner walks the whole in-flight set
+      (the tick's LIMIT-64 kick had re-sent the same 64 blobs forever
+      once one transition gave every blob the same goal), keeps what
+      this node owes and pulls at-risk blobs first; pull evidence pages
+      through an evidence lane instead of three awaited consensus rounds
+      per blob; and a fetch scheduler runs a 64-blob window under global
+      and per-peer caps with peer and blob parking, so an offline origin
+      cannot stall it (`HOPNET_PULL_*` knobs, thor narrower). Still open
+      for design: a free-space floor on pulls, unseating a validator
       that stops voting.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`

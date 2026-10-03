@@ -1194,9 +1194,10 @@ pub(crate) async fn create_hopnet_container(
             // Forward HOPNET_DB_* (pragma tuning), HOPNET_CONSENSUS_*/
             // HOPNET_QUORUM_* (timeouts, quorum profile),
             // HOPNET_GENESIS_* (mesh-creation inputs, e.g. the storage
-            // policy seed), and HOPNET_UPGRADE_* (upgrade-provider
-            // overrides) from the orchestrator process so tests can
-            // configure meshes without rebuilding the image.
+            // policy seed), HOPNET_UPGRADE_* (upgrade-provider overrides)
+            // and HOPNET_PULL_* (pull window and fetch caps) from the
+            // orchestrator process so tests can configure meshes without
+            // rebuilding the image.
             for (k, v) in std::env::vars() {
                 if k.starts_with("HOPNET_DB_")
                     || k.starts_with("HOPNET_CONSENSUS_")
@@ -1205,6 +1206,7 @@ pub(crate) async fn create_hopnet_container(
                     || k.starts_with("HOPNET_UPGRADE_")
                     || k.starts_with("HOPNET_RESTART_")
                     || k.starts_with("HOPNET_STORAGE_")
+                    || k.starts_with("HOPNET_PULL_")
                 {
                     e.push(format!("{}={}", k, v));
                 }
