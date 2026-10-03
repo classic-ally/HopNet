@@ -483,6 +483,16 @@ where
                 .filter(|p| !dark.contains(&p.node_id))
                 .collect(),
         );
+        // Inventory rows of departed nodes (voted out, decayed out of the
+        // storage view) outlive them: they are not holders to wait for. A
+        // class held only by non-members is unserved, so it rebuilds; a
+        // live non-member is still reached through discovery.
+        let members = sched.members(seams.state.as_ref(), std::time::Instant::now());
+        let is_member = |node: i32| {
+            members
+                .as_ref()
+                .is_none_or(|m: &HashSet<i32>| m.contains(&node))
+        };
 
         // Every owed class at once, at most `per_blob` in flight, each under
         // the scheduler's global and per-peer caps.
@@ -491,7 +501,12 @@ where
             tokio::task::JoinSet::new();
         for (chunk, classes) in &owed {
             for (class, hash) in classes {
-                let known = sources.remove(hash).unwrap_or_default();
+                let known: Vec<crate::traits::PeerRef> = sources
+                    .remove(hash)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|p| is_member(p.node_id))
+                    .collect();
                 let attested: Vec<crate::traits::PeerRef> = known
                     .iter()
                     .copied()
@@ -562,11 +577,15 @@ where
         }
 
         let mut park = false;
+        // Parked on dark holders for hours: stop waiting and rebuild.
+        let escalated = sched
+            .blob_parked_for(blob_id, std::time::Instant::now())
+            .is_some_and(|age| age >= fetch::UNREACHABLE_ESCALATE);
         for (chunk, (mut unserved, unreachable)) in unserved_by_chunk {
             unserved.sort_unstable();
-            if unreachable {
-                // Its holders are dark or parked, not its bytes gone: a
-                // rebuild would hold a chunk of shards for nothing the
+            if unreachable && !escalated {
+                // Its holders are dark, parked or busy, not its bytes gone:
+                // a rebuild would hold a chunk of shards for nothing the
                 // holders will not serve once back. Park and retry.
                 outcome.failed += unserved.len();
                 park = true;
@@ -582,7 +601,7 @@ where
                 park = true;
                 continue;
             };
-            let (transport, dark) = (&seams.transport, &dark);
+            let (transport, dark, view) = (&seams.transport, &dark, &members);
             let rebuilt = reencode::reencode_chunk_via(
                 seams.state.as_ref(),
                 seams.local_state.as_ref(),
@@ -590,10 +609,13 @@ where
                 blob_id,
                 chunk,
                 &unserved,
-                |hash, hint, members| async move {
-                    let usable = |p: &crate::traits::PeerRef| !dark.contains(&p.node_id);
+                |hash, hint, view_members| async move {
+                    let usable = |p: &crate::traits::PeerRef| {
+                        !dark.contains(&p.node_id)
+                            && view.as_ref().is_none_or(|m| m.contains(&p.node_id))
+                    };
                     let attested: Vec<_> = hint.into_iter().filter(usable).collect();
-                    let others: Vec<_> = members.into_iter().filter(usable).collect();
+                    let others: Vec<_> = view_members.into_iter().filter(usable).collect();
                     fetch::fetch_class(transport, sched, &hash, &attested, &others)
                         .await
                         .ok()
@@ -927,11 +949,28 @@ mod tests {
     struct HeldOnTwo {
         net: Arc<PullNet>,
         two_reachable: bool,
+        /// Node 2 is in the storage view (else it departed, rows remain).
+        two_member: bool,
     }
 
     impl StateReader for HeldOnTwo {
         fn placement_inputs(&self) -> Result<PlacementInputs, StorageError> {
             self.net.placement_inputs()
+        }
+        fn storage_view(&self) -> Result<crate::traits::StorageView, StorageError> {
+            let members = if self.two_member {
+                peers(&[1, 2])
+            } else {
+                peers(&[1])
+            };
+            Ok(crate::traits::StorageView {
+                height: 9,
+                watermark: 1,
+                tiers: HashMap::new(),
+                weights: HashMap::new(),
+                online: members.iter().map(|p| p.node_id).collect(),
+                members,
+            })
         }
         fn placement_inputs_at(&self, height: u64) -> Result<PlacementInputs, StorageError> {
             self.net.placement_inputs_at(height)
@@ -1003,6 +1042,7 @@ mod tests {
                 state: Arc::new(HeldOnTwo {
                     net: net.clone(),
                     two_reachable,
+                    two_member: true,
                 }),
                 submitter: net.clone(),
                 local_state: net.clone(),
@@ -1016,6 +1056,60 @@ mod tests {
                 parks,
                 "node 2 reachable: {two_reachable}"
             );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: re-review of #96 — a blob whose holder was dark parked
+    // forever, and inventory rows of departed nodes counted as holders to
+    // wait for, so their classes were never rebuilt.
+    // Should: rebuild (not park) a class whose only holder has left the
+    // storage view, even while that node is dark.
+    // Should: rebuild a class whose member holder has been dark for longer
+    // than the escalation threshold.
+    // Should not: escalate a blob parked only briefly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn departed_or_long_dark_holders_escalate_to_a_rebuild() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-escal-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, _outcome, manifest) = encoded_blob(&dir_src).await;
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        let seams_for = |two_member: bool| Seams {
+            transport: net.clone(),
+            state: Arc::new(HeldOnTwo {
+                net: net.clone(),
+                two_reachable: false,
+                two_member,
+            }),
+            submitter: net.clone(),
+            local_state: net.clone(),
+        };
+
+        // Departed: its rows are not holders; the rebuild runs (and, with
+        // no shards anywhere, fails), and the blob is not parked.
+        let sched = FetchScheduler::new(PullLimits::default());
+        pull_with_sched(&seams_for(false), &dir_dst, &blob_id, &sched).await;
+        assert!(!sched.blob_parked(&blob_id, std::time::Instant::now()));
+
+        // A member dark for a minute: parked, no rebuild.
+        let now = std::time::Instant::now();
+        let sched = FetchScheduler::new(PullLimits::default());
+        sched.park_blob(&blob_id, now - std::time::Duration::from_secs(60));
+        pull_with_sched(&seams_for(true), &dir_dst, &blob_id, &sched).await;
+        assert!(sched.blob_parked(&blob_id, std::time::Instant::now()));
+
+        // Dark beyond the threshold: escalated to a rebuild, not re-parked.
+        if let Some(long_ago) = now.checked_sub(fetch::UNREACHABLE_ESCALATE * 2) {
+            let sched = FetchScheduler::new(PullLimits::default());
+            sched.park_blob(&blob_id, long_ago);
+            pull_with_sched(&seams_for(true), &dir_dst, &blob_id, &sched).await;
+            assert!(!sched.blob_parked(&blob_id, std::time::Instant::now()));
         }
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -78,6 +78,12 @@ pub const PEER_PARK_CAP: Duration = Duration::from_secs(600);
 /// First blob park; doubles per repeat, capped.
 pub const BLOB_PARK_BASE: Duration = Duration::from_secs(60);
 pub const BLOB_PARK_CAP: Duration = Duration::from_secs(1800);
+/// A blob parked this long on unreachable holders is rebuilt anyway
+/// (subject to the rebuild slots and K sourceable shards): a holder dark
+/// for hours is as good as gone.
+pub const UNREACHABLE_ESCALATE: Duration = Duration::from_secs(2 * 3600);
+/// How long the cached storage-view membership is reused.
+pub const MEMBERS_TTL: Duration = Duration::from_secs(60);
 
 impl PullLimits {
     /// The defaults, overridden by `HOPNET_PULL_WINDOW`,
@@ -177,6 +183,8 @@ pub struct FetchScheduler {
     per_peer: Mutex<HashMap<i32, Arc<Semaphore>>>,
     /// One-permit gates for peers marked slow.
     slow_gates: Mutex<HashMap<i32, Arc<Semaphore>>>,
+    /// Storage-view member ids, cached for `MEMBERS_TTL`.
+    members: Mutex<Option<(Instant, std::collections::HashSet<i32>)>>,
     peers: Mutex<HashMap<i32, PeerPark>>,
     blobs: Mutex<HashMap<BlobId, BlobPark>>,
 }
@@ -190,6 +198,7 @@ impl FetchScheduler {
             rebuild: Arc::new(Semaphore::new(limits.rebuilds.max(1))),
             per_peer: Mutex::new(HashMap::new()),
             slow_gates: Mutex::new(HashMap::new()),
+            members: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
             blobs: Mutex::new(HashMap::new()),
         })
@@ -320,6 +329,40 @@ impl FetchScheduler {
     /// the park book.
     pub fn unpark_blob(&self, blob_id: &BlobId) {
         self.blobs.lock().unwrap().remove(blob_id);
+    }
+
+    /// How long the blob has been in the park book (since its first park,
+    /// across repeats), if at all.
+    pub fn blob_parked_for(&self, blob_id: &BlobId, now: Instant) -> Option<Duration> {
+        self.blobs
+            .lock()
+            .unwrap()
+            .get(blob_id)
+            .map(|p| now.saturating_duration_since(p.since))
+    }
+
+    /// Current storage-view member ids (cached for `MEMBERS_TTL`), or
+    /// `None` when the view cannot be read (then nothing is filtered).
+    pub fn members<S: crate::traits::StateReader + ?Sized>(
+        &self,
+        state: &S,
+        now: Instant,
+    ) -> Option<std::collections::HashSet<i32>> {
+        let mut cache = self.members.lock().unwrap();
+        if let Some((at, ids)) = cache.as_ref() {
+            if now.saturating_duration_since(*at) < MEMBERS_TTL {
+                return Some(ids.clone());
+            }
+        }
+        let ids: std::collections::HashSet<i32> = state
+            .storage_view()
+            .ok()?
+            .members
+            .iter()
+            .map(|p| p.node_id)
+            .collect();
+        *cache = Some((now, ids.clone()));
+        Some(ids)
     }
 
     pub fn stats(&self, now: Instant) -> SchedulerStats {
