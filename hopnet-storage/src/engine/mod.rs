@@ -603,15 +603,18 @@ where
                 });
             }
         }
-        // chunk -> (classes not fetched, any of them only on dark holders)
-        let mut unserved_by_chunk: BTreeMap<u32, (Vec<u32>, bool)> = BTreeMap::new();
+        // chunk -> (classes to rebuild, classes waiting on a member holder)
+        let mut unserved_by_chunk: BTreeMap<u32, (Vec<u32>, Vec<u32>)> = BTreeMap::new();
         while let Some(joined) = fetches.join_next().await {
             match joined {
                 Ok((_, _, Ok(()))) => outcome.pulled += 1,
                 Ok((chunk, class, Err(miss))) => {
                     let entry = unserved_by_chunk.entry(chunk).or_default();
-                    entry.0.push(class);
-                    entry.1 |= miss == FetchMiss::Unreachable;
+                    if miss == FetchMiss::Unreachable {
+                        entry.1.push(class);
+                    } else {
+                        entry.0.push(class);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("pull: blob {blob_id}: fetch task failed: {e}");
@@ -636,13 +639,18 @@ where
         // store, full disk) stays a member, so its classes are never
         // rebuilt around and its blobs stay parked. The next release makes
         // availability reflect serving.
-        for (chunk, (mut unserved, unreachable)) in unserved_by_chunk {
-            unserved.sort_unstable();
-            if unreachable {
-                outcome.failed += unserved.len();
+        // The rule is per class: a class waiting on a member holder parks
+        // the blob, but does not hold back a sibling class in the same
+        // chunk whose reachable holders all said they do not have it.
+        for (chunk, (mut unserved, waiting)) in unserved_by_chunk {
+            if !waiting.is_empty() {
+                outcome.failed += waiting.len();
                 park = true;
+            }
+            if unserved.is_empty() {
                 continue;
             }
+            unserved.sort_unstable();
             // Genuinely unserved: rebuild from any K live classes (local
             // shards first), a bounded number at once, with every shard
             // fetch under the scheduler's caps and deadline and dark or
@@ -1010,6 +1018,9 @@ mod tests {
         panic_manifest: bool,
         /// Deriving the storage view takes this long (a cold, slow node).
         view_delay: std::time::Duration,
+        /// Fragments attested on node 3 instead, a reachable member (in
+        /// the view whenever this is non-empty).
+        held_on_three: HashSet<Blake3Hash>,
     }
 
     impl StateReader for HeldOnTwo {
@@ -1018,11 +1029,14 @@ mod tests {
         }
         fn storage_view(&self) -> Result<crate::traits::StorageView, StorageError> {
             std::thread::sleep(self.view_delay);
-            let members = if self.two_member {
+            let mut members = if self.two_member {
                 peers(&[1, 2])
             } else {
                 peers(&[1])
             };
+            if !self.held_on_three.is_empty() {
+                members.extend(peers(&[3]));
+            }
             Ok(crate::traits::StorageView {
                 height: 9,
                 watermark: 1,
@@ -1039,7 +1053,13 @@ mod tests {
             &self,
             fragment_hashes: &[Blake3Hash],
         ) -> Result<HashMap<Blake3Hash, Vec<PeerRef>>, StorageError> {
-            Ok(fragment_hashes.iter().map(|h| (*h, peers(&[2]))).collect())
+            Ok(fragment_hashes
+                .iter()
+                .map(|h| {
+                    let holder = if self.held_on_three.contains(h) { 3 } else { 2 };
+                    (*h, peers(&[holder]))
+                })
+                .collect())
         }
         fn all_peers(&self) -> Result<Vec<PeerRef>, StorageError> {
             self.net.all_peers()
@@ -1106,6 +1126,7 @@ mod tests {
                     two_member: true,
                     panic_manifest: false,
                     view_delay: std::time::Duration::ZERO,
+                    held_on_three: HashSet::new(),
                 }),
                 submitter: net.clone(),
                 local_state: net.clone(),
@@ -1153,6 +1174,7 @@ mod tests {
                 two_member,
                 panic_manifest: false,
                 view_delay: std::time::Duration::ZERO,
+                held_on_three: HashSet::new(),
             }),
             submitter: net.clone(),
             local_state: net.clone(),
@@ -1177,6 +1199,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    // Impact: final review of #96 — the wait-for-a-member flag was per
+    // chunk, so one class on a dark member held back the rebuild of every
+    // sibling class in that chunk, even ones whose reachable holders had
+    // all said they do not have it.
+    // Should: rebuild a class whose reachable member holders do not serve
+    // it, while another class of the same chunk waits on a dark member.
+    // Should: still park the blob for the class on the dark member.
+    // Should not: rebuild the class held by the dark member.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_class_on_a_dark_member_does_not_hold_back_its_siblings() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-split-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, outcome, manifest) = encoded_blob(&dir_src).await;
+        let mut chunk0: Vec<_> = outcome
+            .fragments
+            .iter()
+            .filter(|f| f.chunk_number == 0)
+            .map(|f| f.fragment_hash)
+            .collect();
+        chunk0.sort_unstable_by_key(|h| h.to_hex());
+        // Class `on_dark` stays on dark member 2; `lost` is attested on
+        // node 3, which answers but no longer has it; node 3 serves the rest.
+        let (on_dark, lost) = (chunk0[0], chunk0[1]);
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        for f in &outcome.fragments {
+            if f.fragment_hash != on_dark && f.fragment_hash != lost {
+                let bytes = fragstore::read_fragment(&dir_src, &f.fragment_hash).unwrap();
+                net.served.lock().unwrap().insert(f.fragment_hash, bytes);
+            }
+        }
+        let held_on_three = outcome
+            .fragments
+            .iter()
+            .map(|f| f.fragment_hash)
+            .filter(|h| *h != on_dark)
+            .collect();
+        let seams = Seams {
+            transport: net.clone(),
+            state: Arc::new(HeldOnTwo {
+                net: net.clone(),
+                two_reachable: false,
+                two_member: true,
+                panic_manifest: false,
+                view_delay: std::time::Duration::ZERO,
+                held_on_three,
+            }),
+            submitter: net.clone(),
+            local_state: net.clone(),
+        };
+        let sched = FetchScheduler::new(PullLimits::default());
+        let (result, _) = pull_with_sched(&seams, &dir_dst, &blob_id, &sched).await;
+        assert_eq!(result.rebuilt, 1, "the lost class is rebuilt");
+        assert_eq!(result.failed, 1, "the dark member's class waits");
+        assert!(fragstore::read_fragment(&dir_dst, &lost).is_ok());
+        assert!(fragstore::read_fragment(&dir_dst, &on_dark).is_err());
+        assert!(sched.blob_parked(&blob_id, std::time::Instant::now()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // Impact: third review of #96 — the membership cache derived the
     // storage view (pool checkout plus 30 days of availability history)
     // under its lock inside the async pull, so on every expiry each window
@@ -1194,6 +1281,7 @@ mod tests {
             two_member: true,
             panic_manifest: false,
             view_delay: delay,
+            held_on_three: HashSet::new(),
         });
         let sched = FetchScheduler::new(PullLimits::default());
         let t0 = std::time::Instant::now();
@@ -1428,6 +1516,7 @@ mod tests {
                 two_member: true,
                 panic_manifest: true,
                 view_delay: std::time::Duration::ZERO,
+                held_on_three: HashSet::new(),
             }),
             submitter: net.clone(),
             local_state: net.clone(),
