@@ -205,15 +205,7 @@ pub async fn run_network_rebalancing(
     };
 
     let stats = storage.pull_blobs(in_flight, REBALANCE_DEADLINE).await;
-    let result = NetworkRebalancingResult {
-        consensus_height,
-        data_blocks_checked: stats.checked,
-        data_blocks_rebalanced: stats.evidence_queued,
-        data_blocks_failed: stats.failed,
-        total_fragments_migrated: stats.pulled + stats.rebuilt,
-        held_for_space: stats.held_back,
-        data_blocks_timed_out: stats.timed_out,
-    };
+    let result = rebalancing_result(consensus_height, &stats);
     if stats.held_back {
         tracing::info!("In-flight pull check skipped: this node is below its pull floor");
     }
@@ -287,11 +279,31 @@ pub struct NetworkRebalancingResult {
     pub data_blocks_rebalanced: usize,
     pub data_blocks_failed: usize,
     pub total_fragments_migrated: usize,
-    /// The node was below its pull floor: nothing was checked (the paused
-    /// engine would not answer until free space is back).
+    /// Space held this batch back: the node was below its pull floor at
+    /// entry (nothing was checked), or classes were held for space during
+    /// it (`fragments_held_for_space`).
     pub held_for_space: bool,
+    /// Owed classes held back by the pull floor during the batch.
+    pub fragments_held_for_space: usize,
     /// Blobs still unanswered at `REBALANCE_DEADLINE` (they stay queued).
     pub data_blocks_timed_out: usize,
+}
+
+/// The re-kick's answer from the engine's batch stats.
+fn rebalancing_result(
+    consensus_height: u64,
+    stats: &hopnet_storage::engine::PullStats,
+) -> NetworkRebalancingResult {
+    NetworkRebalancingResult {
+        consensus_height,
+        data_blocks_checked: stats.checked,
+        data_blocks_rebalanced: stats.evidence_queued,
+        data_blocks_failed: stats.failed,
+        total_fragments_migrated: stats.pulled + stats.rebuilt,
+        held_for_space: stats.held_back || stats.held_for_space > 0,
+        fragments_held_for_space: stats.held_for_space,
+        data_blocks_timed_out: stats.timed_out,
+    }
 }
 
 /// How long the operator re-kick waits on the engine before answering.
@@ -1854,5 +1866,37 @@ mod tests {
         assert!(!claim_scrub(day, 3));
         assert!(claim_scrub(day, 4));
         assert!(claim_scrub(day + 1, 3));
+    }
+
+    // Impact: review of #100 at bbf1cf58 — the re-kick reported
+    // `held_for_space` only for a pause at entry and dropped the classes
+    // held during the batch, so a batch the floor cut short read as fine.
+    // Should: report held for space, with the class count, whenever classes
+    // were held during the batch.
+    // Should not: report held for a batch that held nothing.
+    #[test]
+    fn the_rekick_reports_classes_held_for_space() {
+        let held = hopnet_storage::engine::PullStats {
+            checked: 4,
+            pulled: 6,
+            held_for_space: 9,
+            ..Default::default()
+        };
+        let result = rebalancing_result(7, &held);
+        assert!(result.held_for_space);
+        assert_eq!(result.fragments_held_for_space, 9);
+
+        let paused = hopnet_storage::engine::PullStats {
+            held_back: true,
+            ..Default::default()
+        };
+        assert!(rebalancing_result(7, &paused).held_for_space);
+
+        let clean = hopnet_storage::engine::PullStats {
+            checked: 4,
+            pulled: 6,
+            ..Default::default()
+        };
+        assert!(!rebalancing_result(7, &clean).held_for_space);
     }
 }

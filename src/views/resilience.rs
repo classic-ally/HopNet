@@ -142,15 +142,17 @@ fn holding_back(
             })
         })
         .collect();
+    // A low-space entry from the metrics is the more specific truth: the
+    // probe-error entry only fills in for a node the metrics call healthy.
     if let Some((me, report)) = local
         && report.pause_reason == Some(PauseReason::ProbeError)
+        && !flagged.iter().any(|n| n.node_id == me)
     {
         let gb = |b: Option<u64>| b.unwrap_or(0) as f64 / BYTES_PER_GB;
         let display_name = disks
             .iter()
             .find(|d| d.node_id == me)
             .map_or_else(|| format!("Node {me}"), |d| d.display_name.clone());
-        flagged.retain(|n| n.node_id != me);
         flagged.push(HoldingBackNode {
             node_id: me,
             display_name,
@@ -830,6 +832,29 @@ mod tests {
 
         report.pause_reason = Some(PauseReason::LowSpace);
         assert!(holding_back(&disks, &[2], Some((2, &report))).is_empty());
+    }
+
+    // Impact: review of #100 at bbf1cf58 — a local probe-error pause
+    // replaced the metrics' low-space entry for the same node, so a full
+    // disk read as "cannot read its free space".
+    // Should: keep the low-space entry when the metrics already flag this
+    // node, whatever its own guard says.
+    #[test]
+    fn a_low_space_entry_wins_over_a_local_probe_error() {
+        use hopnet_storage::admission::{PauseReason, SpaceReport};
+        let disks = vec![NodeDisk {
+            node_id: 3,
+            display_name: "macbook".into(),
+            total_gb: 927.0,
+            used_gb: 926.0,
+        }];
+        let report = SpaceReport {
+            pause_reason: Some(PauseReason::ProbeError),
+            ..SpaceReport::default()
+        };
+        let flagged = holding_back(&disks, &[3], Some((3, &report)));
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].reason, "low_space");
     }
 
     fn parts_reporting(user_data_gb: f64) -> StorageParts {
