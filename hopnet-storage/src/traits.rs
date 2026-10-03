@@ -200,6 +200,14 @@ pub trait StateReader: Send + Sync {
     /// This node's consensus id, once initialized. The engine skips sends to
     /// itself; `None` fails the blob's distribution (retried on next kick).
     fn local_node_id(&self) -> Option<i32>;
+
+    /// Whether `node_id` currently looks reachable to this node (the host's
+    /// liveness evidence). The pull scheduler skips sources that do not,
+    /// so an offline origin's blobs park instead of filling the window.
+    /// Hosts without evidence answer true.
+    fn peer_reachable(&self, _node_id: i32) -> bool {
+        true
+    }
 }
 
 /// Submit failures, classified by retry semantics.

@@ -1,0 +1,671 @@
+//! The fetch scheduler (RFC-STORAGE-003 S3): bounded parallel pulls.
+//!
+//! The worker used to pull one blob at a time and one class at a time,
+//! moving 0.4–3 MB/s per node over idle links (production, 2026-10-03).
+//! Concurrency is now bounded where the cost is — fragment fetches in
+//! flight, globally and per source peer — while the blob window is wide
+//! and cheap (an admitted blob holds descriptors, never bytes):
+//!
+//! - window: blobs admitted at once (`HOPNET_PULL_WINDOW`, default 64);
+//! - global: fetches in flight across all blobs (`HOPNET_PULL_FETCH_GLOBAL`,
+//!   default 24), less `HOPNET_PULL_URGENT_RESERVE` (default 4) held back
+//!   for urgent re-encode, which runs beside the window;
+//! - per peer: fetches in flight from one source (`HOPNET_PULL_FETCH_PER_PEER`,
+//!   default 8), so one slow peer cannot take the global budget;
+//! - per blob: at most a quarter of the global cap, so one many-class blob
+//!   cannot either.
+//!
+//! Why wide: every blob starts with all its fragments on one origin. With
+//! a few blobs in flight, one offline origin fills every slot. So a source
+//! that fails at the transport level three times running is parked with
+//! backoff, and a blob whose remaining sources are all parked or
+//! unreachable (and that cannot be rebuilt) is parked itself and leaves
+//! the window, which admits the next blob.
+
+use crate::traits::{PeerRef, Transport, TransportError};
+use crate::types::BlobId;
+use hopnet_common::Blake3Hash;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+
+/// Pull concurrency knobs, read once at engine spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullLimits {
+    pub window: usize,
+    pub fetch_global: usize,
+    pub fetch_per_peer: usize,
+    pub urgent_reserve: usize,
+    pub fetch_timeout: Duration,
+}
+
+impl Default for PullLimits {
+    fn default() -> Self {
+        PullLimits {
+            window: 64,
+            fetch_global: 24,
+            fetch_per_peer: 8,
+            urgent_reserve: 4,
+            fetch_timeout: Duration::from_secs(PULL_FETCH_TIMEOUT_SECS),
+        }
+    }
+}
+
+/// A fetch that has not answered in this long releases its slots.
+pub const PULL_FETCH_TIMEOUT_SECS: u64 = 30;
+/// Consecutive transport failures before a source peer is parked.
+pub const PEER_FAIL_PARK: u32 = 3;
+/// First peer park; doubles per repeat, capped.
+pub const PEER_PARK_BASE: Duration = Duration::from_secs(30);
+pub const PEER_PARK_CAP: Duration = Duration::from_secs(600);
+/// First blob park; doubles per repeat, capped.
+pub const BLOB_PARK_BASE: Duration = Duration::from_secs(60);
+pub const BLOB_PARK_CAP: Duration = Duration::from_secs(1800);
+
+impl PullLimits {
+    /// The defaults, overridden by `HOPNET_PULL_WINDOW`,
+    /// `HOPNET_PULL_FETCH_GLOBAL`, `HOPNET_PULL_FETCH_PER_PEER` and
+    /// `HOPNET_PULL_URGENT_RESERVE` where set to a positive integer.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let d = Self::default();
+        let read = |k: &str, default: usize| {
+            get(k)
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default)
+        };
+        PullLimits {
+            window: read("HOPNET_PULL_WINDOW", d.window),
+            fetch_global: read("HOPNET_PULL_FETCH_GLOBAL", d.fetch_global),
+            fetch_per_peer: read("HOPNET_PULL_FETCH_PER_PEER", d.fetch_per_peer),
+            urgent_reserve: get("HOPNET_PULL_URGENT_RESERVE")
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(d.urgent_reserve),
+            fetch_timeout: d.fetch_timeout,
+        }
+    }
+
+    /// Fetch permits pulls may use: the global cap less the urgent reserve,
+    /// never below one.
+    pub fn pull_permits(&self) -> usize {
+        self.fetch_global.saturating_sub(self.urgent_reserve).max(1)
+    }
+
+    /// Fetches one blob may hold at once: a quarter of the global cap.
+    pub fn per_blob(&self) -> usize {
+        self.fetch_global.div_ceil(4).max(1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PeerPark {
+    failures: u32,
+    parks: u32,
+    until: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlobPark {
+    attempts: u32,
+    until: Instant,
+    since: Instant,
+}
+
+/// What the scheduler is doing right now — the planner's report field.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct SchedulerStats {
+    pub window_used: usize,
+    pub fetches_in_flight: usize,
+    pub per_peer_in_flight: Vec<(i32, usize)>,
+    pub parked_peers: Vec<ParkedPeer>,
+    pub parked_blobs: usize,
+    pub parked_longest_secs: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParkedPeer {
+    pub node_id: i32,
+    pub failures: u32,
+    pub parked_for_secs: u64,
+}
+
+/// Shared scheduler state: the semaphores and the park books.
+pub struct FetchScheduler {
+    pub limits: PullLimits,
+    pub window: Arc<Semaphore>,
+    global: Arc<Semaphore>,
+    per_peer: Mutex<HashMap<i32, Arc<Semaphore>>>,
+    peers: Mutex<HashMap<i32, PeerPark>>,
+    blobs: Mutex<HashMap<BlobId, BlobPark>>,
+}
+
+impl FetchScheduler {
+    pub fn new(limits: PullLimits) -> Arc<Self> {
+        Arc::new(FetchScheduler {
+            limits,
+            window: Arc::new(Semaphore::new(limits.window.max(1))),
+            global: Arc::new(Semaphore::new(limits.pull_permits())),
+            per_peer: Mutex::new(HashMap::new()),
+            peers: Mutex::new(HashMap::new()),
+            blobs: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn peer_semaphore(&self, node_id: i32) -> Arc<Semaphore> {
+        self.per_peer
+            .lock()
+            .unwrap()
+            .entry(node_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(self.limits.fetch_per_peer.max(1))))
+            .clone()
+    }
+
+    /// Free per-peer permits, for picking the least loaded source.
+    fn peer_free(&self, node_id: i32) -> usize {
+        self.peer_semaphore(node_id).available_permits()
+    }
+
+    pub fn peer_parked(&self, node_id: i32, now: Instant) -> bool {
+        self.peers
+            .lock()
+            .unwrap()
+            .get(&node_id)
+            .and_then(|p| p.until)
+            .is_some_and(|until| until > now)
+    }
+
+    pub fn record_peer_success(&self, node_id: i32) {
+        let mut peers = self.peers.lock().unwrap();
+        if let Some(p) = peers.get_mut(&node_id) {
+            let was_parked = p.until.is_some();
+            *p = PeerPark::default();
+            if was_parked {
+                tracing::info!(node = node_id, "pull: source peer unparked");
+            }
+        }
+    }
+
+    pub fn record_peer_failure(&self, node_id: i32, now: Instant) {
+        let mut peers = self.peers.lock().unwrap();
+        let p = peers.entry(node_id).or_default();
+        p.failures += 1;
+        if p.failures >= PEER_FAIL_PARK && p.until.is_none_or(|u| u <= now) {
+            let backoff = backoff(PEER_PARK_BASE, PEER_PARK_CAP, p.parks);
+            p.parks += 1;
+            p.until = Some(now + backoff);
+            tracing::info!(
+                node = node_id,
+                failures = p.failures,
+                backoff_secs = backoff.as_secs(),
+                "pull: source peer parked"
+            );
+        }
+    }
+
+    pub fn blob_parked(&self, blob_id: &BlobId, now: Instant) -> bool {
+        self.blobs
+            .lock()
+            .unwrap()
+            .get(blob_id)
+            .is_some_and(|p| p.until > now)
+    }
+
+    /// Park a blob whose sources are all unreachable; backs off per repeat.
+    pub fn park_blob(&self, blob_id: &BlobId, now: Instant) {
+        let mut blobs = self.blobs.lock().unwrap();
+        let entry = blobs.entry(blob_id.clone()).or_insert(BlobPark {
+            attempts: 0,
+            until: now,
+            since: now,
+        });
+        entry.until = now + backoff(BLOB_PARK_BASE, BLOB_PARK_CAP, entry.attempts);
+        entry.attempts += 1;
+    }
+
+    /// A blob that made progress (or turned out to owe nothing) leaves
+    /// the park book.
+    pub fn unpark_blob(&self, blob_id: &BlobId) {
+        self.blobs.lock().unwrap().remove(blob_id);
+    }
+
+    pub fn stats(&self, now: Instant) -> SchedulerStats {
+        let per_peer: Vec<(i32, usize)> = {
+            let map = self.per_peer.lock().unwrap();
+            let mut v: Vec<(i32, usize)> = map
+                .iter()
+                .map(|(n, s)| {
+                    (
+                        *n,
+                        self.limits.fetch_per_peer
+                            - s.available_permits().min(self.limits.fetch_per_peer),
+                    )
+                })
+                .filter(|(_, n)| *n > 0)
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let parked_peers = {
+            let peers = self.peers.lock().unwrap();
+            let mut v: Vec<ParkedPeer> = peers
+                .iter()
+                .filter(|(_, p)| p.until.is_some_and(|u| u > now))
+                .map(|(n, p)| ParkedPeer {
+                    node_id: *n,
+                    failures: p.failures,
+                    parked_for_secs: p
+                        .until
+                        .map_or(0, |u| u.saturating_duration_since(now).as_secs()),
+                })
+                .collect();
+            v.sort_unstable_by_key(|p| p.node_id);
+            v
+        };
+        let (parked_blobs, parked_longest_secs) = {
+            let blobs = self.blobs.lock().unwrap();
+            let live: Vec<&BlobPark> = blobs.values().filter(|p| p.until > now).collect();
+            let longest = live
+                .iter()
+                .map(|p| now.saturating_duration_since(p.since).as_secs())
+                .max()
+                .unwrap_or(0);
+            (live.len(), longest)
+        };
+        SchedulerStats {
+            window_used: self.limits.window.max(1) - self.window.available_permits(),
+            fetches_in_flight: self.limits.pull_permits() - self.global.available_permits(),
+            per_peer_in_flight: per_peer,
+            parked_peers,
+            parked_blobs,
+            parked_longest_secs,
+        }
+    }
+}
+
+fn backoff(base: Duration, cap: Duration, repeats: u32) -> Duration {
+    base.saturating_mul(1u32 << repeats.min(16)).min(cap)
+}
+
+/// Why a class was not fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchMiss {
+    /// Some reachable source answered but none served it (or no source is
+    /// known): the rebuild may still have shards.
+    NotServed,
+    /// Every known source is parked or unreachable.
+    Unreachable,
+}
+
+/// Fetch one class: attested holders first, least-loaded first, each
+/// under the global and per-peer caps and the fetch deadline; the bytes
+/// are verified against the manifest hash. Then reactive discovery over
+/// the other reachable peers. `None` on success with the verified bytes.
+pub async fn fetch_class<T: Transport + 'static>(
+    transport: &Arc<T>,
+    sched: &FetchScheduler,
+    hash: &Blake3Hash,
+    attested: &[PeerRef],
+    others: &[PeerRef],
+) -> Result<Vec<u8>, FetchMiss> {
+    let now = Instant::now();
+    let mut holders: Vec<PeerRef> = attested
+        .iter()
+        .copied()
+        .filter(|p| !sched.peer_parked(p.node_id, now))
+        .collect();
+    holders.sort_by_key(|p| std::cmp::Reverse(sched.peer_free(p.node_id)));
+    let mut any_answer = false;
+    for peer in &holders {
+        // The peer's slot first, so a global slot never idles behind a
+        // busy peer.
+        let peer_sem = sched.peer_semaphore(peer.node_id);
+        let Ok(Ok(_slot)) =
+            tokio::time::timeout(sched.limits.fetch_timeout, peer_sem.acquire()).await
+        else {
+            // Busy, not dark: never a reason to park the blob.
+            any_answer = true;
+            continue;
+        };
+        let Ok(_global) = sched.global.acquire().await else {
+            return Err(FetchMiss::NotServed);
+        };
+        match tokio::time::timeout(
+            sched.limits.fetch_timeout,
+            transport.fetch_fragment(peer, hash),
+        )
+        .await
+        {
+            Ok(Ok(data)) if Blake3Hash::new(blake3::hash(&data)) == *hash => {
+                sched.record_peer_success(peer.node_id);
+                return Ok(data);
+            }
+            Ok(Ok(_)) => {
+                tracing::warn!(
+                    node = peer.node_id,
+                    "pull: fragment {} failed verification",
+                    hash.to_hex()
+                );
+                any_answer = true;
+            }
+            Ok(Err(TransportError::Peer(_))) => {
+                // The peer answered: reachable, just not holding it.
+                sched.record_peer_success(peer.node_id);
+                any_answer = true;
+            }
+            Ok(Err(TransportError::Transport(_))) | Err(_) => {
+                sched.record_peer_failure(peer.node_id, Instant::now());
+            }
+        }
+    }
+
+    // Discovery over the rest: health-checked fan-out, so a peer that does
+    // not hold the class is asked, not fetched from.
+    let now = Instant::now();
+    let rest: Vec<PeerRef> = others
+        .iter()
+        .copied()
+        .filter(|p| !attested.iter().any(|a| a.node_id == p.node_id))
+        .filter(|p| !sched.peer_parked(p.node_id, now))
+        .collect();
+    if !rest.is_empty() {
+        let Ok(_global) = sched.global.acquire().await else {
+            return Err(FetchMiss::NotServed);
+        };
+        if let Ok(Some(data)) = tokio::time::timeout(
+            sched.limits.fetch_timeout,
+            crate::api::find_fragment_via(transport, hash, &rest, None),
+        )
+        .await
+        {
+            return Ok(data);
+        }
+    }
+    // Unreachable only when the class HAS known holders and none of them
+    // answered (all parked or failing at the transport): that is the
+    // offline-origin case the blob park exists for.
+    if attested.is_empty() || any_answer {
+        Err(FetchMiss::NotServed)
+    } else {
+        Err(FetchMiss::Unreachable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::StoreResult;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Peer {
+        Serves,
+        Down,
+        Hangs,
+    }
+
+    /// Peers by node id; serving peers hold every fragment. Counts fetches
+    /// in flight, globally and per peer, with their peaks.
+    struct Net {
+        peers: HashMap<i32, Peer>,
+        delay: Duration,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        per_peer: Mutex<HashMap<i32, (usize, usize)>>,
+    }
+
+    impl Net {
+        fn new(peers: &[(i32, Peer)], delay_ms: u64) -> Arc<Self> {
+            Arc::new(Net {
+                peers: peers.iter().copied().collect(),
+                delay: Duration::from_millis(delay_ms),
+                in_flight: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                per_peer: Mutex::new(HashMap::new()),
+            })
+        }
+
+        fn peer_peak(&self, node_id: i32) -> usize {
+            self.per_peer
+                .lock()
+                .unwrap()
+                .get(&node_id)
+                .map_or(0, |(_, peak)| *peak)
+        }
+    }
+
+    fn data_for(hash: &Blake3Hash) -> Vec<u8> {
+        hash.as_bytes().to_vec()
+    }
+
+    fn hash_of(n: u32) -> (Blake3Hash, Vec<u8>) {
+        let data = format!("fragment-{n}").into_bytes();
+        (Blake3Hash::new(blake3::hash(&data)), data)
+    }
+
+    impl Transport for Net {
+        async fn store_fragment(
+            &self,
+            _peer: &PeerRef,
+            _fragment_hash: &Blake3Hash,
+            _data: Vec<u8>,
+        ) -> Result<StoreResult, TransportError> {
+            Err(TransportError::Transport("not used".into()))
+        }
+        async fn fetch_fragment(
+            &self,
+            peer: &PeerRef,
+            fragment_hash: &Blake3Hash,
+        ) -> Result<Vec<u8>, TransportError> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            {
+                let mut map = self.per_peer.lock().unwrap();
+                let e = map.entry(peer.node_id).or_insert((0, 0));
+                e.0 += 1;
+                e.1 = e.1.max(e.0);
+            }
+            let behaviour = self.peers.get(&peer.node_id).copied().unwrap_or(Peer::Down);
+            if behaviour == Peer::Hangs {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(self.delay).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.per_peer
+                .lock()
+                .unwrap()
+                .get_mut(&peer.node_id)
+                .unwrap()
+                .0 -= 1;
+            match behaviour {
+                Peer::Serves => Ok(FRAGMENTS
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|m| m.get(fragment_hash).cloned())
+                    .unwrap_or_else(|| data_for(fragment_hash))),
+                _ => Err(TransportError::Transport("connection refused".into())),
+            }
+        }
+        async fn fragment_health(
+            &self,
+            peer: &PeerRef,
+            _fragment_hash: &Blake3Hash,
+        ) -> Result<bool, TransportError> {
+            match self.peers.get(&peer.node_id) {
+                Some(Peer::Serves) => Ok(true),
+                _ => Err(TransportError::Transport("down".into())),
+            }
+        }
+    }
+
+    /// The bytes each test fragment hashes to (a served fetch returns them).
+    static FRAGMENTS: Mutex<Option<HashMap<Blake3Hash, Vec<u8>>>> = Mutex::new(None);
+
+    fn register(n: u32) -> Blake3Hash {
+        let (hash, data) = hash_of(n);
+        FRAGMENTS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(hash, data);
+        hash
+    }
+
+    fn peer(node_id: i32) -> PeerRef {
+        PeerRef {
+            node_id,
+            pubkey: [node_id as u8; 32],
+        }
+    }
+
+    fn limits(global: usize, per_peer: usize, timeout_ms: u64) -> PullLimits {
+        PullLimits {
+            window: 64,
+            fetch_global: global,
+            fetch_per_peer: per_peer,
+            urgent_reserve: 0,
+            fetch_timeout: Duration::from_millis(timeout_ms),
+        }
+    }
+
+    // Should: read each knob from its env var, keeping the default for an
+    // unset, empty or non-positive value; the reserve may be zero.
+    // Should: give pulls the global cap less the urgent reserve, and each
+    // blob a quarter of the global cap.
+    #[test]
+    fn pull_limits_read_overrides_and_derive_shares() {
+        let env: HashMap<&str, &str> = [
+            ("HOPNET_PULL_WINDOW", "16"),
+            ("HOPNET_PULL_FETCH_GLOBAL", "6"),
+            ("HOPNET_PULL_FETCH_PER_PEER", "0"),
+            ("HOPNET_PULL_URGENT_RESERVE", "2"),
+        ]
+        .into();
+        let l = PullLimits::from_lookup(|k| env.get(k).map(|v| v.to_string()));
+        assert_eq!(
+            (l.window, l.fetch_global, l.fetch_per_peer, l.urgent_reserve),
+            (16, 6, 8, 2)
+        );
+        assert_eq!(l.pull_permits(), 4);
+        assert_eq!(l.per_blob(), 2);
+        assert_eq!(PullLimits::from_lookup(|_| None), PullLimits::default());
+        assert_eq!(PullLimits::default().per_blob(), 6);
+    }
+
+    // Impact: thor (HDD, RAM-pressed) crashed today under lock pressure;
+    // the caps are what bound a node's fetch memory and source load.
+    // Should not: exceed the global cap or any peer's cap, however many
+    // classes are fetched at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetches_never_exceed_global_or_per_peer_caps() {
+        let net = Net::new(
+            &[(2, Peer::Serves), (3, Peer::Serves), (4, Peer::Serves)],
+            20,
+        );
+        let sched = FetchScheduler::new(limits(5, 2, 2_000));
+        let holders = vec![peer(2), peer(3), peer(4)];
+        let mut tasks = tokio::task::JoinSet::new();
+        for n in 0..40 {
+            let hash = register(1000 + n);
+            let (net, sched, holders) = (net.clone(), sched.clone(), holders.clone());
+            tasks.spawn(async move { fetch_class(&net, &sched, &hash, &holders, &[]).await });
+        }
+        while let Some(r) = tasks.join_next().await {
+            assert!(r.unwrap().is_ok());
+        }
+        assert!(net.peak.load(Ordering::SeqCst) <= 5, "global cap");
+        for node in [2, 3, 4] {
+            assert!(net.peer_peak(node) <= 2, "peer {node} cap");
+        }
+        assert!(
+            net.peak.load(Ordering::SeqCst) >= 3,
+            "the work actually ran in parallel"
+        );
+    }
+
+    // Impact: one dark origin stalled the whole pipeline when few blobs
+    // were in flight.
+    // Should: report a class whose only holders fail at the transport as
+    // unreachable, and park that peer after three failures in a row.
+    // Should: still fetch a class with a live holder meanwhile.
+    #[tokio::test]
+    async fn offline_origin_is_unreachable_and_parks() {
+        let net = Net::new(&[(2, Peer::Down), (3, Peer::Serves)], 1);
+        let sched = FetchScheduler::new(limits(8, 4, 1_000));
+        for n in 0..3 {
+            let hash = register(2000 + n);
+            assert_eq!(
+                fetch_class(&net, &sched, &hash, &[peer(2)], &[]).await,
+                Err(FetchMiss::Unreachable)
+            );
+        }
+        assert!(sched.peer_parked(2, Instant::now()));
+        let live = register(2100);
+        assert!(fetch_class(&net, &sched, &live, &[peer(3)], &[])
+            .await
+            .is_ok());
+        assert!(!sched.peer_parked(3, Instant::now()));
+    }
+
+    // Should: park a peer for 30 s on its third consecutive failure,
+    // double the park on a repeat, and clear it on any success.
+    #[test]
+    fn parked_peer_backs_off_and_recovers_on_success() {
+        let sched = FetchScheduler::new(PullLimits::default());
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            sched.record_peer_failure(7, t0);
+        }
+        assert!(sched.peer_parked(7, t0 + Duration::from_secs(29)));
+        assert!(!sched.peer_parked(7, t0 + Duration::from_secs(31)));
+        let t1 = t0 + Duration::from_secs(31);
+        sched.record_peer_failure(7, t1);
+        assert!(
+            sched.peer_parked(7, t1 + Duration::from_secs(59)),
+            "doubled"
+        );
+        sched.record_peer_success(7);
+        assert!(!sched.peer_parked(7, t1));
+    }
+
+    // Should: hold a parked blob out until its backoff passes, double the
+    // backoff on a repeat, and forget it once unparked.
+    #[test]
+    fn parked_blob_is_reoffered_after_its_backoff() {
+        use std::str::FromStr;
+        let sched = FetchScheduler::new(PullLimits::default());
+        let blob = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        let t0 = Instant::now();
+        sched.park_blob(&blob, t0);
+        assert!(sched.blob_parked(&blob, t0 + Duration::from_secs(59)));
+        assert!(!sched.blob_parked(&blob, t0 + Duration::from_secs(61)));
+        let t1 = t0 + Duration::from_secs(61);
+        sched.park_blob(&blob, t1);
+        assert!(sched.blob_parked(&blob, t1 + Duration::from_secs(119)));
+        assert_eq!(sched.stats(t1).parked_blobs, 1);
+        sched.unpark_blob(&blob);
+        assert!(!sched.blob_parked(&blob, t1));
+    }
+
+    // Should: give up on a fetch at its deadline and release its global
+    // and per-peer slots.
+    // Should not: let a hung peer hold slots past the deadline.
+    #[tokio::test]
+    async fn hung_fetch_releases_its_slots_at_the_deadline() {
+        let net = Net::new(&[(2, Peer::Hangs)], 1);
+        let sched = FetchScheduler::new(limits(4, 2, 50));
+        let hash = register(3000);
+        let started = Instant::now();
+        let got = fetch_class(&net, &sched, &hash, &[peer(2)], &[]).await;
+        assert_eq!(got, Err(FetchMiss::Unreachable));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let stats = sched.stats(Instant::now());
+        assert_eq!(stats.fetches_in_flight, 0);
+        assert!(stats.per_peer_in_flight.is_empty());
+    }
+}

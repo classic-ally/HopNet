@@ -42,6 +42,9 @@ pub struct PlannerReport {
     pub offered: usize,
     /// Pull checks queued on the engine when the report was taken.
     pub queued: usize,
+    /// The fetch scheduler at report time: window and fetches in use,
+    /// per-peer load, parked peers and blobs.
+    pub scheduler: hopnet_storage::engine::fetch::SchedulerStats,
 }
 
 static REPORT: Mutex<Option<PlannerReport>> = Mutex::new(None);
@@ -50,7 +53,18 @@ static TASK: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 /// The latest planner report, with the engine's current queue depth.
 pub fn report(app_state: &AppState) -> PlannerReport {
     let mut report = REPORT.lock().unwrap().clone().unwrap_or_default();
-    report.queued = app_state.storage.get().map_or(0, |e| e.queued_len());
+    if let Some(engine) = app_state.storage.get() {
+        report.queued = engine.queued_len();
+        report.scheduler = engine.scheduler_stats();
+        if report.scheduler.parked_blobs > 0 {
+            tracing::info!(
+                parked_blobs = report.scheduler.parked_blobs,
+                parked_peers = ?report.scheduler.parked_peers.iter().map(|p| p.node_id).collect::<Vec<_>>(),
+                longest_secs = report.scheduler.parked_longest_secs,
+                "pull: blobs parked on unreachable sources"
+            );
+        }
+    }
     report
 }
 
@@ -103,6 +117,7 @@ async fn run(app_state: AppState) {
             at_risk_blobs,
             offered: 0,
             queued: engine.queued_len(),
+            scheduler: engine.scheduler_stats(),
         });
         if !plan.is_empty() {
             tracing::info!(
