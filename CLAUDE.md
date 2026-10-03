@@ -47,6 +47,16 @@ When making changes to the codebase:
 # Git Commits
 - Never include your attribution in commits
 
+# Releases
+A `v*` tag builds on the macbook runner and every node auto-stages it; every release is an epoch crossing. Before tagging:
+1. REQUIRED gate: the cross-release orchestrator test must pass. Load the previous release's image (`nix develop --command scripts/build-release-image.sh v<previous>`) and this build's (`nix build .#packages.<system>.dockerImage && ./target/release/orchestrator load-image`), then `./target/release/orchestrator test --test release-crossing`. It crosses a mesh born on the previous release into this build and rejoins a node that was offline through the seal through the old artifact (the path consensus-bugs.md entry 19 broke).
+2. The unit gates in CI must be green, including `every_sealed_ordinal_imports_through_a_spec_of_its_own_version` and the previous-release fixture tests (`previous_release_*`).
+3. Any snapshot section `format_version` bump needs its frozen predecessor spec and a `resolve_import_plan` arm, even when only the version changes (node-local tables and indexes included).
+
+After tagging:
+- Bump `PREVIOUS_RELEASE` in `orchestrator/tests/regenesis.rs` to the new tag.
+- Refresh `src/regenesis/fixtures/previous-release-join/` from a worktree at the new tag (`cargo test --lib regenerate_previous_release_join_fixture -- --ignored`, README beside the files) and commit it to master.
+
 # Important Instruction Reminders
 Do what has been asked; nothing more, nothing less.
 NEVER create files unless they're absolutely necessary for achieving your goal.

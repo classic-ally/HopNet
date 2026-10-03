@@ -149,6 +149,29 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, String)> {
     // RFC-STORAGE-003 cutover rehearsal: the same crossing as above, on a
     // POPULATED mesh, watched through the lifecycle drain (see
     // lifecycle_cutover.rs). Same old image, same staged claim.
+    // The release gate: born on the previous release (load it with
+    // `scripts/build-release-image.sh v<PREVIOUS_RELEASE>`), staged claim
+    // = this build's crossing target.
+    if test_name == "release-crossing" {
+        return vec![
+            (
+                "HOPNET_GENESIS_CONSENSUS_POLICY",
+                "probe_base=2;grace=1;s_full=6;p_prove=6".to_string(),
+            ),
+            (
+                "HOPNET_UPGRADE_STAGED_OVERRIDE",
+                regenesis::release_crossing_target().to_string(),
+            ),
+            (
+                "HOPNET_ORCH_IMAGE",
+                format!(
+                    "hopnet:{}-{}",
+                    crate::naming::checkout_hash(),
+                    regenesis::PREVIOUS_RELEASE
+                ),
+            ),
+        ];
+    }
     if test_name == "enforcement-crossing" || test_name == "lifecycle-cutover-drain" {
         return vec![
             (
@@ -328,6 +351,7 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         | "diverged-node-rebuild"
         | "regenesis-rollback"
         | "enforcement-crossing"
+        | "release-crossing"
         | "lifecycle-cutover-drain" => Some(3),
         _ => None,
     }
@@ -458,6 +482,7 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
+        "release-crossing" => regenesis::ReleaseCrossing.run(mesh_id, nodes, flags).await,
         "three-timescales" => {
             three_timescales::ThreeTimescales
                 .run(mesh_id, nodes, flags)
@@ -700,6 +725,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "mixed-version-mesh",
         "retired-dialer",
         "enforcement-crossing",
+        "release-crossing",
         "auto-seam",
         "three-timescales",
         "evidence-drives-voteout",
