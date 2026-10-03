@@ -281,7 +281,24 @@ impl PullFloor {
         let resume = floor.saturating_add(gap);
         let (floor_cap, resume_cap) = (total / 4, total / 2);
         let clamped = floor > floor_cap || resume > resume_cap;
-        (floor.min(floor_cap), resume.min(resume_cap), clamped)
+        // Clamp first, then raise back to the ingest floor: the pull floor
+        // never sits below it (pulls must stop before uploads do), even
+        // when that leaves a small volume little or no resume headroom —
+        // `cramped` says so, and boot WARNs.
+        let floor = floor.min(floor_cap).max(ingest_floor);
+        let resume = resume.min(resume_cap).max(floor);
+        (floor, resume, clamped)
+    }
+
+    /// Whether the ingest floor plus the resume gap does not fit the
+    /// volume: the pull floor stays at the ingest floor, so a paused node
+    /// may never reach a resume mark above it.
+    pub fn cramped(&self, total: u64, ingest_floor: u64) -> bool {
+        let share = |bp: u64| (total as u128 * bp as u128 / 10_000) as u64;
+        let gap = self.resume_gap_bytes.unwrap_or_else(|| {
+            DEFAULT_PULL_RESUME_GAP_BYTES.max(share(DEFAULT_PULL_RESUME_GAP_BASIS_POINTS))
+        });
+        ingest_floor.saturating_add(gap) > total
     }
 }
 
@@ -295,8 +312,18 @@ pub fn log_pull_floor_marks(dir: &str) {
     }
     match statvfs_probe(Path::new(dir)) {
         Ok((free, total)) => {
-            let (pull, resume, clamped) = floor.marks_clamped(total, min_free_bytes());
-            if clamped {
+            let ingest = min_free_bytes();
+            let (pull, resume, clamped) = floor.marks_clamped(total, ingest);
+            if floor.cramped(total, ingest) {
+                tracing::warn!(
+                    total_bytes = total,
+                    ingest_floor_bytes = ingest,
+                    pull_floor_bytes = pull,
+                    resume_bytes = resume,
+                    "pull floor: the ingest floor plus the resume gap exceeds the volume; \
+                     the pull floor stays at the ingest floor and a paused node may not resume"
+                );
+            } else if clamped {
                 tracing::warn!(
                     total_bytes = total,
                     pull_floor_bytes = pull,
@@ -341,15 +368,36 @@ pub fn set_test_free_ceiling(bytes: u64) {
     TEST_FREE_CEILING.store(bytes, Ordering::Relaxed);
 }
 
+/// Why the guard is holding replica writes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseReason {
+    /// Below the pull floor; clears at the resume mark (hysteresis).
+    LowSpace,
+    /// The free-space probe failed; clears on the next successful probe
+    /// that reads above the pull floor — a single transient error must not
+    /// hold a node with room back for a whole resume gap.
+    ProbeError,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Paused {
+    since: Instant,
+    unix: i64,
+    reason: PauseReason,
+}
+
 #[derive(Debug, Default)]
 struct SpaceState {
-    /// Paused since (monotonic, unix seconds); `None` = open.
-    paused: Option<(Instant, i64)>,
+    /// `None` = open.
+    paused: Option<Paused>,
     last_reminder: Option<Instant>,
     /// The latest probe: (free, total).
     observed: Option<(u64, u64)>,
     /// Last free-space probe failure WARN (rate-limited).
     last_probe_warn: Option<Instant>,
+    /// The latest probe failure, kept for the report.
+    last_probe_error: Option<String>,
 }
 
 /// Probe-failure WARNs at most this often.
@@ -368,6 +416,20 @@ pub struct SpaceReport {
     pub resume_bytes: Option<u64>,
     /// Unix seconds the guard paused pulls; `None` = taking copies.
     pub paused_since: Option<i64>,
+    /// Why it is paused (`low_space` | `probe_error`); `None` when open.
+    pub pause_reason: Option<PauseReason>,
+    /// The latest free-space probe failure, if any.
+    pub last_probe_error: Option<String>,
+}
+
+/// A read-only admission answer ([`SpaceGuard::would_admit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    Admit,
+    /// Below this write class's floor (or the guard is already paused).
+    BelowFloor,
+    /// The free-space probe failed: refused, fail safe.
+    ProbeError,
 }
 
 /// The replica-write floor: one per process in production
@@ -429,8 +491,7 @@ impl SpaceGuard {
         self.ingest_floor.unwrap_or_else(min_free_bytes)
     }
 
-    /// Whether replica writes are paused (below the pull floor, not yet
-    /// back at the resume mark).
+    /// Whether replica writes are held back (low space or a probe error).
     pub fn paused(&self) -> bool {
         self.state.lock().unwrap().paused.is_some()
     }
@@ -438,8 +499,7 @@ impl SpaceGuard {
     /// Reserve room for a replica write of `bytes` under `dir`, or refuse.
     /// Hold the reservation until the bytes are on disk. A pull-class
     /// refusal pauses the guard; while paused, pull-class writes are
-    /// refused until [`SpaceGuard::reprobe`] (or this call) sees the
-    /// resume mark.
+    /// refused until the pause clears (see [`PauseReason`]).
     pub fn reserve(
         &self,
         dir: &str,
@@ -462,11 +522,12 @@ impl SpaceGuard {
         match class {
             WriteClass::Repair => try_reserve(self.counter, free, bytes, ingest),
             WriteClass::Pull => {
-                if state.paused.is_some() {
-                    if free.saturating_sub(reserved) < resume {
+                if let Some(paused) = state.paused {
+                    let available = free.saturating_sub(reserved);
+                    if !Self::clears(paused.reason, available, pull, resume) {
                         Self::remind(&mut state, free, pull, resume);
                         return Err(StorageError::InsufficientSpace {
-                            free: free.saturating_sub(reserved),
+                            free: available,
                             needed: bytes,
                             floor: resume,
                         });
@@ -475,34 +536,44 @@ impl SpaceGuard {
                 }
                 let granted = try_reserve(self.counter, free, bytes, pull);
                 if granted.is_err() {
-                    Self::pause(&mut state, free, pull, resume);
+                    Self::pause(&mut state, PauseReason::LowSpace, free, pull, resume);
                 }
                 granted
             }
         }
     }
 
-    /// Probe free space. A probe failure fails safe: the guard pauses (an
-    /// unreadable volume is not one to keep writing replicas to), a
-    /// rate-limited WARN says why, and the error is returned so the write
-    /// is refused.
+    /// Whether a pause of `reason` clears with `available` bytes free.
+    fn clears(reason: PauseReason, available: u64, pull: u64, resume: u64) -> bool {
+        match reason {
+            PauseReason::LowSpace => available >= resume,
+            PauseReason::ProbeError => available > pull,
+        }
+    }
+
+    /// Probe free space. A probe failure fails safe: the guard pauses
+    /// (`ProbeError`; an unreadable volume is not one to keep writing
+    /// replicas to), a rate-limited WARN says why, and the error is
+    /// returned so the write is refused.
     fn probe_or_hold(&self, dir: &str) -> Result<(u64, u64), StorageError> {
         match (self.probe)(Path::new(dir)) {
             Ok(probed) => Ok(probed),
             Err(e) => {
                 let mut state = self.state.lock().unwrap();
-                Self::warn_probe(&mut state, dir, &e);
+                Self::note_probe_failure(&mut state, dir, &e);
                 if state.paused.is_none() {
                     let (free, total) = state.observed.unwrap_or((0, 0));
                     let (pull, resume) = self.pull_floor().marks(total, self.ingest_floor());
-                    Self::pause(&mut state, free, pull, resume);
+                    Self::pause(&mut state, PauseReason::ProbeError, free, pull, resume);
                 }
                 Err(StorageError::Io(e))
             }
         }
     }
 
-    fn warn_probe(state: &mut SpaceState, dir: &str, e: &std::io::Error) {
+    /// Record a probe failure for the report and WARN (rate-limited).
+    fn note_probe_failure(state: &mut SpaceState, dir: &str, e: &std::io::Error) {
+        state.last_probe_error = Some(e.to_string());
         let now = Instant::now();
         if state
             .last_probe_warn
@@ -516,31 +587,40 @@ impl SpaceGuard {
         );
     }
 
-    /// Would a replica write of `bytes` be admitted right now? Read-only
-    /// (reserves nothing, never pauses): a re-encode asks before gathering
-    /// K shards, so a refusal costs no download. A probe failure answers no.
-    pub fn would_admit(&self, dir: &str, bytes: u64, class: WriteClass) -> bool {
+    /// Would a replica write of `bytes` be admitted right now? Strictly
+    /// read-only: reserves nothing and never changes the guard's state, a
+    /// probe error included (that write is refused, fail safe). A
+    /// re-encode asks before gathering K shards, so a refusal costs no
+    /// download; the caller decides whether to hold the guard back
+    /// ([`SpaceGuard::hold_back`]).
+    pub fn would_admit(&self, dir: &str, bytes: u64, class: WriteClass) -> Admission {
         let floor = self.pull_floor();
         if !floor.enabled() {
-            return true;
+            return Admission::Admit;
         }
         if class == WriteClass::Pull && self.paused() {
-            return false;
+            return Admission::BelowFloor;
         }
-        let Ok((free, total)) = self.probe_or_hold(dir) else {
-            return false;
+        let Ok((free, total)) = (self.probe)(Path::new(dir)) else {
+            return Admission::ProbeError;
         };
         let ingest = self.ingest_floor();
         let limit = match class {
             WriteClass::Repair => ingest,
             WriteClass::Pull => floor.marks(total, ingest).0,
         };
-        fits(free, self.counter.load(Ordering::Acquire), bytes, limit).is_ok()
+        if fits(free, self.counter.load(Ordering::Acquire), bytes, limit).is_ok() {
+            Admission::Admit
+        } else {
+            Admission::BelowFloor
+        }
     }
 
-    /// A write failed with the disk full (another writer took the space
-    /// under us): pause as if the floor had refused it.
-    pub fn note_disk_full(&self) {
+    /// Hold replica writes back for `reason` (no-op if already paused):
+    /// what a caller does when [`SpaceGuard::would_admit`] refused a
+    /// pull-class write, so the refused work waits for the pause to clear
+    /// instead of being retried in a tight loop.
+    pub fn hold_back(&self, reason: PauseReason) {
         let floor = self.pull_floor();
         if !floor.enabled() {
             return;
@@ -548,10 +628,16 @@ impl SpaceGuard {
         let mut state = self.state.lock().unwrap();
         let (free, total) = state.observed.unwrap_or((0, 0));
         let (pull, resume) = floor.marks(total, self.ingest_floor());
-        Self::pause(&mut state, free, pull, resume);
+        Self::pause(&mut state, reason, free, pull, resume);
     }
 
-    /// While paused: probe again and resume at the resume mark. Returns
+    /// A write failed with the disk full (another writer took the space
+    /// under us): pause as if the floor had refused it.
+    pub fn note_disk_full(&self) {
+        self.hold_back(PauseReason::LowSpace);
+    }
+
+    /// While paused: probe again and resume once the pause clears. Returns
     /// whether replica writes are open.
     pub fn reprobe(&self, dir: &str) -> bool {
         let floor = self.pull_floor();
@@ -561,21 +647,21 @@ impl SpaceGuard {
         }
         let probed = (self.probe)(Path::new(dir));
         let mut state = self.state.lock().unwrap();
-        if state.paused.is_none() {
+        let Some(paused) = state.paused else {
             return true;
-        }
+        };
         let (free, total) = match probed {
             Ok(probed) => probed,
             // Stay paused (fail safe), and say why.
             Err(e) => {
-                Self::warn_probe(&mut state, dir, &e);
+                Self::note_probe_failure(&mut state, dir, &e);
                 return false;
             }
         };
         state.observed = Some((free, total));
         let (pull, resume) = floor.marks(total, self.ingest_floor());
-        let reserved = self.counter.load(Ordering::Acquire);
-        if free.saturating_sub(reserved) >= resume {
+        let available = free.saturating_sub(self.counter.load(Ordering::Acquire));
+        if Self::clears(paused.reason, available, pull, resume) {
             Self::resume(&mut state, free);
             true
         } else {
@@ -600,11 +686,13 @@ impl SpaceGuard {
             ingest_floor_bytes: ingest,
             pull_floor_bytes: marks.map(|m| m.0),
             resume_bytes: marks.map(|m| m.1),
-            paused_since: state.paused.map(|p| p.1),
+            paused_since: state.paused.map(|p| p.unix),
+            pause_reason: state.paused.map(|p| p.reason),
+            last_probe_error: state.last_probe_error.clone(),
         }
     }
 
-    fn pause(state: &mut SpaceState, free: u64, pull: u64, resume: u64) {
+    fn pause(state: &mut SpaceState, reason: PauseReason, free: u64, pull: u64, resume: u64) {
         if state.paused.is_some() {
             return;
         }
@@ -612,25 +700,31 @@ impl SpaceGuard {
         let unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
-        state.paused = Some((now, unix));
+        state.paused = Some(Paused {
+            since: now,
+            unix,
+            reason,
+        });
         state.last_reminder = Some(now);
-        tracing::warn!(
-            free_bytes = free,
-            pull_floor_bytes = pull,
-            resume_bytes = resume,
-            "storage: below the pull floor; holding back pulls and re-encodes (still serving)"
-        );
+        match reason {
+            PauseReason::LowSpace => tracing::warn!(
+                free_bytes = free,
+                pull_floor_bytes = pull,
+                resume_bytes = resume,
+                "storage: below the pull floor; holding back pulls and re-encodes (still serving)"
+            ),
+            PauseReason::ProbeError => tracing::warn!(
+                "storage: free space unreadable; holding back pulls and re-encodes \
+                 until a probe reads above the pull floor (still serving)"
+            ),
+        }
     }
 
     fn resume(state: &mut SpaceState, free: u64) {
-        let held_secs = state.paused.map_or(0, |p| p.0.elapsed().as_secs());
+        let held_secs = state.paused.map_or(0, |p| p.since.elapsed().as_secs());
         state.paused = None;
         state.last_reminder = None;
-        tracing::info!(
-            free_bytes = free,
-            held_secs,
-            "storage: back at the resume mark; pulls resume"
-        );
+        tracing::info!(free_bytes = free, held_secs, "storage: pulls resume");
     }
 
     fn remind(state: &mut SpaceState, free: u64, pull: u64, resume: u64) {
@@ -646,7 +740,7 @@ impl SpaceGuard {
             free_bytes = free,
             pull_floor_bytes = pull,
             resume_bytes = resume,
-            "storage: still holding back pulls for space"
+            "storage: still holding back pulls"
         );
     }
 }
@@ -855,10 +949,10 @@ mod tests {
         let total = 32_000_000_000u64;
         let (floor, resume, clamped) = PullFloor::default().marks_clamped(total, 10 * GIB);
         assert!(clamped);
-        assert!(
-            floor <= total / 4 && resume <= total / 2,
-            "{floor} {resume}"
-        );
+        // The floor stays at the ingest floor (never below it); the resume
+        // mark is held to half the volume.
+        assert_eq!(floor, 10 * GIB);
+        assert!(resume <= total / 2, "{floor} {resume}");
         assert!(floor < resume);
 
         let (guard, free, _) = fake_guard(GIB, total);
@@ -903,7 +997,10 @@ mod tests {
         assert!(guard.reserve("/x", MB, WriteClass::Pull).is_err());
         assert!(guard.paused());
         assert!(!guard.reprobe("/x"));
-        assert!(!guard.would_admit("/x", MB, WriteClass::Repair));
+        assert_eq!(
+            guard.would_admit("/x", MB, WriteClass::Repair),
+            Admission::ProbeError
+        );
         fail.store(false, Ordering::Release);
         assert!(guard.reprobe("/x"));
         assert!(guard.reserve("/x", MB, WriteClass::Pull).is_ok());
@@ -915,9 +1012,45 @@ mod tests {
     #[test]
     fn would_admit_checks_the_class_floor() {
         let (guard, _, _) = fake_guard(15 * GIB, 927 * GIB);
-        assert!(guard.would_admit("/x", GIB, WriteClass::Repair));
-        assert!(!guard.would_admit("/x", 6 * GIB, WriteClass::Repair));
-        assert!(!guard.would_admit("/x", GIB, WriteClass::Pull));
+        assert_eq!(
+            guard.would_admit("/x", GIB, WriteClass::Repair),
+            Admission::Admit
+        );
+        assert_eq!(
+            guard.would_admit("/x", 6 * GIB, WriteClass::Repair),
+            Admission::BelowFloor
+        );
+        assert_eq!(
+            guard.would_admit("/x", GIB, WriteClass::Pull),
+            Admission::BelowFloor
+        );
         assert!(!guard.paused(), "a read-only check never pauses");
+    }
+
+    // Impact: second review of #100 — a probe-failure pause was visible only
+    // in the node's log: the report said "paused" with no why, so a node
+    // with plenty of room read as full.
+    // Should: report the pause reason (probe_error vs low_space) and the
+    // last probe error.
+    // Should: clear the reason when the pause clears.
+    #[test]
+    fn the_report_says_why_the_guard_is_holding_back() {
+        let (guard, fail) = failing_guard();
+        assert!(guard.reserve("/x", MB, WriteClass::Pull).is_err());
+        let report = guard.report();
+        assert_eq!(report.pause_reason, Some(PauseReason::ProbeError));
+        assert!(report
+            .last_probe_error
+            .as_deref()
+            .is_some_and(|e| e.contains("I/O")));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["pause_reason"], "probe_error");
+        fail.store(false, Ordering::Release);
+        assert!(guard.reprobe("/x"));
+        assert_eq!(guard.report().pause_reason, None);
+
+        let (low, _, _) = fake_guard(GIB, 927 * GIB);
+        assert!(low.reserve("/x", MB, WriteClass::Pull).is_err());
+        assert_eq!(low.report().pause_reason, Some(PauseReason::LowSpace));
     }
 }

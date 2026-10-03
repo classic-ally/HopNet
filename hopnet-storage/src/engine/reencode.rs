@@ -7,7 +7,7 @@
 //! touches disk. No key custody, no plaintext, no consensus transaction —
 //! the inventory settles through the next self-check.
 
-use crate::admission::{self, SpaceGuard, WriteClass};
+use crate::admission::{self, Admission, PauseReason, SpaceGuard, WriteClass};
 use crate::fragstore;
 use crate::rs::{ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK};
 use crate::traits::{LocalStateSink, StateReader, Transport};
@@ -223,7 +223,20 @@ where
     // the worst-case size of the classes it will store.
     let worst_case =
         targets.len() as u64 * admission::fragment_file_bytes(crate::rs::MAX_FRAGMENT_SIZE);
-    if !space.would_admit(fragments_dir, worst_case, write_class) {
+    let reason = match space.would_admit(fragments_dir, worst_case, write_class) {
+        Admission::Admit => None,
+        Admission::BelowFloor => Some(PauseReason::LowSpace),
+        Admission::ProbeError => Some(PauseReason::ProbeError),
+    };
+    if let Some(reason) = reason {
+        // A refused pull-class write (a pull-path rebuild, lazy repair)
+        // holds the guard back, so the blob waits in the queue for the
+        // pause to clear instead of coming back every re-probe interval to
+        // be refused again. An urgent repair just fails: the next policy
+        // tick re-derives it.
+        if write_class == WriteClass::Pull {
+            space.hold_back(reason);
+        }
         return Err(EngineError::NoSpace);
     }
 

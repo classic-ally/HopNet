@@ -2907,4 +2907,60 @@ mod tests {
         assert!(!engine.enqueue_reencode(cmd(), false));
         assert!(engine.enqueue_reencode(cmd(), true));
     }
+
+    // Impact: second review of #100 — a pull-path rebuild refused by the
+    // read-only pre-check while the guard was open came back as held for
+    // space with a re-probe retry, and was refused again every 30 s forever,
+    // holding a window slot each time: the guard never paused.
+    // Should: hold the guard back when a pull-class rebuild is refused, so
+    // the blob waits for the pause to clear instead of looping.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_rebuild_holds_the_guard_back() {
+        let base = std::env::temp_dir().join(format!("hopnet-reenc-loop-{}", std::process::id()));
+        let dir = base.to_str().unwrap().to_string();
+        let (blob_id, outcome, mut manifest) = encoded_blob(&dir).await;
+        let lost: Vec<u32> = vec![3, 17];
+        let chunk = manifest.chunks.get_mut(&0).unwrap();
+        for map in [&mut chunk.0, &mut chunk.1] {
+            for (idx, entry) in map.iter_mut() {
+                entry.2 = !lost.contains(&(*idx as u32));
+            }
+        }
+        for f in &outcome.fragments {
+            if lost.contains(&f.local_index) {
+                fragstore::delete_fragment(&dir, &f.fragment_hash).unwrap();
+            }
+        }
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        // Open, but 1 MiB above the floor: two worst-case classes do not fit.
+        let floor = 1u64 << 30;
+        let space = crate::admission::SpaceGuard::new(
+            crate::admission::PullFloor {
+                min_free_bytes: floor,
+                min_free_basis_points: 0,
+                resume_gap_bytes: Some(1 << 20),
+            },
+            Some(1),
+            Box::new(move |_| Ok((floor + (1 << 20), 1 << 40))),
+            Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0))),
+        );
+        assert!(!space.paused());
+        let rebuilt = reencode::reencode_chunk_via(
+            net.as_ref(),
+            net.as_ref(),
+            &dir,
+            &blob_id,
+            0,
+            &lost,
+            (&space, WriteClass::Pull),
+            |_, _, _| std::future::ready(None),
+        )
+        .await;
+        assert!(matches!(rebuilt, Err(EngineError::NoSpace)), "{rebuilt:?}");
+        assert!(space.paused(), "held back, not retried in a loop");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
