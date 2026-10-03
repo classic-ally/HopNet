@@ -1307,12 +1307,15 @@ pub struct PolicyTickReport {
     pub repair_grace_online: usize,
     pub watermark: usize,
     /// Chunks below the watermark with a class this node owes a rebuild
-    /// of (all enqueued, urgently).
+    /// of (all enqueued, urgently, unless already queued).
     pub urgent_chunks_owed: usize,
     /// Chunks at or above the watermark with a class this node owes a
     /// rebuild of — one is picked per tick.
     pub lazy_chunks_owed: usize,
+    /// Urgent chunks newly queued by this tick (not already waiting).
     pub urgent_reencodes: usize,
+    /// Urgent re-encodes queued or running on the engine after this tick.
+    pub urgent_reencodes_pending: usize,
     pub lazy_reencodes: usize,
     /// Blobs the pull planner has handed the reconciler since its current
     /// pass started (a wake-up, not a result — the worker pulls on its
@@ -1413,6 +1416,7 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
         .map_err(|e| Error::Failed(Arc::new(format!("settings join: {e}").into())))?
         .map_err(|e| Error::Failed(Arc::new(e.into())))?
     };
+    let mut urgent_owed = 0usize;
     let mut urgent_enqueued = 0usize;
     let mut lazy_enqueued = 0usize;
     let mut lazy_owed = 0usize;
@@ -1527,8 +1531,12 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
                     missing_classes: owed,
                 };
                 if urgent {
-                    engine.enqueue_reencode(cmd, true);
-                    urgent_enqueued += 1;
+                    urgent_owed += 1;
+                    // A chunk still queued from an earlier tick is not
+                    // queued twice.
+                    if engine.enqueue_reencode(cmd, true) {
+                        urgent_enqueued += 1;
+                    }
                 } else {
                     lazy_owed += 1;
                     if lazy_pick.is_none() {
@@ -1589,9 +1597,13 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
         online: view.online.len(),
         repair_grace_online,
         watermark: view.watermark,
-        urgent_chunks_owed: urgent_enqueued,
+        urgent_chunks_owed: urgent_owed,
         lazy_chunks_owed: lazy_owed,
         urgent_reencodes: urgent_enqueued,
+        urgent_reencodes_pending: app_state
+            .storage
+            .get()
+            .map_or(0, |engine| engine.urgent_reencodes_pending()),
         lazy_reencodes: lazy_enqueued,
         pull_kicks,
         confirms_proposed,

@@ -140,6 +140,11 @@ pub struct ReencodeCmd {
 
 type PullRequest = BlobId;
 
+/// Urgent re-encodes queued or running, by (blob, chunk): the tick re-sends
+/// its whole urgent set every pass, and a chunk already waiting is not
+/// queued again.
+type UrgentPending = Arc<std::sync::Mutex<std::collections::HashSet<(BlobId, u32)>>>;
+
 /// Blobs queued for (or in) a pull check, each with the callers waiting
 /// on its outcome. One entry per blob: a second request for a queued blob
 /// waits on the same check instead of queueing a duplicate.
@@ -219,6 +224,7 @@ pub struct EngineHandle {
     /// Blobs waiting for (or in) a pull check: hints for a blob already
     /// queued are dropped, and the planner paces itself on the count.
     queued: PullQueue,
+    urgent_pending: UrgentPending,
     sched: Arc<FetchScheduler>,
 }
 
@@ -309,16 +315,32 @@ impl EngineHandle {
 
     /// Enqueue one chunk re-encode on the serial worker. Urgent (live
     /// classes below the watermark) preempts pulls and lazy work; lazy
-    /// items drain one at a time behind everything else.
-    pub fn enqueue_reencode(&self, cmd: ReencodeCmd, urgent: bool) {
+    /// items drain one at a time behind everything else. An urgent chunk
+    /// already queued or running is not queued again. Returns whether it
+    /// was queued.
+    pub fn enqueue_reencode(&self, cmd: ReencodeCmd, urgent: bool) -> bool {
+        let key = (cmd.blob_id.clone(), cmd.chunk_number);
         let tx = if urgent {
+            if !self.urgent_pending.lock().unwrap().insert(key.clone()) {
+                return false;
+            }
             &self.reencode_urgent_tx
         } else {
             &self.reencode_lazy_tx
         };
         if tx.send(cmd).is_err() {
+            if urgent {
+                self.urgent_pending.lock().unwrap().remove(&key);
+            }
             tracing::error!("re-encode: engine gone — command dropped");
+            return false;
         }
+        true
+    }
+
+    /// Urgent re-encodes queued or running.
+    pub fn urgent_reencodes_pending(&self) -> usize {
+        self.urgent_pending.lock().unwrap().len()
     }
 
     /// Spawn the engine on `data_rt`: one dispatch loop running the duty
@@ -346,6 +368,8 @@ impl EngineHandle {
         let fragments_dir = config.fragments_dir;
         let queued: PullQueue = Default::default();
         let worker_queued = queued.clone();
+        let urgent_pending: UrgentPending = Default::default();
+        let worker_urgent = urgent_pending.clone();
         let sched = FetchScheduler::new(config.limits);
         let worker_sched = sched.clone();
         // Weak, so the loop still ends when every handle is dropped.
@@ -360,7 +384,9 @@ impl EngineHandle {
                     biased;
                     cmd = reencode_urgent_rx.recv() => {
                         let Some(cmd) = cmd else { break };
+                        let key = (cmd.blob_id.clone(), cmd.chunk_number);
                         run_reencode_guarded(&seams, &fragments_dir, cmd).await;
+                        worker_urgent.lock().unwrap().remove(&key);
                     }
                     Some(_) = running.join_next(), if !running.is_empty() => {}
                     admitted = async {
@@ -423,6 +449,7 @@ impl EngineHandle {
             reencode_urgent_tx,
             reencode_lazy_tx,
             queued,
+            urgent_pending,
             sched,
         }
     }
@@ -1729,6 +1756,62 @@ mod tests {
             .await
             .expect("the engine still answers");
         assert_eq!(outcome, Some(PullOutcome::default()));
+        // Should: release the chunk's pending mark even when its re-encode
+        // panics, so a later tick can queue it again.
+        assert_eq!(engine.urgent_reencodes_pending(), 0);
+    }
+
+    /// A handle with no dispatch loop: whatever is enqueued stays in the
+    /// returned receivers.
+    fn bare_handle() -> (
+        EngineHandle,
+        mpsc::UnboundedReceiver<ReencodeCmd>,
+        mpsc::UnboundedReceiver<ReencodeCmd>,
+    ) {
+        let (pull_tx, _) = mpsc::unbounded_channel();
+        let (reencode_urgent_tx, urgent_rx) = mpsc::unbounded_channel();
+        let (reencode_lazy_tx, lazy_rx) = mpsc::unbounded_channel();
+        let handle = EngineHandle {
+            pull_tx,
+            reencode_urgent_tx,
+            reencode_lazy_tx,
+            queued: Default::default(),
+            urgent_pending: Default::default(),
+            sched: FetchScheduler::new(PullLimits::default()),
+        };
+        (handle, urgent_rx, lazy_rx)
+    }
+
+    fn reencode_cmd(blob: &BlobId, chunk_number: u32) -> ReencodeCmd {
+        ReencodeCmd {
+            blob_id: blob.clone(),
+            chunk_number,
+            missing_classes: vec![1],
+        }
+    }
+
+    // Impact: the tick re-sends its whole urgent set every five minutes
+    // into an unbounded channel; without dedup a slow backlog grew by a
+    // full copy of itself per tick (2026.10.8 crossing).
+    // Should: queue an urgent chunk once while it is still waiting, and a
+    // different chunk of the same blob separately.
+    // Should not: deduplicate lazy picks (one per tick, run in order).
+    #[tokio::test]
+    async fn an_urgent_reencode_already_pending_is_not_queued_twice() {
+        let (engine, mut urgent_rx, mut lazy_rx) = bare_handle();
+        let a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        assert!(engine.enqueue_reencode(reencode_cmd(&a, 0), true));
+        assert!(!engine.enqueue_reencode(reencode_cmd(&a, 0), true));
+        assert!(engine.enqueue_reencode(reencode_cmd(&a, 1), true));
+        assert_eq!(engine.urgent_reencodes_pending(), 2);
+        assert_eq!(urgent_rx.recv().await.unwrap().chunk_number, 0);
+        assert_eq!(urgent_rx.recv().await.unwrap().chunk_number, 1);
+        assert!(urgent_rx.try_recv().is_err());
+
+        assert!(engine.enqueue_reencode(reencode_cmd(&a, 0), false));
+        assert!(engine.enqueue_reencode(reencode_cmd(&a, 0), false));
+        assert!(lazy_rx.recv().await.is_some());
+        assert!(lazy_rx.recv().await.is_some());
     }
 
     // Impact: review of #96 — park entries for blobs that stopped being

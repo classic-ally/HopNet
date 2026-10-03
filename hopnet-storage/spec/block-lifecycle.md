@@ -1268,7 +1268,11 @@ optimization and carries no proof obligation.
       node that has left the storage view is never revived, so repair
       after a real departure is unchanged. No tolerance-0 bypass: it
       would fire on every chunk in exactly the crossing case. The tick
-      report carries `repair_grace_online`. Still open: re-encode
+      report carries `repair_grace_online`. The engine queues an urgent
+      (blob, chunk) once while it waits or runs (the tick re-sends its
+      whole urgent set every pass, which grew the backlog by a full
+      copy per tick); the report adds `urgent_reencodes_pending`, and
+      `urgent_reencodes` counts only newly queued chunks. Still open: re-encode
       off the pull dispatch loop (its own budget), and a `GRACE`
       constant in `spec/storage_policy.qnt`.
   - Rehearsal (2026-09-27): `orchestrator test --test
