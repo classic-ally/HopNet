@@ -2783,6 +2783,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    // Impact: review of #100 at bbf1cf58 — an urgent repair refused for
+    // space was only logged at debug and never recorded, so it was retried
+    // every tick forever with no signal while its chunk stayed below the
+    // watermark.
+    // Should: count each refused urgent repair with its reason in the
+    // report, a probe failure included (recorded as the last probe error).
+    // Should not: pause the guard for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_urgent_repair_is_counted_not_silent() {
+        let base = std::env::temp_dir().join(format!("hopnet-reenc-count-{}", std::process::id()));
+        let dir = base.to_str().unwrap().to_string();
+        let (blob_id, _outcome, manifest) = encoded_blob(&dir).await;
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        // Missing on disk per the manifest's flags: two classes to repair.
+        let mut manifest = net.manifest.lock().unwrap().clone().unwrap();
+        let chunk = manifest.chunks.get_mut(&0).unwrap();
+        for map in [&mut chunk.0, &mut chunk.1] {
+            for (idx, entry) in map.iter_mut() {
+                entry.2 = !matches!(*idx, 3 | 17);
+            }
+        }
+        *net.manifest.lock().unwrap() = Some(manifest);
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_fail = fail.clone();
+        let space = crate::admission::SpaceGuard::new(
+            crate::admission::PullFloor {
+                min_free_bytes: 1 << 30,
+                min_free_basis_points: 0,
+                resume_gap_bytes: Some(0),
+            },
+            Some(1 << 30),
+            Box::new(move |_| {
+                if probe_fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err(std::io::Error::from_raw_os_error(5))
+                } else {
+                    Ok((1 << 20, 1 << 40))
+                }
+            }),
+            Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0))),
+        );
+        let urgent = || {
+            reencode::reencode_chunk_via(
+                net.as_ref(),
+                net.as_ref(),
+                &dir,
+                &blob_id,
+                0,
+                &[3, 17],
+                (&space, WriteClass::Repair),
+                |_, _, _| std::future::ready(None),
+            )
+        };
+        assert!(matches!(urgent().await, Err(EngineError::NoSpace)));
+        let report = space.report();
+        assert_eq!(report.urgent_refused, 1);
+        assert_eq!(
+            report.last_urgent_refused,
+            Some(crate::admission::PauseReason::LowSpace)
+        );
+
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(urgent().await, Err(EngineError::NoSpace)));
+        let report = space.report();
+        assert_eq!(report.urgent_refused, 2);
+        assert_eq!(
+            report.last_urgent_refused,
+            Some(crate::admission::PauseReason::ProbeError)
+        );
+        assert!(report.last_probe_error.is_some());
+        assert!(!space.paused());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // Impact: review of #100 — blobs already admitted when the pause began
     // were marked held and left the queue with no retry: the feeder had
     // already popped them, so the most at-risk blobs were lost until the

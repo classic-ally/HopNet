@@ -232,10 +232,14 @@ where
         // A refused pull-class write (a pull-path rebuild, lazy repair)
         // holds the guard back, so the blob waits in the queue for the
         // pause to clear instead of coming back every re-probe interval to
-        // be refused again. An urgent repair just fails: the next policy
-        // tick re-derives it.
-        if write_class == WriteClass::Pull {
-            space.hold_back(reason);
+        // be refused again. An urgent repair is counted and WARNed (its
+        // chunk stays below the watermark) and the next policy tick
+        // re-derives it; it never pauses the guard.
+        match write_class {
+            WriteClass::Pull => space.hold_back(reason),
+            WriteClass::Repair => {
+                space.note_urgent_refused(&format!("blob {blob_id} chunk {chunk_number}"), reason)
+            }
         }
         return Err(EngineError::NoSpace);
     }
