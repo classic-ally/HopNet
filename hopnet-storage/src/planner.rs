@@ -69,6 +69,80 @@ pub fn sort_plan(items: &mut [PlanItem]) {
     });
 }
 
+/// The owed blobs the planner knows of, across bounded passes, in global
+/// at-risk-first order. Each pass reads one slice of the in-flight set
+/// (by id) and `absorb`s it: the slice's old entries are replaced by its
+/// fresh scores, so a blob re-scored or no longer owed is updated, and an
+/// at-risk blob from any slice reaches the head as soon as its slice is
+/// read. The feeder `pop`s from the head while passes continue. ~70k
+/// entries fit easily in memory.
+#[derive(Debug, Default)]
+pub struct PriorityBook {
+    /// blob id (as its stored text) → (tolerance, owed, id).
+    entries: std::collections::BTreeMap<String, (i32, usize, BlobId)>,
+    /// (tolerance, more owed first, id text) — the feed order.
+    order: BTreeSet<(i32, std::cmp::Reverse<usize>, String)>,
+}
+
+impl PriorityBook {
+    /// Replace everything known about the slice of ids in `(after, through]`
+    /// (`after` None = from the start, `through` None = to the end) with
+    /// `items`, the slice's freshly scored owed blobs.
+    pub fn absorb(
+        &mut self,
+        after: Option<&BlobId>,
+        through: Option<&BlobId>,
+        items: Vec<PlanItem>,
+    ) {
+        use std::ops::Bound;
+        let lo = after.map_or(Bound::Unbounded, |id| Bound::Excluded(id.to_string()));
+        let hi = through.map_or(Bound::Unbounded, |id| Bound::Included(id.to_string()));
+        let stale: Vec<String> = self
+            .entries
+            .range((lo, hi))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stale {
+            self.remove(&key);
+        }
+        for item in items {
+            let key = item.blob_id.to_string();
+            self.remove(&key);
+            self.order
+                .insert((item.tolerance, std::cmp::Reverse(item.owed), key.clone()));
+            self.entries
+                .insert(key, (item.tolerance, item.owed, item.blob_id));
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some((tolerance, owed, _)) = self.entries.remove(key) {
+            self.order
+                .remove(&(tolerance, std::cmp::Reverse(owed), key.to_string()));
+        }
+    }
+
+    /// Take the most at-risk blob (it returns on its slice's next read if
+    /// still owed).
+    pub fn pop(&mut self) -> Option<BlobId> {
+        let (_, _, key) = self.order.pop_first()?;
+        self.entries.remove(&key).map(|(_, _, id)| id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Owed blobs at member fault tolerance 0 or below.
+    pub fn at_risk(&self) -> usize {
+        self.order.iter().take_while(|(t, _, _)| *t <= 0).count()
+    }
+}
+
 /// One manifest row as the planner needs it.
 struct ClassRow {
     local_index: usize,
@@ -508,5 +582,35 @@ mod tests {
             got.items.into_iter().map(|i| i.blob_id).collect::<Vec<_>>(),
             vec![blob(2)]
         );
+    }
+
+    // Impact: re-review of #96 — with bounded passes, at-risk-first held
+    // only within each 16k slice, so an at-risk blob in a later slice waited
+    // behind healthy blobs of the slice being fed.
+    // Should: feed the most at-risk blob across every slice read so far.
+    // Should: re-score a blob when its slice is read again, and drop one
+    // its slice no longer lists as owed.
+    // Should not: touch entries outside the slice being absorbed.
+    #[test]
+    fn the_priority_book_orders_globally_across_slices() {
+        let item = |n: u8, tolerance: i32, owed: usize| PlanItem {
+            blob_id: blob(n),
+            tolerance,
+            owed,
+        };
+        let mut book = PriorityBook::default();
+        // Slice 1 (.. through blob 3): healthy blobs.
+        book.absorb(None, Some(&blob(3)), vec![item(1, 2, 1), item(2, 2, 3)]);
+        // Slice 2 (blob 3 .. end): one at risk.
+        book.absorb(Some(&blob(3)), None, vec![item(5, 0, 1), item(6, 1, 1)]);
+        assert_eq!(book.len(), 4);
+        assert_eq!(book.at_risk(), 1);
+        assert_eq!(book.pop(), Some(blob(5)), "at risk, from the later slice");
+
+        // Slice 1 re-read: blob 1 now at risk, blob 2 no longer owed.
+        book.absorb(None, Some(&blob(3)), vec![item(1, -1, 2)]);
+        assert_eq!(book.pop(), Some(blob(1)));
+        assert_eq!(book.pop(), Some(blob(6)), "slice 2 untouched");
+        assert_eq!(book.pop(), None);
     }
 }

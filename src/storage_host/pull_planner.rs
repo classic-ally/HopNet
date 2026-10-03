@@ -45,11 +45,11 @@ pub struct PlannerReport {
     pub pass_ms: u64,
     /// In-flight blobs the pass read.
     pub scanned: usize,
-    /// Of those, blobs this node owes at least one class of.
+    /// Owed blobs waiting in the priority book (every slice read so far).
     pub owed_blobs: usize,
     /// Owed blobs at member fault tolerance 0 or below.
     pub at_risk_blobs: usize,
-    /// Blobs handed to the engine since the pass started.
+    /// Blobs the feeder has handed the engine since the planner started.
     pub offered: usize,
     /// Pull checks queued on the engine when the report was taken.
     pub queued: usize,
@@ -94,7 +94,52 @@ pub fn ensure_running(app_state: &AppState) -> bool {
     true
 }
 
+/// The owed blobs known so far, in global at-risk-first order; passes
+/// absorb slices into it and the feeder offers from its head.
+type Book = std::sync::Arc<Mutex<planner::PriorityBook>>;
+
+/// Offer the book's most at-risk blob whenever the engine's queue has
+/// room, independently of the planning passes, so an at-risk blob found
+/// in any slice is fed without waiting for the current slice to drain.
+async fn feed(app_state: AppState, book: Book) {
+    loop {
+        let Some(engine) = app_state.storage.get().cloned() else {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        };
+        if engine.queued_len() >= PULL_QUEUE_TARGET {
+            tokio::time::sleep(FEED_POLL).await;
+            continue;
+        }
+        let next = book.lock().unwrap().pop();
+        let Some(blob_id) = next else {
+            tokio::time::sleep(FEED_POLL).await;
+            continue;
+        };
+        // Parked since it was planned: its next slice read brings it back
+        // once the park ends.
+        if engine.blob_parked(&blob_id) {
+            continue;
+        }
+        if engine.offer(blob_id)
+            && let Some(r) = REPORT.lock().unwrap().as_mut()
+        {
+            r.offered += 1;
+        }
+    }
+}
+
 async fn run(app_state: AppState) {
+    let book: Book = Default::default();
+    let feeder = tokio::spawn(feed(app_state.clone(), book.clone()));
+    // The feeder dies with the planner (the tick restarts both).
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _feeder = AbortOnDrop(feeder);
     let mut resume: Option<hopnet_storage::BlobId> = None;
     loop {
         let Some(engine) = app_state.storage.get().cloned() else {
@@ -103,8 +148,9 @@ async fn run(app_state: AppState) {
         };
         let started = std::time::Instant::now();
         let started_at = chrono::Utc::now().timestamp();
+        let start = resume.take();
         let pass = {
-            let (app_state, engine, start) = (app_state.clone(), engine.clone(), resume.take());
+            let (app_state, engine, start) = (app_state.clone(), engine.clone(), start.clone());
             tokio::task::spawn_blocking(move || {
                 plan_from(&app_state, start, PLAN_BLOBS_PER_PASS, &|id| {
                     engine.blob_parked(id)
@@ -112,10 +158,14 @@ async fn run(app_state: AppState) {
             })
             .await
         };
-        let (plan, scanned) = match pass {
+        let (found_work, scanned) = match pass {
             Ok(Ok(p)) => {
                 resume = p.resume;
-                (p.plan, p.scanned)
+                let found = !p.plan.is_empty();
+                book.lock()
+                    .unwrap()
+                    .absorb(start.as_ref(), resume.as_ref(), p.plan);
+                (found, p.scanned)
             }
             Ok(Err(e)) => {
                 tracing::warn!("pull planner: pass failed: {e}");
@@ -128,37 +178,29 @@ async fn run(app_state: AppState) {
                 continue;
             }
         };
-        let at_risk_blobs = plan.iter().filter(|i| i.tolerance <= 0).count();
+        let (owed_blobs, at_risk_blobs) = {
+            let book = book.lock().unwrap();
+            (book.len(), book.at_risk())
+        };
+        let offered = REPORT.lock().unwrap().as_ref().map_or(0, |r| r.offered);
         *REPORT.lock().unwrap() = Some(PlannerReport {
             pass_started_at: started_at,
             pass_ms: started.elapsed().as_millis() as u64,
             scanned,
-            owed_blobs: plan.len(),
+            owed_blobs,
             at_risk_blobs,
-            offered: 0,
+            offered,
             queued: engine.queued_len(),
             scheduler: engine.scheduler_stats(),
         });
-        if !plan.is_empty() {
+        if found_work {
             tracing::info!(
                 scanned,
-                owed = plan.len(),
+                owed = owed_blobs,
                 at_risk = at_risk_blobs,
                 pass_ms = started.elapsed().as_millis() as u64,
-                "pull planner: pass planned"
+                "pull planner: slice planned"
             );
-        }
-
-        let found_work = !plan.is_empty();
-        for item in plan {
-            while engine.queued_len() >= PULL_QUEUE_TARGET {
-                tokio::time::sleep(FEED_POLL).await;
-            }
-            if engine.offer(item.blob_id)
-                && let Some(r) = REPORT.lock().unwrap().as_mut()
-            {
-                r.offered += 1;
-            }
         }
         tokio::time::sleep(pass_rest(found_work, resume.is_none(), started.elapsed())).await;
     }
