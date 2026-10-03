@@ -46,8 +46,9 @@ pub struct SelfCheckFragments {
     /// Consensus height when this check was performed
     pub self_verified_height: u64,
 
-    /// Previous fragment count for state sync verification
-    /// Other nodes verify this matches their view of the inventory
+    /// The builder's inventory row count at build time. Informational
+    /// since the apply became idempotent (appliers log a mismatch at DEBUG,
+    /// never gate on it); kept for wire stability. New builders send 0.
     pub previous_count: u32,
 
     /// Fragments found locally but not in consensus inventory

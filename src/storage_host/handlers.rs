@@ -32,7 +32,7 @@ impl TransactionHandler for AttestFragmentsHandler {
         &self,
         tx: &TxMeta<'_>,
         _execute: bool,
-        _ctx: &HandlerCtx<'_>,
+        ctx: &HandlerCtx<'_>,
         db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (report, _) =
@@ -53,6 +53,7 @@ impl TransactionHandler for AttestFragmentsHandler {
             db_tx,
             report.node_id,
             report.height,
+            ctx.height,
             &report.present,
             &report.suspect,
         )
@@ -198,12 +199,8 @@ impl TransactionHandler for UpdatePlacementHeightsHandler {
                     .into_iter()
                     .map(|u| (u.blob_id, u.placement_height))
                     .collect();
-                hopnet_storage::store::apply_placement_commit(db_tx, &crate_updates).map_err(
-                    |e| {
-                        tracing::error!("apply_placement_commit failed: {e}");
-                        DatabaseError::ProcessingError
-                    },
-                )?;
+                hopnet_storage::store::apply_placement_commit(db_tx, &crate_updates)
+                    .map_err(storage_err("apply_placement_commit"))?;
                 Ok(())
             }
             Err(_) => Err(DatabaseError::InvalidPayload),

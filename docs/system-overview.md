@@ -549,7 +549,7 @@ apply functions inside consensus handlers.
       two-call orphan API is gone), scrubbing the weekly slice on the same
       walk and attesting what it saw; the pull path attests the blob's
       local fragments before proposing; confirmation evidence must be
-      verified within 1024 heights and not suspect. S6 (2026-09-27):
+      verified within 8192 heights (1024 before 2026.10.5) and not suspect. S6 (2026-09-27):
       lifecycle closure — orphan deletion drops the deleted blobs'
       inventory rows for every node, the orphaned data-block cleanup runs
       daily per node (bounded batches), and the availability-class branch
@@ -573,6 +573,26 @@ apply functions inside consensus handlers.
       attestation, transient-safe applies, fatal effects with a retried
       decide, hash-mismatch-only scrub, boot attestation after the first
       provider poll); the drain's convergence remains the acceptance test.
+      2026-10-02, 24 h into 2026.10.4: 0 of 68,689 blobs confirmed. The
+      macbook filled its disk and, with DiskFull/CannotOpen classified as
+      semantic verdicts, nil-voted and rejected synced values for 13 hours;
+      `apply_self_check`'s exact-count guard and plain INSERT dropped 201
+      self-check txs a day; the per-pull whole-node differential and the
+      tick's full GROUP_CONCAT scan (>15 min on a 5-min cron) bounded
+      pulls and delayed fulfillment. Fixed on `worktree-mesh-stall-fixes`
+      (unreleased): infrastructure codes are Undetermined/restaged
+      everywhere (consensus-bugs.md 16), the self-check apply is an
+      idempotent upsert + CAS on `verified_height` and the pull's prompt
+      belief is blob-scoped (17), the tick scan is two indexed passes on
+      the blocking pool (storage step 0004), SQLite defaults to a 256 MiB
+      cache and a 1 GiB WAL limit, temp fragments are reaped, the ETA uses
+      the sustained drain rate, 507s log at debug, the ingress daemon backs
+      off while parked. The recency window is 8192 heights (was 1024),
+      the sweep attests even when its self-check submit fails and logs a
+      failed sweep (thor had attested nothing for a day), and
+      attestation stamps are capped at the deciding height and only rise
+      (consensus-bugs.md 18). Still open for design: a free-space floor on
+      pulls, unseating a validator that stops voting, a paged sweep.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage

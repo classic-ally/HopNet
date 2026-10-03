@@ -1035,7 +1035,7 @@ optimization and carries no proof obligation.
     the attestation. Cadence decision: every 30-minute self-check is
     disk-backed (the RFC's "daily" was a floor) — belief is dishonest
     for at most one cycle. Confirmation evidence now requires a row
-    verified within `ATTESTATION_RECENCY_HEIGHTS` (1024) of the
+    verified within `ATTESTATION_RECENCY_HEIGHTS` (1024; 8192 from 2026.10.5) of the
     deciding height and not suspect; read routing ranks by
     `verified_height` and skips suspect rows; the obligation check and
     the eviction belt treat suspect as missing. Prompt attestation on
@@ -1092,7 +1092,7 @@ optimization and carries no proof obligation.
     reads, each the worker's own predicate: `lifecycle_counts`
     (three disjoint stages — owed `desired < T`, in flight, confirmed
     — and `converged()`), `in_flight_age_buckets` (heights since goal,
-    edges 8/64/256/1024, severity warn at 256 and stale at the
+    edges 8/256/1024/window (8/64/256/1024 before 2026.10.5), severity warn at 256 and stale at the
     attestation window, set in the crate), `verification_by_node`
     (fresh / stale / never / suspect against the recency window,
     grouped by holder), the fetch histograms (`FETCH_LATENCY_US`,
@@ -1139,6 +1139,40 @@ optimization and carries no proof obligation.
     file deleted earlier in the same sweep as corrupt (5,525 false
     positives; S5 scrub bullet). 2026.10.2 carries the fixes; the
     drain's convergence on the pane is still the acceptance test.
+  - 2026-10-02, 24 h into 2026.10.4: 0 of 68,689 blobs confirmed and
+    49 GB at fault tolerance 0. Diagnosis on the live nodes: one
+    validator filled its disk and, with `DiskFull`/`CannotOpen`
+    classified as semantic verdicts, went silent (consensus-bugs.md
+    16); the self-check apply's exact-count guard and plain INSERT
+    dropped 201 belief txs a day (17); the per-pull whole-node
+    differential bounded pull throughput; the tick's GROUP_CONCAT scan
+    ran past 15 min on a 5-min cron; SQLite ran on a 2 MB page cache.
+    Fixed on `worktree-mesh-stall-fixes` (unreleased): infrastructure
+    codes are Undetermined/restaged everywhere; the apply is an
+    idempotent upsert with a removal CAS on `verified_height`; the pull
+    submits a blob-scoped belief (S3 record stands, the report is
+    narrower); the scan is two indexed passes on the blocking pool with
+    its wall time in the tick report; storage step 0004 indexes held
+    fragments (section format 4, covered set unchanged); connections
+    default to a 256 MiB cache and 1 GiB WAL limit; the sweep reaps
+    `.tmp.` leftovers; the ETA uses the sustained drain rate. Left for
+    design: a free-space floor on pulls (the admission floor covers
+    ingest only), unseating a validator that stops voting, and paging
+    the sweep's walk.
+  - Recency window (2026-10-03, PR #93, rides the 2026.10.5 crossing):
+    thor held 318 fresh rows of 600,646. Its journal showed 21 sweeps
+    in a day and no attestation from any of them: each stopped at a
+    failed or timed-out self-check submit, and the job runner dropped
+    the error unlogged. Now the sweep attests even when its self-check
+    fails, carries on past a failed page, and logs a failed sweep. The
+    window itself was 1024 heights, 23 minutes under drain traffic
+    against an HDD sweep of ~50 minutes on a 30-minute cron; it is
+    8192 (~3 h at drain, ~10 h quiet), decided with Allison, and
+    surplus release keeps sharing it. Attestation stamps are capped at
+    the deciding height and only rise (consensus-bugs.md 18). The
+    safety note above stands: no recency scheme closes the
+    attest-then-die window, and a wider one only lengthens how long
+    belief may lag a dead disk.
   - Rehearsal (2026-09-27): `orchestrator test --test
     lifecycle-cutover-drain --flags blobs=N` — a mesh born on the
     deployed release image, populated, crosses into the build under

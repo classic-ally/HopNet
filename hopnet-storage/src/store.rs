@@ -60,13 +60,16 @@ pub struct ApplyCtx<'a> {
     pub height: u64,
 }
 
+/// Storage infrastructure codes (contention, disk full, unopenable file,
+/// I/O) become `StorageError::Transient` so the host keeps them out of
+/// consensus verdicts; everything else is a real I/O-shaped failure.
 pub(crate) fn db_err(what: &'static str) -> impl Fn(rusqlite::Error) -> StorageError {
     move |e| {
         tracing::error!("apply: failed to {what}: {e:?}");
         match e.sqlite_error_code() {
-            Some(
-                code @ (rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked),
-            ) => StorageError::Transient(code),
+            Some(code) if hopnet_common::db_impl::sqlite_code_is_infrastructure(code) => {
+                StorageError::Transient(code)
+            }
             _ => StorageError::Io(std::io::Error::other(format!("{what}: {e}"))),
         }
     }
@@ -86,7 +89,10 @@ pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionS
     // v3 (RFC-STORAGE-003 S5): fragment_inventory.verified_height /
     // provenance / suspect — the replicated disk-truth record (stamped by
     // attest_fragments); the legacy self_verified_height stays excluded.
-    format_version: 3,
+    // v4 (operational fixes 2026-10): storage step 0004 adds an index only;
+    // the covered set is unchanged, so a storage@3 artifact imports with
+    // this spec at ordinal 3 and fast-forwards (no frozen copy needed).
+    format_version: 4,
     tables: &[
         hopnet_common::TableSpec::exported("data_blocks"),
         hopnet_common::TableSpec::exported("storage_view_transitions"),
@@ -187,6 +193,11 @@ pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
             3,
             "disk_truth",
             include_str!("../migrations/storage/0003_disk_truth.sql"),
+        ),
+        hopnet_common::Step::sql(
+            4,
+            "scan_indexes",
+            include_str!("../migrations/storage/0004_scan_indexes.sql"),
         ),
     ],
 };
@@ -302,10 +313,40 @@ pub fn apply_placement_commit(
     Ok(applied)
 }
 
-/// Batched inventory attestation (self_check_fragments): verify the reported
-/// previous count against current state, then remove / re-height / add.
-/// Addition-only reports tolerate concurrent growth; removal reports require
-/// an exact count match (we must not remove against a stale view).
+/// What one self-check apply changed. Logging only — never consulted for a
+/// verdict: every node applies the same SQL to the same replicated state
+/// and reaches the same rows.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SelfCheckApplied {
+    /// Rows the report's removals deleted.
+    pub removed: usize,
+    /// Removals skipped because the row carries disk-verified evidence
+    /// newer than the report's view (a stale differential).
+    pub kept: usize,
+    /// Rows asserted — inserted or re-asserted; always `added.len()`.
+    pub asserted: usize,
+}
+
+/// Batched inventory belief (self_check_fragments): remove, then assert.
+///
+/// Idempotent and race-tolerant by construction. Two reports built from one
+/// snapshot (the prompt per-pull report and the sweep's), or the same report
+/// applied twice, converge on the same rows: additions are an upsert and
+/// removals are a per-row compare-and-swap. The old exact-count guard made
+/// ordinary concurrency a permanent rejection — 201 reports a day were
+/// dropped on one node (2026-10-02) and the belief rows an attestation needs
+/// never existed, so nothing could confirm.
+///
+/// The removal CAS keys on `verified_height`, a REPLICATED column: a
+/// flag-derived removal never discards a row disk-verified at or after the
+/// report's own view. It must not key on `self_verified_height`, which is
+/// node-local (excluded from the canonical snapshot, NULL on a joiner,
+/// carried on a member) — a predicate over it would make row presence
+/// diverge between nodes and break the seal's section hash.
+///
+/// `previous_count` is informational since this change; it stays on the
+/// wire for stability and is only compared under DEBUG logging. A hash in
+/// both lists converges to present (removal runs first) on every node.
 pub fn apply_self_check(
     db_tx: &rusqlite::Transaction,
     node_id: i32,
@@ -313,53 +354,68 @@ pub fn apply_self_check(
     self_verified_height: u64,
     added: &[Blake3Hash],
     removed: &[Blake3Hash],
-) -> Result<(), StorageError> {
-    let current_count: i64 = db_tx
-        .query_row(
-            "SELECT COUNT(*) FROM fragment_inventory WHERE node_id = ?",
-            params![node_id],
-            |r| r.get(0),
-        )
-        .map_err(db_err("count fragment_inventory"))?;
-    let current_count = current_count as u32;
+) -> Result<SelfCheckApplied, StorageError> {
+    let mut applied = SelfCheckApplied::default();
+    let height_db = height_to_db(self_verified_height);
 
-    if removed.is_empty() {
-        if current_count < previous_count {
-            tracing::error!(
-                "Fragment inventory count decreased unexpectedly for node {node_id}: expected >= {previous_count}, found {current_count}"
+    // Observability only, and only when someone is listening: the COUNT
+    // walks the node's whole inventory index and runs in both the dry-run
+    // and the apply.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let current: i64 = db_tx
+            .query_row(
+                "SELECT COUNT(*) FROM fragment_inventory WHERE node_id = ?",
+                params![node_id],
+                |r| r.get(0),
+            )
+            .map_err(db_err("count fragment_inventory"))?;
+        if current as u32 != previous_count {
+            tracing::debug!(
+                node_id,
+                previous_count,
+                current,
+                "self-check: inventory moved between build and apply"
             );
-            return Err(StorageError::Rs);
         }
-    } else if current_count != previous_count {
-        tracing::error!(
-            "Fragment inventory state mismatch for node {node_id} (removal requires exact count): expected {previous_count}, found {current_count}"
-        );
-        return Err(StorageError::Rs);
     }
 
+    let mut remove = db_tx
+        .prepare_cached(
+            "DELETE FROM fragment_inventory
+             WHERE node_id = ? AND fragment_hash = ?
+               AND (verified_height IS NULL OR verified_height <= ?)",
+        )
+        .map_err(db_err("prepare inventory removal"))?;
     for hash in removed {
-        db_tx
-            .execute(
-                "DELETE FROM fragment_inventory WHERE node_id = ? AND fragment_hash = ?",
-                params![node_id, hash],
-            )
+        let n = remove
+            .execute(params![node_id, hash, height_db])
             .map_err(db_err("remove inventory fragment"))?;
+        applied.removed += n;
+        applied.kept += 1 - n;
     }
 
     // No blanket restamp (RFC-STORAGE-003 S5): a self-check reads the flag,
-    // not the disk, so it verifies nothing. `verified_height` is stamped
-    // only by disk-verified attestations (`apply_attestation`); the legacy
-    // self_verified_height is written once, at insert.
+    // not the disk, so it verifies nothing. `verified_height`, `provenance`
+    // and `suspect` are stamped only by disk-verified attestations
+    // (`apply_attestation`); the legacy self_verified_height keeps the
+    // newest assertion.
+    let mut assert_row = db_tx
+        .prepare_cached(
+            "INSERT INTO fragment_inventory (fragment_hash, node_id, self_verified_height)
+             VALUES (?, ?, ?)
+             ON CONFLICT(fragment_hash, node_id) DO UPDATE SET
+               self_verified_height = MAX(COALESCE(self_verified_height, 0),
+                                          excluded.self_verified_height)",
+        )
+        .map_err(db_err("prepare inventory assertion"))?;
     for hash in added {
-        db_tx
-            .execute(
-                "INSERT INTO fragment_inventory (fragment_hash, node_id, self_verified_height) VALUES (?, ?, ?)",
-                params![hash, node_id, height_to_db(self_verified_height)],
-            )
+        assert_row
+            .execute(params![hash, node_id, height_db])
             .map_err(db_err("insert inventory fragment"))?;
+        applied.asserted += 1;
     }
 
-    Ok(())
+    Ok(applied)
 }
 
 /// Disk-truth attestation apply (RFC-STORAGE-003 S5): stamp the rows this
@@ -367,20 +423,28 @@ pub fn apply_self_check(
 /// self-scan, suspect cleared) and flag the rows it marks suspect. Only
 /// rows that exist are touched — attestation never creates belief, the
 /// self-check does; unknown hashes are ignored. Idempotent.
+///
+/// The stamp is the report's height capped at `deciding_height`, and it
+/// only ever rises: the payload's height is the submitter's word, so an
+/// uncapped one could keep a row inside the recency window indefinitely,
+/// and a page that commits late with an older height must not age out a
+/// newer stamp.
 pub fn apply_attestation(
     db_tx: &rusqlite::Transaction,
     node_id: i32,
     height: u64,
+    deciding_height: u64,
     present: &[Blake3Hash],
     suspect: &[Blake3Hash],
 ) -> Result<usize, StorageError> {
     let mut stamped = 0usize;
-    let height_db = height_to_db(height);
+    let height_db = height_to_db(height.min(deciding_height));
     for chunk in present.chunks(500) {
         let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let query = format!(
             "UPDATE fragment_inventory
-             SET verified_height = ?, provenance = 0, suspect = 0
+             SET verified_height = MAX(COALESCE(verified_height, 0), ?),
+                 provenance = 0, suspect = 0
              WHERE node_id = ? AND fragment_hash IN ({placeholders})"
         );
         let mut stmt = db_tx
@@ -510,6 +574,42 @@ pub fn compute_inventory_differential(
         previous_count,
         fragments_added,
         fragments_removed,
+    })
+}
+
+/// Blob-scoped belief for the prompt path (RFC-STORAGE-003 S3/S5): the
+/// hashes of ONE blob this node holds (`stored_locally`) that have no
+/// inventory row for it yet — the classes a pull just landed or rebuilt
+/// and, at birth, the origin's. Indexed on both sides (fragment_hashes PK
+/// prefix, fragment_inventory PK), so the per-pull cost is the blob's class
+/// count, not the node's whole inventory; filtered against existing rows,
+/// so it is empty (no consensus round) when belief is already on record.
+///
+/// Removals stay the sweep's: a pull has evidence that bytes landed, never
+/// that they vanished. `previous_count` is informational and sent as 0.
+pub fn compute_blob_inventory_differential(
+    conn: &rusqlite::Connection,
+    node_id: i32,
+    blob_id: &BlobId,
+    self_verified_height: u64,
+) -> Result<SelfCheckFragments, rusqlite::Error> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT fh.fragment_hash FROM fragment_hashes fh
+         WHERE fh.data_block_id = ? AND fh.stored_locally = 1
+           AND NOT EXISTS (SELECT 1 FROM fragment_inventory fi
+                           WHERE fi.fragment_hash = fh.fragment_hash
+                             AND fi.node_id = ?)
+         ORDER BY fh.chunk_number, fh.local_index",
+    )?;
+    let fragments_added = stmt
+        .query_map(params![blob_id, node_id], |row| row.get::<_, Blake3Hash>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SelfCheckFragments {
+        node_id,
+        self_verified_height,
+        previous_count: 0,
+        fragments_added,
+        fragments_removed: Vec::new(),
     })
 }
 
@@ -772,6 +872,7 @@ pub fn count_unplaced_blobs(conn: &rusqlite::Connection) -> Result<i64, rusqlite
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use rusqlite::OptionalExtension;
 
     fn test_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1095,5 +1196,226 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM data_blocks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(blobs, 1);
+    }
+
+    /// The production `fragment_inventory` shape (0001 + 0003 columns).
+    fn inventory_schema(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS fragment_inventory (
+                fragment_hash BLOB NOT NULL, node_id INTEGER NOT NULL,
+                self_verified_height INTEGER, verified_height INTEGER,
+                provenance INTEGER, suspect INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (fragment_hash, node_id)
+            );",
+        )
+        .unwrap();
+    }
+
+    fn inventory_row(
+        conn: &rusqlite::Connection,
+        node: i32,
+        hash: &Blake3Hash,
+    ) -> Option<(Option<i64>, Option<i64>, i64)> {
+        conn.query_row(
+            "SELECT self_verified_height, verified_height, suspect
+             FROM fragment_inventory WHERE node_id = ? AND fragment_hash = ?",
+            params![node, hash],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    // Impact: 201 self-check transactions a day were dropped on one node as
+    // "UNIQUE constraint failed" — two reports built from one snapshot (the
+    // prompt per-pull report and the sweep's) — and the belief row the
+    // attestation needs never existed, so no placement could confirm.
+    // Should: apply the same additions twice, and two reports carrying the
+    // same hash, without error, leaving one row per (hash, node) with the
+    // newest self_verified_height.
+    // Should: leave verified_height and suspect untouched on a re-assertion;
+    // only attestations stamp disk truth.
+    // Should not: consult previous_count — a report with 0 and one with a
+    // wildly wrong count both apply.
+    #[test]
+    fn self_check_apply_is_idempotent_and_merges_concurrent_reports() {
+        let mut conn = test_conn();
+        inventory_schema(&conn);
+        let hash = Blake3Hash::from_bytes([7u8; 32]);
+        conn.execute(
+            "INSERT INTO fragment_inventory
+             (fragment_hash, node_id, self_verified_height, verified_height, suspect)
+             VALUES (?, 1, 5, 7, 1)",
+            params![hash],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let first = apply_self_check(&tx, 1, 0, 5, &[hash], &[]).unwrap();
+        let second = apply_self_check(&tx, 1, 999, 9, &[hash], &[]).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(first.asserted, 1);
+        assert_eq!(second.asserted, 1);
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fragment_inventory WHERE node_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "one row per (hash, node) however many reports assert it");
+        assert_eq!(
+            inventory_row(&conn, 1, &hash),
+            Some((Some(9), Some(7), 1)),
+            "newest assertion height, disk-truth columns untouched"
+        );
+    }
+
+    // Impact: a sweep differential built before a pull landed carried the
+    // pulled hash under fragments_removed; applied after the prompt
+    // attestation, an unconditional DELETE erased disk-verified evidence.
+    // The CAS must also key on replicated state only: self_verified_height
+    // is NULL on a joiner and carried on a member, so a predicate over it
+    // would make row presence diverge between nodes.
+    // Should: delete a row whose verified_height is NULL or at most the
+    // report's height.
+    // Should not: delete a row disk-verified after the report's view; count
+    // it as kept.
+    // Should not: let self_verified_height decide — a row with it NULL but a
+    // newer verified_height survives.
+    #[test]
+    fn self_check_removal_keeps_rows_verified_after_the_report() {
+        let mut conn = test_conn();
+        inventory_schema(&conn);
+        let never = Blake3Hash::from_bytes([1u8; 32]);
+        let older = Blake3Hash::from_bytes([2u8; 32]);
+        let newer = Blake3Hash::from_bytes([3u8; 32]);
+        for (hash, self_h, verified) in [
+            (&never, None::<i64>, None::<i64>),
+            (&older, Some(3), Some(4)),
+            (&newer, None, Some(8)),
+        ] {
+            conn.execute(
+                "INSERT INTO fragment_inventory
+                 (fragment_hash, node_id, self_verified_height, verified_height)
+                 VALUES (?, 1, ?, ?)",
+                params![hash, self_h, verified],
+            )
+            .unwrap();
+        }
+
+        let tx = conn.transaction().unwrap();
+        let applied = apply_self_check(&tx, 1, 3, 5, &[], &[never, older, newer]).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            applied,
+            SelfCheckApplied {
+                removed: 2,
+                kept: 1,
+                asserted: 0
+            }
+        );
+        assert!(inventory_row(&conn, 1, &never).is_none());
+        assert!(inventory_row(&conn, 1, &older).is_none());
+        assert_eq!(
+            inventory_row(&conn, 1, &newer),
+            Some((None, Some(8), 0)),
+            "disk-verified after the report: the removal is stale"
+        );
+    }
+
+    // Impact: the sweep's pages commit over minutes and a prompt pull
+    // attestation can land between them; an overwrite let an older page
+    // age a newer stamp back out of the recency window.
+    // Should: keep the newer stamp when an older attestation lands later.
+    // Should: still clear the suspect flag on the older attestation.
+    #[test]
+    fn attestation_never_lowers_a_stamp() {
+        let mut conn = test_conn();
+        inventory_schema(&conn);
+        let hash = Blake3Hash::from_bytes([4u8; 32]);
+        conn.execute(
+            "INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height, suspect)
+             VALUES (?, 1, 50, 1)",
+            params![hash],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let stamped = apply_attestation(&tx, 1, 40, 60, &[hash], &[]).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(stamped, 1);
+        assert_eq!(inventory_row(&conn, 1, &hash), Some((None, Some(50), 0)));
+    }
+
+    // Impact: the attestation's height is the submitter's word and the
+    // confirmation window trusts it; a far-future height would keep a row
+    // fresh indefinitely.
+    // Should: stamp no later than the height the attestation is applied at.
+    #[test]
+    fn attestation_height_is_clamped_to_the_deciding_height() {
+        let mut conn = test_conn();
+        inventory_schema(&conn);
+        let hash = Blake3Hash::from_bytes([5u8; 32]);
+        conn.execute(
+            "INSERT INTO fragment_inventory (fragment_hash, node_id) VALUES (?, 1)",
+            params![hash],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        apply_attestation(&tx, 1, 1_000_000, 70, &[hash], &[]).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(inventory_row(&conn, 1, &hash), Some((None, Some(70), 0)));
+    }
+
+    // Impact: the whole-node differential ran once per pull (~5×/min over
+    // ~768k rows on a large node) and bounded pull throughput; a birth
+    // without an upload attestation had no belief rows until the next sweep.
+    // Should: list only THIS blob's stored_locally hashes that lack a row
+    // for this node, in (chunk, index) order, with no removals and a zero
+    // previous_count.
+    // Should not: list another blob's hashes, an un-stored hash, or a hash
+    // already inventoried for this node — another node's row does not count.
+    #[test]
+    fn blob_inventory_differential_is_scoped_and_filtered() {
+        let conn = test_conn();
+        inventory_schema(&conn);
+        let mine = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap();
+        let other = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap();
+        let h = |b: u8| Blake3Hash::from_bytes([b; 32]);
+        // (blob, chunk, index, hash, stored_locally)
+        for (blob, chunk, index, hash, local) in [
+            (&mine, 0, 2, h(1), true),  // held, no row → listed
+            (&mine, 0, 0, h(2), true),  // held, no row → listed first
+            (&mine, 0, 1, h(3), false), // not held → skipped
+            (&mine, 1, 0, h(4), true),  // held, my row exists → skipped
+            (&mine, 1, 1, h(5), true),  // held, only another node's row → listed
+            (&other, 0, 0, h(6), true), // another blob → skipped
+        ] {
+            conn.execute(
+                "INSERT INTO fragment_hashes
+                 (data_block_id, chunk_number, local_index, fragment_hash, stored_locally)
+                 VALUES (?, ?, ?, ?, ?)",
+                params![blob, chunk, index, hash, local],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO fragment_inventory (fragment_hash, node_id) VALUES (?, 1), (?, 2)",
+            params![h(4), h(5)],
+        )
+        .unwrap();
+
+        let report = compute_blob_inventory_differential(&conn, 1, &mine, 42).unwrap();
+        assert_eq!(report.node_id, 1);
+        assert_eq!(report.self_verified_height, 42);
+        assert_eq!(report.previous_count, 0);
+        assert!(report.fragments_removed.is_empty());
+        assert_eq!(report.fragments_added, vec![h(2), h(1), h(5)]);
     }
 }

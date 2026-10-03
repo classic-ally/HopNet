@@ -17,10 +17,10 @@
   type Bucket = { label: string; blobs: number; gb: number; severity?: 'warn' | 'stale' };
   const ages = (b: [number, number, number, number, number], gbEach = 0.5): Bucket[] => [
     { label: '<8', blobs: b[0], gb: b[0] * gbEach },
-    { label: '<64', blobs: b[1], gb: b[1] * gbEach },
-    { label: '<256', blobs: b[2], gb: b[2] * gbEach },
-    { label: '<1k', blobs: b[3], gb: b[3] * gbEach, severity: 'warn' },
-    { label: '≥1k', blobs: b[4], gb: b[4] * gbEach, severity: 'stale' }
+    { label: '<256', blobs: b[1], gb: b[1] * gbEach },
+    { label: '<1k', blobs: b[2], gb: b[2] * gbEach, severity: 'warn' },
+    { label: '<8k', blobs: b[3], gb: b[3] * gbEach, severity: 'warn' },
+    { label: '≥8k', blobs: b[4], gb: b[4] * gbEach, severity: 'stale' }
   ];
 </script>
 

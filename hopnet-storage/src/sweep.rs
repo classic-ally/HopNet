@@ -136,6 +136,27 @@ pub struct SweepReport {
     /// self-check, so this pass carried their removal to consensus).
     pub surplus_released: usize,
     pub surplus_bytes_freed: u64,
+    /// `<hash>.tmp.<nonce>` leftovers of interrupted stores, older than the
+    /// orphan grace, deleted on this walk.
+    #[serde(default)]
+    pub temps_deleted: usize,
+    /// Attestation pages whose submit failed; the sweep carries on past
+    /// them and the next cycle re-covers their hashes.
+    #[serde(default)]
+    pub attest_failed_pages: usize,
+}
+
+/// The temp files old enough to reap: an in-flight store is seconds old,
+/// so anything past the orphan grace is a leftover.
+pub fn stale_temps(
+    temps: &[crate::fragstore::TempFile],
+    grace_cutoff: u64,
+) -> Vec<std::path::PathBuf> {
+    temps
+        .iter()
+        .filter(|t| t.mtime < grace_cutoff)
+        .map(|t| t.path.clone())
+        .collect()
 }
 
 /// The surplus release's input, picked from the sweep's own walk: files
@@ -158,6 +179,24 @@ pub fn release_listing(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Impact: interrupted stores left `<hash>.tmp.<nonce>` files the walk
+    // only warned about, forever; they are reaped on the orphan schedule.
+    // Should: select temp files older than the grace cutoff.
+    // Should not: select a temp file young enough to be an in-flight store.
+    #[test]
+    fn stale_temps_respect_the_orphan_grace() {
+        let temp = |mtime: u64, name: &str| crate::fragstore::TempFile {
+            path: std::path::PathBuf::from(name),
+            mtime,
+        };
+        let temps = [temp(10, "old"), temp(99, "fresh"), temp(100, "at-cutoff")];
+        assert_eq!(
+            stale_temps(&temps, 100),
+            vec![std::path::PathBuf::from("old"), std::path::PathBuf::from("fresh")]
+        );
+        assert!(stale_temps(&temps, 5).is_empty());
+    }
 
     fn h(b: u8) -> Blake3Hash {
         Blake3Hash::from_bytes([b; 32])

@@ -927,7 +927,10 @@ fn staged_join_transition(
     // Post-swap, pre-engine: the fragment store survived untouched but
     // the inventory it is measured against was just replaced. Log-only —
     // a reconcile failure must never strand a node that just rejoined.
-    match rusqlite::Connection::open(db_path) {
+    match rusqlite::Connection::open(db_path).and_then(|fresh| {
+        crate::db::shared::apply_connection_pragmas(&fresh)?;
+        Ok(fresh)
+    }) {
         Ok(fresh) => {
             let fragments_dir =
                 hopnet_storage::fragstore::get_fragments_dir().unwrap_or_else(|_| String::new());
@@ -1152,6 +1155,7 @@ fn install_epoch_genesis(
 /// state-C recovery where the genesis record is not in hand).
 fn read_epoch_of(db_path: &str) -> Result<u64, String> {
     let conn = rusqlite::Connection::open(db_path).map_err(|e| format!("open: {e}"))?;
+    crate::db::shared::apply_connection_pragmas(&conn).map_err(|e| format!("pragmas: {e}"))?;
     Ok(genesis::current_epoch(&conn))
 }
 
@@ -2419,13 +2423,15 @@ pub(crate) mod tests {
         // Simulate the pre-chain sealed shape by reverting every
         // post-baseline step: identity 0001 (schema_ordinals), storage
         // 0002 (RFC-STORAGE-003: the goal column, its indexes, the
-        // transition record) and storage 0003 (the disk-truth columns).
+        // transition record), storage 0003 (the disk-truth columns) and
+        // storage 0004 (the held-fragment index).
         // Fingerprints compare DDL text, so the reverts must restore the
         // baseline statements byte for byte.
         {
             let conn = open(&db_path);
             conn.execute_batch(
                 "DROP TABLE schema_ordinals;
+                 DROP INDEX idx_fragment_hashes_local;
                  DROP INDEX idx_fragment_inventory_verified;
                  ALTER TABLE fragment_inventory DROP COLUMN suspect;
                  ALTER TABLE fragment_inventory DROP COLUMN provenance;

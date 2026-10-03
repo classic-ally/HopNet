@@ -61,6 +61,9 @@ pub struct DbStats {
     pub cache_size_raw: i64,
     pub cache_bytes: i64,
     pub mmap_size: i64,
+    /// `PRAGMA journal_size_limit` — the WAL truncation threshold after a
+    /// checkpoint (-1 = unlimited, SQLite's default).
+    pub journal_size_limit: i64,
     pub temp_store: String,
     pub busy_timeout_ms: i64,
     pub counters: CounterSnapshot,
@@ -88,6 +91,7 @@ pub fn get_db_stats(
     let sync_int = q_i64("PRAGMA synchronous")?;
     let cache_size_raw = q_i64("PRAGMA cache_size")?;
     let mmap_size = q_i64("PRAGMA mmap_size")?;
+    let journal_size_limit = q_i64("PRAGMA journal_size_limit")?;
     let temp_store_int = q_i64("PRAGMA temp_store")?;
     let busy_timeout_ms = q_i64("PRAGMA busy_timeout")?;
 
@@ -167,6 +171,7 @@ pub fn get_db_stats(
         cache_size_raw,
         cache_bytes,
         mmap_size,
+        journal_size_limit,
         temp_store,
         busy_timeout_ms,
         counters,

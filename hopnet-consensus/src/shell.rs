@@ -295,16 +295,24 @@ async fn run_shell<A, S, F>(
     }
     // On-demand cores defer the boot start unless the pending height has WAL
     // state (active at crash time — must replay, never pause).
-    match core.start_or_defer(start_height) {
-        Ok(started) => {
+    // A failed start is a host error like any other step's: the same
+    // disposition, the same abort. A clean `return` here was the one
+    // remaining way to leave the node serving HTTP with no engine behind it.
+    let start = core
+        .start_or_defer(start_height)
+        .map(|started| {
             if !started {
                 tracing::debug!(height = start_height.0, "consensus paused pending work");
             }
-        }
-        Err(e) => {
-            tracing::error!("consensus start_height failed: {e:?}");
-            return;
-        }
+            true
+        })
+        .map_err(|e| format!("start_height: {e:?}"));
+    if disposition(&start) == StepDisposition::Fatal {
+        tracing::error!(
+            "consensus host fatal error at start — aborting process: {}",
+            start.unwrap_err()
+        );
+        std::process::abort();
     }
     drain(
         &mut core,

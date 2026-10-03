@@ -192,3 +192,95 @@ pub fn register_uuid_extract_timestamp(conn: &rusqlite::Connection) -> rusqlite:
         },
     )
 }
+
+/// SQLite primary result codes that describe the node's own storage
+/// infrastructure rather than the operation: lock contention, a full or
+/// read-only disk, an unopenable file, an I/O or file-locking failure.
+///
+/// None of these is a verdict on the data being written. Consensus
+/// validation must surface them as Undetermined (never a nil vote or a
+/// false determinism alarm), preflight must restage (never drop as
+/// Permanent), and durability effects must retry under their bounded
+/// budget before going fatal. Corruption, constraint and misuse codes stay
+/// out: those are real statements about the data or the program.
+///
+/// Observed 2026-10-02: a node whose disk filled up had `DiskFull` then
+/// `CannotOpen` classified as semantic failures, nil-voted on valid blocks
+/// at one height and rejected certificate-backed sync values for 13 hours.
+pub fn sqlite_code_is_infrastructure(code: rusqlite::ErrorCode) -> bool {
+    use rusqlite::ErrorCode as C;
+    matches!(
+        code,
+        C::DatabaseBusy
+            | C::DatabaseLocked
+            | C::DiskFull
+            | C::CannotOpen
+            | C::SystemIoFailure
+            | C::ReadOnly
+            | C::FileLockingProtocolFailed
+    )
+}
+
+/// [`sqlite_code_is_infrastructure`] over a rusqlite error, `false` for
+/// errors that carry no SQLite code (type conversions, no rows, ...).
+pub fn sqlite_error_is_infrastructure(e: &rusqlite::Error) -> bool {
+    e.sqlite_error_code()
+        .is_some_and(sqlite_code_is_infrastructure)
+}
+
+#[cfg(test)]
+mod infrastructure_tests {
+    use super::*;
+
+    fn failure(code: std::ffi::c_int) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+    }
+
+    // Impact: this predicate is the one boundary between "my storage is
+    // unavailable" and "this block is wrong" for every consensus seam
+    // (validation, preflight, decide). A code missing here turns a disk
+    // fault into a vote.
+    // Should: classify lock contention, disk full, unopenable file, I/O,
+    // read-only and locking-protocol failures (including extended codes) as
+    // infrastructure.
+    #[test]
+    fn storage_availability_codes_are_infrastructure() {
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_CANTOPEN,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_IOERR_WRITE,
+            rusqlite::ffi::SQLITE_READONLY,
+            rusqlite::ffi::SQLITE_PROTOCOL,
+        ] {
+            assert!(
+                sqlite_error_is_infrastructure(&failure(code)),
+                "{code} must classify as infrastructure"
+            );
+        }
+    }
+
+    // Should not: classify corruption, constraint violations, misuse, or
+    // errors without a SQLite code as infrastructure — those are verdicts
+    // or bugs and must stay loud.
+    #[test]
+    fn data_and_program_faults_are_not_infrastructure() {
+        for code in [
+            rusqlite::ffi::SQLITE_CORRUPT,
+            rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE,
+            rusqlite::ffi::SQLITE_MISUSE,
+            rusqlite::ffi::SQLITE_NOTADB,
+        ] {
+            assert!(
+                !sqlite_error_is_infrastructure(&failure(code)),
+                "{code} must NOT classify as infrastructure"
+            );
+        }
+        assert!(!sqlite_error_is_infrastructure(
+            &rusqlite::Error::QueryReturnedNoRows
+        ));
+    }
+}

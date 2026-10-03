@@ -240,14 +240,18 @@ pub async fn propose_ready_confirmations(
     let mut proposed = 0usize;
     for round in 0..CONFIRM_ROUNDS_PER_TICK {
         let (ready, sampled) = {
-            let conn = app_state
-                .db_pool
-                .get()
-                .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-            let tip = crate::db::consensus::get_current_consensus_height(&conn)
-                .map_err(|e| Error::Failed(Arc::new(format!("height: {e:?}").into())))?;
-            hopnet_storage::lifecycle::ready_confirmations(&conn, sample_n, tip)
-                .map_err(|e| Error::Failed(Arc::new(format!("fulfillment read: {e}").into())))?
+            // One evidence probe per sampled blob — blocking-pool work.
+            let pool = app_state.db_pool.clone();
+            tokio::task::spawn_blocking(move || {
+                let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+                let tip = crate::db::consensus::get_current_consensus_height(&conn)
+                    .map_err(|e| format!("height: {e:?}"))?;
+                hopnet_storage::lifecycle::ready_confirmations(&conn, sample_n, tip)
+                    .map_err(|e| format!("fulfillment read: {e}"))
+            })
+            .await
+            .map_err(|e| Error::Failed(Arc::new(format!("fulfillment join: {e}").into())))?
+            .map_err(|e| Error::Failed(Arc::new(e.into())))?
         };
         let count = ready.len();
         let next = next_fulfillment_sample(sample_n, sampled, count);
@@ -280,15 +284,19 @@ pub async fn propose_ready_confirmations(
 /// pulls (and attests, and proposes for births and moved bytes) on its own
 /// time; the tick never waits on a consensus round it did not submit.
 /// Level-triggered: any blob a hint missed is found here next tick.
-fn kick_in_flight(app_state: &AppState, limit: usize) -> Result<usize, Error> {
-    // Scoped checkout, dropped before the engine is touched.
+async fn kick_in_flight(app_state: &AppState, limit: usize) -> Result<usize, Error> {
+    // Scoped checkout on the blocking pool, dropped before the engine is
+    // touched.
     let blob_ids = {
-        let conn = app_state
-            .db_pool
-            .get()
-            .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-        hopnet_storage::lifecycle::in_flight_blobs(&conn, limit)
-            .map_err(|e| Error::Failed(Arc::new(format!("in-flight page: {e}").into())))?
+        let pool = app_state.db_pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+            hopnet_storage::lifecycle::in_flight_blobs(&conn, limit)
+                .map_err(|e| format!("in-flight page: {e}"))
+        })
+        .await
+        .map_err(|e| Error::Failed(Arc::new(format!("in-flight join: {e}").into())))?
+        .map_err(|e| Error::Failed(Arc::new(e.into())))?
     };
     let Some(storage) = app_state.storage.get() else {
         return Err(Error::Failed(Arc::new(
@@ -387,8 +395,10 @@ pub struct UnplacedDrainResult {
     pub limit: i32,
 }
 
-/// Scheduled job handler for the disk-truth sweep + self-check (the
-/// 20–30 minute cron): every self-check is disk-backed (RFC-STORAGE-003 S5).
+/// Scheduled job handler for the disk-truth sweep + self-check (every 30
+/// minutes at a per-node random offset): every self-check is disk-backed
+/// (RFC-STORAGE-003 S5). A failed sweep is logged here: the job runner
+/// drops the error silently, which hid thor's aborted sweeps for a day.
 pub async fn handle_fragment_inventory_self_check(
     job: TaskId,
     ctx: Data<AppState>,
@@ -396,6 +406,7 @@ pub async fn handle_fragment_inventory_self_check(
     run_disk_truth_sweep(&ctx, SWEEP_ORPHAN_GRACE_SECS)
         .await
         .map(|_| ())
+        .inspect_err(|e| tracing::warn!("sweep failed: {e}"))
 }
 
 /// Orphan grace: a rowless file younger than this is an in-flight store,
@@ -437,12 +448,13 @@ pub async fn run_disk_truth_sweep(
 
     // (1) The walk (blocking IO off the async thread) and the table.
     let dir = fragments_dir.clone();
-    let listing = tokio::task::spawn_blocking(move || {
-        hopnet_storage::fragstore::scan_fragments_detailed(&dir)
+    let walk = tokio::task::spawn_blocking(move || {
+        hopnet_storage::fragstore::scan_fragments_with_temps(&dir)
     })
     .await
     .map_err(|e| Error::Failed(Arc::new(format!("sweep join: {e}").into())))?
     .map_err(|e| Error::Failed(Arc::new(format!("sweep walk: {e}").into())))?;
+    let listing = walk.fragments;
     let rows = {
         let conn = app_state
             .db_pool
@@ -473,7 +485,19 @@ pub async fn run_disk_truth_sweep(
         host.mark_remote_batch(diff.flagged_missing.clone()).await;
     }
 
-    // (2) Orphans past grace.
+    // (2) Orphans past grace — and the temp files of interrupted stores,
+    //     which have no row to be judged by and were never reaped before.
+    let mut temps_deleted = 0usize;
+    for path in hopnet_storage::sweep::stale_temps(
+        &walk.temps,
+        now_unix.saturating_sub(orphan_grace_secs),
+    ) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => temps_deleted += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => temps_deleted += 1,
+            Err(e) => tracing::warn!("sweep: delete temp file {} failed: {e}", path.display()),
+        }
+    }
     let mut orphans_deleted = 0usize;
     let mut orphan_bytes_freed = 0u64;
     for (hash, size) in &diff.orphans {
@@ -537,8 +561,8 @@ pub async fn run_disk_truth_sweep(
     //      differential and the attestation on purpose: the self-check
     //      below carries the removals to consensus in this same pass, and
     //      the attestation never stamps a file this pass deleted — no
-    //      stale attested row, no exact-count rejection window. A failure
-    //      here must not cost the sweep its belief and truth steps.
+    //      stale attested row. A failure here must not cost the sweep its
+    //      belief and truth steps.
     let mut surplus_released = 0usize;
     let mut surplus_bytes_freed = 0u64;
     let release_input = hopnet_storage::sweep::release_listing(
@@ -567,15 +591,24 @@ pub async fn run_disk_truth_sweep(
     if !differential.is_empty() {
         let payload = bincode::serde::encode_to_vec(&differential, bincode::config::standard())
             .map_err(|e| Error::Failed(Arc::new(format!("self-check encode: {e}").into())))?;
-        host.submit(hopnet_storage::engine::policy::SELF_CHECK_FN, payload)
+        // Belief and truth are independent: attestation stamps only rows
+        // that already exist, so a differential that did not land costs
+        // the new rows their stamps until the next cycle. Aborting here
+        // left a node whose self-check kept timing out with no fresh
+        // attestation at all.
+        if let Err(e) = host
+            .submit(hopnet_storage::engine::policy::SELF_CHECK_FN, payload)
             .await
-            .map_err(|e| Error::Failed(Arc::new(format!("self-check submit: {e:?}").into())))?;
+        {
+            tracing::warn!("sweep: self-check submit failed, attesting anyway: {e:?}");
+        }
     }
 
     // (5) Truth: attest everything seen on disk this cycle, one awaited
     // page at a time (ATTEST_PAGE_SIZE): a page that commits stays
-    // committed, so a failure part-way leaves the next sweep less to do.
+    // committed, and a page that fails does not stop the rest.
     let mut attested_pages = 0usize;
+    let mut attest_failed_pages = 0usize;
     if !present.is_empty() {
         let height = {
             let conn = app_state
@@ -591,21 +624,9 @@ pub async fn run_disk_truth_sweep(
             &present,
             hopnet_storage::engine::policy::ATTEST_PAGE_SIZE,
         );
-        let total = pages.len();
-        for (i, attestation) in pages.into_iter().enumerate() {
-            let payload = bincode::serde::encode_to_vec(&attestation, bincode::config::standard())
-                .map_err(|e| Error::Failed(Arc::new(format!("attestation encode: {e}").into())))?;
-            host.submit(hopnet_storage::engine::policy::ATTEST_FN, payload)
-                .await
-                .map_err(|e| {
-                    Error::Failed(Arc::new(
-                        format!("attestation submit (page {} of {total}): {e:?}", i + 1).into(),
-                    ))
-                })?;
-            attested_pages += 1;
-        }
+        (attested_pages, attest_failed_pages) = submit_attestation_pages(&host, pages).await;
         tracing::info!(
-            "sweep: attested {} fragments in {attested_pages} pages",
+            "sweep: attested {} fragments in {attested_pages} pages ({attest_failed_pages} failed)",
             present.len()
         );
     }
@@ -624,19 +645,62 @@ pub async fn run_disk_truth_sweep(
         attested_pages,
         surplus_released,
         surplus_bytes_freed,
+        temps_deleted,
+        attest_failed_pages,
     };
     tracing::info!(
-        "sweep: {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} corrupt deleted, {} surplus released",
+        "sweep: {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} corrupt deleted, {} surplus released, {} temp files deleted, {} attestation pages failed",
         report.files_on_disk,
         report.present,
         report.reflagged,
         report.unflagged,
         report.orphans_deleted,
         report.corrupt_deleted,
-        report.surplus_released
+        report.surplus_released,
+        report.temps_deleted,
+        report.attest_failed_pages
     );
     *app_state.last_sweep.lock().unwrap() = Some(report.clone());
+    if attested_pages == 0 && attest_failed_pages > 0 {
+        return Err(Error::Failed(Arc::new(
+            format!("attestation: all {attest_failed_pages} pages failed").into(),
+        )));
+    }
     Ok(report)
+}
+
+/// Submit the sweep's attestation pages one at a time, carrying on past a
+/// failed page: each page stands alone (`apply_attestation` is
+/// idempotent), so one timed-out page must not cost the others their
+/// stamps. Returns `(committed, failed)`.
+pub(crate) async fn submit_attestation_pages<S: hopnet_storage::traits::TxSubmitter>(
+    submitter: &S,
+    pages: Vec<hopnet_storage::FragmentAttestation>,
+) -> (usize, usize) {
+    let total = pages.len();
+    let (mut committed, mut failed) = (0usize, 0usize);
+    for (i, attestation) in pages.into_iter().enumerate() {
+        let payload =
+            match bincode::serde::encode_to_vec(&attestation, bincode::config::standard()) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("sweep: attestation encode (page {} of {total}): {e}", i + 1);
+                    failed += 1;
+                    continue;
+                }
+            };
+        match submitter
+            .submit(hopnet_storage::engine::policy::ATTEST_FN, payload)
+            .await
+        {
+            Ok(()) => committed += 1,
+            Err(e) => {
+                tracing::warn!("sweep: attestation submit (page {} of {total}): {e:?}", i + 1);
+                failed += 1;
+            }
+        }
+    }
+    (committed, failed)
 }
 
 /// Kept for callers that only want belief refreshed (tests, routes): the
@@ -913,7 +977,8 @@ struct SurplusRelease {
 /// ingesting node's local fragments a sweep or so after its blobs are
 /// confirmed elsewhere — a non-member origin ends up holding nothing.
 /// Stricter than the watermark path on evidence: another member's copy
-/// must have been disk-verified within the confirmation recency window.
+/// must have been disk-verified within the confirmation recency window
+/// (hours since 2026.10.5, deliberately the same window as confirmation).
 /// Bounded per call. Rides the disk-truth sweep's walk; the operator route
 /// pays for its own.
 async fn release_surplus(
@@ -1019,6 +1084,9 @@ pub struct PolicyTickReport {
     pub confirms_proposed: usize,
     pub grace_declared: usize,
     pub eviction: serde_json::Value,
+    /// Wall time of the repair scan (plus its goal lookups), so a tick that
+    /// overruns its 5-minute cron is visible without a profiler.
+    pub scan_ms: u64,
 }
 
 /// The engine policy tick (RFC-STORAGE-001 Repair; RFC-STORAGE-002 S6):
@@ -1091,41 +1159,65 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
     // holder is merely asleep inside its tier); below the watermark the
     // deputy rule has the lowest live class's responsible cover a down
     // responsible. Urgent items preempt pulls; one lazy pick per tick.
+    // Every DB read in this tick runs on the blocking pool: the scan below
+    // walks the whole fragment table, and the tick shares its runtime with
+    // the consensus host and the HTTP surface.
     let settings = {
-        let conn = app_state
-            .db_pool
-            .get()
-            .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-        crate::db::shared::read_storage_node_settings(&conn)
-            .map_err(|e| Error::Failed(Arc::new(format!("settings: {e:?}").into())))?
+        let pool = app_state.db_pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+            crate::db::shared::read_storage_node_settings(&conn)
+                .map_err(|e| format!("settings: {e:?}"))
+        })
+        .await
+        .map_err(|e| Error::Failed(Arc::new(format!("settings join: {e}").into())))?
+        .map_err(|e| Error::Failed(Arc::new(e.into())))?
     };
     let mut urgent_enqueued = 0usize;
     let mut lazy_enqueued = 0usize;
     let mut lazy_owed = 0usize;
+    let mut scan_ms = 0u64;
     if settings.reencode_enabled {
         let online: std::collections::HashSet<i32> = view.online.iter().copied().collect();
         let members: std::collections::HashSet<i32> = member_ids.iter().copied().collect();
-        let (candidates, goals) = {
-            let conn = app_state
-                .db_pool
-                .get()
-                .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-            let candidates =
-                crate::db::inventory::find_chunks_with_missing_classes(&conn, &online, &members)
-                    .map_err(|e| Error::Failed(Arc::new(format!("repair scan: {e:?}").into())))?;
-            // Goal assignments, memoized per blob (many chunks share one).
-            let mut goals: std::collections::HashMap<hopnet_storage::BlobId, Option<Vec<i32>>> =
-                Default::default();
-            for cand in &candidates {
-                if !goals.contains_key(&cand.blob_id) {
-                    let assignment = hopnet_storage::lifecycle::pull_target(&conn, &cand.blob_id)
-                        .map_err(|e| Error::Failed(Arc::new(format!("pull target: {e}").into())))?
-                        .map(|t| t.assignment);
-                    goals.insert(cand.blob_id.clone(), assignment);
+        let (candidates, goals, elapsed) = {
+            let pool = app_state.db_pool.clone();
+            let (online, members) = (online.clone(), members.clone());
+            tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+                let candidates = crate::db::inventory::find_chunks_with_missing_classes(
+                    &conn, &online, &members,
+                )
+                .map_err(|e| format!("repair scan: {e:?}"))?;
+                // Goal assignments, memoized per blob (many chunks share one).
+                let mut goals: std::collections::HashMap<
+                    hopnet_storage::BlobId,
+                    Option<Vec<i32>>,
+                > = Default::default();
+                for cand in &candidates {
+                    if !goals.contains_key(&cand.blob_id) {
+                        let assignment =
+                            hopnet_storage::lifecycle::pull_target(&conn, &cand.blob_id)
+                                .map_err(|e| format!("pull target: {e}"))?
+                                .map(|t| t.assignment);
+                        goals.insert(cand.blob_id.clone(), assignment);
+                    }
                 }
-            }
-            (candidates, goals)
+                Ok::<_, String>((candidates, goals, started.elapsed()))
+            })
+            .await
+            .map_err(|e| Error::Failed(Arc::new(format!("repair scan join: {e}").into())))?
+            .map_err(|e| Error::Failed(Arc::new(e.into())))?
         };
+        scan_ms = elapsed.as_millis() as u64;
+        if elapsed > std::time::Duration::from_secs(60) {
+            tracing::warn!(
+                scan_ms,
+                candidates = candidates.len(),
+                "policy tick: repair scan is slow"
+            );
+        }
         if let Some(engine) = app_state.storage.get() {
             let up: std::collections::BTreeSet<i32> = online.iter().copied().collect();
             let mut lazy_pick: Option<ReencodeCmd> = None;
@@ -1229,6 +1321,7 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
         app_state,
         hopnet_storage::engine::policy::PULL_KICKS_PER_TICK,
     )
+    .await
     .unwrap_or_else(|e| {
         tracing::warn!("in-flight re-kick failed: {e}");
         0
@@ -1252,6 +1345,7 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
         confirms_proposed,
         grace_declared,
         eviction,
+        scan_ms,
     };
     *app_state.last_tick.lock().unwrap() = Some(report.clone());
     Ok(report)

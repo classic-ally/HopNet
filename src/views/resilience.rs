@@ -529,9 +529,10 @@ fn eta_view(
         lazy: tick.as_ref().map_or(0, |t| t.lazy_chunks_owed as u64 * k),
     };
     let p50_fetch_us = (transfers.fetches > 0).then_some(transfers.latency_us.p50);
-    let etas = owed.etas(p50_fetch_us);
+    let etas = owed.etas(p50_fetch_us, transfers.wall_us_per_fetch);
     EtaView {
         p50_fetch_us,
+        wall_us_per_fetch: transfers.wall_us_per_fetch,
         tiers: ["urgent", "pull", "lazy"]
             .into_iter()
             .map(|tier| {
@@ -867,7 +868,7 @@ mod tests {
                 ('01890a5d-ac96-774b-b9aa-9f8b24f0c9a2', X'02', 3, 0, NULL, 1073741824, 40),
                 ('01890a5d-ac96-774b-b9aa-9f8b24f0c9a3', X'03', 3, 0, 10, 1073741824, 10);
              INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height, suspect) VALUES
-                (X'A1', 1, 1999, 0), (X'A2', 1, NULL, 0), (X'A3', 2, 5, 0), (X'A4', 2, 1999, 1);",
+                (X'A1', 1, 9999, 0), (X'A2', 1, NULL, 0), (X'A3', 2, 5, 0), (X'A4', 2, 9999, 1);",
         )
         .expect("fixture");
         // T = 50: blobs 2 (goal 40, unplaced) and 3 (goal 10) are owed a
@@ -891,11 +892,11 @@ mod tests {
             .iter()
             .map(|b| b.blobs)
             .collect();
-        assert_eq!(ages, vec![0, 1, 0, 0, 0], "age 60 lands in <64");
+        assert_eq!(ages, vec![0, 1, 0, 0, 0], "age 60 lands in <256");
         assert!((lifecycle.in_flight_buckets[1].gb - 1.0).abs() < 1e-9);
 
-        // Tip 2000 puts the window floor at 976: 1999 is fresh, 5 is stale.
-        let v = verification_view(&conn, 2000);
+        // Tip 10000 puts the window floor at 1808: 9999 is fresh, 5 is stale.
+        let v = verification_view(&conn, 10_000);
         assert_eq!(v.window, observe::INFLIGHT_STALE_HEIGHTS);
         assert_eq!(
             (

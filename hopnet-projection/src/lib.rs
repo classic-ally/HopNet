@@ -91,22 +91,25 @@ pub enum DatabaseError {
     NotEmpty,
     AuthorizationError, // User or node not authorized for the operation
     ValidationError, // Data validation failed (e.g., cryptographic verification, consistency checks)
-    /// Transient, node-local storage contention (SQLITE_BUSY / SQLITE_LOCKED).
-    /// Not a verdict on the operation: consumers must retry or restage, never
-    /// treat it as a permanent semantic failure (it is non-deterministic and
-    /// would otherwise leak into consensus verdicts and client-visible 409s).
+    /// Node-local storage infrastructure failure: lock contention
+    /// (SQLITE_BUSY / SQLITE_LOCKED), a full or read-only disk, an
+    /// unopenable file, an I/O error. Not a verdict on the operation:
+    /// consumers must retry or restage, never treat it as a permanent
+    /// semantic failure (it is non-deterministic and would otherwise leak
+    /// into consensus verdicts and client-visible 409s). The code set is
+    /// `hopnet_common::db_impl::sqlite_code_is_infrastructure`.
     Transient(rusqlite::ErrorCode),
 }
 
 impl DatabaseError {
     /// Classify a rusqlite failure at the seam where it is still typed:
-    /// retryable lock contention becomes [`DatabaseError::Transient`];
+    /// a storage infrastructure code becomes [`DatabaseError::Transient`];
     /// anything else keeps the caller's chosen verdict.
     pub fn classified(e: &rusqlite::Error, fallback: DatabaseError) -> DatabaseError {
         match e.sqlite_error_code() {
-            Some(
-                code @ (rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked),
-            ) => DatabaseError::Transient(code),
+            Some(code) if hopnet_common::db_impl::sqlite_code_is_infrastructure(code) => {
+                DatabaseError::Transient(code)
+            }
             _ => fallback,
         }
     }

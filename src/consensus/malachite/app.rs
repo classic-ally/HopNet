@@ -158,8 +158,16 @@ impl HopNetApplication {
                 // at Sync — decided is decided, and the certificate
                 // carries the quorum's word.
                 let started = std::time::Instant::now();
-                let local = crate::db::snapshot::compute_artifact_hash_tx(db_tx)
-                    .map_err(|e| format!("vote-iff-match snapshot: {e:?}"))?;
+                let local = crate::db::snapshot::compute_artifact_hash_tx(db_tx).map_err(|e| {
+                    match e {
+                        crate::db::DatabaseError::Transient(code) => ValidateFailure::Transient(
+                            format!("vote-iff-match snapshot: {code:?}"),
+                        ),
+                        other => ValidateFailure::Semantic(format!(
+                            "vote-iff-match snapshot: {other:?}"
+                        )),
+                    }
+                })?;
                 tracing::info!(
                     height = height.0,
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -196,7 +204,7 @@ impl HopNetApplication {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| format!("parent lookup: {e}"))?;
+            .map_err(|e| db_failure("parent lookup", &e))?;
         let parent = block.data.parent_hash.map(|h| h.as_bytes().to_vec());
         if parent != last {
             return Err("parent hash does not extend the decided chain".into());
@@ -204,8 +212,10 @@ impl HopNetApplication {
 
         // Per-transaction signature verification against the registered keys.
         let old_txs = to_old_transactions(&block.data.transactions)?;
-        let node_keys = pubkeys(db_tx, "SELECT node_id, pubkey FROM nodes")?;
-        let user_keys = pubkeys(db_tx, "SELECT user_id, pubkey FROM users")?;
+        let node_keys = pubkeys(db_tx, "SELECT node_id, pubkey FROM nodes")
+            .map_err(|e| db_failure("node keys", &e))?;
+        let user_keys = pubkeys(db_tx, "SELECT user_id, pubkey FROM users")
+            .map_err(|e| db_failure("user keys", &e))?;
         for tx in old_txs.0.iter() {
             let key = node_keys
                 .get(&tx.submitter.id)
@@ -226,7 +236,7 @@ impl HopNetApplication {
             let now = chrono::Utc::now();
             let mut dedup = db_tx
                 .prepare_cached("SELECT 1 FROM committed_tx_nonces WHERE nonce = ?")
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| db_failure("nonce dedup", &e))?;
             for tx in old_txs.0.iter() {
                 if let Some(created_at) = tx.nonce.extract_timestamp()
                     && now - created_at > MAX_TRANSACTION_AGE
@@ -235,7 +245,7 @@ impl HopNetApplication {
                 }
                 let committed = dedup
                     .exists([tx.nonce.to_string()])
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| db_failure("nonce dedup", &e))?;
                 if committed {
                     return Err("already-committed nonce (leader replay)".into());
                 }
@@ -296,8 +306,21 @@ enum ValidateFailure {
     Semantic(String),
 }
 
+/// A raw SQLite failure on one of validate_inner's own reads: a storage
+/// infrastructure code (contention, disk full, unopenable file, I/O) is not
+/// a judgement on the block and surfaces as Transient; anything else keeps
+/// the legacy semantic verdict.
+fn db_failure(what: &str, e: &rusqlite::Error) -> ValidateFailure {
+    if hopnet_common::db_impl::sqlite_error_is_infrastructure(e) {
+        ValidateFailure::Transient(format!("{what}: {e}"))
+    } else {
+        ValidateFailure::Semantic(format!("{what}: {e}"))
+    }
+}
+
 // Every legacy string error inside validate_inner is a semantic judgement;
-// only the classified handler dry-run produces Transient.
+// only the classified handler dry-run and the node's own reads (through
+// `db_failure`) produce Transient.
 impl From<String> for ValidateFailure {
     fn from(reason: String) -> Self {
         ValidateFailure::Semantic(reason)
@@ -313,12 +336,10 @@ impl From<&str> for ValidateFailure {
 fn pubkeys(
     db_tx: &rusqlite::Transaction<'_>,
     sql: &str,
-) -> Result<HashMap<i32, crate::db::PubKey>, String> {
-    let mut stmt = db_tx.prepare_cached(sql).map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(|e| e.to_string())?;
-    rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+) -> Result<HashMap<i32, crate::db::PubKey>, rusqlite::Error> {
+    let mut stmt = db_tx.prepare_cached(sql)?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
 }
 
 impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>

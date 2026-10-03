@@ -293,6 +293,8 @@ CREATE TABLE storage_view_transitions (
 
 CREATE INDEX idx_fragment_inventory_verified ON fragment_inventory (node_id, verified_height);
 
+CREATE INDEX idx_fragment_hashes_local ON fragment_hashes (fragment_hash) WHERE stored_locally = 1;
+
 CREATE TABLE inodes (
             -- stable identifier for FileProvider (UUIDv7 encodes creation time)
             id              TEXT UNIQUE NOT NULL,

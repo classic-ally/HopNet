@@ -103,8 +103,13 @@ async fn serve_spa(request: Request) -> Response<Body> {
 /// `HOPNET_HTTP_PORT`. The network surface is the pinned-HTTPS listener
 /// on `0.0.0.0:{DEFAULT_HTTPS_PORT}`, bound here too.
 async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // tracing
-    tracing_subscriber::fmt::init();
+    // tracing — RUST_LOG as the operator set it, with the consensus
+    // engine's per-vote chatter held at WARN unless they ask for it.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter(
+            std::env::var("RUST_LOG").ok().as_deref(),
+        )))
+        .init();
 
     // The hoisted effective-code seam (hopnet_common::version) ignores a
     // malformed override silently; validate once here so the operator
@@ -830,7 +835,11 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             if app_state.node_id.get().is_some()
                 && let Err(e) = consensus::malachite::engine::spawn_engine(&app_state)
             {
-                tracing::error!("failed to start consensus engine: {e}");
+                // A node without its engine must not keep serving as if it
+                // were healthy — leave with the restart code so supervision
+                // re-execs it (the 2026-08-17 zombie shape, at boot).
+                tracing::error!("failed to start consensus engine — restarting: {e}");
+                std::process::exit(EXIT_CODE_RESTART);
             }
 
             // Host capabilities (RFC-016): one seam bundle handed to every
@@ -1169,9 +1178,11 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
             // Create trace layer with request IDs. Failure logging: a 503 is
             // deliberate load shedding (the DB-capacity gate / concurrency
-            // limit doing their job) — logging each at ERROR floods the logs
-            // exactly when the system is busiest, so sheds log at DEBUG;
-            // genuine 5xx failures stay ERROR.
+            // limit doing their job) and a 507 is the admission floor
+            // refusing an ingest on a low disk — logging each at ERROR
+            // floods the logs exactly when the system is busiest (46,000
+            // lines in a day from one ingress agent against a full disk),
+            // so both log at DEBUG; genuine 5xx failures stay ERROR.
             let trace_layer = TraceLayer::new_for_http()
                 .make_span_with(|request: &axum::http::Request<_>| {
                     let id = hopnet_common::CustomUUID::new(None);
@@ -1192,6 +1203,12 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 tracing::debug!(
                                     latency_ms = latency.as_millis() as u64,
                                     "request shed (503)"
+                                );
+                            }
+                            C::StatusCode(StatusCode::INSUFFICIENT_STORAGE) => {
+                                tracing::debug!(
+                                    latency_ms = latency.as_millis() as u64,
+                                    "admission refused (507)"
                                 );
                             }
                             other => {
@@ -1599,4 +1616,57 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
     server_handle.abort();
 
     Ok(())
+}
+
+/// The consensus engine's per-vote INFO lines (proposal, each vote,
+/// each timeout, ~20 per height at 25 heights a minute) are held at WARN
+/// unless the operator names the crate.
+const CHATTY_CONSENSUS_CRATES: &[&str] =
+    &["arc_malachitebft_core_consensus", "arc_malachitebft_engine"];
+
+/// The tracing filter for this process: `RUST_LOG` as given (default
+/// `info`), plus a WARN directive for each chatty consensus crate the
+/// operator did not mention. A more specific directive always wins in
+/// `EnvFilter`, so `RUST_LOG=info` still shows every hopnet line.
+fn log_filter(rust_log: Option<&str>) -> String {
+    let base = rust_log
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("info");
+    let mut filter = base.to_string();
+    for crate_name in CHATTY_CONSENSUS_CRATES {
+        if !base.contains(crate_name) {
+            filter.push_str(&format!(",{crate_name}=warn"));
+        }
+    }
+    filter
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::log_filter;
+
+    // Impact: every node logged ~20 consensus INFO lines per height at 25
+    // heights a minute, most of what journald stored; operators keep
+    // control, the default just stops the chatter.
+    // Should: default to info and quieten the consensus crates when
+    // RUST_LOG is unset or empty, and keep the operator's filter verbatim
+    // in front of the directives.
+    // Should not: add a directive for a crate the operator already named.
+    #[test]
+    fn quiets_consensus_chatter_unless_asked_for() {
+        assert_eq!(
+            log_filter(None),
+            "info,arc_malachitebft_core_consensus=warn,arc_malachitebft_engine=warn"
+        );
+        assert_eq!(log_filter(Some("  ")), log_filter(None));
+        assert_eq!(
+            log_filter(Some("warn,hopnet=debug")),
+            "warn,hopnet=debug,arc_malachitebft_core_consensus=warn,arc_malachitebft_engine=warn"
+        );
+        assert_eq!(
+            log_filter(Some("info,arc_malachitebft_core_consensus=info")),
+            "info,arc_malachitebft_core_consensus=info,arc_malachitebft_engine=warn"
+        );
+    }
 }

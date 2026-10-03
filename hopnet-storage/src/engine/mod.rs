@@ -19,7 +19,7 @@
 //!
 //! After a pull check that changed this node's disk — or for a
 //! never-confirmed blob it holds (the origin at birth) — the node attests
-//! promptly (its `self_check_fragments` differential, then disk truth) and,
+//! promptly (a blob-scoped `self_check_fragments` belief, then disk truth) and,
 //! when the goal's evidence is complete, proposes `ConfirmPlacement`: the
 //! latency path for uploads and real moves. Re-goaled blobs already held
 //! here submit nothing from the worker; the tick's fulfillment pass
@@ -399,38 +399,48 @@ where
     let moved_bytes = outcome.pulled + outcome.rebuilt > 0;
     let birth_holder = target.placement_height.is_none() && holds_any;
     if in_flight && (moved_bytes || birth_holder) {
-        // Belief first (rows for what we hold), then disk truth (S5):
-        // every fragment of this blob on our disk is content-verified
-        // right now and attested with the current height, so the
-        // confirmation's recency check has fresh evidence — the origin's
-        // classes included, which no pull ever touches.
-        let report = seams.state.self_check_report()?;
+        // Belief first (rows for what we hold of THIS blob — the classes
+        // this pull landed or rebuilt and, at birth, the origin's), then
+        // disk truth (S5): every fragment of this blob on our disk is
+        // content-verified right now and attested with the current height,
+        // so the confirmation's recency check has fresh evidence. The
+        // report is blob-scoped and already filtered against the inventory
+        // (one indexed query, not the whole-node differential that used to
+        // run here ~5×/min and bound pull throughput), and the apply is
+        // idempotent, so no round is bought for rows that exist.
+        let report = seams.state.blob_self_check_report(blob_id)?;
         if !report.is_empty() {
             let encoded = bincode::serde::encode_to_vec(&report, bincode::config::standard())
                 .map_err(|e| EngineError::Transfer(format!("self-check encode: {e}")))?;
             match seams.submitter.submit(policy::SELF_CHECK_FN, encoded).await {
                 Ok(()) => outcome.attested = true,
-                // The differential is a whole-node snapshot whose exact
-                // count the apply re-checks; a pull landing between build
-                // and preflight fails it. Routine under load — the sweep
-                // cron rebuilds the report; nothing here is lost.
+                // Belief is the sweep's to repair; disk truth and the
+                // proposal below still go out.
                 Err(SubmitError::Rejected(r)) => {
-                    tracing::warn!(
-                        "prompt self-check rejected (differential raced the inventory): {r}"
-                    )
+                    tracing::warn!("prompt self-check rejected: {r}")
                 }
                 Err(SubmitError::Transient(e)) => {
-                    tracing::debug!("prompt self-check deferred to the self-check cron: {e}")
+                    tracing::debug!("prompt self-check deferred to the sweep: {e}")
                 }
             }
         }
-        let present: Vec<Blake3Hash> = manifest
+        // Content-verifying every fragment of the blob reads and hashes each
+        // file: blocking work, off the serial worker's async thread.
+        let candidates: Vec<Blake3Hash> = manifest
             .chunks
             .values()
             .flat_map(|(o, r)| o.values().chain(r.values()))
             .map(|(hash, _, _)| *hash)
-            .filter(|hash| fragstore::fragment_exists_and_valid(fragments_dir, hash))
             .collect();
+        let dir = fragments_dir.to_string();
+        let present: Vec<Blake3Hash> = tokio::task::spawn_blocking(move || {
+            candidates
+                .into_iter()
+                .filter(|hash| fragstore::fragment_exists_and_valid(&dir, hash))
+                .collect()
+        })
+        .await
+        .map_err(|e| EngineError::Transfer(format!("attestation rehash join: {e}")))?;
         if !present.is_empty() {
             let attestation = crate::types::FragmentAttestation {
                 node_id: me,
@@ -504,6 +514,11 @@ mod tests {
         ready: Option<u64>,
         marked_local: Mutex<Vec<Blake3Hash>>,
         submitted: Mutex<Vec<&'static str>>,
+        /// Hashes consensus already believes this node holds — what the
+        /// blob-scoped report filters against.
+        inventoried: Mutex<std::collections::HashSet<Blake3Hash>>,
+        /// Every submitted (function, payload), for decoding in asserts.
+        payloads: Mutex<Vec<(&'static str, Vec<u8>)>>,
     }
 
     fn peers(ids: &[i32]) -> Vec<PeerRef> {
@@ -582,6 +597,36 @@ mod tests {
                 fragments_removed: vec![],
             })
         }
+        fn blob_self_check_report(
+            &self,
+            _blob_id: &BlobId,
+        ) -> Result<crate::types::SelfCheckFragments, StorageError> {
+            // What the host query computes: the manifest's classes this node
+            // holds (flagged before the pull, or marked local by it) that
+            // consensus has no row for yet.
+            let inventoried = self.inventoried.lock().unwrap();
+            let marked: std::collections::HashSet<Blake3Hash> =
+                self.marked_local.lock().unwrap().iter().copied().collect();
+            let mut fragments_added = Vec::new();
+            if let Some(manifest) = self.manifest.lock().unwrap().as_ref() {
+                for (hash, _, local) in manifest
+                    .chunks
+                    .values()
+                    .flat_map(|(o, r)| o.values().chain(r.values()))
+                {
+                    if (*local || marked.contains(hash)) && !inventoried.contains(hash) {
+                        fragments_added.push(*hash);
+                    }
+                }
+            }
+            Ok(crate::types::SelfCheckFragments {
+                node_id: 1,
+                self_verified_height: 9,
+                previous_count: 0,
+                fragments_added,
+                fragments_removed: vec![],
+            })
+        }
         fn confirm_ready(&self, _blob_id: &BlobId) -> Result<Option<u64>, StorageError> {
             Ok(self.ready)
         }
@@ -603,11 +648,43 @@ mod tests {
         async fn submit(
             &self,
             function: &'static str,
-            _payload: Vec<u8>,
+            payload: Vec<u8>,
         ) -> Result<(), SubmitError> {
             self.submitted.lock().unwrap().push(function);
+            self.payloads.lock().unwrap().push((function, payload));
             Ok(())
         }
+    }
+
+    /// The seam a duplicate belief hits in production: the submitter
+    /// refuses the self-check, everything else goes through.
+    struct RejectSelfCheck(Arc<PullNet>);
+
+    impl TxSubmitter for RejectSelfCheck {
+        async fn submit(
+            &self,
+            function: &'static str,
+            payload: Vec<u8>,
+        ) -> Result<(), SubmitError> {
+            if function == policy::SELF_CHECK_FN {
+                return Err(SubmitError::Rejected("already believed".into()));
+            }
+            self.0.submit(function, payload).await
+        }
+    }
+
+    /// The hashes a self-check payload asserts, as a set.
+    fn self_check_hashes(payloads: &[(&'static str, Vec<u8>)]) -> std::collections::HashSet<Blake3Hash> {
+        payloads
+            .iter()
+            .filter(|(f, _)| *f == policy::SELF_CHECK_FN)
+            .flat_map(|(_, bytes)| {
+                let (report, _): (crate::types::SelfCheckFragments, _) =
+                    bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                        .expect("self-check payload decodes");
+                report.fragments_added
+            })
+            .collect()
     }
 
     impl LocalStateSink for PullNet {
@@ -697,6 +774,8 @@ mod tests {
             ready: Some(9),
             marked_local: Mutex::new(Vec::new()),
             submitted: Mutex::new(Vec::new()),
+            inventoried: Mutex::new(Default::default()),
+            payloads: Mutex::new(Vec::new()),
         });
         for f in &outcome.fragments {
             let data = fragstore::read_fragment(&dir_src, &f.fragment_hash).unwrap();
@@ -718,6 +797,13 @@ mod tests {
             vec![policy::SELF_CHECK_FN, policy::ATTEST_FN, CONFIRM_TX_FN],
             "attestation lands before the confirm proposal"
         );
+        let believed = self_check_hashes(&net.payloads.lock().unwrap());
+        let landed: std::collections::HashSet<Blake3Hash> =
+            outcome.fragments.iter().map(|f| f.fragment_hash).collect();
+        assert_eq!(
+            believed, landed,
+            "the prompt belief carries exactly the classes this pull landed"
+        );
         for f in &outcome.fragments {
             assert!(fragstore::fragment_exists_and_valid(
                 &dir_dst,
@@ -735,6 +821,8 @@ mod tests {
             ready: None,
             marked_local: Mutex::new(Vec::new()),
             submitted: Mutex::new(Vec::new()),
+            inventoried: Mutex::new(Default::default()),
+            payloads: Mutex::new(Vec::new()),
         });
         let result = pull_owed(&seams(net2.clone()), &dir_dst2, &blob_id)
             .await
@@ -758,6 +846,8 @@ mod tests {
             ready: None,
             marked_local: Mutex::new(Vec::new()),
             submitted: Mutex::new(Vec::new()),
+            inventoried: Mutex::new(Default::default()),
+            payloads: Mutex::new(Vec::new()),
         });
         let result = pull_owed(&seams(net3), &dir_dst2, &blob_id).await.unwrap();
         assert_eq!(result, PullOutcome::default());
@@ -769,7 +859,11 @@ mod tests {
     // already holds — no self-check, no attestation, no confirm proposal;
     // the sweep owns its rows and the fulfillment floor its confirmation.
     // Should: still attest and propose for a never-confirmed blob this
-    // node holds (the origin at birth), so uploads confirm promptly.
+    // node holds (the origin at birth), so uploads confirm promptly, and
+    // assert belief for its classes when consensus has no rows for them (a
+    // photos origin, a failed upload attestation).
+    // Should not: buy a self-check round at birth when the rows already
+    // exist.
     // Impact: the serial worker awaited a consensus round per rubber stamp
     // after every view transition (~30 confirms/min); the 500-blob cutover
     // rehearsal never converged. Only births and moved bytes buy a round.
@@ -796,6 +890,8 @@ mod tests {
             ready: Some(9),
             marked_local: Mutex::new(Vec::new()),
             submitted: Mutex::new(Vec::new()),
+            inventoried: Mutex::new(Default::default()),
+            payloads: Mutex::new(Vec::new()),
         });
         let result = pull_owed(&seams(regoal.clone()), &dir, &blob_id)
             .await
@@ -806,14 +902,23 @@ mod tests {
             "a rubber stamp buys no consensus round on the worker"
         );
 
-        // Birth: never confirmed, held here — the origin's prompt evidence.
+        // Birth: never confirmed, held here, no belief rows yet — the
+        // origin's prompt evidence asserts its classes first.
+        let all_hashes: std::collections::HashSet<Blake3Hash> = manifest
+            .chunks
+            .values()
+            .flat_map(|(o, r)| o.values().chain(r.values()))
+            .map(|(hash, _, _)| *hash)
+            .collect();
         let birth = Arc::new(PullNet {
             served: Mutex::new(HashMap::new()),
-            manifest: Mutex::new(Some(manifest)),
+            manifest: Mutex::new(Some(manifest.clone())),
             target: Some(all_mine(9)),
             ready: Some(9),
             marked_local: Mutex::new(Vec::new()),
             submitted: Mutex::new(Vec::new()),
+            inventoried: Mutex::new(Default::default()),
+            payloads: Mutex::new(Vec::new()),
         });
         let result = pull_owed(&seams(birth.clone()), &dir, &blob_id)
             .await
@@ -821,10 +926,34 @@ mod tests {
         assert_eq!(result.owed, 0);
         assert!(result.attested);
         assert!(result.confirm_proposed);
-        // No pull → the mock's self-check differential is empty and is
-        // skipped; disk truth and the proposal still go out.
         assert_eq!(
             *birth.submitted.lock().unwrap(),
+            vec![policy::SELF_CHECK_FN, policy::ATTEST_FN, CONFIRM_TX_FN]
+        );
+        assert_eq!(
+            self_check_hashes(&birth.payloads.lock().unwrap()),
+            all_hashes,
+            "every held class without a row is asserted"
+        );
+
+        // Birth with belief already on record (the upload attestation
+        // landed): no self-check round, disk truth and the proposal only.
+        let believed = Arc::new(PullNet {
+            served: Mutex::new(HashMap::new()),
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ready: Some(9),
+            marked_local: Mutex::new(Vec::new()),
+            submitted: Mutex::new(Vec::new()),
+            inventoried: Mutex::new(all_hashes),
+            payloads: Mutex::new(Vec::new()),
+        });
+        let result = pull_owed(&seams(believed.clone()), &dir, &blob_id)
+            .await
+            .unwrap();
+        assert!(result.attested);
+        assert_eq!(
+            *believed.submitted.lock().unwrap(),
             vec![policy::ATTEST_FN, CONFIRM_TX_FN]
         );
 
@@ -853,6 +982,8 @@ mod tests {
             ready: None,
             marked_local: Mutex::new(Vec::new()),
             submitted: Mutex::new(Vec::new()),
+            inventoried: Mutex::new(Default::default()),
+            payloads: Mutex::new(Vec::new()),
         });
         for f in outcome.fragments.iter().filter(|f| !f.recovery) {
             let data = fragstore::read_fragment(&dir_src, &f.fragment_hash).unwrap();
@@ -882,6 +1013,8 @@ mod tests {
             ready: None,
             marked_local: Mutex::new(Vec::new()),
             submitted: Mutex::new(Vec::new()),
+            inventoried: Mutex::new(Default::default()),
+            payloads: Mutex::new(Vec::new()),
         });
         let result = pull_owed(&seams(dead.clone()), &dir_dst2, &blob_id)
             .await
@@ -890,6 +1023,51 @@ mod tests {
         assert!(
             dead.submitted.lock().unwrap().is_empty(),
             "nothing to attest"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Should: still attest disk truth and propose confirmation when the
+    // prompt self-check is refused — belief is the sweep's to repair, the
+    // evidence the confirmation needs must not wait on it.
+    // Should not: fail the pull or skip the attestation on that refusal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prompt_self_check_rejection_does_not_block_attestation() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-reject-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, outcome, manifest) = encoded_blob(&dir_src).await;
+
+        let net = Arc::new(PullNet {
+            served: Mutex::new(HashMap::new()),
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ready: Some(9),
+            marked_local: Mutex::new(Vec::new()),
+            submitted: Mutex::new(Vec::new()),
+            inventoried: Mutex::new(Default::default()),
+            payloads: Mutex::new(Vec::new()),
+        });
+        for f in &outcome.fragments {
+            let data = fragstore::read_fragment(&dir_src, &f.fragment_hash).unwrap();
+            net.served.lock().unwrap().insert(f.fragment_hash, data);
+        }
+        let seams = Seams {
+            transport: net.clone(),
+            state: net.clone(),
+            submitter: Arc::new(RejectSelfCheck(net.clone())),
+            local_state: net.clone(),
+        };
+
+        let result = pull_owed(&seams, &dir_dst, &blob_id).await.unwrap();
+        assert_eq!(result.pulled, 30);
+        assert!(result.confirm_proposed);
+        assert_eq!(
+            *net.submitted.lock().unwrap(),
+            vec![policy::ATTEST_FN, CONFIRM_TX_FN],
+            "the refused belief is skipped, disk truth and the proposal still go out"
         );
 
         let _ = std::fs::remove_dir_all(&base);

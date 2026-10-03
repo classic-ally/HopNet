@@ -2171,3 +2171,44 @@ async fn concurrency_bounds_uploads_in_flight() {
     let report = pass_task.await.unwrap();
     assert_eq!(report.published, 9);
 }
+
+// Impact: a parked publisher re-probed a node refusing admission with its
+// whole window every pass — sixteen admit probes a tick, one a second for
+// 13 hours against a full disk (2026-10-02).
+// Should: after a parked pass, send a single photo first and open the full
+// window only once the node answers.
+// Should not: spend more than one attempt per parked pass while the node
+// stays away.
+#[tokio::test(flavor = "multi_thread")]
+async fn parked_pass_probes_once_before_reopening_the_window() {
+    let mut rig = rig().await;
+    rig.config.publish.concurrency = 16;
+    let mut ids = Vec::new();
+    for n in 0..6 {
+        let local = format!("photo-{n}");
+        ids.push(materialize(&rig, &local, local.as_bytes()).await);
+    }
+
+    let refusing =
+        FakePublisher::with_fallback(|| Err(PublishError::NodeUnreachable("refused".into())));
+    let mut state = PublishState::default();
+
+    // First park: the node was fine a moment ago, the full window goes out.
+    let report = pass(&rig, &refusing, &mut state).await;
+    assert!(report.parked);
+    let after_first = refusing.calls.load(Ordering::Relaxed);
+    assert_eq!(after_first, 6);
+
+    // Still parked: exactly one probe.
+    let report = pass(&rig, &refusing, &mut state).await;
+    assert!(report.parked);
+    assert_eq!(refusing.calls.load(Ordering::Relaxed), after_first + 1);
+
+    // The node answers: the probe succeeds and the window reopens so the
+    // whole batch publishes in this pass.
+    let answering = FakePublisher::ok();
+    let report = pass(&rig, &answering, &mut state).await;
+    assert!(!report.parked);
+    assert_eq!(report.published, 6);
+    assert_eq!(answering.calls.load(Ordering::Relaxed), 6);
+}

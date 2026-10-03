@@ -90,7 +90,13 @@ pub fn store_fragment(
     // Write to temp file then atomic rename to prevent concurrent readers
     // from seeing partial data (POSIX rename is atomic on the same filesystem)
     let temp_path = format!("{}.tmp.{:x}", full_file_path, rand::random::<u64>());
-    fs::write(&temp_path, &data)?;
+    fs::write(&temp_path, &data).map_err(|e| {
+        // A partial write (ENOSPC, EIO) must not leave its temp file behind:
+        // the sweep cannot attribute it to a row and would only reap it
+        // after the orphan grace period.
+        let _ = fs::remove_file(&temp_path);
+        StorageError::Io(e)
+    })?;
     fs::rename(&temp_path, &full_file_path).map_err(|e| {
         // Clean up temp file on rename failure
         let _ = fs::remove_file(&temp_path);
@@ -152,15 +158,58 @@ pub fn scan_fragments(
 pub fn scan_fragments_detailed(
     fragments_dir: &str,
 ) -> Result<Vec<crate::sweep::DiskFragment>, StorageError> {
+    Ok(scan_fragments_with_temps(fragments_dir)?.fragments)
+}
+
+/// A `<hash>.tmp.<nonce>` file left by an interrupted `store_fragment`
+/// (a crash between write and rename, or a partial write on an older
+/// binary). Never a fragment: it is reaped once older than the orphan
+/// grace period.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TempFile {
+    pub path: std::path::PathBuf,
+    /// Modification time, unix seconds.
+    pub mtime: u64,
+}
+
+/// The sweep's full view of the fragment directory: the fragments, the
+/// temp files, and how many names were neither.
+#[derive(Debug, Default)]
+pub struct FragmentListing {
+    pub fragments: Vec<crate::sweep::DiskFragment>,
+    pub temps: Vec<TempFile>,
+    /// Files whose name is neither a fragment hash nor a temp file — left
+    /// alone, counted so the operator sees one line, not one per file.
+    pub unexpected: usize,
+}
+
+/// Is this the name `store_fragment` gives its in-flight file?
+fn is_temp_fragment_name(name: &str) -> bool {
+    match name.split_once(".tmp.") {
+        Some((hash, nonce)) => {
+            hash.len() == 64
+                && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                && !nonce.is_empty()
+                && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        None => false,
+    }
+}
+
+/// `scan_fragments_detailed` plus the temp files and the unexpected-name
+/// count — the disk-truth sweep's walk.
+pub fn scan_fragments_with_temps(fragments_dir: &str) -> Result<FragmentListing, StorageError> {
     use std::time::SystemTime;
 
     let fragments_path = std::path::Path::new(fragments_dir);
     if !fragments_path.exists() {
         tracing::warn!("Fragments directory does not exist: {}", fragments_dir);
-        return Ok(Vec::new());
+        return Ok(FragmentListing::default());
     }
 
     let mut disk_fragments = Vec::new();
+    let mut temps = Vec::new();
+    let mut unexpected = 0usize;
 
     // Iterate through first-level directories (00-ff)
     for first_level_entry in fs::read_dir(fragments_path)? {
@@ -195,8 +244,16 @@ pub fn scan_fragments_detailed(
                 // Parse filename as Blake3 hash (64 hex characters)
                 let filename = file_entry.file_name();
                 let filename_str = filename.to_string_lossy();
+                if is_temp_fragment_name(&filename_str) {
+                    temps.push(TempFile {
+                        path: file_entry.path(),
+                        mtime,
+                    });
+                    continue;
+                }
                 if filename_str.len() != 64 {
-                    tracing::warn!("Unexpected fragment filename: {}", filename_str);
+                    tracing::debug!("Unexpected fragment filename: {}", filename_str);
+                    unexpected += 1;
                     continue;
                 }
                 match hex::decode(&*filename_str) {
@@ -210,14 +267,24 @@ pub fn scan_fragments_detailed(
                         });
                     }
                     _ => {
-                        tracing::warn!("Invalid fragment hash filename: {}", filename_str);
+                        tracing::debug!("Invalid fragment hash filename: {}", filename_str);
+                        unexpected += 1;
                     }
                 }
             }
         }
     }
+    if unexpected > 0 {
+        tracing::warn!(
+            "fragment walk: {unexpected} files with names that are neither fragments nor temp files were left alone"
+        );
+    }
 
-    Ok(disk_fragments)
+    Ok(FragmentListing {
+        fragments: disk_fragments,
+        temps,
+        unexpected,
+    })
 }
 
 /// Fetch and verify a fragment from local storage
@@ -314,6 +381,71 @@ pub fn verify_listing(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Impact: the full-disk node (2026-10-02) left a `.tmp.` file behind
+    // every failed store, which the sweep warned about on every walk and
+    // never deleted.
+    // Should: remove the temp file when the write itself fails.
+    // Should not: leave anything behind in the fragment's directory.
+    #[test]
+    fn store_failure_leaves_no_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "hopnet-fragstore-nowrite-{}",
+            std::process::id()
+        ));
+        let dir = dir.to_str().unwrap().to_string();
+        let _ = fs::remove_dir_all(&dir);
+        let data = b"doomed".to_vec();
+        let hash = Blake3Hash::new(blake3::hash(&data));
+        let leaf = create_fragment_path(&dir, &hash).unwrap();
+        fs::create_dir_all(&leaf).unwrap();
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = store_fragment(&dir, &hash, data);
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o755)).unwrap();
+        if result.is_ok() {
+            // Running as a user the mode bits do not bind (root): nothing
+            // to assert about a failure that did not happen.
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let leftovers: Vec<_> = fs::read_dir(&leaf).unwrap().collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Should: list a stored fragment under fragments, a `<hash>.tmp.<nonce>`
+    // file under temps with its mtime, and count any other name as
+    // unexpected without listing it anywhere.
+    #[test]
+    fn listing_separates_temp_files_from_fragments() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopnet-fragstore-listing-{}",
+            std::process::id()
+        ));
+        let dir = dir.to_str().unwrap().to_string();
+        let _ = fs::remove_dir_all(&dir);
+        let data = b"kept".to_vec();
+        let hash = Blake3Hash::new(blake3::hash(&data));
+        store_fragment(&dir, &hash, data).unwrap();
+        let leaf = create_fragment_path(&dir, &hash).unwrap();
+        let temp = format!("{leaf}/{}.tmp.deadbeef", hash.to_hex());
+        fs::write(&temp, b"partial").unwrap();
+        fs::write(format!("{leaf}/notes.txt"), b"junk").unwrap();
+
+        let listing = scan_fragments_with_temps(&dir).unwrap();
+        assert_eq!(listing.fragments.len(), 1);
+        assert_eq!(listing.fragments[0].hash, hash);
+        assert_eq!(listing.temps.len(), 1);
+        assert_eq!(listing.temps[0].path, std::path::PathBuf::from(&temp));
+        assert!(listing.temps[0].mtime > 0);
+        assert_eq!(listing.unexpected, 1);
+        // The plain listing still sees only the fragment.
+        assert_eq!(scan_fragments_detailed(&dir).unwrap().len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn store_read_verify_delete_cycle() {

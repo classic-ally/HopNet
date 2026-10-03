@@ -205,6 +205,22 @@ impl StateReader for SubstrateHost {
             .map_err(|e| StorageError::Host(format!("inventory differential: {e:?}")))
     }
 
+    fn blob_self_check_report(
+        &self,
+        blob_id: &BlobId,
+    ) -> Result<hopnet_storage::SelfCheckFragments, StorageError> {
+        let node_id = self
+            .app_state
+            .get_node_id()
+            .map_err(|_| StorageError::Host("node id not set".to_string()))?;
+        crate::db::inventory::compute_blob_inventory_differential(
+            self.app_state.db_pool.get(),
+            node_id,
+            blob_id,
+        )
+        .map_err(|e| StorageError::Host(format!("blob inventory differential: {e:?}")))
+    }
+
     fn confirm_ready(&self, blob_id: &BlobId) -> Result<Option<u64>, StorageError> {
         let conn = self
             .app_state

@@ -675,8 +675,14 @@ async fn run_scope_pass(
         JoinSet::new();
     // Clamped: a 0 window would join an empty set immediately and drop the
     // whole batch silently rather than publishing it.
-    let window = cfg.concurrency.max(1);
-    let permits = Arc::new(tokio::sync::Semaphore::new(window));
+    let full_window = cfg.concurrency.max(1);
+    // Probe first after a park: the previous pass found the node unreachable
+    // (or refusing admission), so this one sends a single photo and opens
+    // the full window only once the node answers. Otherwise every parked
+    // pass spent `concurrency` admit probes against a 507 — one a second
+    // for 13 hours on the 2026-10-02 full-disk node.
+    let mut window = if state.unreachable { 1 } else { full_window };
+    let permits = Arc::new(tokio::sync::Semaphore::new(full_window));
     let mut parked = false;
 
     loop {
@@ -741,6 +747,8 @@ async fn run_scope_pass(
                     state.unreachable = false;
                     let _ = store.append_log("node_regained", None, None).await;
                 }
+                // The node answered: the probe window opens to full width.
+                window = full_window;
             }
             Err(PublishError::NodeUnreachable(msg)) => {
                 if !state.unreachable {

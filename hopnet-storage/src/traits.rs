@@ -165,11 +165,20 @@ pub trait StateReader: Send + Sync {
     /// reach the goal (nothing is owed until it does).
     fn pull_target(&self, blob_id: &BlobId) -> Result<Option<PullTarget>, StorageError>;
 
-    /// This node's inventory attestation as of now — the differential
+    /// This node's whole-inventory belief as of now — the differential
     /// between what it holds and what consensus believes it holds — ready
-    /// to submit as `self_check_fragments`. The prompt attestation after a
-    /// pull rides this (RFC-STORAGE-003 S3/S5).
+    /// to submit as `self_check_fragments`. The sweep's report; the prompt
+    /// path after a pull rides `blob_self_check_report` instead.
     fn self_check_report(&self) -> Result<crate::types::SelfCheckFragments, StorageError>;
+
+    /// Blob-scoped belief after a pull (RFC-STORAGE-003 S3/S5): this node's
+    /// held classes of `blob_id` with no inventory row yet — the classes the
+    /// pull landed or rebuilt and, at birth, the origin's. Empty when belief
+    /// is already on record, so the engine buys no round for it.
+    fn blob_self_check_report(
+        &self,
+        blob_id: &BlobId,
+    ) -> Result<crate::types::SelfCheckFragments, StorageError>;
 
     /// `Some(desired)` when the blob is in flight and every responsible
     /// node under its goal has attested recently — a ConfirmPlacement for

@@ -80,10 +80,18 @@ pub fn ensure_database_dir(db_path: &str) -> Result<(), std::io::Error> {
 }
 
 /// Optional pragma overrides read from environment.
-/// Used for benchmarking; absent values fall back to SQLite defaults.
+/// Used for benchmarking; absent values fall back to HopNet's defaults where
+/// one is named below, else SQLite's.
 ///
 /// `HOPNET_DB_SYNCHRONOUS` — OFF | NORMAL | FULL | EXTRA (default: SQLite picks FULL under WAL)
-/// `HOPNET_DB_CACHE_KIB`    — positive integer; applied as `PRAGMA cache_size = -<N>` (KiB form)
+/// `HOPNET_DB_CACHE_KIB`    — positive integer; applied as `PRAGMA cache_size = -<N>` (KiB form).
+///                            Default 262144 (256 MiB): SQLite's own 2 MB default against a
+///                            multi-GB database with 16 KiB pages made every inventory scan a
+///                            pread storm (5.5 billion read syscalls in a day on one node).
+/// `HOPNET_DB_JOURNAL_SIZE_LIMIT_BYTES` — non-negative integer; `PRAGMA journal_size_limit`.
+///                            Default 1073741824 (1 GiB): the WAL file is truncated back to
+///                            this after a checkpoint instead of keeping its high-water mark
+///                            (one node carried a 10.8 GB dead WAL).
 /// `HOPNET_DB_MMAP_BYTES`   — non-negative integer; applied as `PRAGMA mmap_size = <N>`
 /// `HOPNET_DB_TEMP_STORE`   — DEFAULT | FILE | MEMORY
 /// `HOPNET_DB_PAGE_SIZE`    — power of 2 in [512, 65536]. Only takes effect on a fresh
@@ -118,6 +126,52 @@ fn page_size_pragma() -> String {
     format!("PRAGMA page_size = {};\n", chosen)
 }
 
+/// Per-connection page cache, KiB. 256 MiB: the hot inventory tables and
+/// their indexes stay resident across a scan instead of being re-read a
+/// page at a time through the OS cache.
+const DEFAULT_CACHE_KIB: u64 = 256 * 1024;
+
+/// WAL truncation threshold after a checkpoint, bytes. 1 GiB leaves room
+/// for a big transaction without carrying its high-water mark forever.
+const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// `PRAGMA cache_size` from an optional `HOPNET_DB_CACHE_KIB` value; an
+/// absent or invalid value yields the HopNet default.
+fn cache_pragma(env: Option<&str>) -> String {
+    let kib = match env.map(|v| v.trim().parse::<u64>()) {
+        Some(Ok(kib)) if kib > 0 => kib,
+        Some(_) => {
+            tracing::warn!(
+                "ignoring invalid HOPNET_DB_CACHE_KIB={}; using default {}",
+                env.unwrap_or(""),
+                DEFAULT_CACHE_KIB
+            );
+            DEFAULT_CACHE_KIB
+        }
+        None => DEFAULT_CACHE_KIB,
+    };
+    format!("PRAGMA cache_size = -{kib};\n")
+}
+
+/// `PRAGMA journal_size_limit` from an optional
+/// `HOPNET_DB_JOURNAL_SIZE_LIMIT_BYTES` value; an absent or invalid value
+/// yields the HopNet default.
+fn journal_size_limit_pragma(env: Option<&str>) -> String {
+    let bytes = match env.map(|v| v.trim().parse::<u64>()) {
+        Some(Ok(bytes)) => bytes,
+        Some(Err(_)) => {
+            tracing::warn!(
+                "ignoring invalid HOPNET_DB_JOURNAL_SIZE_LIMIT_BYTES={}; using default {}",
+                env.unwrap_or(""),
+                DEFAULT_JOURNAL_SIZE_LIMIT_BYTES
+            );
+            DEFAULT_JOURNAL_SIZE_LIMIT_BYTES
+        }
+        None => DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+    };
+    format!("PRAGMA journal_size_limit = {bytes};\n")
+}
+
 fn env_pragma_overrides() -> String {
     let mut out = String::new();
 
@@ -131,14 +185,14 @@ fn env_pragma_overrides() -> String {
         }
     }
 
-    if let Ok(v) = std::env::var("HOPNET_DB_CACHE_KIB") {
-        match v.trim().parse::<u64>() {
-            Ok(kib) if kib > 0 => {
-                out.push_str(&format!("PRAGMA cache_size = -{};\n", kib));
-            }
-            _ => tracing::warn!("ignoring invalid HOPNET_DB_CACHE_KIB={}", v),
-        }
-    }
+    out.push_str(&cache_pragma(
+        std::env::var("HOPNET_DB_CACHE_KIB").ok().as_deref(),
+    ));
+    out.push_str(&journal_size_limit_pragma(
+        std::env::var("HOPNET_DB_JOURNAL_SIZE_LIMIT_BYTES")
+            .ok()
+            .as_deref(),
+    ));
 
     if let Ok(v) = std::env::var("HOPNET_DB_MMAP_BYTES") {
         match v.trim().parse::<u64>() {
@@ -325,4 +379,62 @@ pub fn read_upgrade_node_settings(
         tracing::error!("read upgrade node settings: {e:?}");
         DatabaseError::RecallError
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Impact: SQLite's 2 MB default page cache against a multi-GB database
+    // turned every inventory scan into a pread storm; the default must be
+    // HopNet's, with the env var still winning.
+    // Should: emit the 256 MiB default when the variable is absent or
+    // invalid, and the given KiB when it is valid.
+    #[test]
+    fn cache_pragma_defaults_and_overrides() {
+        assert_eq!(cache_pragma(None), "PRAGMA cache_size = -262144;\n");
+        assert_eq!(
+            cache_pragma(Some("garbage")),
+            "PRAGMA cache_size = -262144;\n"
+        );
+        assert_eq!(cache_pragma(Some("0")), "PRAGMA cache_size = -262144;\n");
+        assert_eq!(cache_pragma(Some(" 4096 ")), "PRAGMA cache_size = -4096;\n");
+    }
+
+    // Should: emit the 1 GiB journal_size_limit default when the variable
+    // is absent or invalid, and the given byte count when it is valid
+    // (zero included: "truncate to nothing" is a legitimate choice).
+    #[test]
+    fn journal_size_limit_pragma_defaults_and_overrides() {
+        let default = "PRAGMA journal_size_limit = 1073741824;\n";
+        assert_eq!(journal_size_limit_pragma(None), default);
+        assert_eq!(journal_size_limit_pragma(Some("x")), default);
+        assert_eq!(
+            journal_size_limit_pragma(Some("0")),
+            "PRAGMA journal_size_limit = 0;\n"
+        );
+    }
+
+    // Should: leave a freshly initialised connection with the HopNet cache
+    // and journal-size defaults readable back through the pragmas.
+    #[test]
+    fn connection_pragmas_apply_the_defaults() {
+        // Only meaningful when the env does not override; the two pure
+        // tests above cover the override arithmetic.
+        if std::env::var_os("HOPNET_DB_CACHE_KIB").is_some()
+            || std::env::var_os("HOPNET_DB_JOURNAL_SIZE_LIMIT_BYTES").is_some()
+        {
+            return;
+        }
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_connection_pragmas(&conn).unwrap();
+        let cache: i64 = conn
+            .query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cache, -(DEFAULT_CACHE_KIB as i64));
+        let limit: i64 = conn
+            .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(limit, DEFAULT_JOURNAL_SIZE_LIMIT_BYTES as i64);
+    }
 }
