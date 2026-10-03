@@ -97,5 +97,8 @@
       { tolerance: 1, rawGb: 120 }
     ],
     unplacedBuckets: buckets(22, 0),
-    holdingBack: [{ nodeId: 3, displayName: 'macbook', freeGb: 0.1, pullFloorGb: 20 }]
+    holdingBack: [
+      { nodeId: 3, displayName: 'macbook', freeGb: 0.1, pullFloorGb: 20, reason: 'low_space' },
+      { nodeId: 2, displayName: 'desktop', freeGb: 900, pullFloorGb: 39, reason: 'probe_error' }
+    ]
   }} />

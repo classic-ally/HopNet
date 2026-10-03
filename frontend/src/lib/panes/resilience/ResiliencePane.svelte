@@ -108,7 +108,8 @@
             nodeId: n.node_id,
             displayName: n.display_name,
             freeGb: n.free_gb,
-            pullFloorGb: n.pull_floor_gb
+            pullFloorGb: n.pull_floor_gb,
+            reason: n.reason
         }))
     };
 

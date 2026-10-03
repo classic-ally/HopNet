@@ -307,6 +307,9 @@ pub struct HoldingBackNode {
     /// The default pull floor for its volume (GiB).
     #[typeshare(serialized_as = "number")]
     pub pull_floor_gb: f64,
+    /// Why: `low_space` (from replicated metrics) or `probe_error` (this
+    /// node cannot read its own free space; seen only from its own pane).
+    pub reason: String,
 }
 
 /// One age decade of unplaced data.
