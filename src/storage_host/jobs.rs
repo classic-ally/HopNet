@@ -208,7 +208,7 @@ pub async fn run_network_rebalancing(
     let result = NetworkRebalancingResult {
         consensus_height,
         data_blocks_checked: stats.checked,
-        data_blocks_rebalanced: stats.confirms_proposed,
+        data_blocks_rebalanced: stats.evidence_queued,
         data_blocks_failed: stats.failed,
         total_fragments_migrated: stats.pulled + stats.rebuilt,
     };
@@ -372,8 +372,9 @@ pub const ROTATION_TARGET_SECS: u64 = 3600;
 
 /// A buffered belief or attestation page is submitted part-full once its
 /// oldest hash has waited this long: the bound on how long a fragment the
-/// walk saw waits for its stamp.
-pub const MAX_BUFFER_AGE_SECS: u64 = 60;
+/// walk saw waits for its stamp. One clock with the pull path's evidence
+/// lane, so sweep and pull evidence age out of their buffers alike.
+pub const MAX_BUFFER_AGE_SECS: u64 = hopnet_storage::engine::policy::EVIDENCE_MAX_AGE_SECS;
 
 /// Shards whose content was scrubbed today: `(day, flags)`. Each shard is
 /// read once on its day of seven (`sweep::scrub_due`); in memory, as the

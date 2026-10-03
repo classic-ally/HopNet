@@ -30,13 +30,14 @@
 //! threshold, the blind placement batcher) is gone. The engine owns NO
 //! runtime: the host passes a handle at spawn.
 
+pub mod evidence;
 pub mod policy;
 pub mod reencode;
 
 use crate::error::StorageError;
 use crate::fragstore;
-use crate::lifecycle::{ConfirmPlacement, PlacementConfirmation, CONFIRM_TX_FN};
-use crate::traits::{LocalStateSink, StateReader, SubmitError, Transport, TxSubmitter};
+
+use crate::traits::{LocalStateSink, StateReader, Transport, TxSubmitter};
 use crate::types::BlobId;
 use hopnet_common::Blake3Hash;
 use std::collections::BTreeMap;
@@ -106,10 +107,9 @@ pub struct PullOutcome {
     pub rebuilt: usize,
     /// Owed classes still missing after both — retried on the next kick.
     pub failed: usize,
-    /// A prompt attestation was submitted for this node's new copies.
-    pub attested: bool,
-    /// A ConfirmPlacement was proposed (the goal's evidence was complete).
-    pub confirm_proposed: bool,
+    /// This blob's belief, disk truth and confirmation check went to the
+    /// evidence lane (births and moved bytes only).
+    pub evidence_queued: bool,
 }
 
 /// Aggregate of many pull checks (the tick's re-kick, the operator drain).
@@ -120,7 +120,8 @@ pub struct PullStats {
     pub pulled: usize,
     pub rebuilt: usize,
     pub failed: usize,
-    pub confirms_proposed: usize,
+    /// Blobs whose evidence went to the evidence lane.
+    pub evidence_queued: usize,
 }
 
 /// One re-encode work item for the serial worker (RFC-STORAGE-001 Repair:
@@ -198,7 +199,7 @@ impl EngineHandle {
                     stats.pulled += o.pulled;
                     stats.rebuilt += o.rebuilt;
                     stats.failed += o.failed;
-                    stats.confirms_proposed += o.confirm_proposed as usize;
+                    stats.evidence_queued += o.evidence_queued as usize;
                 }
                 None => {
                     stats.failed += 1;
@@ -245,6 +246,8 @@ impl EngineHandle {
         let fragments_dir = config.fragments_dir;
         let queued: Arc<std::sync::Mutex<std::collections::HashSet<BlobId>>> = Default::default();
         let worker_queued = queued.clone();
+        let lane =
+            evidence::EvidenceLane::spawn(seams.state.clone(), seams.submitter.clone(), &data_rt);
         data_rt.spawn(async move {
             loop {
                 tokio::select! {
@@ -255,7 +258,7 @@ impl EngineHandle {
                     }
                     item = pull_rx.recv() => {
                         let Some((blob_id, reply)) = item else { break };
-                        let outcome = match pull_owed(&seams, &fragments_dir, &blob_id).await {
+                        let outcome = match pull_owed(&seams, &fragments_dir, &blob_id, &lane).await {
                             Ok(o) => o,
                             Err(e) => {
                                 tracing::warn!("pull: blob {blob_id} failed: {e}");
@@ -316,12 +319,15 @@ async fn run_reencode_cmd<T, S, X, L>(
 }
 
 /// The pull check for one blob on this node: derive the owed classes from
-/// the goal, fetch each with recovery, then attest and (if the goal's
-/// evidence is complete) propose confirmation.
+/// the goal, fetch each with recovery, then content-verify the blob's
+/// fragments and hand the evidence to the lane — which reports belief and
+/// disk truth and proposes confirmation in pages. The worker never waits
+/// on consensus.
 async fn pull_owed<T, S, X, L>(
     seams: &Seams<T, S, X, L>,
     fragments_dir: &str,
     blob_id: &BlobId,
+    lane: &evidence::EvidenceLane,
 ) -> Result<PullOutcome, EngineError>
 where
     T: Transport + 'static,
@@ -429,33 +435,11 @@ where
     let moved_bytes = outcome.pulled + outcome.rebuilt > 0;
     let birth_holder = target.placement_height.is_none() && holds_any;
     if in_flight && (moved_bytes || birth_holder) {
-        // Belief first (rows for what we hold of THIS blob — the classes
-        // this pull landed or rebuilt and, at birth, the origin's), then
-        // disk truth (S5): every fragment of this blob on our disk is
-        // content-verified right now and attested with the current height,
-        // so the confirmation's recency check has fresh evidence. The
-        // report is blob-scoped and already filtered against the inventory
-        // (one indexed query, not the whole-node differential that used to
-        // run here ~5×/min and bound pull throughput), and the apply is
-        // idempotent, so no round is bought for rows that exist.
-        let report = seams.state.blob_self_check_report(blob_id)?;
-        if !report.is_empty() {
-            let encoded = bincode::serde::encode_to_vec(&report, bincode::config::standard())
-                .map_err(|e| EngineError::Transfer(format!("self-check encode: {e}")))?;
-            match seams.submitter.submit(policy::SELF_CHECK_FN, encoded).await {
-                Ok(()) => outcome.attested = true,
-                // Belief is the sweep's to repair; disk truth and the
-                // proposal below still go out.
-                Err(SubmitError::Rejected(r)) => {
-                    tracing::warn!("prompt self-check rejected: {r}")
-                }
-                Err(SubmitError::Transient(e)) => {
-                    tracing::debug!("prompt self-check deferred to the sweep: {e}")
-                }
-            }
-        }
-        // Content-verifying every fragment of the blob reads and hashes each
-        // file: blocking work, off the serial worker's async thread.
+        // The height is read BEFORE the rehash, so the attestation never
+        // claims a fragment was seen later than it was (the rolling
+        // sweep's rule). Content-verifying every fragment of the blob reads
+        // and hashes each file: blocking work, off the async worker.
+        let height = seams.state.current_height()?;
         let candidates: Vec<Blake3Hash> = manifest
             .chunks
             .values()
@@ -471,41 +455,15 @@ where
         })
         .await
         .map_err(|e| EngineError::Transfer(format!("attestation rehash join: {e}")))?;
+        // Belief (computed at flush, after the marks landed), truth and the
+        // confirmation check ride the lane's pages: no consensus round is
+        // awaited here.
         if !present.is_empty() {
-            let attestation = crate::types::FragmentAttestation {
-                node_id: me,
-                height: seams.state.current_height()?,
+            outcome.evidence_queued = lane.push(evidence::EvidenceItem {
+                blob_id: blob_id.clone(),
+                height,
                 present,
-                suspect: Vec::new(),
-            };
-            let encoded = bincode::serde::encode_to_vec(&attestation, bincode::config::standard())
-                .map_err(|e| EngineError::Transfer(format!("attestation encode: {e}")))?;
-            match seams.submitter.submit(policy::ATTEST_FN, encoded).await {
-                Ok(()) => outcome.attested = true,
-                Err(SubmitError::Rejected(r)) => {
-                    tracing::warn!("disk-truth attestation rejected: {r}")
-                }
-                Err(SubmitError::Transient(e)) => {
-                    tracing::debug!("disk-truth attestation deferred to the sweep: {e}")
-                }
-            }
-        }
-        if let Some(height) = seams.state.confirm_ready(blob_id)? {
-            let payload = ConfirmPlacement {
-                confirmations: vec![PlacementConfirmation {
-                    blob_id: blob_id.clone(),
-                    height,
-                }],
-            };
-            let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
-                .map_err(|e| EngineError::Transfer(format!("confirm encode: {e}")))?;
-            match seams.submitter.submit(CONFIRM_TX_FN, encoded).await {
-                Ok(()) => outcome.confirm_proposed = true,
-                Err(SubmitError::Rejected(r)) => tracing::warn!("confirm proposal rejected: {r}"),
-                Err(SubmitError::Transient(e)) => {
-                    tracing::debug!("confirm proposal deferred to the tick: {e}")
-                }
-            }
+            });
         }
     }
 
@@ -517,8 +475,8 @@ where
             outcome.pulled,
             outcome.rebuilt,
             outcome.failed,
-            if outcome.confirm_proposed {
-                " (confirm proposed)"
+            if outcome.evidence_queued {
+                " (evidence queued)"
             } else {
                 ""
             }
@@ -530,7 +488,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::{PeerRef, PlacementInputs, PullTarget, StoreResult, TransportError};
+    use crate::lifecycle::{ConfirmPlacement, CONFIRM_TX_FN};
+    use crate::traits::{
+        PeerRef, PlacementInputs, PullTarget, StoreResult, SubmitError, TransportError,
+    };
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Mutex;
@@ -719,6 +680,40 @@ mod tests {
             .collect()
     }
 
+    /// One pull with a test lane: the outcome and the evidence it queued.
+    async fn pull_with_lane<T, S, X, L>(
+        seams: &Seams<T, S, X, L>,
+        dir: &str,
+        blob_id: &BlobId,
+    ) -> (PullOutcome, Vec<evidence::EvidenceItem>)
+    where
+        T: Transport + 'static,
+        S: StateReader,
+        X: TxSubmitter,
+        L: LocalStateSink,
+    {
+        let (lane, mut rx) = evidence::EvidenceLane::channel();
+        let outcome = pull_owed(seams, dir, blob_id, &lane).await.unwrap();
+        let mut items = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            items.push(item);
+        }
+        (outcome, items)
+    }
+
+    /// Flush queued evidence the way the lane task does.
+    async fn flush_items<X: TxSubmitter>(
+        state: &PullNet,
+        submitter: &X,
+        items: Vec<evidence::EvidenceItem>,
+    ) -> evidence::LaneFlush {
+        let mut buf = evidence::LaneBuffer::default();
+        for item in items {
+            buf.push(item, 0);
+        }
+        evidence::flush(state, submitter, &mut buf).await
+    }
+
     impl LocalStateSink for PullNet {
         async fn mark_local(&self, fragment_hash: Blake3Hash) {
             self.marked_local.lock().unwrap().push(fragment_hash);
@@ -828,14 +823,16 @@ mod tests {
     }
 
     // Should: pull every class this node owes under the goal from a
-    // serving holder, settle each through the (awaited) sink, attest
-    // promptly, and propose confirmation once the goal's evidence is
-    // complete.
-    // Should not: propose confirmation when the evidence is incomplete, nor
-    // pull anything for a blob whose goal assigns this node nothing.
+    // serving holder, settle each through the (awaited) sink, and queue the
+    // blob's evidence for the lane, which then reports belief, attests and
+    // proposes confirmation once the goal's evidence is complete.
+    // Should not: submit anything to consensus from the pull itself;
+    // propose confirmation when the evidence is incomplete; pull anything
+    // for a blob whose goal assigns this node nothing.
     // Impact: this is the whole distribution path now — a missed duty
     // strands a class on the origin; a premature confirm lapses obligations
-    // against holders that do not exist.
+    // against holders that do not exist; a consensus wait on the worker
+    // capped production at ~6 blobs a minute.
     #[tokio::test(flavor = "multi_thread")]
     async fn pulls_owed_classes_attests_and_confirms() {
         let base = std::env::temp_dir().join(format!("hopnet-pull-test-{}", std::process::id()));
@@ -859,20 +856,27 @@ mod tests {
             net.served.lock().unwrap().insert(f.fragment_hash, data);
         }
 
-        let result = pull_owed(&seams(net.clone()), &dir_dst, &blob_id)
-            .await
-            .unwrap();
+        let (result, items) = pull_with_lane(&seams(net.clone()), &dir_dst, &blob_id).await;
         assert_eq!(result.owed, 30);
         assert_eq!(result.pulled, 30);
         assert_eq!(result.rebuilt, 0);
         assert_eq!(result.failed, 0);
-        assert!(result.attested);
-        assert!(result.confirm_proposed);
+        assert!(result.evidence_queued);
         assert_eq!(net.marked_local.lock().unwrap().len(), 30);
+        assert!(
+            net.submitted.lock().unwrap().is_empty(),
+            "the pull awaits no consensus round"
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].height, 9, "read before the rehash");
+        assert_eq!(items[0].present.len(), 30);
+
+        let flushed = flush_items(&net, net.as_ref(), items).await;
+        assert_eq!(flushed.confirmed, 1);
         assert_eq!(
             *net.submitted.lock().unwrap(),
             vec![policy::SELF_CHECK_FN, policy::ATTEST_FN, CONFIRM_TX_FN],
-            "attestation lands before the confirm proposal"
+            "belief, then truth, then the confirm proposal"
         );
         let believed = self_check_hashes(&net.payloads.lock().unwrap());
         let landed: std::collections::HashSet<Blake3Hash> =
@@ -901,11 +905,10 @@ mod tests {
             inventoried: Mutex::new(Default::default()),
             payloads: Mutex::new(Vec::new()),
         });
-        let result = pull_owed(&seams(net2.clone()), &dir_dst2, &blob_id)
-            .await
-            .unwrap();
+        let (result, items) = pull_with_lane(&seams(net2.clone()), &dir_dst2, &blob_id).await;
         assert_eq!(result.pulled, 30);
-        assert!(!result.confirm_proposed);
+        let flushed = flush_items(&net2, net2.as_ref(), items).await;
+        assert_eq!(flushed.confirmed, 0);
         assert_eq!(
             *net2.submitted.lock().unwrap(),
             vec![policy::SELF_CHECK_FN, policy::ATTEST_FN]
@@ -926,8 +929,9 @@ mod tests {
             inventoried: Mutex::new(Default::default()),
             payloads: Mutex::new(Vec::new()),
         });
-        let result = pull_owed(&seams(net3), &dir_dst2, &blob_id).await.unwrap();
+        let (result, items) = pull_with_lane(&seams(net3), &dir_dst2, &blob_id).await;
         assert_eq!(result, PullOutcome::default());
+        assert!(items.is_empty());
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -970,13 +974,11 @@ mod tests {
             inventoried: Mutex::new(Default::default()),
             payloads: Mutex::new(Vec::new()),
         });
-        let result = pull_owed(&seams(regoal.clone()), &dir, &blob_id)
-            .await
-            .unwrap();
+        let (result, items) = pull_with_lane(&seams(regoal.clone()), &dir, &blob_id).await;
         assert_eq!(result, PullOutcome::default(), "nothing owed, nothing done");
         assert!(
-            regoal.submitted.lock().unwrap().is_empty(),
-            "a rubber stamp buys no consensus round on the worker"
+            items.is_empty() && regoal.submitted.lock().unwrap().is_empty(),
+            "a rubber stamp queues no evidence"
         );
 
         // Birth: never confirmed, held here, no belief rows yet — the
@@ -997,12 +999,11 @@ mod tests {
             inventoried: Mutex::new(Default::default()),
             payloads: Mutex::new(Vec::new()),
         });
-        let result = pull_owed(&seams(birth.clone()), &dir, &blob_id)
-            .await
-            .unwrap();
+        let (result, items) = pull_with_lane(&seams(birth.clone()), &dir, &blob_id).await;
         assert_eq!(result.owed, 0);
-        assert!(result.attested);
-        assert!(result.confirm_proposed);
+        assert!(result.evidence_queued);
+        let flushed = flush_items(&birth, birth.as_ref(), items).await;
+        assert_eq!(flushed.confirmed, 1);
         assert_eq!(
             *birth.submitted.lock().unwrap(),
             vec![policy::SELF_CHECK_FN, policy::ATTEST_FN, CONFIRM_TX_FN]
@@ -1025,10 +1026,9 @@ mod tests {
             inventoried: Mutex::new(all_hashes),
             payloads: Mutex::new(Vec::new()),
         });
-        let result = pull_owed(&seams(believed.clone()), &dir, &blob_id)
-            .await
-            .unwrap();
-        assert!(result.attested);
+        let (result, items) = pull_with_lane(&seams(believed.clone()), &dir, &blob_id).await;
+        assert!(result.evidence_queued);
+        flush_items(&believed, believed.as_ref(), items).await;
         assert_eq!(
             *believed.submitted.lock().unwrap(),
             vec![policy::ATTEST_FN, CONFIRM_TX_FN]
@@ -1066,9 +1066,7 @@ mod tests {
             let data = fragstore::read_fragment(&dir_src, &f.fragment_hash).unwrap();
             net.served.lock().unwrap().insert(f.fragment_hash, data);
         }
-        let result = pull_owed(&seams(net.clone()), &dir_dst, &blob_id)
-            .await
-            .unwrap();
+        let (result, _) = pull_with_lane(&seams(net.clone()), &dir_dst, &blob_id).await;
         assert_eq!(result.owed, 30);
         assert_eq!(result.pulled, 10);
         assert_eq!(result.rebuilt, 20);
@@ -1093,20 +1091,15 @@ mod tests {
             inventoried: Mutex::new(Default::default()),
             payloads: Mutex::new(Vec::new()),
         });
-        let result = pull_owed(&seams(dead.clone()), &dir_dst2, &blob_id)
-            .await
-            .unwrap();
+        let (result, items) = pull_with_lane(&seams(dead.clone()), &dir_dst2, &blob_id).await;
         assert_eq!(result.failed, 30);
-        assert!(
-            dead.submitted.lock().unwrap().is_empty(),
-            "nothing to attest"
-        );
+        assert!(items.is_empty(), "nothing to attest");
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
     // Should: still attest disk truth and propose confirmation when the
-    // prompt self-check is refused — belief is the sweep's to repair, the
+    // lane's belief page is refused — belief is the sweep's to repair, the
     // evidence the confirmation needs must not wait on it.
     // Should not: fail the pull or skip the attestation on that refusal.
     #[tokio::test(flavor = "multi_thread")]
@@ -1138,9 +1131,17 @@ mod tests {
             local_state: net.clone(),
         };
 
-        let result = pull_owed(&seams, &dir_dst, &blob_id).await.unwrap();
+        let (result, items) = pull_with_lane(&seams, &dir_dst, &blob_id).await;
         assert_eq!(result.pulled, 30);
-        assert!(result.confirm_proposed);
+        let flushed = flush_items(&net, seams.submitter.as_ref(), items).await;
+        assert_eq!(
+            (
+                flushed.belief_failed,
+                flushed.truth_pages,
+                flushed.confirmed
+            ),
+            (1, 1, 1)
+        );
         assert_eq!(
             *net.submitted.lock().unwrap(),
             vec![policy::ATTEST_FN, CONFIRM_TX_FN],
@@ -1148,5 +1149,92 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn item(n: u8, height: u64, hashes: &[u8]) -> evidence::EvidenceItem {
+        evidence::EvidenceItem {
+            blob_id: BlobId::from_str(&format!("01890a5d-ac96-774b-b9aa-9f8b24f0c9{n:02x}"))
+                .unwrap(),
+            height,
+            present: hashes
+                .iter()
+                .map(|b| Blake3Hash::from_bytes([*b; 32]))
+                .collect(),
+        }
+    }
+
+    // Impact: a page stamped with a later height than one of its hashes was
+    // seen at overstates freshness for the confirmation's recency check.
+    // Should: stamp an attestation page with the lowest height among the
+    // pulls whose hashes it carries.
+    #[tokio::test]
+    async fn page_height_is_the_lowest_observation() {
+        let net = idle_net();
+        let flushed = flush_items(
+            &net,
+            net.as_ref(),
+            vec![item(1, 12, &[1]), item(2, 7, &[2])],
+        )
+        .await;
+        assert_eq!(flushed.truth_pages, 1);
+        let payloads = net.payloads.lock().unwrap();
+        let (_, bytes) = payloads
+            .iter()
+            .find(|(f, _)| *f == policy::ATTEST_FN)
+            .unwrap();
+        let (attestation, _): (crate::types::FragmentAttestation, _) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard()).unwrap();
+        assert_eq!(attestation.height, 7);
+        assert_eq!(attestation.present.len(), 2);
+    }
+
+    // Impact: one consensus round per confirmed blob was the old worker's
+    // ceiling; the lane batches every ready blob it attested.
+    // Should: propose one ConfirmPlacement carrying every buffered blob
+    // whose evidence is complete.
+    // Should not: queue the same blob twice when two pulls report it.
+    #[tokio::test]
+    async fn confirm_proposed_for_every_ready_buffered_blob_in_one_tx() {
+        let net = Arc::new(PullNet {
+            ready: Some(9),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        let flushed = flush_items(
+            &net,
+            net.as_ref(),
+            vec![item(1, 9, &[1]), item(2, 9, &[2]), item(1, 9, &[3])],
+        )
+        .await;
+        assert_eq!(flushed.confirmed, 2);
+        let payloads = net.payloads.lock().unwrap();
+        let confirms: Vec<_> = payloads
+            .iter()
+            .filter(|(f, _)| *f == CONFIRM_TX_FN)
+            .collect();
+        assert_eq!(confirms.len(), 1, "one transaction");
+        let (payload, _): (ConfirmPlacement, _) =
+            bincode::serde::decode_from_slice(&confirms[0].1, bincode::config::standard()).unwrap();
+        assert_eq!(payload.confirmations.len(), 2);
+    }
+
+    // Should: hold a partial page until it is a minute old, and flush at
+    // once when a full page is waiting.
+    #[test]
+    fn lane_flushes_at_size_or_age() {
+        let mut buf = evidence::LaneBuffer::default();
+        assert!(!buf.due(100));
+        buf.push(item(1, 9, &[1]), 100);
+        assert!(!buf.due(100 + policy::EVIDENCE_MAX_AGE_SECS - 1));
+        assert!(buf.due(100 + policy::EVIDENCE_MAX_AGE_SECS));
+
+        let mut full = evidence::LaneBuffer::default();
+        full.push(
+            evidence::EvidenceItem {
+                present: vec![Blake3Hash::from_bytes([7; 32]); policy::ATTEST_PAGE_SIZE],
+                ..item(2, 9, &[])
+            },
+            100,
+        );
+        assert!(full.due(100));
     }
 }
