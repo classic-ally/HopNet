@@ -109,6 +109,13 @@ pub struct StorageView {
     /// Members whose current absence is zero (newest bucket saw them) —
     /// the repair tick's liveness set for class counting.
     pub online: Vec<i32>,
+    /// node_id → current continuous absence on the grid, in seconds (0 =
+    /// online). Node-local use only (the repair grace's cap); not part of
+    /// the replicated view snapshot.
+    pub absence: std::collections::HashMap<i32, i64>,
+    /// The availability grid's bucket width, in seconds: how late the grid
+    /// can be to see a node come back.
+    pub grid_step_secs: i64,
 }
 
 /// Replicated-state reads the engine needs. Sync — implementations read from
@@ -139,6 +146,8 @@ pub trait StateReader: Send + Sync {
             tiers: std::collections::HashMap::new(),
             weights,
             online: inputs.validators.iter().map(|p| p.node_id).collect(),
+            absence: std::collections::HashMap::new(),
+            grid_step_secs: 0,
             members: inputs.validators,
         })
     }

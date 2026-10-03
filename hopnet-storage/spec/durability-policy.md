@@ -126,7 +126,9 @@ contact with counts as up for 15 minutes after the repairer boots, or
 after the member's contact resumes from a silence — the availability
 grid marks a rebooted node offline until its own next metrics sample,
 and a reboot is not a departure. A member in unbroken contact for longer
-than that which the grid still calls offline gets no grace
+than that which the grid still calls offline gets no grace, and none
+applies once the grid has called a member offline for longer than the
+grace plus one grid bucket
 (`REPAIR_GRACE`, block-lifecycle.md, the 2026.10.8 crossing record).
 
 Assignment: smallest tier above ~P95 of the node's offline-duration

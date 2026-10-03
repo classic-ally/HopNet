@@ -1270,7 +1270,13 @@ optimization and carries no proof obligation.
       come back). The grace is bounded to the reboot window on purpose:
       a peer in unbroken contact for longer than the grace that the grid
       still calls offline (a wedged sampler, a full disk) gets none, and
-      its classes are repaired as the grid says. Liveness, not
+      its classes are repaired as the grid says. The total grace per
+      grid-offline episode is capped too: no grace once the grid has
+      called the member offline for longer than the grace plus one grid
+      bucket (`StorageView::absence`, node-local, not in the replicated
+      snapshot), so a member whose contact keeps dropping and resuming
+      cannot restart its grace for as long as its decay tier keeps it in
+      the view (3–7 days in production). Liveness, not
       visibility: a straggler outside the epoch, whose status pings and
       lineage requests refresh `last_seen` only, must not hold repair
       off. Known gap: a peer reboot shorter than t_unresponsive(Lazy)

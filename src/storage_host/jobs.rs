@@ -1270,6 +1270,26 @@ fn repair_grace() -> std::time::Duration {
     })
 }
 
+/// The members the repair grace may cover: grid-offline, and offline on
+/// the grid for no longer than the grace plus one grid bucket (the grid's
+/// own lag in seeing a node come back). The cap bounds the total grace per
+/// grid-offline episode: a member whose contact keeps dropping and
+/// resuming would otherwise restart its grace forever while the grid
+/// calls it offline for good (a stuck metrics sampler, a full disk).
+fn grace_candidates(
+    members: &std::collections::HashSet<i32>,
+    view: &hopnet_storage::traits::StorageView,
+    grace: std::time::Duration,
+) -> Vec<i32> {
+    let cap = grace.as_secs() as i64 + view.grid_step_secs;
+    members
+        .iter()
+        .copied()
+        .filter(|m| !view.online.contains(m))
+        .filter(|m| view.absence.get(m).copied().unwrap_or(0) <= cap)
+        .collect()
+}
+
 /// Who repair counts as up: the grid's online set, this node, and the
 /// members in liveness contact within the grace (`in_grace`). Grace only adds
 /// members back — it never removes a grid-online node, and never revives
@@ -1434,7 +1454,7 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
             app_state.evidence.origin(),
             std::time::Instant::now(),
             repair_grace(),
-            members.iter().copied().filter(|m| !view.online.contains(m)),
+            grace_candidates(&members, &view, repair_grace()),
         );
         let online = repair_online(&view.online, &members, my_node_id, &in_grace);
         repair_grace_online = online.iter().filter(|n| !view.online.contains(n)).count();
@@ -1658,6 +1678,56 @@ mod tests {
         let in_grace = HashSet::from([1, 9]);
         let up = repair_online(&[2], &members, 3, &in_grace);
         assert_eq!(up, HashSet::from([1, 2, 3]));
+    }
+
+    fn grid_view(online: Vec<i32>, absence: &[(i32, i64)]) -> hopnet_storage::traits::StorageView {
+        hopnet_storage::traits::StorageView {
+            height: 1,
+            members: vec![],
+            tiers: Default::default(),
+            weights: Default::default(),
+            watermark: 18,
+            online,
+            absence: absence.iter().copied().collect(),
+            grid_step_secs: 600,
+        }
+    }
+
+    // Impact: review of #99 — every silence over ~2 min restarts the
+    // contact span, so a member the grid calls offline for good (a stuck
+    // sampler, a full disk) whose link also drops every few minutes (a
+    // flaky link, a sleeping laptop) would restart its grace forever and
+    // never be rebuilt around.
+    // Should not: keep a flapping member live for repair once the grid has
+    // called it offline for longer than the grace plus one grid bucket.
+    // Should: keep the same member live while its grid absence is within
+    // that bound (a reboot whose metrics have not landed yet).
+    #[test]
+    fn a_flapping_member_offline_in_the_grid_for_longer_than_the_grace_is_not_kept_live() {
+        let evidence = crate::consensus::evidence::EvidenceMap::new();
+        let origin = evidence.origin();
+        let grace = std::time::Duration::from_secs(900);
+        // Long after boot; contact resumed 2 minutes ago after a 5-minute
+        // drop-out: a fresh contact span.
+        evidence.record_at(2, None, origin + std::time::Duration::from_secs(3000));
+        evidence.record_at(2, None, origin + std::time::Duration::from_secs(3300));
+        let now = origin + std::time::Duration::from_secs(3420);
+        let members = HashSet::from([1, 2]);
+        let in_grace = |view: &hopnet_storage::traits::StorageView| {
+            crate::consensus::evidence::repair_grace_peers(
+                &evidence.snapshot(),
+                origin,
+                now,
+                grace,
+                grace_candidates(&members, view, grace),
+            )
+        };
+
+        let hours_offline = grid_view(vec![1], &[(1, 0), (2, 3 * 3600)]);
+        assert!(in_grace(&hours_offline).is_empty());
+
+        let just_rebooted = grid_view(vec![1], &[(1, 0), (2, 600)]);
+        assert_eq!(in_grace(&just_rebooted), HashSet::from([2]));
     }
 
     // Should not: drop a node the grid calls online because it is outside

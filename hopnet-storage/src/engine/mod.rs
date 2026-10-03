@@ -1152,6 +1152,8 @@ mod tests {
                 tiers: HashMap::new(),
                 weights: HashMap::new(),
                 online: members.iter().map(|p| p.node_id).collect(),
+                absence: Default::default(),
+                grid_step_secs: 0,
                 members,
             })
         }
