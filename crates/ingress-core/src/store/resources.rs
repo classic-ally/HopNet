@@ -497,7 +497,7 @@ mod tests {
             "superseded pointer survives the reopen"
         );
 
-        let queue = super::super::photos::pending_photos(store.pool(), 5, Utc::now(), 10)
+        let queue = super::super::photos::pending_photos(store.pool(), 5, Utc::now(), 10, false)
             .await
             .unwrap();
         assert_eq!(queue.iter().filter(|p| p.photo_id == id).count(), 1);

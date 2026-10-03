@@ -101,10 +101,6 @@ pub struct DrainReport {
     pub awaiting_retry: i64,
     pub gave_up: i64,
     pub earliest_next_retry_at: Option<DateTime<Utc>>,
-    /// The run stopped with pending work held at the spool soft cap — not
-    /// drained. A drain never publishes, so only a publishing run (the
-    /// daemon) brings the spool back under.
-    pub held_at_spool_cap: bool,
 }
 
 #[derive(Default)]
@@ -222,8 +218,8 @@ impl<F: ResourceFetcher> Scheduler<F> {
             let claimable = self.claim_batch(&no_skip).await?;
             if claimable.is_empty() {
                 if tasks.is_empty() {
-                    // Queue drained (or only future retries remain) — or
-                    // held at the spool cap, which the report says apart.
+                    // Queue drained (or only future retries remain). The
+                    // production drain has no publisher, so no spool cap.
                     break;
                 }
                 let _ = tasks.join_next().await; // wait for capacity/progress
@@ -259,16 +255,19 @@ impl<F: ResourceFetcher> Scheduler<F> {
     /// caller's skip set (the daemon's deferred photos — a photo with a
     /// queued hard move must not start fetching into the old root).
     async fn claim_batch(&self, skip: &HashSet<PhotoId>) -> Result<Vec<PhotoRecord>> {
-        // Over the spool soft cap: claim nothing until eviction brings it
-        // back under (the daemon loop keeps publishing meanwhile).
-        if !spool_has_room(&self.shared).await? {
-            return Ok(Vec::new());
-        }
+        // The spool soft cap gates only brand-new photos (no resource
+        // written yet). A started photo is always claimable whatever the
+        // spool size: it holds bytes it can only release by completing,
+        // publishing and evicting, so holding it back (a transient fetch
+        // failure, a pause, a cancellation, a Live Photo's video on retry,
+        // a resource revived by `reset_gave_up`) would wedge the cap.
+        let started_only = !spool_has_room(&self.shared).await?;
         let batch = photos::pending_photos(
             self.shared.store.pool(),
             self.shared.config.retry_cap,
             Utc::now(),
             (self.shared.config.fetch_concurrency * 2) as i64,
+            started_only,
         )
         .await?;
         let inflight = self.shared.inflight.lock().expect("inflight mutex");
@@ -339,8 +338,6 @@ impl<F: ResourceFetcher> Scheduler<F> {
             .store
             .retry_summary(self.shared.config.retry_cap)
             .await?;
-        let at_cap = *self.shared.spool_full.lock().expect("spool mutex");
-        let held_at_spool_cap = at_cap && self.shared.store.count_pending_resources().await? > 0;
         let c = self.shared.counters.lock().expect("counters mutex");
         Ok(DrainReport {
             photos_completed: c.photos_completed,
@@ -353,7 +350,6 @@ impl<F: ResourceFetcher> Scheduler<F> {
             awaiting_retry: summary.awaiting_retry,
             gave_up: summary.gave_up,
             earliest_next_retry_at: summary.earliest_next_retry_at,
-            held_at_spool_cap,
         })
     }
 
@@ -398,10 +394,10 @@ impl<F: ResourceFetcher> Scheduler<F> {
     }
 }
 
-/// The spool soft cap: may a new photo be claimed? Counts only
-/// publishable bytes (`StateStore::publishable_unevicted_bytes`) plus
-/// inflight writes, since only those ever evict; stuck bytes never hold
-/// the cap. Off without a publisher (nothing would ever evict). Logs
+/// The spool soft cap: may a brand-new photo be claimed? Counts unevicted
+/// bytes minus stuck bytes (`store::blobs` `stuck_referent!`) plus inflight
+/// writes — only bytes that will still evict; stuck bytes never hold the
+/// cap. Off without a publisher (nothing would ever evict). Logs
 /// `spool_full` once on reaching the cap and `spool_below_cap` once on
 /// coming back under, and `spool_stuck` once whenever the stuck bytes
 /// alone reach the cap (they need an operator, not more time).
@@ -411,15 +407,12 @@ async fn spool_has_room(shared: &Shared) -> Result<bool> {
         *shared.spool_full.lock().expect("spool mutex") = false;
         return Ok(true);
     }
-    let publishable = shared
-        .store
-        .publishable_unevicted_bytes(shared.config.retry_cap, shared.config.publish.retry_cap)
-        .await?;
+    let unevicted = shared.store.unevicted_bytes().await?;
     let stuck = shared
         .store
-        .unevicted_bytes()
-        .await?
-        .saturating_sub(publishable);
+        .stuck_unevicted_bytes(shared.config.retry_cap, shared.config.publish.retry_cap)
+        .await?;
+    let publishable = unevicted.saturating_sub(stuck);
     let stuck_over = stuck >= cap;
     let was_stuck = std::mem::replace(
         &mut *shared.spool_stuck.lock().expect("spool mutex"),

@@ -62,14 +62,12 @@ pub async fn status(store: &StateStore, retry_cap: i64) -> Result<StatusReport> 
         unmapped_photos: store.count_unmapped_photos().await?,
         resources_pending: store.count_pending_resources().await?,
         spool_bytes,
-        spool_stuck_bytes: spool_bytes.saturating_sub(
-            store
-                .publishable_unevicted_bytes(
-                    retry_cap,
-                    crate::publish::PublishConfig::default().retry_cap,
-                )
-                .await?,
-        ),
+        spool_stuck_bytes: store
+            .stuck_unevicted_bytes(
+                retry_cap,
+                crate::publish::PublishConfig::default().retry_cap,
+            )
+            .await?,
         retries: store.retry_summary(retry_cap).await?,
     };
     Ok(StatusReport {

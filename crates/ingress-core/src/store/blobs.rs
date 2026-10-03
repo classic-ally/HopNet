@@ -10,6 +10,42 @@ use crate::model::BlobRecord;
 
 use super::StateStore;
 
+/// A referent photo `p` (library `l`) that will never let its blobs evict
+/// — the terminal dual of eviction eligibility.
+///
+/// A spool file leaves only by eviction ([`StateStore::evictable_blobs`]),
+/// which needs EVERY referent of a blob done: published, with no edit
+/// owed. The file itself stays while ANY library's row for its hash is
+/// unevicted (hash liveness). So a file is stuck iff some referent of some
+/// unevicted row can never become done, and every way a referent can fail
+/// to become done for good is one disjunct here:
+///
+/// - deleted before it was published (it waits on hard delete, never
+///   publish);
+/// - a scope-bound library with no `mesh_library_id` (nothing claims it);
+/// - unpublished at the publish retry cap;
+/// - published, at the edit retry cap (the edit ledger is never reset,
+///   so the owed edit never propagates);
+/// - a resource given up at the fetch retry cap, unpublished or
+///   published (an edit refetch) alike: the photo never materializes, so
+///   it never publishes or propagates.
+///
+/// Anything not stuck and not evicted is in progress, and only that is
+/// counted against the spool soft cap. Binds: `?1` = the fetch retry cap,
+/// `?2` = the publish/edit retry cap.
+macro_rules! stuck_referent {
+    () => {
+        "\
+    (p.deleted_at IS NOT NULL AND p.published_at IS NULL) \
+    OR (l.scope_binding IS NOT NULL AND l.mesh_library_id IS NULL) \
+    OR (p.published_at IS NULL AND p.publish_attempts >= ?2) \
+    OR (p.published_at IS NOT NULL AND p.edit_publish_attempts >= ?2) \
+    OR EXISTS (SELECT 1 FROM photo_resources g \
+               WHERE g.photo_id = p.photo_id AND g.written_at IS NULL \
+                 AND g.retry_count >= ?1)"
+    };
+}
+
 impl StateStore {
     /// Largest blob seen in a library — the pessimistic size estimate for
     /// admission when a descriptor reports no expected size.
@@ -38,52 +74,48 @@ impl StateStore {
         Ok(sum.unwrap_or(0).max(0) as u64)
     }
 
-    /// The part of [`StateStore::unevicted_bytes`] still on its way to
-    /// eviction — the only bytes the spool soft cap may count, since only
-    /// they ever come back down. A blob is **publishable** when some photo
-    /// referencing it (same library, a resource with its hash) is:
-    ///
-    /// - not deleted (an unpublished photo deleted inside its retention
-    ///   window waits on hard delete, not publish);
-    /// - in a library with a publish target (personal, or a scope-bound
-    ///   library with a `mesh_library_id`);
-    /// - and either unpublished, under the publish retry cap, with no
-    ///   resource given up at the fetch retry cap (it can still
-    ///   materialize and publish) — or published with an edit still under
-    ///   the edit retry cap (the edit path evicts it).
-    ///
-    /// Everything else (given-up resources, photos at the publish cap
-    /// awaiting an operator reset, unbound shared libraries, deleted
-    /// unpublished photos) is stuck: counted by `unevicted_bytes`, never
-    /// by this.
-    pub async fn publishable_unevicted_bytes(
+    /// Unevicted spool bytes that can never evict without an operator: one
+    /// file per content hash some unevicted row of which has a STUCK
+    /// referent (`stuck_referent!`). Bound `?1` = the fetch retry cap,
+    /// `?2` = the publish (and edit) retry cap.
+    pub async fn stuck_unevicted_bytes(
         &self,
         fetch_retry_cap: i64,
         publish_retry_cap: i64,
     ) -> Result<u64> {
-        let sum: Option<i64> = sqlx::query_scalar(
+        let sum: Option<i64> = sqlx::query_scalar(concat!(
             "SELECT SUM(size_bytes) FROM ( \
                SELECT MAX(b.size_bytes) AS size_bytes FROM blobs b \
-               WHERE b.evicted_at IS NULL AND EXISTS ( \
+               WHERE b.evicted_at IS NULL \
+               GROUP BY b.content_hash \
+               HAVING MAX(EXISTS ( \
                  SELECT 1 FROM photo_resources r \
                  JOIN photos p ON p.photo_id = r.photo_id \
                  JOIN libraries l ON l.library_id = p.library_id \
                  WHERE p.library_id = b.library_id \
                    AND r.content_hash = b.content_hash \
-                   AND p.deleted_at IS NULL \
-                   AND (l.scope_binding IS NULL OR l.mesh_library_id IS NOT NULL) \
-                   AND ((p.published_at IS NULL AND p.publish_attempts < ?2 \
-                         AND NOT EXISTS (SELECT 1 FROM photo_resources g \
-                           WHERE g.photo_id = p.photo_id AND g.written_at IS NULL \
-                             AND g.retry_count >= ?1)) \
-                     OR (p.published_at IS NOT NULL AND p.edit_publish_attempts < ?2))) \
-               GROUP BY b.content_hash)",
-        )
+                   AND (",
+            stuck_referent!(),
+            "))))"
+        ))
         .bind(fetch_retry_cap)
         .bind(publish_retry_cap)
         .fetch_one(self.pool())
         .await?;
         Ok(sum.unwrap_or(0).max(0) as u64)
+    }
+
+    /// What the spool soft cap counts: unevicted bytes minus stuck bytes —
+    /// the bytes that will still leave the spool by eviction.
+    pub async fn publishable_unevicted_bytes(
+        &self,
+        fetch_retry_cap: i64,
+        publish_retry_cap: i64,
+    ) -> Result<u64> {
+        let stuck = self
+            .stuck_unevicted_bytes(fetch_retry_cap, publish_retry_cap)
+            .await?;
+        Ok(self.unevicted_bytes().await?.saturating_sub(stuck))
     }
 
     pub async fn blob(

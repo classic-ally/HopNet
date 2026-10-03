@@ -176,11 +176,17 @@ pub(crate) async fn delete_photo(exec: &mut sqlx::SqliteConnection, id: &PhotoId
 
 /// The drain work queue (spec §Discovery: state.db IS the work queue):
 /// FIFO by discovery time, photos with at least one fetchable resource.
+///
+/// `started_only` keeps just the photos already started (at least one
+/// resource written). The spool soft cap never holds those back: a started
+/// photo holds spool bytes it can only release by completing, publishing
+/// and evicting.
 pub(crate) async fn pending_photos<'e, E>(
     exec: E,
     retry_cap: i64,
     now: DateTime<Utc>,
     limit: i64,
+    started_only: bool,
 ) -> Result<Vec<PhotoRecord>>
 where
     E: Executor<'e, Database = Sqlite>,
@@ -195,11 +201,15 @@ where
                          AND r.written_at IS NULL \
                          AND r.retry_count < ? \
                          AND (r.next_retry_at IS NULL OR r.next_retry_at <= ?)) \
+           AND (? = 0 OR EXISTS (SELECT 1 FROM photo_resources w \
+                                 WHERE w.photo_id = p.photo_id \
+                                   AND w.written_at IS NOT NULL)) \
          ORDER BY p.discovered_at, p.photo_id \
          LIMIT ?",
     )
     .bind(retry_cap)
     .bind(now)
+    .bind(started_only)
     .bind(limit)
     .fetch_all(exec)
     .await?)

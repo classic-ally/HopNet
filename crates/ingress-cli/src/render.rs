@@ -94,8 +94,9 @@ pub fn print_status(report: &StatusReport) {
     if p.spool_stuck_bytes > 0 {
         println!(
             "  WARNING: {} of spool can never evict without an operator \
-             (given-up fetches, publish retry cap, unbound shared library, deleted \
-             unpublished photos); it does not count against the spool cap",
+             (a fetch given up at the retry cap, the publish retry cap, the edit \
+             retry cap, a shared library with no mesh binding, a photo deleted before \
+             it was published); it does not count against the spool cap",
             human_bytes(i64::try_from(p.spool_stuck_bytes).unwrap_or(i64::MAX))
         );
     }
