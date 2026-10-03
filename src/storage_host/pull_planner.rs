@@ -139,19 +139,41 @@ async fn feed(app_state: AppState, book: Book) {
     }
 }
 
+/// A task aborted when its handle is dropped: the feeder dies with the
+/// planner (the tick restarts both).
+pub struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Respawn the task if it has stopped (ended or panicked). Returns whether
+/// it was respawned.
+pub fn respawn_if_finished(
+    task: &mut AbortOnDrop,
+    spawn: impl FnOnce() -> tokio::task::JoinHandle<()>,
+) -> bool {
+    if !task.0.is_finished() {
+        return false;
+    }
+    *task = AbortOnDrop(spawn());
+    true
+}
+
 async fn run(app_state: AppState) {
     let book: Book = Default::default();
-    let feeder = tokio::spawn(feed(app_state.clone(), book.clone()));
-    // The feeder dies with the planner (the tick restarts both).
-    struct AbortOnDrop(tokio::task::JoinHandle<()>);
-    impl Drop for AbortOnDrop {
-        fn drop(&mut self) {
-            self.0.abort();
-        }
-    }
-    let _feeder = AbortOnDrop(feeder);
+    let mut feeder = AbortOnDrop(tokio::spawn(feed(app_state.clone(), book.clone())));
     let mut resume: Option<hopnet_storage::BlobId> = None;
     loop {
+        // A dead feeder would leave the book filling with nobody to offer
+        // from it; checked every pass.
+        if respawn_if_finished(&mut feeder, || {
+            tokio::spawn(feed(app_state.clone(), book.clone()))
+        }) {
+            tracing::warn!("pull planner: feeder had stopped; restarted");
+        }
         let Some(engine) = app_state.storage.get().cloned() else {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;

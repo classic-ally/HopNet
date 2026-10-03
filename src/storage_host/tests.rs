@@ -973,3 +973,22 @@ fn planner_passes_are_paced() {
         "a slow pass still rests"
     );
 }
+
+// Impact: third review of #96 — a feeder that died (a panic) went
+// unnoticed: the planner kept filling the book and nothing was offered.
+// Should: respawn a feeder that has stopped.
+// Should not: respawn one that is still running.
+#[tokio::test]
+async fn a_dead_feeder_is_respawned() {
+    use crate::storage_host::pull_planner::{AbortOnDrop, respawn_if_finished};
+    let mut task = AbortOnDrop(tokio::spawn(async { panic!("feeder panicked") }));
+    while !task.0.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let respawned = respawn_if_finished(&mut task, || tokio::spawn(std::future::pending::<()>()));
+    assert!(respawned);
+    assert!(!task.0.is_finished());
+    assert!(!respawn_if_finished(&mut task, || unreachable!(
+        "a running feeder is left alone"
+    )));
+}
