@@ -116,6 +116,8 @@ pub struct LaneBuffer {
     truth: PageBuffer,
     /// When the oldest buffered blob arrived (unix seconds).
     opened_at: Option<u64>,
+    /// When the newest one arrived.
+    last_push: Option<u64>,
 }
 
 impl LaneBuffer {
@@ -125,16 +127,22 @@ impl LaneBuffer {
         }
         self.truth.push(item.height, now, item.present);
         self.opened_at.get_or_insert(now);
+        self.last_push = Some(now);
     }
 
     pub fn is_empty(&self) -> bool {
         self.blobs.is_empty() && self.truth.is_empty()
     }
 
-    /// A full attestation page is waiting, or the oldest entry has waited
-    /// the sweep's buffer age.
+    /// A full attestation page is waiting, the input has gone quiet, or the
+    /// oldest entry has waited the sweep's buffer age. Quiet is what keeps
+    /// a lone upload's confirmation prompt; under a drain, items arrive
+    /// faster than the quiet gap and the age and size bounds batch them.
     pub fn due(&self, now: u64) -> bool {
         self.truth.len() >= policy::ATTEST_PAGE_SIZE
+            || self
+                .last_push
+                .is_some_and(|t| now.saturating_sub(t) >= policy::EVIDENCE_QUIET_SECS)
             || self
                 .opened_at
                 .is_some_and(|t| now.saturating_sub(t) >= policy::EVIDENCE_MAX_AGE_SECS)
@@ -165,6 +173,7 @@ where
     let blobs = std::mem::take(&mut buf.blobs);
     buf.seen.clear();
     buf.opened_at = None;
+    buf.last_push = None;
     let Some(me) = state.local_node_id() else {
         tracing::warn!("evidence lane: node id not set; dropping a flush");
         buf.truth = PageBuffer::default();
