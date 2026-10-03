@@ -1193,6 +1193,64 @@ mod tests {
         );
     }
 
+    /// The oldest ordinal a released binary has sealed for each module:
+    /// every ordinal from here to head must stay importable. Identity's
+    /// 0 never reached an artifact (steps 0 and 1 both first shipped in
+    /// 2026.8.6); consensus's pre-chain label 1 has its own pre-split arm.
+    const OLDEST_SEALED: &[(&str, u32)] = &[
+        ("identity", 1),
+        ("telemetry", 0),
+        ("consensus", 2),
+        ("storage", 1),
+        ("drive", 1),
+        ("photos", 1),
+        ("takeout", 1),
+    ];
+
+    // Impact: the format_version is hashed into the artifact, so a
+    // section bump without a frozen predecessor strands every straggler
+    // and joiner holding the previous release's seal (consensus-bugs 19:
+    // the macbook could not join epoch 10).
+    // Should: resolve every chain ordinal from the oldest sealed one to
+    // head with a spec of exactly that format_version.
+    // Should: list every chain in OLDEST_SEALED, so a new module cannot
+    // skip the check.
+    #[test]
+    fn every_sealed_ordinal_imports_through_a_spec_of_its_own_version() {
+        for chain in chains() {
+            let floor = OLDEST_SEALED
+                .iter()
+                .find(|(m, _)| *m == chain.module)
+                .map(|(_, o)| *o)
+                .unwrap_or_else(|| panic!("{} missing from OLDEST_SEALED", chain.module));
+            for ordinal in floor..=chain.head() {
+                if !chain.contains(ordinal) {
+                    continue;
+                }
+                let plan = crate::db::snapshot::resolve_import_plan(&[(
+                    chain.module.to_string(),
+                    ordinal,
+                )])
+                .unwrap_or_else(|e| panic!("{}@{ordinal}: {e}", chain.module));
+                assert_eq!(plan.specs.len(), 1);
+                assert_eq!(
+                    plan.specs[0].format_version, ordinal,
+                    "{}@{ordinal} resolved to a spec of another version",
+                    chain.module
+                );
+                assert_eq!(plan.targets.get(chain.module), Some(&ordinal));
+            }
+        }
+    }
+
+    // Should: refuse, by name, a chain ordinal that has no frozen import
+    // spec instead of building it with the live spec.
+    #[test]
+    fn unfrozen_ordinal_is_refused_at_plan_time() {
+        let err = crate::db::snapshot::resolve_import_plan(&[("identity".into(), 0)]).unwrap_err();
+        assert!(err.contains("no frozen import spec"), "{err}");
+    }
+
     // Impact: "module names are section names" is load-bearing — the
     // ordinal stamp validates against the section registry, and the
     // artifact manifest's format_version IS the chain position.

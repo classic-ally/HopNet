@@ -227,6 +227,19 @@ pub fn resolve_import_plan(headers: &[(String, u32)]) -> Result<ImportPlan, Stri
                         "artifact section {name}@{fv} names an ordinal outside the {name} chain"
                     ));
                 }
+                // The format_version is serialized into the artifact and
+                // hashed, so the live spec can only verify its own
+                // ordinal. An older ordinal needs its frozen spec (an arm
+                // above); building it with the live one fails the
+                // roundtrip with an opaque hash mismatch (consensus-bugs
+                // 19). Refuse here, by name.
+                if *fv != spec.format_version {
+                    return Err(format!(
+                        "artifact section {name}@{fv} has no frozen import spec \
+                         (this binary's {name} spec is @{}) — refusing to import",
+                        spec.format_version
+                    ));
+                }
                 plan.specs.push(spec);
                 plan.expected.insert(name.clone(), *fv);
                 plan.targets.insert(chain.module, *fv);
