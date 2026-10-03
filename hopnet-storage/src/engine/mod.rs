@@ -575,9 +575,11 @@ where
             // Genuinely unserved: rebuild from any K live classes (local
             // shards first), a bounded number at once, with every shard
             // fetch under the scheduler's caps and deadline and dark or
-            // parked peers skipped.
-            let Ok(_rebuild) = sched.rebuild.clone().acquire_owned().await else {
+            // parked peers skipped. No rebuild slot free: park and retry
+            // rather than hold a window slot while queued for one.
+            let Ok(_rebuild) = sched.rebuild.clone().try_acquire_owned() else {
                 outcome.failed += unserved.len();
+                park = true;
                 continue;
             };
             let (transport, dark) = (&seams.transport, &dark);
@@ -1015,6 +1017,41 @@ mod tests {
                 "node 2 reachable: {two_reachable}"
             );
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: re-review of #96 — window tasks waited for a rebuild slot
+    // with no timeout while holding their window slot, so a few long
+    // rebuilds could stall every blob in the window behind them.
+    // Should: park the blob when no rebuild slot is free.
+    // Should not: wait for one (the pull returns at once).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_free_rebuild_slot_parks_instead_of_waiting() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-noslot-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, _outcome, manifest) = encoded_blob(&dir_src).await;
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        let sched = FetchScheduler::new(PullLimits::default());
+        let _all = sched
+            .rebuild
+            .clone()
+            .acquire_many_owned(PullLimits::default().rebuilds as u32)
+            .await
+            .unwrap();
+        let pulled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pull_with_sched(&seams(net.clone()), &dir_dst, &blob_id, &sched),
+        )
+        .await
+        .expect("the pull must not wait for a rebuild slot");
+        assert_eq!(pulled.0.rebuilt, 0);
+        assert!(sched.blob_parked(&blob_id, std::time::Instant::now()));
         let _ = std::fs::remove_dir_all(&base);
     }
 
