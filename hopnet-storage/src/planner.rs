@@ -160,37 +160,58 @@ pub struct PlannedPage {
     pub scanned: usize,
 }
 
-/// A whole planning pass over the in-flight set, page by page. `read_page`
+/// What one (bounded) pass produced.
+#[derive(Debug, Default)]
+pub struct PlannedPass {
+    /// Owed blobs, sorted at-risk first.
+    pub plan: Vec<PlanItem>,
+    /// In-flight blobs this pass read.
+    pub scanned: usize,
+    /// Where the next pass resumes; `None` once the walk reached the end
+    /// (the next pass starts over).
+    pub resume: Option<BlobId>,
+}
+
+/// One planning pass over the in-flight set, page by page from `start`,
+/// stopping once `budget` blobs have been read: per-pass DB work is
+/// bounded, and the next pass resumes where this one stopped. `read_page`
 /// runs one page in its own short read (the host passes a closure that
-/// checks out a connection per call). Returns the sorted plan and how many
-/// in-flight blobs were scanned.
-pub fn plan_pass<F>(mut read_page: F) -> Result<(Vec<PlanItem>, usize), StorageError>
+/// checks out a connection per call).
+pub fn plan_pass<F>(
+    start: Option<BlobId>,
+    budget: usize,
+    mut read_page: F,
+) -> Result<PlannedPass, StorageError>
 where
     F: FnMut(Option<BlobId>) -> Result<PlannedPage, StorageError>,
 {
-    let mut plan = Vec::new();
-    let mut scanned = 0usize;
-    let mut cursor: Option<BlobId> = None;
+    let mut pass = PlannedPass::default();
+    let mut cursor = start;
     loop {
         let page = read_page(cursor.take())?;
-        scanned += page.scanned;
-        plan.extend(page.items);
+        pass.scanned += page.scanned;
+        pass.plan.extend(page.items);
         match page.next {
-            Some(c) => cursor = Some(c),
-            None => break,
+            Some(c) if pass.scanned < budget => cursor = Some(c),
+            next => {
+                pass.resume = next;
+                break;
+            }
         }
     }
-    sort_plan(&mut plan);
-    Ok((plan, scanned))
+    sort_plan(&mut pass.plan);
+    Ok(pass)
 }
 
 /// One planning page on `conn`: the in-flight blobs after `after`, planned.
+/// Blobs `skip` names (parked on unreachable sources) cost no lookups.
 pub fn plan_page(
     conn: &rusqlite::Connection,
     after: Option<&BlobId>,
     me: i32,
     members: &BTreeSet<i32>,
     snapshots: &mut HashMap<u64, Option<ViewSnapshot>>,
+    skip: &dyn Fn(&BlobId) -> bool,
 ) -> Result<PlannedPage, StorageError> {
     let page = in_flight_page_after(conn, after, PLAN_PAGE_SIZE)?;
     let scanned = page.len();
@@ -201,6 +222,9 @@ pub fn plan_page(
     };
     let mut items = Vec::new();
     for (desired, blob_id) in &page {
+        if skip(blob_id) {
+            continue;
+        }
         if let Some(item) = plan_blob(conn, blob_id, *desired, me, members, snapshots)? {
             items.push(item);
         }
@@ -398,11 +422,91 @@ mod tests {
         insert_blob(&conn, &blob(2), 2, 4, &[], &lumped);
 
         let mut snapshots = HashMap::new();
-        let (plan, scanned) =
-            plan_pass(|after| plan_page(&conn, after.as_ref(), 1, &members, &mut snapshots))
-                .unwrap();
-        assert_eq!(scanned, 2);
-        let got: Vec<(BlobId, i32)> = plan.into_iter().map(|i| (i.blob_id, i.tolerance)).collect();
+        let pass = plan_pass(None, usize::MAX, |after| {
+            plan_page(&conn, after.as_ref(), 1, &members, &mut snapshots, &|_| {
+                false
+            })
+        })
+        .unwrap();
+        assert_eq!(pass.scanned, 2);
+        assert_eq!(pass.resume, None);
+        let got: Vec<(BlobId, i32)> = pass
+            .plan
+            .into_iter()
+            .map(|i| (i.blob_id, i.tolerance))
+            .collect();
         assert_eq!(got, vec![(blob(2), 0), (blob(1), 1)]);
+    }
+
+    // Impact: review of #96 — each pass read every in-flight blob's
+    // manifest and ~30 inventory rows (~2M random reads at 68.8k blobs),
+    // back to back, even when most owed blobs were parked.
+    // Should: stop a pass once its budget of blobs is read and hand back
+    // where to resume; resume there next pass.
+    // Should not: look up a blob the skip predicate names (parked).
+    #[test]
+    fn a_pass_is_bounded_resumable_and_skips_parked_blobs() {
+        let pages: Vec<Vec<u8>> = vec![vec![1, 2], vec![3, 4], vec![5]];
+        let page = |after: Option<BlobId>| -> Result<PlannedPage, StorageError> {
+            let i = match after {
+                None => 0,
+                Some(id) => {
+                    pages
+                        .iter()
+                        .position(|p| blob(*p.last().unwrap()) == id)
+                        .unwrap()
+                        + 1
+                }
+            };
+            let ids = &pages[i];
+            Ok(PlannedPage {
+                items: ids
+                    .iter()
+                    .map(|n| PlanItem {
+                        blob_id: blob(*n),
+                        tolerance: 1,
+                        owed: 1,
+                    })
+                    .collect(),
+                next: (i + 1 < pages.len()).then(|| blob(*ids.last().unwrap())),
+                scanned: ids.len(),
+            })
+        };
+        let first = plan_pass(None, 2, page).unwrap();
+        assert_eq!(first.scanned, 2);
+        assert_eq!(first.resume, Some(blob(2)));
+        let second = plan_pass(first.resume, 2, page).unwrap();
+        assert_eq!(
+            second
+                .plan
+                .iter()
+                .map(|i| i.blob_id.clone())
+                .collect::<Vec<_>>(),
+            vec![blob(3), blob(4)]
+        );
+        let last = plan_pass(second.resume, 2, page).unwrap();
+        assert_eq!(last.resume, None, "end of the set: start over");
+
+        // Skip: a parked blob costs no plan_blob lookups.
+        let mut conn = test_conn();
+        {
+            let tx = conn.transaction().unwrap();
+            record_transition(&tx, 5, &view(&[1])).unwrap();
+            tx.commit().unwrap();
+        }
+        insert_blob(&conn, &blob(1), 2, 4, &[], &[]);
+        insert_blob(&conn, &blob(2), 2, 4, &[], &[]);
+        let members: BTreeSet<i32> = [1].into();
+        let mut snapshots = HashMap::new();
+        let parked = blob(1);
+        let got = plan_page(&conn, None, 1, &members, &mut snapshots, &|id| {
+            *id == parked
+        })
+        .unwrap();
+        assert_eq!(got.scanned, 2);
+        assert_eq!(
+            got.items.into_iter().map(|i| i.blob_id).collect::<Vec<_>>(),
+            vec![blob(2)]
+        );
     }
 }

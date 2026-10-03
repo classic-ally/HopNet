@@ -937,3 +937,28 @@ fn planner_pass_plans_owed_blobs_on_the_host_schema() {
     let owed: Vec<(CustomUUID, usize)> = plan.into_iter().map(|i| (i.blob_id, i.owed)).collect();
     assert_eq!(owed, vec![(blob(1), 3)]);
 }
+
+// Impact: review of #96 — passes ran back to back whenever any work
+// existed, re-reading every manifest continuously while most owed blobs
+// sat parked.
+// Should: start passes no closer than the minimum interval, and rest the
+// idle interval after a pass that walked to the end and found nothing.
+// Should not: rest at all once a slow pass has already used the interval.
+#[test]
+fn planner_passes_are_paced() {
+    use crate::storage_host::pull_planner::{PLANNER_IDLE_SECS, PLANNER_MIN_PASS_SECS, pass_rest};
+    use std::time::Duration;
+    let secs = Duration::from_secs;
+    assert_eq!(
+        pass_rest(true, false, secs(2)),
+        secs(PLANNER_MIN_PASS_SECS - 2)
+    );
+    assert_eq!(pass_rest(true, true, secs(0)), secs(PLANNER_MIN_PASS_SECS));
+    assert_eq!(
+        pass_rest(false, false, secs(0)),
+        secs(PLANNER_MIN_PASS_SECS),
+        "mid-walk"
+    );
+    assert_eq!(pass_rest(false, true, secs(5)), secs(PLANNER_IDLE_SECS - 5));
+    assert_eq!(pass_rest(true, false, secs(600)), Duration::ZERO);
+}

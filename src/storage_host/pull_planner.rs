@@ -20,8 +20,19 @@ use std::time::Duration;
 /// worker busy between refills without building a long stale backlog.
 pub const PULL_QUEUE_TARGET: usize = 128;
 
-/// Rest after a pass that found nothing owed.
+/// Rest after a pass that walked to the end of the set and found nothing
+/// owed.
 pub const PLANNER_IDLE_SECS: u64 = 60;
+
+/// Passes start at most this often: with most owed blobs parked a pass
+/// drains its plan at once, and back-to-back passes would re-read the
+/// same manifests continuously.
+pub const PLANNER_MIN_PASS_SECS: u64 = 30;
+
+/// In-flight blobs one pass reads (manifest plus inventory probes each);
+/// the next pass resumes where it stopped. At 68.8k in-flight blobs a full
+/// walk takes ~5 passes, ~2.5 min at the minimum interval.
+pub const PLAN_BLOBS_PER_PASS: usize = 16_384;
 
 /// How often the feeder looks at the engine's queue.
 const FEED_POLL: Duration = Duration::from_millis(500);
@@ -84,6 +95,7 @@ pub fn ensure_running(app_state: &AppState) -> bool {
 }
 
 async fn run(app_state: AppState) {
+    let mut resume: Option<hopnet_storage::BlobId> = None;
     loop {
         let Some(engine) = app_state.storage.get().cloned() else {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -92,11 +104,19 @@ async fn run(app_state: AppState) {
         let started = std::time::Instant::now();
         let started_at = chrono::Utc::now().timestamp();
         let pass = {
-            let app_state = app_state.clone();
-            tokio::task::spawn_blocking(move || plan(&app_state)).await
+            let (app_state, engine, start) = (app_state.clone(), engine.clone(), resume.take());
+            tokio::task::spawn_blocking(move || {
+                plan_from(&app_state, start, PLAN_BLOBS_PER_PASS, &|id| {
+                    engine.blob_parked(id)
+                })
+            })
+            .await
         };
         let (plan, scanned) = match pass {
-            Ok(Ok(p)) => p,
+            Ok(Ok(p)) => {
+                resume = p.resume;
+                (p.plan, p.scanned)
+            }
             Ok(Err(e)) => {
                 tracing::warn!("pull planner: pass failed: {e}");
                 tokio::time::sleep(Duration::from_secs(PLANNER_IDLE_SECS)).await;
@@ -140,15 +160,37 @@ async fn run(app_state: AppState) {
                 r.offered += 1;
             }
         }
-        if !found_work {
-            tokio::time::sleep(Duration::from_secs(PLANNER_IDLE_SECS)).await;
-        }
+        tokio::time::sleep(pass_rest(found_work, resume.is_none(), started.elapsed())).await;
     }
 }
 
-/// One planning pass over the in-flight set: a fresh pool connection per
-/// page, so no read is held across the whole walk.
+/// How long to rest before the next pass, which may start no sooner than
+/// the minimum interval after this one started: one that reached the end
+/// of the set with nothing owed rests for the idle interval instead.
+pub fn pass_rest(found_work: bool, reached_end: bool, elapsed: Duration) -> Duration {
+    let interval = if !found_work && reached_end {
+        PLANNER_IDLE_SECS
+    } else {
+        PLANNER_MIN_PASS_SECS
+    };
+    Duration::from_secs(interval).saturating_sub(elapsed)
+}
+
+/// One full, unbounded planning pass over the in-flight set (the operator
+/// route's order).
 pub fn plan(app_state: &AppState) -> Result<(Vec<PlanItem>, usize), String> {
+    plan_from(app_state, None, usize::MAX, &|_| false).map(|p| (p.plan, p.scanned))
+}
+
+/// A planning pass from `start`, reading at most `budget` in-flight blobs,
+/// with a fresh pool connection per page so no read is held across the
+/// walk. Blobs `skip` names cost no lookups.
+pub fn plan_from(
+    app_state: &AppState,
+    start: Option<hopnet_storage::BlobId>,
+    budget: usize,
+    skip: &dyn Fn(&hopnet_storage::BlobId) -> bool,
+) -> Result<planner::PlannedPass, String> {
     let me = app_state
         .get_node_id()
         .map_err(|_| "node id not set".to_string())?;
@@ -162,12 +204,12 @@ pub fn plan(app_state: &AppState) -> Result<(Vec<PlanItem>, usize), String> {
             .collect()
     };
     let mut snapshots = HashMap::new();
-    planner::plan_pass(|after| {
+    planner::plan_pass(start, budget, |after| {
         let conn = app_state
             .db_pool
             .get()
             .map_err(|e| hopnet_storage::StorageError::Host(format!("pool: {e}")))?;
-        planner::plan_page(&conn, after.as_ref(), me, &members, &mut snapshots)
+        planner::plan_page(&conn, after.as_ref(), me, &members, &mut snapshots, skip)
     })
     .map_err(|e| e.to_string())
 }

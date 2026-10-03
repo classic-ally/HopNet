@@ -226,6 +226,12 @@ impl EngineHandle {
         self.sched.stats(std::time::Instant::now())
     }
 
+    /// Parked on unreachable sources: the planner skips it until its
+    /// backoff passes.
+    pub fn blob_parked(&self, blob_id: &BlobId) -> bool {
+        self.sched.blob_parked(blob_id, std::time::Instant::now())
+    }
+
     /// Pull check for one blob, run in the window; resolves when it
     /// completes. `None` = engine gone.
     pub async fn pull_blob(&self, blob_id: BlobId) -> Option<PullOutcome> {
