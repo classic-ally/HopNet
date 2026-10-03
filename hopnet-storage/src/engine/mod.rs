@@ -465,7 +465,7 @@ async fn pull_owed<T, S, X, L>(
 ) -> Result<PullOutcome, EngineError>
 where
     T: Transport + 'static,
-    S: StateReader,
+    S: StateReader + 'static,
     X: TxSubmitter,
     L: LocalStateSink + 'static,
 {
@@ -531,11 +531,11 @@ where
         // storage view) outlive them: they are not holders to wait for. A
         // class held only by non-members is unserved, so it rebuilds; a
         // live non-member is still reached through discovery.
-        let members = sched.members(seams.state.as_ref(), std::time::Instant::now());
+        let members = sched.members(&seams.state, std::time::Instant::now()).await;
         let is_member = |node: i32| {
             members
                 .as_ref()
-                .is_none_or(|m: &HashSet<i32>| m.contains(&node))
+                .is_none_or(|m: &Arc<HashSet<i32>>| m.contains(&node))
         };
 
         // Every owed class at once, at most `per_blob` in flight, each under
@@ -963,7 +963,7 @@ mod tests {
     ) -> (PullOutcome, Vec<evidence::EvidenceItem>)
     where
         T: Transport + 'static,
-        S: StateReader,
+        S: StateReader + 'static,
         X: TxSubmitter,
         L: LocalStateSink + 'static,
     {
@@ -979,7 +979,7 @@ mod tests {
     ) -> (PullOutcome, Vec<evidence::EvidenceItem>)
     where
         T: Transport + 'static,
-        S: StateReader,
+        S: StateReader + 'static,
         X: TxSubmitter,
         L: LocalStateSink + 'static,
     {
@@ -1001,6 +1001,8 @@ mod tests {
         two_member: bool,
         /// Reading any manifest panics (a re-encode that blows up).
         panic_manifest: bool,
+        /// Deriving the storage view takes this long (a cold, slow node).
+        view_delay: std::time::Duration,
     }
 
     impl StateReader for HeldOnTwo {
@@ -1008,6 +1010,7 @@ mod tests {
             self.net.placement_inputs()
         }
         fn storage_view(&self) -> Result<crate::traits::StorageView, StorageError> {
+            std::thread::sleep(self.view_delay);
             let members = if self.two_member {
                 peers(&[1, 2])
             } else {
@@ -1095,6 +1098,7 @@ mod tests {
                     two_reachable,
                     two_member: true,
                     panic_manifest: false,
+                    view_delay: std::time::Duration::ZERO,
                 }),
                 submitter: net.clone(),
                 local_state: net.clone(),
@@ -1140,6 +1144,7 @@ mod tests {
                 two_reachable: false,
                 two_member,
                 panic_manifest: false,
+                view_delay: std::time::Duration::ZERO,
             }),
             submitter: net.clone(),
             local_state: net.clone(),
@@ -1162,6 +1167,42 @@ mod tests {
         assert_eq!(result.rebuilt, 0);
         assert!(sched.blob_parked(&blob_id, std::time::Instant::now()));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: third review of #96 — the membership cache derived the
+    // storage view (pool checkout plus 30 days of availability history)
+    // under its lock inside the async pull, so on every expiry each window
+    // task blocked behind one slow derivation.
+    // Should: refresh a stale membership in the background, once, and let
+    // every caller use the stale value meanwhile.
+    // Should not: make a caller wait for the derivation once any value
+    // exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_membership_is_refreshed_without_blocking_callers() {
+        let delay = std::time::Duration::from_millis(800);
+        let state = Arc::new(HeldOnTwo {
+            net: idle_net(),
+            two_reachable: true,
+            two_member: true,
+            panic_manifest: false,
+            view_delay: delay,
+        });
+        let sched = FetchScheduler::new(PullLimits::default());
+        let t0 = std::time::Instant::now();
+        let first = sched.members(&state, t0).await.unwrap();
+        assert_eq!(*first, [1, 2].into_iter().collect::<HashSet<i32>>());
+
+        // Stale: every caller returns at once with the stale value.
+        let stale_at = std::time::Instant::now() + fetch::MEMBERS_TTL;
+        let started = std::time::Instant::now();
+        for _ in 0..8 {
+            assert!(sched.members(&state, stale_at).await.is_some());
+        }
+        assert!(
+            started.elapsed() < delay / 2,
+            "callers waited {:?}",
+            started.elapsed()
+        );
     }
 
     // Impact: re-review of #96 — window tasks waited for a rebuild slot
@@ -1378,6 +1419,7 @@ mod tests {
                 two_reachable: true,
                 two_member: true,
                 panic_manifest: true,
+                view_delay: std::time::Duration::ZERO,
             }),
             submitter: net.clone(),
             local_state: net.clone(),

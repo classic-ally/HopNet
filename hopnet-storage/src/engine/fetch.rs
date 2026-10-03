@@ -184,7 +184,9 @@ pub struct FetchScheduler {
     /// One-permit gates for peers marked slow.
     slow_gates: Mutex<HashMap<i32, Arc<Semaphore>>>,
     /// Storage-view member ids, cached for `MEMBERS_TTL`.
-    members: Mutex<Option<(Instant, std::collections::HashSet<i32>)>>,
+    members: Mutex<Option<(Instant, Arc<std::collections::HashSet<i32>>)>>,
+    /// One membership refresh at a time.
+    members_refreshing: std::sync::atomic::AtomicBool,
     peers: Mutex<HashMap<i32, PeerPark>>,
     blobs: Mutex<HashMap<BlobId, BlobPark>>,
 }
@@ -199,6 +201,7 @@ impl FetchScheduler {
             per_peer: Mutex::new(HashMap::new()),
             slow_gates: Mutex::new(HashMap::new()),
             members: Mutex::new(None),
+            members_refreshing: std::sync::atomic::AtomicBool::new(false),
             peers: Mutex::new(HashMap::new()),
             blobs: Mutex::new(HashMap::new()),
         })
@@ -367,28 +370,54 @@ impl FetchScheduler {
             .map(|p| now.saturating_duration_since(p.since))
     }
 
-    /// Current storage-view member ids (cached for `MEMBERS_TTL`), or
-    /// `None` when the view cannot be read (then nothing is filtered).
-    pub fn members<S: crate::traits::StateReader + ?Sized>(
-        &self,
-        state: &S,
+    /// Current storage-view member ids, cached for `MEMBERS_TTL`. Deriving
+    /// the view is a pool checkout plus 30 days of availability history,
+    /// so it never runs under the cache lock or on an async worker: one
+    /// caller at a time refreshes it on the blocking pool, in the
+    /// background while a stale value exists (everyone keeps using that
+    /// value meanwhile), awaited only by the first caller when there is
+    /// none. `None` = no view yet or it cannot be read; nothing is
+    /// filtered then.
+    pub async fn members<S: crate::traits::StateReader + 'static>(
+        self: &Arc<Self>,
+        state: &Arc<S>,
         now: Instant,
-    ) -> Option<std::collections::HashSet<i32>> {
-        let mut cache = self.members.lock().unwrap();
-        if let Some((at, ids)) = cache.as_ref() {
+    ) -> Option<Arc<std::collections::HashSet<i32>>> {
+        let cached = self.members.lock().unwrap().clone();
+        if let Some((at, ids)) = &cached {
             if now.saturating_duration_since(*at) < MEMBERS_TTL {
                 return Some(ids.clone());
             }
         }
-        let ids: std::collections::HashSet<i32> = state
-            .storage_view()
-            .ok()?
-            .members
-            .iter()
-            .map(|p| p.node_id)
-            .collect();
-        *cache = Some((now, ids.clone()));
-        Some(ids)
+        if self
+            .members_refreshing
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return cached.map(|(_, ids)| ids);
+        }
+        let (this, state) = (self.clone(), state.clone());
+        let refresh = async move {
+            let view = tokio::task::spawn_blocking(move || state.storage_view()).await;
+            let ids = match view {
+                Ok(Ok(view)) => {
+                    let ids: Arc<std::collections::HashSet<i32>> =
+                        Arc::new(view.members.iter().map(|p| p.node_id).collect());
+                    *this.members.lock().unwrap() = Some((Instant::now(), ids.clone()));
+                    Some(ids)
+                }
+                _ => None,
+            };
+            this.members_refreshing
+                .store(false, std::sync::atomic::Ordering::Release);
+            ids
+        };
+        match cached {
+            Some((_, stale)) => {
+                tokio::spawn(refresh);
+                Some(stale)
+            }
+            None => refresh.await,
+        }
     }
 
     pub fn stats(&self, now: Instant) -> SchedulerStats {
