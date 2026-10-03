@@ -50,8 +50,26 @@ xcrun notarytool submit "$NOTARY_ZIP" \
   --password "$NOTARY_PASSWORD" \
   --wait
 
-echo "📎 Stapling ticket to bundle..."
-xcrun stapler staple "$APP_BUNDLE"
+# Stapling can fail for a while after notarization is Accepted: Apple's
+# ticket takes time to propagate to the CloudKit lookup the stapler uses
+# (2026.10.7 release: `CloudKit query ... failed due to "(null)"` /
+# `Could not find base64 encoded ticket`). Retry before giving up.
+STAPLE_ATTEMPTS=5
+STAPLE_DELAY_SECS=30
+attempt=1
+while true; do
+  echo "📎 Stapling ticket to bundle (attempt $attempt of $STAPLE_ATTEMPTS)..."
+  if xcrun stapler staple "$APP_BUNDLE"; then
+    break
+  fi
+  if [ "$attempt" -ge "$STAPLE_ATTEMPTS" ]; then
+    echo "❌ Stapling failed after $STAPLE_ATTEMPTS attempts"
+    exit 1
+  fi
+  echo "⏳ Stapling failed (ticket may not have propagated yet); retrying in ${STAPLE_DELAY_SECS}s..."
+  sleep "$STAPLE_DELAY_SECS"
+  attempt=$((attempt + 1))
+done
 
 echo "🔍 Verifying stapled ticket..."
 xcrun stapler validate "$APP_BUNDLE"
