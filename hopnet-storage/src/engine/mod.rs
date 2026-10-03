@@ -170,6 +170,23 @@ impl Drop for QueuedEntry {
     }
 }
 
+/// Held by the dispatch loop: however it ends, every queued blob is
+/// dropped and every waiter sees the engine as gone (`None`) instead of
+/// hanging, and the closed channel refuses later requests.
+struct DrainOnExit(PullQueue);
+
+impl Drop for DrainOnExit {
+    fn drop(&mut self) {
+        let drained = std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
+        if !drained.is_empty() {
+            tracing::error!(
+                queued = drained.len(),
+                "pull: dispatch loop ended; queued checks dropped"
+            );
+        }
+    }
+}
+
 /// Handle to the running engine. Cheap to clone; the host stores one in its
 /// app state (mirrors the consensus EngineHandle pattern).
 #[derive(Clone)]
@@ -321,13 +338,14 @@ impl EngineHandle {
         let lane =
             evidence::EvidenceLane::spawn(seams.state.clone(), seams.submitter.clone(), &data_rt);
         data_rt.spawn(async move {
+            let _drain = DrainOnExit(worker_queued.clone());
             let mut running: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     biased;
                     cmd = reencode_urgent_rx.recv() => {
                         let Some(cmd) = cmd else { break };
-                        run_reencode_cmd(&seams, &fragments_dir, cmd).await;
+                        run_reencode_guarded(&seams, &fragments_dir, cmd).await;
                     }
                     Some(_) = running.join_next(), if !running.is_empty() => {}
                     admitted = async {
@@ -366,7 +384,7 @@ impl EngineHandle {
                     }
                     cmd = reencode_lazy_rx.recv() => {
                         let Some(cmd) = cmd else { break };
-                        run_reencode_cmd(&seams, &fragments_dir, cmd).await;
+                        run_reencode_guarded(&seams, &fragments_dir, cmd).await;
                     }
                 }
             }
@@ -382,8 +400,28 @@ impl EngineHandle {
     }
 }
 
-/// Run one re-encode command on the serial worker (errors logged, not
-/// propagated — the next tick's scan re-elects and retries).
+/// Run one re-encode command as its own task and wait for it: still one
+/// at a time on the dispatch loop, but a panic in it ends that task, not
+/// the loop that every pull depends on.
+async fn run_reencode_guarded<T, S, X, L>(
+    seams: &Seams<T, S, X, L>,
+    fragments_dir: &str,
+    cmd: ReencodeCmd,
+) where
+    T: Transport + 'static,
+    S: StateReader + 'static,
+    X: TxSubmitter + 'static,
+    L: LocalStateSink + 'static,
+{
+    let (seams, dir) = (seams.clone(), fragments_dir.to_string());
+    let (blob_id, chunk) = (cmd.blob_id.clone(), cmd.chunk_number);
+    if let Err(e) = tokio::spawn(async move { run_reencode_cmd(&seams, &dir, cmd).await }).await {
+        tracing::error!("re-encode: blob {blob_id} chunk {chunk} task failed: {e}");
+    }
+}
+
+/// Run one re-encode command (errors logged, not propagated — the next
+/// tick's scan re-elects and retries).
 async fn run_reencode_cmd<T, S, X, L>(
     seams: &Seams<T, S, X, L>,
     fragments_dir: &str,
@@ -957,6 +995,8 @@ mod tests {
         two_reachable: bool,
         /// Node 2 is in the storage view (else it departed, rows remain).
         two_member: bool,
+        /// Reading any manifest panics (a re-encode that blows up).
+        panic_manifest: bool,
     }
 
     impl StateReader for HeldOnTwo {
@@ -1012,6 +1052,7 @@ mod tests {
             &self,
             blob_id: &BlobId,
         ) -> Result<Option<crate::store::BlobManifest>, StorageError> {
+            assert!(!self.panic_manifest, "manifest read panics");
             self.net.blob_manifest(blob_id)
         }
         fn local_node_id(&self) -> Option<i32> {
@@ -1049,6 +1090,7 @@ mod tests {
                     net: net.clone(),
                     two_reachable,
                     two_member: true,
+                    panic_manifest: false,
                 }),
                 submitter: net.clone(),
                 local_state: net.clone(),
@@ -1092,6 +1134,7 @@ mod tests {
                 net: net.clone(),
                 two_reachable: false,
                 two_member,
+                panic_manifest: false,
             }),
             submitter: net.clone(),
             local_state: net.clone(),
@@ -1298,6 +1341,64 @@ mod tests {
         });
         assert!(task.await.is_err());
         assert!(queue.lock().unwrap().is_empty());
+    }
+
+    // Impact: re-review of #96 — waiters live in the shared queue map; if
+    // the dispatch loop died, pull_blob callers hung and new requests
+    // joined dead entries.
+    // Should: drop every queued blob and wake every waiter with "engine
+    // gone" when the dispatch loop ends.
+    #[tokio::test]
+    async fn a_dead_dispatch_loop_releases_its_waiters() {
+        let queue: PullQueue = Default::default();
+        let a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        let (tx, rx) = oneshot::channel();
+        queue.lock().unwrap().insert(a, vec![tx]);
+        drop(DrainOnExit(queue.clone()));
+        assert!(rx.await.is_err(), "the waiter is woken, not left hanging");
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    // Impact: re-review of #96 — a panic in a re-encode ran on the
+    // dispatch loop itself and would have ended it, stranding every pull.
+    // Should: keep serving pulls after a re-encode panics.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_reencode_does_not_stop_the_engine() {
+        let net = idle_net();
+        let seams = Seams {
+            transport: net.clone(),
+            state: Arc::new(HeldOnTwo {
+                net: net.clone(),
+                two_reachable: true,
+                two_member: true,
+                panic_manifest: true,
+            }),
+            submitter: net.clone(),
+            local_state: net.clone(),
+        };
+        let engine = EngineHandle::spawn(
+            seams,
+            EngineConfig {
+                fragments_dir: String::new(),
+                limits: PullLimits::default(),
+            },
+            tokio::runtime::Handle::current(),
+        );
+        let a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        engine.enqueue_reencode(
+            ReencodeCmd {
+                blob_id: a.clone(),
+                chunk_number: 0,
+                missing_classes: vec![1],
+            },
+            true,
+        );
+        // No goal on record (target None): the pull returns before any
+        // manifest read, so only the re-encode panics.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), engine.pull_blob(a))
+            .await
+            .expect("the engine still answers");
+        assert_eq!(outcome, Some(PullOutcome::default()));
     }
 
     // Impact: review of #96 — park entries for blobs that stopped being
