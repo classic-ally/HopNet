@@ -607,8 +607,9 @@ apply functions inside consensus handlers.
       that stops voting, and (known 10.8 limitation) availability that
       reflects serving: a member that answers probes but cannot serve
       fragments stays in the storage view and is never rebuilt around.
-      [~] Repair grace (next release): urgent repair counts a member
-      in liveness contact within 15 minutes as up (`HOPNET_REPAIR_GRACE_SECS`),
+      [~] Repair grace (next release): urgent repair counts a grid-offline
+      member in liveness contact as up for 15 minutes after this node
+      boots or after the member's contact resumes (`HOPNET_REPAIR_GRACE_SECS`),
       so a crossing's simultaneous reboots no longer trigger re-encodes
       of every chunk (the 2026.10.8 storm); re-encode off the pull
       dispatch loop remains open.

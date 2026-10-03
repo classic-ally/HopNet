@@ -330,18 +330,26 @@ pub fn seen_age(view: Option<&PeerEvidenceView>, origin: Instant, now: Instant) 
     }
 }
 
-/// The candidates urgent repair counts as up through the repair grace: in
-/// liveness contact (`contact_age`, the vote-out clock) within `grace`. A
-/// peer with no entry ages from `origin`, so every peer is within grace
-/// for `grace` after this node boots — after an epoch crossing, when
-/// every node reboots at once, the whole mesh is. The replicated
-/// availability grid marks a rebooted node offline until its own next
-/// metrics sample (up to ten minutes), and a reboot is not a departure.
+/// The candidates (members the availability grid calls offline) urgent
+/// repair still counts as up through the repair grace. The grid marks a
+/// rebooted node offline until its own next metrics sample (up to ten
+/// minutes), and a reboot is not a departure; but the grace covers only
+/// that window, never a node whose samples have stopped landing for good.
+/// A candidate is in grace when it is in liveness contact within `grace`
+/// (`contact_age`, the vote-out clock) AND either:
+/// - this node booted less than `grace` ago — after an epoch crossing
+///   every node reboots at once, and a peer with no entry ages from
+///   `origin`; or
+/// - its current contact span (`bright_since`, which restarts after a
+///   silence no band tolerates) began less than `grace` ago — it has just
+///   come back.
 ///
-/// Liveness, not visibility: other-epoch status pings, regenesis lineage
-/// requests and mismatched Pongs refresh `last_seen` only, and a
-/// straggler stuck outside the epoch (grid-offline for good: it cannot
-/// commit metrics) must not hold repair off forever.
+/// A peer in unbroken contact for longer than `grace` that the grid still
+/// calls offline (a wedged sampler, a full disk) gets no grace: its
+/// classes are repaired as the grid says. Liveness, not visibility:
+/// other-epoch status pings, regenesis lineage requests and mismatched
+/// Pongs refresh `last_seen` only, and a straggler outside the epoch must
+/// not hold repair off forever.
 pub fn repair_grace_peers(
     snapshot: &[(i32, PeerEvidenceView)],
     origin: Instant,
@@ -349,11 +357,18 @@ pub fn repair_grace_peers(
     grace: Duration,
     candidates: impl IntoIterator<Item = i32>,
 ) -> std::collections::HashSet<i32> {
+    let booting = now.saturating_duration_since(origin) < grace;
     candidates
         .into_iter()
         .filter(|id| {
             let view = snapshot.iter().find(|(n, _)| n == id).map(|(_, v)| v);
-            contact_age(view, origin, now) < grace
+            if contact_age(view, origin, now) >= grace {
+                return false;
+            }
+            booting
+                || view
+                    .and_then(|v| v.bright_since)
+                    .is_some_and(|since| now.saturating_duration_since(since) < grace)
         })
         .collect()
 }
@@ -1381,15 +1396,41 @@ mod tests {
         }
     }
 
-    // Should: count a peer in liveness contact within the grace as live
-    // for repair.
+    // Should: keep a grid-offline peer live for repair when its contact
+    // resumed within the grace after a silence no band tolerates (it has
+    // just rebooted and its metrics sample has not landed yet).
     #[test]
-    fn a_peer_in_contact_within_the_grace_counts_as_live_for_repair() {
-        let origin = Instant::now();
+    fn a_peer_whose_contact_resumed_within_the_grace_is_kept_live() {
+        let map = EvidenceMap::new();
+        let origin = map.origin();
+        let grace = Duration::from_secs(900);
+        map.record_at(2, None, origin + Duration::from_secs(60));
+        map.record_at(2, None, origin + Duration::from_secs(3000));
+        // Down for the reboot, back 5 minutes ago.
+        map.record_at(2, None, origin + Duration::from_secs(3300));
         let now = origin + Duration::from_secs(3600);
-        let snap = vec![(2, view(now - Duration::from_secs(60)))];
-        let live = repair_grace_peers(&snap, origin, now, Duration::from_secs(900), [2]);
+        let live = repair_grace_peers(&map.snapshot(), origin, now, grace, [2]);
         assert!(live.contains(&2));
+    }
+
+    // Impact: review of #99 — a node consensus-live but whose metrics
+    // samples stop landing (wedged sampler, storage host down, full disk)
+    // is grid-offline for good; an unbounded grace would never rebuild its
+    // classes.
+    // Should not: keep a peer live for repair when it has been in unbroken
+    // contact for longer than the grace while the grid calls it offline.
+    #[test]
+    fn a_peer_in_contact_longer_than_the_grace_is_not_kept_live() {
+        let map = EvidenceMap::new();
+        let origin = map.origin();
+        let grace = Duration::from_secs(900);
+        // Contact every minute for an hour: one span since minute 1.
+        for minute in 1..=60u64 {
+            map.record_at(2, None, origin + Duration::from_secs(minute * 60));
+        }
+        let now = origin + Duration::from_secs(3600 + 10);
+        let live = repair_grace_peers(&map.snapshot(), origin, now, grace, [2]);
+        assert!(live.is_empty());
     }
 
     // Impact: review of #99 — a straggler outside the epoch is
@@ -1430,6 +1471,32 @@ mod tests {
         assert_eq!(early.len(), 3);
         let late = repair_grace_peers(&[], origin, origin + grace, grace, [1, 2, 3]);
         assert!(late.is_empty());
+    }
+
+    // Should: keep a peer in contact since this node's boot live for
+    // repair through the boot window, though its contact span is as old
+    // as the boot.
+    // Should not: keep it once the boot window has passed and its span is
+    // older than the grace.
+    #[test]
+    fn a_peer_in_contact_since_boot_is_kept_live_only_through_the_boot_window() {
+        let map = EvidenceMap::new();
+        let origin = map.origin();
+        let grace = Duration::from_secs(900);
+        for minute in 0..=20u64 {
+            map.record_at(2, None, origin + Duration::from_secs(minute * 60));
+        }
+        let at = |s: u64| {
+            repair_grace_peers(
+                &map.snapshot(),
+                origin,
+                origin + Duration::from_secs(s),
+                grace,
+                [2],
+            )
+        };
+        assert!(at(14 * 60).contains(&2));
+        assert!(at(20 * 60 + 5).is_empty());
     }
 
     // Should not: keep a peer live for repair once it has been out of contact for

@@ -1246,10 +1246,12 @@ static LAST_VIEW_SUMMARY: std::sync::Mutex<Option<String>> = std::sync::Mutex::n
 /// same confirmations twice and double the consensus traffic for nothing.
 static TICK_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// How long a member in liveness contact with this node stays up for repair
-/// after the availability grid calls it offline. A rebooted node is
-/// grid-offline until its own next metrics sample — up to ten minutes
-/// after boot — so the grace must outlast that; after an epoch crossing
+/// How long, after this node boots or after a member's contact resumes, a
+/// member in liveness contact stays up for repair although the
+/// availability grid calls it offline (`evidence::repair_grace_peers`). A
+/// rebooted node is grid-offline until its own next metrics sample — up
+/// to ten minutes after boot — so the grace must outlast that; after an
+/// epoch crossing
 /// every node reboots at once, and without it two members "down" put
 /// every chunk below the watermark (2026.10.8: hours of urgent re-encodes
 /// of copies that were only rebooting).

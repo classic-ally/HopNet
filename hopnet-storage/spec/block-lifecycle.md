@@ -1259,14 +1259,24 @@ optimization and carries no proof obligation.
       stopped until each was restarted by hand (desktop regenerated
       3,399 chunks in 12 minutes; thor's backlog was hours).
       Fix (node-local, no consensus rule or schema change): repair
-      counts as up the grid's online set plus every member this node
-      has been in liveness contact with (`last_contact`, the vote-out clock) —
-      visibility would let a straggler outside the epoch, whose status
-      pings and lineage requests refresh `last_seen` only, hold repair
-      off forever —
-      within `REPAIR_GRACE` — 15 minutes, `HOPNET_REPAIR_GRACE_SECS`,
-      0 turns it off. A peer with no evidence ages from this node's
-      boot, so after a crossing the whole mesh is in grace. Grace only
+      counts as up the grid's online set plus each grid-offline member
+      in liveness contact (`last_contact`, the vote-out clock) within
+      `REPAIR_GRACE` — 15 minutes, `HOPNET_REPAIR_GRACE_SECS`, 0 turns
+      it off — and only while either this node booted less than the
+      grace ago (a crossing: a peer with no evidence ages from this
+      node's boot, so the whole mesh is in grace) or the peer's current
+      contact span (`bright_since`, restarted by a silence longer than
+      t_unresponsive(Lazy)) began less than the grace ago (it has just
+      come back). The grace is bounded to the reboot window on purpose:
+      a peer in unbroken contact for longer than the grace that the grid
+      still calls offline (a wedged sampler, a full disk) gets none, and
+      its classes are repaired as the grid says. Liveness, not
+      visibility: a straggler outside the epoch, whose status pings and
+      lineage requests refresh `last_seen` only, must not hold repair
+      off. Known gap: a peer reboot shorter than t_unresponsive(Lazy)
+      (~2 min) keeps its span, so outside a crossing it gets no grace —
+      one such node down leaves chunks above W (lazy, tier-gated), and
+      the drop-if-stale filter below bounds the rest. Grace only
       adds holders back: a grid-online node is never dropped, and a
       node that has left the storage view is never revived, so repair
       after a real departure is unchanged. No tolerance-0 bypass: it
