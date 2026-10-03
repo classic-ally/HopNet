@@ -140,6 +140,10 @@ pub struct SweepReport {
     /// orphan grace, deleted on this walk.
     #[serde(default)]
     pub temps_deleted: usize,
+    /// Attestation pages whose submit failed; the sweep carries on past
+    /// them and the next cycle re-covers their hashes.
+    #[serde(default)]
+    pub attest_failed_pages: usize,
 }
 
 /// The temp files old enough to reap: an in-flight store is seconds old,

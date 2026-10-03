@@ -787,3 +787,46 @@ fn recent_holder_counts_demand_fresh_verification() {
     assert_eq!(plain.get(&fresh), Some(&2));
     assert_eq!(plain.get(&stale), Some(&1));
 }
+
+/// Fails the listed submits (1-based call numbers) and accepts the rest.
+struct FlakySubmitter {
+    fail_on: std::collections::HashSet<usize>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl hopnet_storage::traits::TxSubmitter for FlakySubmitter {
+    async fn submit(
+        &self,
+        _function: &'static str,
+        _payload: Vec<u8>,
+    ) -> Result<(), hopnet_storage::traits::SubmitError> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if self.fail_on.contains(&n) {
+            Err(hopnet_storage::traits::SubmitError::Transient("timeout".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+// Impact: thor's sweeps stopped at the first failed submit and never
+// attested, so none of its rows stayed inside the recency window.
+// Should: submit every page even when an earlier one fails.
+// Should: report committed and failed pages separately.
+#[tokio::test]
+async fn attestation_continues_past_a_failed_page() {
+    let present: Vec<Blake3Hash> = (0u8..5)
+        .map(|i| Blake3Hash::new(blake3::hash(&[i])))
+        .collect();
+    let pages = hopnet_storage::sweep::attestation_pages(1, 100, &present, 1);
+    let submitter = FlakySubmitter {
+        fail_on: [2, 4].into(),
+        calls: Default::default(),
+    };
+
+    let (committed, failed) =
+        crate::storage_host::jobs::submit_attestation_pages(&submitter, pages).await;
+
+    assert_eq!((committed, failed), (3, 2));
+    assert_eq!(submitter.calls.load(std::sync::atomic::Ordering::SeqCst), 5);
+}

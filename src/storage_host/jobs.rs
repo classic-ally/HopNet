@@ -395,8 +395,10 @@ pub struct UnplacedDrainResult {
     pub limit: i32,
 }
 
-/// Scheduled job handler for the disk-truth sweep + self-check (the
-/// 20–30 minute cron): every self-check is disk-backed (RFC-STORAGE-003 S5).
+/// Scheduled job handler for the disk-truth sweep + self-check (every 30
+/// minutes at a per-node random offset): every self-check is disk-backed
+/// (RFC-STORAGE-003 S5). A failed sweep is logged here: the job runner
+/// drops the error silently, which hid thor's aborted sweeps for a day.
 pub async fn handle_fragment_inventory_self_check(
     job: TaskId,
     ctx: Data<AppState>,
@@ -404,6 +406,7 @@ pub async fn handle_fragment_inventory_self_check(
     run_disk_truth_sweep(&ctx, SWEEP_ORPHAN_GRACE_SECS)
         .await
         .map(|_| ())
+        .inspect_err(|e| tracing::warn!("sweep failed: {e}"))
 }
 
 /// Orphan grace: a rowless file younger than this is an in-flight store,
@@ -588,15 +591,24 @@ pub async fn run_disk_truth_sweep(
     if !differential.is_empty() {
         let payload = bincode::serde::encode_to_vec(&differential, bincode::config::standard())
             .map_err(|e| Error::Failed(Arc::new(format!("self-check encode: {e}").into())))?;
-        host.submit(hopnet_storage::engine::policy::SELF_CHECK_FN, payload)
+        // Belief and truth are independent: attestation stamps only rows
+        // that already exist, so a differential that did not land costs
+        // the new rows their stamps until the next cycle. Aborting here
+        // left a node whose self-check kept timing out with no fresh
+        // attestation at all.
+        if let Err(e) = host
+            .submit(hopnet_storage::engine::policy::SELF_CHECK_FN, payload)
             .await
-            .map_err(|e| Error::Failed(Arc::new(format!("self-check submit: {e:?}").into())))?;
+        {
+            tracing::warn!("sweep: self-check submit failed, attesting anyway: {e:?}");
+        }
     }
 
     // (5) Truth: attest everything seen on disk this cycle, one awaited
     // page at a time (ATTEST_PAGE_SIZE): a page that commits stays
-    // committed, so a failure part-way leaves the next sweep less to do.
+    // committed, and a page that fails does not stop the rest.
     let mut attested_pages = 0usize;
+    let mut attest_failed_pages = 0usize;
     if !present.is_empty() {
         let height = {
             let conn = app_state
@@ -612,21 +624,9 @@ pub async fn run_disk_truth_sweep(
             &present,
             hopnet_storage::engine::policy::ATTEST_PAGE_SIZE,
         );
-        let total = pages.len();
-        for (i, attestation) in pages.into_iter().enumerate() {
-            let payload = bincode::serde::encode_to_vec(&attestation, bincode::config::standard())
-                .map_err(|e| Error::Failed(Arc::new(format!("attestation encode: {e}").into())))?;
-            host.submit(hopnet_storage::engine::policy::ATTEST_FN, payload)
-                .await
-                .map_err(|e| {
-                    Error::Failed(Arc::new(
-                        format!("attestation submit (page {} of {total}): {e:?}", i + 1).into(),
-                    ))
-                })?;
-            attested_pages += 1;
-        }
+        (attested_pages, attest_failed_pages) = submit_attestation_pages(&host, pages).await;
         tracing::info!(
-            "sweep: attested {} fragments in {attested_pages} pages",
+            "sweep: attested {} fragments in {attested_pages} pages ({attest_failed_pages} failed)",
             present.len()
         );
     }
@@ -646,9 +646,10 @@ pub async fn run_disk_truth_sweep(
         surplus_released,
         surplus_bytes_freed,
         temps_deleted,
+        attest_failed_pages,
     };
     tracing::info!(
-        "sweep: {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} corrupt deleted, {} surplus released, {} temp files deleted",
+        "sweep: {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} corrupt deleted, {} surplus released, {} temp files deleted, {} attestation pages failed",
         report.files_on_disk,
         report.present,
         report.reflagged,
@@ -656,10 +657,50 @@ pub async fn run_disk_truth_sweep(
         report.orphans_deleted,
         report.corrupt_deleted,
         report.surplus_released,
-        report.temps_deleted
+        report.temps_deleted,
+        report.attest_failed_pages
     );
     *app_state.last_sweep.lock().unwrap() = Some(report.clone());
+    if attested_pages == 0 && attest_failed_pages > 0 {
+        return Err(Error::Failed(Arc::new(
+            format!("attestation: all {attest_failed_pages} pages failed").into(),
+        )));
+    }
     Ok(report)
+}
+
+/// Submit the sweep's attestation pages one at a time, carrying on past a
+/// failed page: each page stands alone (`apply_attestation` is
+/// idempotent), so one timed-out page must not cost the others their
+/// stamps. Returns `(committed, failed)`.
+pub(crate) async fn submit_attestation_pages<S: hopnet_storage::traits::TxSubmitter>(
+    submitter: &S,
+    pages: Vec<hopnet_storage::FragmentAttestation>,
+) -> (usize, usize) {
+    let total = pages.len();
+    let (mut committed, mut failed) = (0usize, 0usize);
+    for (i, attestation) in pages.into_iter().enumerate() {
+        let payload =
+            match bincode::serde::encode_to_vec(&attestation, bincode::config::standard()) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("sweep: attestation encode (page {} of {total}): {e}", i + 1);
+                    failed += 1;
+                    continue;
+                }
+            };
+        match submitter
+            .submit(hopnet_storage::engine::policy::ATTEST_FN, payload)
+            .await
+        {
+            Ok(()) => committed += 1,
+            Err(e) => {
+                tracing::warn!("sweep: attestation submit (page {} of {total}): {e:?}", i + 1);
+                failed += 1;
+            }
+        }
+    }
+    (committed, failed)
 }
 
 /// Kept for callers that only want belief refreshed (tests, routes): the
