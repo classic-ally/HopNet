@@ -1191,6 +1191,45 @@ optimization and carries no proof obligation.
     restarting node resumes instead of rescanning from the top. The
     operator routes run one unpaced rotation, exclusive with the walker
     per shard. "Paging the sweep's walk" is closed by this.
+  - Pull pipeline (2026-10-03, branch `pull-pipeline` on
+    `feat-rolling-sweep`, decided with Allison; ships as 2026.10.8).
+    Production after the 10.6 crossing: 68,878 in-flight blobs, pulls
+    flat-lined (desktop 0 fetches in 5 min). Three causes, three
+    fixes, all host-side (no consensus rule, wire or schema change):
+    - Starved kick. One transition gives every in-flight blob the same
+      goal height, so the tick's `in_flight_blobs` LIMIT-64 page
+      returned the same lowest ids every tick, blobs that had pulled
+      what they owed and waited on confirmation. A pull planner
+      (`hopnet_storage::planner`, host task `pull_planner`) now walks
+      the whole set by keyset pages (`in_flight_page_after`, one short
+      read per page), keeps the blobs this node owes a class of, orders
+      them at-risk first by the resilience pane's own worst-case rule,
+      and feeds the engine as its queue drains (target 128). The tick
+      only keeps it alive; the operator rebalance drains in its order.
+      In memory: a restart costs one pass.
+    - Consensus on the worker. Each moved blob awaited belief, truth
+      and confirmation (each up to 120 s) before the next began, ~6
+      blobs a minute. The worker now hands (blob, height read before
+      the rehash, present hashes) to a per-node evidence lane that
+      pages them through the sweep's `PageBuffer` on the sweep's
+      clock (8192 hashes or 60 s): belief, then attestation at the
+      lowest height observed, then one ConfirmPlacement for every
+      buffered blob whose evidence is complete, so the last responsible
+      to attest proposes. The rolling walker keeps its own buffers of
+      the same type and age (one constant); one lane for both is a
+      later merge.
+    - Serial fetch. Pulls run in a window of 64 blobs whose class
+      fetches share a global cap (24, less 4 held for urgent
+      re-encode), a per-peer cap (8) and a per-blob share (6), each
+      with a 30 s deadline. A source failing at the transport three
+      times running parks (30 s doubling to 10 min); one the host's
+      liveness evidence calls dark is skipped; a blob whose known
+      holders are all dark and cannot be rebuilt parks (1 min doubling
+      to 30 min) and leaves the window, so an offline origin cannot
+      stall it. Knobs `HOPNET_PULL_WINDOW`, `_FETCH_GLOBAL`,
+      `_FETCH_PER_PEER`, `_URGENT_RESERVE`; thor runs 16/6/3/2 from
+      nix-config. Re-encode's own shard fetches stay serial (one chunk
+      at a time on the dispatch loop), outside the caps.
   - Rehearsal (2026-09-27): `orchestrator test --test
     lifecycle-cutover-drain --flags blobs=N` — a mesh born on the
     deployed release image, populated, crosses into the build under
