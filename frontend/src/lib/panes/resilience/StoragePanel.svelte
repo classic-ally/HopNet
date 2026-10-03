@@ -21,7 +21,12 @@
     }[] = [];
 
     // Members below their pull floor: serving, but taking on no copies.
-    export let holdingBack: { displayName: string; freeGb: number; pullFloorGb: number }[] = [];
+    export let holdingBack: {
+        nodeId: number;
+        displayName: string;
+        freeGb: number;
+        pullFloorGb: number;
+    }[] = [];
 
     // The minimum supported redundancy. Below 2 tolerable failures the mesh is
     // still writing, but it is producing fragments that buy no node redundancy
@@ -69,7 +74,7 @@
 
     <StorageSummary {consumedGb} {capacityGb} {unrecoverableGb} {unplacedBuckets} />
 
-    {#each holdingBack as node (node.displayName)}
+    {#each holdingBack as node (node.nodeId)}
         <p class="mt-2 text-xs font-mono">
             <span class="text-yellow">{node.displayName} holding back:</span>
             <span class="text-subtitle">

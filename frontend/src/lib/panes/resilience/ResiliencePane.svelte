@@ -105,6 +105,7 @@
             severity: b.severity
         })),
         holdingBack: (view.storage.holding_back ?? []).map(n => ({
+            nodeId: n.node_id,
             displayName: n.display_name,
             freeGb: n.free_gb,
             pullFloorGb: n.pull_floor_gb

@@ -97,5 +97,5 @@
       { tolerance: 1, rawGb: 120 }
     ],
     unplacedBuckets: buckets(22, 0),
-    holdingBack: [{ displayName: 'macbook', freeGb: 0.1, pullFloorGb: 20 }]
+    holdingBack: [{ nodeId: 3, displayName: 'macbook', freeGb: 0.1, pullFloorGb: 20 }]
   }} />
