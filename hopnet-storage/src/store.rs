@@ -871,8 +871,8 @@ pub fn count_unplaced_blobs(conn: &rusqlite::Connection) -> Result<i64, rusqlite
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
     use rusqlite::OptionalExtension;
+    use std::str::FromStr;
 
     fn test_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1264,7 +1264,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(rows, 1, "one row per (hash, node) however many reports assert it");
+        assert_eq!(
+            rows, 1,
+            "one row per (hash, node) however many reports assert it"
+        );
         assert_eq!(
             inventory_row(&conn, 1, &hash),
             Some((Some(9), Some(7), 1)),

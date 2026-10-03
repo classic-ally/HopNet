@@ -158,16 +158,15 @@ impl HopNetApplication {
                 // at Sync — decided is decided, and the certificate
                 // carries the quorum's word.
                 let started = std::time::Instant::now();
-                let local = crate::db::snapshot::compute_artifact_hash_tx(db_tx).map_err(|e| {
-                    match e {
-                        crate::db::DatabaseError::Transient(code) => ValidateFailure::Transient(
-                            format!("vote-iff-match snapshot: {code:?}"),
-                        ),
-                        other => ValidateFailure::Semantic(format!(
-                            "vote-iff-match snapshot: {other:?}"
-                        )),
-                    }
-                })?;
+                let local =
+                    crate::db::snapshot::compute_artifact_hash_tx(db_tx).map_err(|e| match e {
+                        crate::db::DatabaseError::Transient(code) => {
+                            ValidateFailure::Transient(format!("vote-iff-match snapshot: {code:?}"))
+                        }
+                        other => {
+                            ValidateFailure::Semantic(format!("vote-iff-match snapshot: {other:?}"))
+                        }
+                    })?;
                 tracing::info!(
                     height = height.0,
                     elapsed_ms = started.elapsed().as_millis() as u64,

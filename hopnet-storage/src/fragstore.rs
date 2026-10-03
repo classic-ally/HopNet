@@ -390,10 +390,8 @@ mod tests {
     #[test]
     fn store_failure_leaves_no_temp_file() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "hopnet-fragstore-nowrite-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hopnet-fragstore-nowrite-{}", std::process::id()));
         let dir = dir.to_str().unwrap().to_string();
         let _ = fs::remove_dir_all(&dir);
         let data = b"doomed".to_vec();
@@ -420,10 +418,8 @@ mod tests {
     // unexpected without listing it anywhere.
     #[test]
     fn listing_separates_temp_files_from_fragments() {
-        let dir = std::env::temp_dir().join(format!(
-            "hopnet-fragstore-listing-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hopnet-fragstore-listing-{}", std::process::id()));
         let dir = dir.to_str().unwrap().to_string();
         let _ = fs::remove_dir_all(&dir);
         let data = b"kept".to_vec();

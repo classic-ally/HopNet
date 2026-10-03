@@ -193,7 +193,10 @@ mod tests {
         let temps = [temp(10, "old"), temp(99, "fresh"), temp(100, "at-cutoff")];
         assert_eq!(
             stale_temps(&temps, 100),
-            vec![std::path::PathBuf::from("old"), std::path::PathBuf::from("fresh")]
+            vec![
+                std::path::PathBuf::from("old"),
+                std::path::PathBuf::from("fresh")
+            ]
         );
         assert!(stale_temps(&temps, 5).is_empty());
     }
