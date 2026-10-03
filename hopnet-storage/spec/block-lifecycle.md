@@ -1300,6 +1300,51 @@ optimization and carries no proof obligation.
       and a wrong tick costs at most one tick's work. Still open: re-encode
       off the pull dispatch loop (its own budget), and a `GRACE`
       constant in `spec/storage_policy.qnt`.
+    - The pull floor (2026.10.9, decided with Allison). Incident
+      2026-10-03 ~20:31 UTC: under 2026.10.8 the macbook pulled at ~30
+      fetches/s and took its APFS volume from 2 GB free to 116 MB in a
+      minute. Placement gives every member an even share whatever its
+      disk, and nothing on the replica-write path checked free space.
+      Worse, a store that failed with ENOSPC was read as the holder not
+      serving the class, so the class went down the rebuild path:
+      fetch K shards to write more.
+      - A node-local guard (`admission::SpaceGuard`), not a consensus
+        rule. The ladder, lowest first: ingest floor (10 GiB,
+        `HOPNET_STORAGE_MIN_FREE_BYTES`, uploads refused) < pull floor
+        max(20 GiB, 2%) < resume mark (pull floor + max(10 GiB, 1%)) <
+        the eviction high watermark (90% used). Knobs
+        `HOPNET_PULL_MIN_FREE_BYTES` (0 disables), `_MIN_FREE_PCT`,
+        `_RESUME_FREE_BYTES` (the gap above the floor). Free space is
+        statvfs `f_bavail` (on APFS it excludes purgeable space, so it
+        errs low).
+      - Every replica write reserves its bytes on the same counter as
+        ingest before landing: pulled fragments, pull-path rebuilds,
+        re-encodes, the inbound store arm. A refusal pauses the guard;
+        while paused the dispatch loop takes nothing off the pull queue
+        and lazy re-encode waits, so owed blobs stay queued in the
+        planner's at-risk-first order with no failing, no parking, no
+        peer strike. A 30 s re-probe resumes at the resume mark. One
+        WARN on pausing, one INFO on resuming, a reminder at most every
+        30 min.
+      - Urgent re-encode (a chunk below the watermark) may still write
+        into the reserve between the pull floor and the ingest floor,
+        never below it.
+      - A held class is `FetchMiss::NoSpace` (`PullOutcome::held_for_space`),
+        never `NotServed`; an ENOSPC store maps to it as well and pauses
+        the guard.
+      - The node keeps serving while held back, so others pull its
+        classes, its blobs confirm and surplus release frees space: the
+        self-heal path for a node over its fair share (the macbook held
+        ~1.06M classes against ~537k).
+      - Visible in the tick report (`planner.scheduler.space`) and, mesh
+        wide, on the resilience pane: members whose last reported free
+        space is below the default pull floor show as holding back
+        (approximate; the node's own report is authoritative).
+      - Not covered: the read-through cache on `get` still writes
+        fragments it fetched (follow-up: reconstruct in memory). A
+        genuinely full mesh, where a node cannot hold even its fair
+        share, needs placement to know: "closed: keep what you hold,
+        give up what you don't" is a later RFC, with a model change.
   - Rehearsal (2026-09-27): `orchestrator test --test
     lifecycle-cutover-drain --flags blobs=N` — a mesh born on the
     deployed release image, populated, crosses into the build under

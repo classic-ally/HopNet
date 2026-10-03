@@ -47,6 +47,7 @@ pub(crate) mod photos_ingress_tombstone;
 pub(crate) mod photos_shared_library;
 mod post_files_mixed;
 mod post_files_shape;
+mod pull_floor;
 mod range_download;
 mod recents;
 pub(crate) mod reencode;
@@ -697,6 +698,11 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
+        "pull-floor-holds-back" => {
+            pull_floor::PullFloorHoldsBack
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -781,6 +787,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "mixed-files-and-folders-one-request",
         "db-pragma-bench",
         "upload-and-confirm-placement",
+        "pull-floor-holds-back",
     ]
 }
 
