@@ -475,8 +475,10 @@ impl Rotation {
 /// the node's lifetime, one shard (the hash's first byte, one first-level
 /// directory of the store) per step, paced so a rotation over all 256
 /// takes `ROTATION_TARGET_SECS`. The cursor is persisted after every
-/// step, so a restart resumes where it stopped. Belief is dishonest for
-/// at most one rotation.
+/// step that leaves the buffers drained, so a restart resumes at the
+/// first shard whose belief and truth had not yet gone out (at most a
+/// flush age of shards repeats). Belief is dishonest for at most one
+/// rotation.
 pub async fn run_rolling_sweep(app_state: AppState) {
     let per_shard = std::time::Duration::from_secs(ROTATION_TARGET_SECS)
         / hopnet_storage::sweep::SHARD_COUNT as u32;
@@ -522,19 +524,35 @@ pub async fn run_rolling_sweep(app_state: AppState) {
             finish_rotation(&app_state, done, cursor.started_height);
         }
         *cursor = next;
-        if let Err(e) = app_state
-            .db_pool
-            .get()
-            .map_err(|e| e.to_string())
-            .and_then(|conn| {
-                hopnet_storage::store::write_sweep_cursor(&conn, cursor).map_err(|e| e.to_string())
-            })
+        if let Some(durable) = cursor_to_persist(rotation, next)
+            && let Err(e) = app_state
+                .db_pool
+                .get()
+                .map_err(|e| e.to_string())
+                .and_then(|conn| {
+                    hopnet_storage::store::write_sweep_cursor(&conn, &durable)
+                        .map_err(|e| e.to_string())
+                })
         {
             tracing::warn!("sweep: cursor not saved: {e}");
         }
 
         tokio::time::sleep(per_shard.saturating_sub(step_started.elapsed())).await;
     }
+}
+
+/// The cursor a step may persist: only once both buffers are empty, i.e.
+/// every shard the cursor has passed has had its belief and truth handed
+/// to consensus. Saving past buffered work would let a restart drop it
+/// while the cursor claims the shards done — a node restarting faster than
+/// the flush age would "complete" rotations having sent nothing. Holding
+/// the save back costs a restart at most the shards since the last drain,
+/// swept again (idempotent).
+fn cursor_to_persist(
+    rotation: &Rotation,
+    next: hopnet_storage::sweep::SweepCursor,
+) -> Option<hopnet_storage::sweep::SweepCursor> {
+    (rotation.belief.is_empty() && rotation.truth.is_empty()).then_some(next)
 }
 
 /// The walker's starting point: the saved cursor, or a fresh rotation.
@@ -1630,6 +1648,29 @@ mod tests {
             (rot.report.belief_failed_pages, rot.report.attested_pages),
             (1, 1)
         );
+    }
+
+    // Impact: the cursor exists so a restart-looping node still completes
+    // rotations; saving it past shards whose belief and truth are only
+    // buffered in memory let a restart drop them while the cursor claimed
+    // them done (code review of PR #95).
+    // Should: persist the cursor once a flush has drained both buffers.
+    // Should not: persist it while either buffer still holds a passed
+    // shard's hashes.
+    #[tokio::test]
+    async fn cursor_is_persisted_only_after_the_buffers_drain() {
+        let rec = Recorder::default();
+        let mut rot = Rotation::new(7, 0);
+        let next = hopnet_storage::sweep::SweepCursor::fresh(0, 10);
+        assert_eq!(cursor_to_persist(&rot, next), Some(next), "empty buffers");
+
+        rot.truth.push(42, unix_now(), [h(1)]);
+        assert_eq!(cursor_to_persist(&rot, next), None, "truth buffered");
+        flush_buffers(&rec, &mut rot, true).await;
+        assert_eq!(cursor_to_persist(&rot, next), Some(next), "drained");
+
+        rot.belief.removed.push(42, unix_now(), [h(2)]);
+        assert_eq!(cursor_to_persist(&rot, next), None, "belief buffered");
     }
 
     // Should: hand each shard's scrub out once per day, and again on a
