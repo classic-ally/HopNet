@@ -621,6 +621,7 @@ where
         }
 
         let mut park = false;
+        let mut wait_for_rebuild_slot = false;
         // The rebuild rule: a class is rebuilt only when every holder has
         // left the storage view (filtered out above, so it arrives here as
         // unserved) or every reachable holder says it does not have it.
@@ -642,7 +643,7 @@ where
             // rather than hold a window slot while queued for one.
             let Ok(_rebuild) = sched.rebuild.clone().try_acquire_owned() else {
                 outcome.failed += unserved.len();
-                park = true;
+                wait_for_rebuild_slot = true;
                 continue;
             };
             let (transport, dark, view) = (&seams.transport, &dark, &members);
@@ -689,6 +690,9 @@ where
         if park {
             sched.park_blob(blob_id, now);
             tracing::debug!("pull: blob {blob_id} parked: its sources are unreachable");
+        } else if wait_for_rebuild_slot {
+            sched.park_blob_for_rebuild(blob_id, now);
+            tracing::debug!("pull: blob {blob_id} waits for a rebuild slot");
         } else if outcome.failed == 0 {
             sched.unpark_blob(blob_id);
         }
@@ -1191,7 +1195,12 @@ mod tests {
         .await
         .expect("the pull must not wait for a rebuild slot");
         assert_eq!(pulled.0.rebuilt, 0);
-        assert!(sched.blob_parked(&blob_id, std::time::Instant::now()));
+        let now = std::time::Instant::now();
+        assert!(sched.blob_parked(&blob_id, now));
+        assert!(
+            !sched.blob_parked(&blob_id, now + fetch::REBUILD_WAIT_PARK),
+            "a short flat wait, not the unreachable backoff"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

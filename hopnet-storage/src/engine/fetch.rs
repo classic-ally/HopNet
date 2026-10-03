@@ -78,6 +78,8 @@ pub const PEER_PARK_CAP: Duration = Duration::from_secs(600);
 /// First blob park; doubles per repeat, capped.
 pub const BLOB_PARK_BASE: Duration = Duration::from_secs(60);
 pub const BLOB_PARK_CAP: Duration = Duration::from_secs(1800);
+/// How long a blob waits out busy rebuild slots (flat, no backoff).
+pub const REBUILD_WAIT_PARK: Duration = Duration::from_secs(30);
 /// A park entry whose park ended this long ago is forgotten.
 pub const PARK_FORGET: Duration = Duration::from_secs(3600);
 /// How long the cached storage-view membership is reused.
@@ -321,6 +323,20 @@ impl FetchScheduler {
         });
         entry.until = now + backoff(BLOB_PARK_BASE, BLOB_PARK_CAP, entry.attempts);
         entry.attempts += 1;
+    }
+
+    /// Hold a blob out briefly because every rebuild slot is busy: a flat
+    /// `REBUILD_WAIT_PARK` that leaves the unreachable backoff alone, so a
+    /// rebuild-needing (often at-risk) blob is back as soon as a slot may
+    /// have freed. Never shortens a longer park already in force.
+    pub fn park_blob_for_rebuild(&self, blob_id: &BlobId, now: Instant) {
+        let mut blobs = self.blobs.lock().unwrap();
+        let entry = blobs.entry(blob_id.clone()).or_insert(BlobPark {
+            attempts: 0,
+            until: now,
+            since: now,
+        });
+        entry.until = entry.until.max(now + REBUILD_WAIT_PARK);
     }
 
     /// A blob that made progress (or turned out to owe nothing) leaves
@@ -868,6 +884,30 @@ mod tests {
             sched.record_peer_failure(2, PeerFailure::Timeout, t1 + Duration::from_secs(10 * i));
         }
         assert!(sched.peer_parked(2, t1 + Duration::from_secs(20)));
+    }
+
+    // Impact: third review of #96 — waiting for a rebuild slot used the
+    // doubling unreachable backoff, so rebuild-needing (often at-risk)
+    // blobs sat out minutes while slots idled.
+    // Should: hold a blob out for a flat short wait each time no rebuild
+    // slot is free.
+    // Should not: grow that wait, or bump the unreachable backoff.
+    #[test]
+    fn waiting_for_a_rebuild_slot_is_a_short_flat_park() {
+        use std::str::FromStr;
+        let sched = FetchScheduler::new(PullLimits::default());
+        let blob = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        let t0 = Instant::now();
+        for i in 0..4 {
+            let t = t0 + Duration::from_secs(100 * i);
+            sched.park_blob_for_rebuild(&blob, t);
+            assert!(sched.blob_parked(&blob, t + REBUILD_WAIT_PARK - Duration::from_secs(1)));
+            assert!(!sched.blob_parked(&blob, t + REBUILD_WAIT_PARK));
+        }
+        // The unreachable backoff still starts from its base.
+        let t = t0 + Duration::from_secs(1000);
+        sched.park_blob(&blob, t);
+        assert!(!sched.blob_parked(&blob, t + BLOB_PARK_BASE));
     }
 
     // Impact: re-review of #96 — park entries for blobs that became
