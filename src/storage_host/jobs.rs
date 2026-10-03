@@ -1550,7 +1550,12 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
             engine.set_urgent_reencodes(
                 urgent_cmds
                     .iter()
-                    .map(|c| (c.blob_id.clone(), c.chunk_number))
+                    .map(|c| {
+                        (
+                            (c.blob_id.clone(), c.chunk_number),
+                            c.missing_classes.clone(),
+                        )
+                    })
                     .collect(),
             );
             for cmd in urgent_cmds {

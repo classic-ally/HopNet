@@ -1287,10 +1287,11 @@ optimization and carries no proof obligation.
       copy per tick); the report adds `urgent_reencodes_pending`, and
       `urgent_reencodes` counts only newly queued chunks. Each tick also
       publishes its urgent set to the engine before queueing it, and the
-      dispatcher drops, unrun, a queued urgent chunk outside the latest
-      set, so a backlog built on a wrong view drains on the next tick
-      that sees the holders back and a wrong tick costs at most one
-      tick's work. Still open: re-encode
+      dispatcher runs a queued urgent chunk with the classes the latest
+      set owes for it (not those it was queued with) and drops it,
+      unrun, when the latest set owes it nothing, so a backlog built on
+      a wrong view drains on the next tick that sees the holders back
+      and a wrong tick costs at most one tick's work. Still open: re-encode
       off the pull dispatch loop (its own budget), and a `GRACE`
       constant in `spec/storage_policy.qnt`.
   - Rehearsal (2026-09-27): `orchestrator test --test

@@ -145,10 +145,10 @@ type PullRequest = BlobId;
 /// queued again.
 type UrgentPending = Arc<std::sync::Mutex<std::collections::HashSet<(BlobId, u32)>>>;
 
-/// The urgent set the latest policy tick owed, by (blob, chunk); `None`
-/// until a tick publishes one. A queued urgent re-encode outside it is
-/// dropped unrun.
-type UrgentLatest = Arc<std::sync::Mutex<Option<std::collections::HashSet<(BlobId, u32)>>>>;
+/// What the latest policy tick owes urgently: (blob, chunk) → the classes
+/// owed; `None` until a tick publishes one.
+pub type UrgentOwed = HashMap<(BlobId, u32), Vec<u32>>;
+type UrgentLatest = Arc<std::sync::Mutex<Option<UrgentOwed>>>;
 
 /// Blobs queued for (or in) a pull check, each with the callers waiting
 /// on its outcome. One entry per blob: a second request for a queued blob
@@ -349,12 +349,14 @@ impl EngineHandle {
         self.urgent_pending.lock().unwrap().len()
     }
 
-    /// The urgent set the latest policy tick owes, replacing the last one.
-    /// The tick publishes it every pass (empty included) BEFORE queueing
-    /// it; the dispatcher drops a queued urgent chunk outside it, so a
-    /// backlog built on a wrong view drains on the next tick that sees
-    /// the holders back.
-    pub fn set_urgent_reencodes(&self, owed: std::collections::HashSet<(BlobId, u32)>) {
+    /// What the latest policy tick owes urgently, per chunk with its
+    /// classes, replacing the last. The tick publishes it every pass
+    /// (empty included) BEFORE queueing it. At dequeue a queued urgent
+    /// re-encode runs the classes the latest tick owes for its chunk, not
+    /// the ones it was queued with, and is dropped when the latest tick
+    /// owes the chunk nothing: a backlog built on a wrong view drains on
+    /// the next tick that sees the holders back.
+    pub fn set_urgent_reencodes(&self, owed: UrgentOwed) {
         *self.urgent_latest.lock().unwrap() = Some(owed);
     }
 
@@ -402,7 +404,7 @@ impl EngineHandle {
                     cmd = reencode_urgent_rx.recv() => {
                         let Some(cmd) = cmd else { break };
                         let key = (cmd.blob_id.clone(), cmd.chunk_number);
-                        if still_owed(&worker_latest, &key) {
+                        if let Some(cmd) = still_owed(&worker_latest, cmd) {
                             run_reencode_guarded(&seams, &fragments_dir, cmd).await;
                         } else {
                             tracing::debug!(
@@ -481,14 +483,21 @@ impl EngineHandle {
     }
 }
 
-/// Whether the latest tick still owes this urgent chunk; before any tick
-/// has published a set, everything queued is.
-fn still_owed(latest: &UrgentLatest, key: &(BlobId, u32)) -> bool {
-    latest
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_none_or(|owed| owed.contains(key))
+/// The queued urgent command as the latest tick still owes it: with the
+/// classes the latest tick owes for its chunk (a class the tick no longer
+/// owes is not rebuilt; one it newly owes rides along), or `None` when it
+/// owes the chunk nothing. Before any tick has published, as queued.
+fn still_owed(latest: &UrgentLatest, mut cmd: ReencodeCmd) -> Option<ReencodeCmd> {
+    let latest = latest.lock().unwrap();
+    let Some(owed) = latest.as_ref() else {
+        return Some(cmd);
+    };
+    let classes = owed.get(&(cmd.blob_id.clone(), cmd.chunk_number))?;
+    if classes.is_empty() {
+        return None;
+    }
+    cmd.missing_classes.clone_from(classes);
+    Some(cmd)
 }
 
 /// Run one re-encode command as its own task and wait for it: still one
@@ -1898,7 +1907,7 @@ mod tests {
         // anything, after the urgent branch has had its turn.
         let other = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c902").unwrap();
 
-        engine.set_urgent_reencodes(HashSet::new());
+        engine.set_urgent_reencodes(HashMap::new());
         assert!(engine.enqueue_reencode(reencode_cmd(&blob_id, 0), true));
         engine.pull_blob(other.clone()).await.unwrap();
         assert_eq!(
@@ -1907,11 +1916,42 @@ mod tests {
         );
         assert_eq!(engine.urgent_reencodes_pending(), 0);
 
-        engine.set_urgent_reencodes(HashSet::from([(blob_id.clone(), 0)]));
+        engine.set_urgent_reencodes(HashMap::from([((blob_id.clone(), 0), vec![1])]));
         assert!(engine.enqueue_reencode(reencode_cmd(&blob_id, 0), true));
         engine.pull_blob(other).await.unwrap();
         assert!(state.view_calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: review of #99 — the stale-command filter keyed only on the
+    // chunk, so a command queued when a tick owed classes [1, 2] still
+    // rebuilt class 1 after the next tick owed only [2].
+    // Should: run a queued urgent command with the classes the latest tick
+    // owes for its chunk, not those it was queued with.
+    // Should not: run it when the latest tick owes the chunk nothing, or
+    // before that, filter anything until a tick has published.
+    #[test]
+    fn a_queued_urgent_reencode_runs_only_the_classes_the_latest_tick_owes() {
+        let a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        let queued = || ReencodeCmd {
+            blob_id: a.clone(),
+            chunk_number: 0,
+            missing_classes: vec![1, 2],
+        };
+        let latest: UrgentLatest = Default::default();
+        assert_eq!(
+            still_owed(&latest, queued()).unwrap().missing_classes,
+            vec![1, 2]
+        );
+
+        *latest.lock().unwrap() = Some(HashMap::from([((a.clone(), 0), vec![2])]));
+        assert_eq!(
+            still_owed(&latest, queued()).unwrap().missing_classes,
+            vec![2]
+        );
+
+        *latest.lock().unwrap() = Some(HashMap::from([((a.clone(), 1), vec![2])]));
+        assert!(still_owed(&latest, queued()).is_none());
     }
 
     // Impact: review of #96 — park entries for blobs that stopped being
