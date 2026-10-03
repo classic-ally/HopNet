@@ -52,6 +52,15 @@ pub const DECLARE_PAGE_SIZE: usize = 500;
 /// 6.5 MB transaction timed out in the queue (2026-10-01).
 pub const ATTEST_PAGE_SIZE: usize = 8192;
 
+/// The longest a pull's evidence waits in the evidence lane before a
+/// partial page is flushed — the rolling sweep's buffer age, so pull and
+/// sweep evidence age out of their buffers on the same clock.
+pub const EVIDENCE_MAX_AGE_SECS: u64 = 60;
+
+/// Blobs per `ConfirmPlacement` the evidence lane proposes. Block-size
+/// hygiene like the declare page: an entry is a blob id and a height.
+pub const CONFIRM_PAGE_SIZE: usize = 500;
+
 /// The staleness pass's grace rung: a node that has not observed the
 /// `desired < T` check (a proposal of its own, or anyone's declare page
 /// applying) for this long submits a page directly. Longer than the
