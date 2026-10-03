@@ -82,6 +82,8 @@ pub const BLOB_PARK_CAP: Duration = Duration::from_secs(1800);
 /// (subject to the rebuild slots and K sourceable shards): a holder dark
 /// for hours is as good as gone.
 pub const UNREACHABLE_ESCALATE: Duration = Duration::from_secs(2 * 3600);
+/// A park entry whose park ended this long ago is forgotten.
+pub const PARK_FORGET: Duration = Duration::from_secs(3600);
 /// How long the cached storage-view membership is reused.
 pub const MEMBERS_TTL: Duration = Duration::from_secs(60);
 
@@ -329,6 +331,17 @@ impl FetchScheduler {
     /// the park book.
     pub fn unpark_blob(&self, blob_id: &BlobId) {
         self.blobs.lock().unwrap().remove(blob_id);
+    }
+
+    /// Forget park entries whose park ended over `PARK_FORGET` ago: nothing
+    /// re-parked them since, so the blob was confirmed, deleted, or went
+    /// quiet. A blob still stuck is re-parked on every retry and keeps its
+    /// entry (and its escalation age). Returns how many were dropped.
+    pub fn prune_parks(&self, now: Instant) -> usize {
+        let mut blobs = self.blobs.lock().unwrap();
+        let before = blobs.len();
+        blobs.retain(|_, p| now.saturating_duration_since(p.until) < PARK_FORGET);
+        before - blobs.len()
     }
 
     /// How long the blob has been in the park book (since its first park,
@@ -858,6 +871,28 @@ mod tests {
             sched.record_peer_failure(2, PeerFailure::Timeout, t1 + Duration::from_secs(10 * i));
         }
         assert!(sched.peer_parked(2, t1 + Duration::from_secs(20)));
+    }
+
+    // Impact: re-review of #96 — park entries for blobs that became
+    // quiescent or were deleted while parked were never removed.
+    // Should: drop an entry whose park ended more than an hour ago.
+    // Should not: drop one still parked, or recently ended (a stuck blob
+    // re-parked on retry keeps its escalation age).
+    #[test]
+    fn stale_park_entries_are_pruned() {
+        use std::str::FromStr;
+        let sched = FetchScheduler::new(PullLimits::default());
+        let (stale, fresh) = (
+            BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap(),
+            BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c902").unwrap(),
+        );
+        let t0 = Instant::now();
+        sched.park_blob(&stale, t0);
+        let later = t0 + BLOB_PARK_BASE + PARK_FORGET + Duration::from_secs(1);
+        sched.park_blob(&fresh, later - Duration::from_secs(10));
+        assert_eq!(sched.prune_parks(later), 1);
+        assert!(sched.blob_parked_for(&stale, later).is_none());
+        assert!(sched.blob_parked_for(&fresh, later).is_some());
     }
 
     // Should: hold a parked blob out until its backoff passes, double the

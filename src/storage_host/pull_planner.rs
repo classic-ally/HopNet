@@ -202,6 +202,13 @@ async fn run(app_state: AppState) {
                 "pull planner: slice planned"
             );
         }
+        if resume.is_none() {
+            // A full walk ended: forget parks nothing has renewed.
+            let pruned = engine.prune_parks();
+            if pruned > 0 {
+                tracing::debug!(pruned, "pull planner: stale park entries dropped");
+            }
+        }
         tokio::time::sleep(pass_rest(found_work, resume.is_none(), started.elapsed())).await;
     }
 }

@@ -232,6 +232,12 @@ impl EngineHandle {
         self.sched.blob_parked(blob_id, std::time::Instant::now())
     }
 
+    /// Drop park entries nobody has re-parked for an hour (blobs that went
+    /// quiescent or were deleted while parked). Returns how many.
+    pub fn prune_parks(&self) -> usize {
+        self.sched.prune_parks(std::time::Instant::now())
+    }
+
     /// Pull check for one blob, run in the window; resolves when it
     /// completes. `None` = engine gone.
     pub async fn pull_blob(&self, blob_id: BlobId) -> Option<PullOutcome> {
