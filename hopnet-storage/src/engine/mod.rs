@@ -41,7 +41,7 @@ use crate::traits::{LocalStateSink, StateReader, Transport, TxSubmitter};
 use crate::types::BlobId;
 use fetch::{FetchMiss, FetchScheduler, PullLimits};
 use hopnet_common::Blake3Hash;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -136,7 +136,39 @@ pub struct ReencodeCmd {
     pub missing_classes: Vec<u32>,
 }
 
-type PullRequest = (BlobId, Option<oneshot::Sender<PullOutcome>>);
+type PullRequest = BlobId;
+
+/// Blobs queued for (or in) a pull check, each with the callers waiting
+/// on its outcome. One entry per blob: a second request for a queued blob
+/// waits on the same check instead of queueing a duplicate.
+type PullQueue = Arc<std::sync::Mutex<HashMap<BlobId, Vec<oneshot::Sender<PullOutcome>>>>>;
+
+/// Takes a blob out of the queue when its check ends — normally by
+/// `finish`, which answers the waiters; if the check panics, on drop, so
+/// the blob can be queued again (its waiters see the engine as gone).
+struct QueuedEntry {
+    queue: PullQueue,
+    blob_id: Option<BlobId>,
+}
+
+impl QueuedEntry {
+    fn finish(mut self, outcome: PullOutcome) {
+        if let Some(blob_id) = self.blob_id.take() {
+            let waiters = self.queue.lock().unwrap().remove(&blob_id);
+            for waiter in waiters.into_iter().flatten() {
+                let _ = waiter.send(outcome);
+            }
+        }
+    }
+}
+
+impl Drop for QueuedEntry {
+    fn drop(&mut self) {
+        if let Some(blob_id) = self.blob_id.take() {
+            self.queue.lock().unwrap().remove(&blob_id);
+        }
+    }
+}
 
 /// Handle to the running engine. Cheap to clone; the host stores one in its
 /// app state (mirrors the consensus EngineHandle pattern).
@@ -147,7 +179,7 @@ pub struct EngineHandle {
     reencode_lazy_tx: mpsc::UnboundedSender<ReencodeCmd>,
     /// Blobs waiting for (or in) a pull check: hints for a blob already
     /// queued are dropped, and the planner paces itself on the count.
-    queued: Arc<std::sync::Mutex<HashSet<BlobId>>>,
+    queued: PullQueue,
     sched: Arc<FetchScheduler>,
 }
 
@@ -164,13 +196,21 @@ impl EngineHandle {
     /// Queue a pull check for `blob_id` unless one is already queued.
     /// Returns whether it was queued.
     pub fn offer(&self, blob_id: BlobId) -> bool {
-        if !self.queued.lock().unwrap().insert(blob_id.clone()) {
+        self.enqueue(blob_id, None)
+    }
+
+    /// The one way into the queue: a blob already queued gains a waiter
+    /// (if any) and is not sent again. Returns whether it was newly queued.
+    fn enqueue(&self, blob_id: BlobId, waiter: Option<oneshot::Sender<PullOutcome>>) -> bool {
+        let mut queued = self.queued.lock().unwrap();
+        if let Some(waiters) = queued.get_mut(&blob_id) {
+            waiters.extend(waiter);
             return false;
         }
-        if self.pull_tx.send((blob_id.clone(), None)).is_err() {
-            self.queued.lock().unwrap().remove(&blob_id);
+        if self.pull_tx.send(blob_id.clone()).is_err() {
             return false;
         }
+        queued.insert(blob_id, waiter.into_iter().collect());
         true
     }
 
@@ -190,10 +230,8 @@ impl EngineHandle {
     /// completes. `None` = engine gone.
     pub async fn pull_blob(&self, blob_id: BlobId) -> Option<PullOutcome> {
         let (tx, rx) = oneshot::channel();
-        // Always queued (the caller waits on this exact check); counted so
-        // the planner's pacing sees operator work too.
-        self.queued.lock().unwrap().insert(blob_id.clone());
-        self.pull_tx.send((blob_id, Some(tx))).ok()?;
+        // A blob already queued is waited on, not queued twice.
+        self.enqueue(blob_id, Some(tx));
         rx.await.ok()
     }
 
@@ -205,12 +243,7 @@ impl EngineHandle {
         let mut waiting = Vec::new();
         for blob_id in blob_ids {
             let (tx, rx) = oneshot::channel();
-            self.queued.lock().unwrap().insert(blob_id.clone());
-            if self.pull_tx.send((blob_id.clone(), Some(tx))).is_err() {
-                stats.checked += 1;
-                stats.failed += 1;
-                continue;
-            }
+            self.enqueue(blob_id.clone(), Some(tx));
             waiting.push((blob_id, rx));
         }
         for (blob_id, rx) in waiting {
@@ -269,7 +302,7 @@ impl EngineHandle {
         let (reencode_lazy_tx, mut reencode_lazy_rx) = mpsc::unbounded_channel::<ReencodeCmd>();
 
         let fragments_dir = config.fragments_dir;
-        let queued: Arc<std::sync::Mutex<HashSet<BlobId>>> = Default::default();
+        let queued: PullQueue = Default::default();
         let worker_queued = queued.clone();
         let sched = FetchScheduler::new(config.limits);
         let worker_sched = sched.clone();
@@ -289,23 +322,25 @@ impl EngineHandle {
                         let permit = worker_sched.window.clone().acquire_owned().await;
                         (permit, pull_rx.recv().await)
                     } => {
-                        let (Ok(permit), Some((blob_id, reply))) = admitted else { break };
+                        let (Ok(permit), Some(blob_id)) = admitted else { break };
+                        let entry = QueuedEntry {
+                            queue: worker_queued.clone(),
+                            blob_id: Some(blob_id.clone()),
+                        };
                         if worker_sched.blob_parked(&blob_id, std::time::Instant::now()) {
                             // Its sources are dark: let the window move on.
-                            worker_queued.lock().unwrap().remove(&blob_id);
-                            if let Some(reply) = reply {
-                                let _ = reply.send(PullOutcome::default());
-                            }
+                            entry.finish(PullOutcome::default());
                             continue;
                         }
-                        let (seams, dir, lane, sched, queued) = (
+                        let (seams, dir, lane, sched) = (
                             seams.clone(),
                             fragments_dir.clone(),
                             lane.clone(),
                             worker_sched.clone(),
-                            worker_queued.clone(),
                         );
                         running.spawn(async move {
+                            // Dropped on panic too: the blob leaves the queue.
+                            let entry = entry;
                             let outcome = match pull_owed(&seams, &dir, &blob_id, &lane, &sched).await {
                                 Ok(o) => o,
                                 Err(e) => {
@@ -314,10 +349,7 @@ impl EngineHandle {
                                 }
                             };
                             drop(permit);
-                            queued.lock().unwrap().remove(&blob_id);
-                            if let Some(reply) = reply {
-                                let _ = reply.send(outcome);
-                            }
+                            entry.finish(outcome);
                         });
                     }
                     cmd = reencode_lazy_rx.recv() => {
@@ -391,9 +423,11 @@ where
     let Some(target) = seams.state.pull_target(blob_id)? else {
         // Unknown blob (raced a delete), or the record does not reach the
         // goal yet: nothing is owed until it does.
+        sched.unpark_blob(blob_id);
         return Ok(outcome);
     };
     let Some(manifest) = seams.state.blob_manifest(blob_id)? else {
+        sched.unpark_blob(blob_id);
         return Ok(outcome);
     };
     let me = seams
@@ -420,6 +454,11 @@ where
         }
     }
     outcome.owed = owed.values().map(Vec::len).sum();
+    if outcome.owed == 0 {
+        // Owing nothing (pulled since, or re-goaled away): it has no
+        // business in the park book.
+        sched.unpark_blob(blob_id);
+    }
 
     if outcome.owed > 0 {
         let hashes: Vec<Blake3Hash> = owed.values().flatten().map(|(_, h)| *h).collect();
@@ -1087,12 +1126,65 @@ mod tests {
         assert!(engine.offer(b.clone()));
         assert_eq!(engine.queued_len(), 2);
 
-        // A reply-carrying check queues behind them; once it resolves the
-        // worker has drained everything ahead of it.
-        let c = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c903").unwrap();
-        engine.pull_blob(c).await.unwrap();
+        // A caller waiting on a queued blob waits on that same check.
+        let (tx, rx) = oneshot::channel();
+        assert!(!engine.enqueue(a.clone(), Some(tx)), "waits, not re-queued");
+        assert_eq!(engine.queued_len(), 2);
+        rx.await.unwrap();
+        engine.pull_blob(b).await.unwrap();
         assert_eq!(engine.queued_len(), 0);
         assert!(engine.offer(a), "re-offered after its check finished");
+    }
+
+    // Impact: review of #96 — a panicking pull task left its blob in the
+    // queue forever, so it could never be offered again and the planner's
+    // queue depth only grew.
+    // Should: take the blob out of the queue when its check panics.
+    #[tokio::test]
+    async fn a_panicking_check_leaves_the_queue() {
+        let queue: PullQueue = Default::default();
+        let a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        queue.lock().unwrap().insert(a.clone(), Vec::new());
+        let entry = QueuedEntry {
+            queue: queue.clone(),
+            blob_id: Some(a.clone()),
+        };
+        let task = tokio::spawn(async move {
+            let _entry = entry;
+            panic!("pull check panicked");
+        });
+        assert!(task.await.is_err());
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    // Impact: review of #96 — park entries for blobs that stopped being
+    // owed were never removed, so the park book grew without bound.
+    // Should: drop a blob's park entry once a check finds it owes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_owing_nothing_leaves_the_park_book() {
+        let base = std::env::temp_dir().join(format!("hopnet-unpark-{}", std::process::id()));
+        let dir = base.join("held").to_str().unwrap().to_string();
+        let (blob_id, _outcome, mut manifest) = encoded_blob(&dir).await;
+        for (originals, recovery) in manifest.chunks.values_mut() {
+            for entry in originals.values_mut().chain(recovery.values_mut()) {
+                entry.2 = true;
+            }
+        }
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(PullTarget {
+                placement_height: Some(5),
+                desired: 9,
+                assignment: vec![1; crate::rs::TOTAL_FRAGMENTS_PER_CHUNK],
+            }),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        let sched = FetchScheduler::new(PullLimits::default());
+        sched.park_blob(&blob_id, std::time::Instant::now());
+        let (result, _) = pull_with_sched(&seams(net), &dir, &blob_id, &sched).await;
+        assert_eq!(result.owed, 0);
+        assert_eq!(sched.stats(std::time::Instant::now()).parked_blobs, 0);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // Should: pull every class this node owes under the goal from a
