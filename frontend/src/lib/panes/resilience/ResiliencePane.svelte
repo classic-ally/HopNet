@@ -103,6 +103,11 @@
             label: b.label,
             gb: b.gb,
             severity: b.severity
+        })),
+        holdingBack: (view.storage.holding_back ?? []).map(n => ({
+            displayName: n.display_name,
+            freeGb: n.free_gb,
+            pullFloorGb: n.pull_floor_gb
         }))
     };
 

@@ -87,3 +87,15 @@
     unreachableMembers: 2,
     unplacedBuckets: buckets(0, 0)
   }} />
+
+<!-- A member below its pull floor: still serving, taking on no copies -->
+<Story name="Member holding back for space" {template}
+  args={{
+    curve,
+    observedLevels: [
+      { tolerance: 2, rawGb: 300 },
+      { tolerance: 1, rawGb: 120 }
+    ],
+    unplacedBuckets: buckets(22, 0),
+    holdingBack: [{ displayName: 'macbook', freeGb: 0.1, pullFloorGb: 20 }]
+  }} />

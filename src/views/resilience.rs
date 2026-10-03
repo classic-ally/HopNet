@@ -15,9 +15,9 @@ use r2d2_sqlite::SqliteConnectionManager;
 
 use hopnet_common::db::{FaultToleranceCurvePoint, NodeStorageBaseline};
 use hopnet_common::views::{
-    AgeBucketView, AgeSeverity, ConsensusPanelView, EtaTierView, EtaView, LifecycleView,
-    NodeVerificationView, PercentilesView, ResilienceLevelBytes, StoragePanelView, TransferView,
-    UnplacedBucket, UnplacedSeverity, VerificationView,
+    AgeBucketView, AgeSeverity, ConsensusPanelView, EtaTierView, EtaView, HoldingBackNode,
+    LifecycleView, NodeVerificationView, PercentilesView, ResilienceLevelBytes, StoragePanelView,
+    TransferView, UnplacedBucket, UnplacedSeverity, VerificationView,
 };
 use hopnet_storage::observe;
 
@@ -72,6 +72,67 @@ pub struct StorageParts {
     /// and whether the bounded scan was cut short. Behind the TTL with the
     /// other scans because it walks the in-flight set.
     pub owed_pull: (u64, bool),
+    /// Each node's last reported disk (replicated metrics), for the
+    /// "holding back for space" flag.
+    pub disks: Vec<NodeDisk>,
+}
+
+/// A node's latest reported volume, in GiB.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeDisk {
+    pub node_id: i32,
+    pub display_name: String,
+    pub total_gb: f64,
+    pub used_gb: f64,
+}
+
+/// Latest `metrics` disk report per node.
+fn node_disks(conn: &rusqlite::Connection) -> Result<Vec<NodeDisk>, DatabaseError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT n.node_id, COALESCE(n.name, 'Node ' || n.node_id), m.storage_total_gb, m.storage_used_gb
+             FROM nodes n
+             JOIN (SELECT to_node, storage_total_gb, storage_used_gb,
+                          ROW_NUMBER() OVER (PARTITION BY to_node ORDER BY height DESC, start_time DESC) AS rn
+                   FROM metrics WHERE storage_total_gb > 0) m
+               ON m.to_node = n.node_id AND m.rn = 1",
+        )
+        .map_err(|_| DatabaseError::ProcessingError)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(NodeDisk {
+                node_id: r.get(0)?,
+                display_name: r.get(1)?,
+                total_gb: r.get(2)?,
+                used_gb: r.get(3)?,
+            })
+        })
+        .map_err(|_| DatabaseError::ProcessingError)?;
+    rows.collect::<Result<_, _>>()
+        .map_err(|_| DatabaseError::ProcessingError)
+}
+
+/// Members whose last reported free space is below the default pull floor
+/// for their volume (`admission::PullFloor::default()` over the default
+/// ingest floor): approximate, since a node may override its knobs.
+fn holding_back(disks: &[NodeDisk], member_ids: &[i32]) -> Vec<HoldingBackNode> {
+    let floor = hopnet_storage::admission::PullFloor::default();
+    let ingest = hopnet_storage::admission::DEFAULT_MIN_FREE_BYTES;
+    disks
+        .iter()
+        .filter(|d| member_ids.contains(&d.node_id))
+        .filter_map(|d| {
+            let total = (d.total_gb * BYTES_PER_GB) as u64;
+            let free = ((d.total_gb - d.used_gb).max(0.0) * BYTES_PER_GB) as u64;
+            let (pull_floor, _) = floor.marks(total, ingest);
+            (free <= pull_floor).then(|| HoldingBackNode {
+                node_id: d.node_id,
+                display_name: d.display_name.clone(),
+                free_gb: free as f64 / BYTES_PER_GB,
+                pull_floor_gb: pull_floor as f64 / BYTES_PER_GB,
+            })
+        })
+        .collect()
 }
 
 struct Cached {
@@ -245,6 +306,7 @@ pub fn storage_parts(
             .map_err(|_| DatabaseError::ProcessingError)?,
         None => (0, false),
     };
+    let disks = node_disks(conn)?;
 
     Ok(StorageParts {
         member_ids,
@@ -253,6 +315,7 @@ pub fn storage_parts(
         curve,
         unplaced,
         owed_pull,
+        disks,
     })
 }
 
@@ -428,6 +491,7 @@ pub fn storage_view(
         unknown_gb,
         unreachable_members,
         unplaced_buckets,
+        holding_back: holding_back(&parts.disks, &parts.member_ids),
         lifecycle,
         verification,
         transfers: TransferView {
@@ -677,12 +741,37 @@ mod tests {
         );
     }
 
+    // Should: flag a member whose reported free space is at or below the
+    // default pull floor for its volume (max(20 GiB, 2%)).
+    // Should not: flag a member above it, or a node outside the storage view.
+    #[test]
+    fn holding_back_flags_members_below_the_pull_floor() {
+        let disk = |node_id, total_gb: f64, used_gb: f64| NodeDisk {
+            node_id,
+            display_name: format!("n{node_id}"),
+            total_gb,
+            used_gb,
+        };
+        let disks = vec![
+            disk(1, 927.0, 926.0),
+            disk(2, 2000.0, 1000.0),
+            disk(3, 12000.0, 11800.0),
+            disk(4, 927.0, 926.0),
+        ];
+        let flagged = holding_back(&disks, &[1, 2, 3]);
+        let ids: Vec<i32> = flagged.iter().map(|n| n.node_id).collect();
+        assert_eq!(ids, vec![1, 3]);
+        assert_eq!(flagged[0].pull_floor_gb, 20.0);
+        assert!((flagged[1].pull_floor_gb - 240.0).abs() < 0.01);
+    }
+
     fn parts_reporting(user_data_gb: f64) -> StorageParts {
         StorageParts {
             member_ids: vec![1, 2, 3],
             levels: vec![(2, 4096.0)],
             baselines: vec![],
             owed_pull: (0, false),
+            disks: vec![],
             curve: vec![FaultToleranceCurvePoint {
                 user_data_gb,
                 active_nodes: 3,

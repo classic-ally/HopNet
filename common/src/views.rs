@@ -120,6 +120,13 @@ pub struct StoragePanelView {
     /// Unplaced volume by age, youngest first.
     pub unplaced_buckets: Vec<UnplacedBucket>,
 
+    /// Members whose last reported free space is below the default pull
+    /// floor: they still serve, but take on no copies until free space is
+    /// back at their resume mark. Approximate (replicated metrics, default
+    /// marks); the node's own tick report is authoritative.
+    #[serde(default)]
+    pub holding_back: Vec<HoldingBackNode>,
+
     /// RFC-STORAGE-003 S7: the lifecycle's own work-list predicates.
     pub lifecycle: LifecycleView,
     /// Disk-truth freshness per holder.
@@ -286,6 +293,20 @@ pub struct ResilienceLevelBytes {
     /// Raw user plaintext bytes, from `data_blocks.file_size`. NOT
     /// post-erasure-coding, so it shares the curve's x-axis.
     pub raw_gb: f64,
+}
+
+/// A member holding back replica writes for space (below its pull floor).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[typeshare]
+pub struct HoldingBackNode {
+    pub node_id: i32,
+    pub display_name: String,
+    /// Last reported free space (GiB).
+    #[typeshare(serialized_as = "number")]
+    pub free_gb: f64,
+    /// The default pull floor for its volume (GiB).
+    #[typeshare(serialized_as = "number")]
+    pub pull_floor_gb: f64,
 }
 
 /// One age decade of unplaced data.
