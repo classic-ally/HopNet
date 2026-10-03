@@ -2491,14 +2491,16 @@ pub(crate) mod tests {
         // Simulate the pre-chain sealed shape by reverting every
         // post-baseline step: identity 0001 (schema_ordinals), storage
         // 0002 (RFC-STORAGE-003: the goal column, its indexes, the
-        // transition record), storage 0003 (the disk-truth columns) and
-        // storage 0004 (the held-fragment index).
+        // transition record), storage 0003 (the disk-truth columns),
+        // storage 0004 (the held-fragment index) and storage 0005 (the
+        // sweep cursor).
         // Fingerprints compare DDL text, so the reverts must restore the
         // baseline statements byte for byte.
         {
             let conn = open(&db_path);
             conn.execute_batch(
                 "DROP TABLE schema_ordinals;
+                 DROP TABLE hopnet_storage_sweep_cursor;
                  DROP INDEX idx_fragment_hashes_local;
                  DROP INDEX idx_fragment_inventory_verified;
                  ALTER TABLE fragment_inventory DROP COLUMN suspect;

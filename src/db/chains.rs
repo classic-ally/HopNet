@@ -985,6 +985,29 @@ mod tests {
     const STEP_FIXTURE_STORAGE_0004_HASH: &str =
         "5e27cb2c3b7cf731a98b443cb3ecc9b4fb24753fff9d494e6934201e7cc46343";
 
+    // Should: add the empty node-local sweep cursor table without touching
+    // any replicated row.
+    // Impact: the rolling sweep's cursor; the step is pure DDL and must
+    // replay identically.
+    #[test]
+    fn step_fixture_storage_0005_sweep_cursor() {
+        let hash = run_step_fixture(
+            "storage",
+            5,
+            "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes, file_size)
+             VALUES ('01890a5d-ac96-774b-b9aa-9f8b24f0c9a1', X'00', 1, 0, 1);",
+        );
+        assert_eq!(
+            hash, STEP_FIXTURE_STORAGE_0005_HASH,
+            "storage/0005 output moved — a released step may never change \
+             (contract rules 1-2); if this is an intentional pre-release \
+             redefinition, re-pin in the same commit"
+        );
+    }
+
+    const STEP_FIXTURE_STORAGE_0005_HASH: &str =
+        "aed7136eb9338e287a765b1079a1de7d6738604335a1f7e15b04aadf48065480";
+
     // Should: land the documented backfill values, not just a stable hash.
     #[test]
     fn storage_0002_backfill_values() {

@@ -93,12 +93,15 @@ pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionS
     // the covered set is unchanged, but the format_version is part of the
     // serialized bytes, so storage@3 artifacts import through the frozen
     // v3 spec below (re-serializing at 4 cannot reproduce their hash).
-    format_version: 4,
+    // v5 (rolling sweep): storage step 0005 adds the node-local sweep
+    // cursor; the covered set is unchanged, and storage@4 artifacts import
+    // through the frozen v4 spec below.
+    format_version: 5,
     tables: STORAGE_TABLES,
 };
 
-/// The covered tables shared by every spec since v3: the index-only v4
-/// bump changed no table or column.
+/// The covered tables shared by every spec since v3: the v4 (index) and
+/// v5 (node-local cursor) bumps changed no covered table or column.
 const STORAGE_TABLES: &[hopnet_common::TableSpec] = &[
     hopnet_common::TableSpec::exported("data_blocks"),
     hopnet_common::TableSpec::exported("storage_view_transitions"),
@@ -126,6 +129,17 @@ pub const PRE_SCAN_INDEX_SNAPSHOT_SECTION: hopnet_common::SectionSpec =
     hopnet_common::SectionSpec {
         name: "storage",
         format_version: 3,
+        tables: STORAGE_TABLES,
+    };
+
+/// The storage section as sealed by 2026.10.5 and 2026.10.6 (ordinal 4).
+/// FROZEN — the import mapping for storage@4 artifacts (the epoch-11 seal
+/// and the previous-release join fixture). Identical tables; only the
+/// hashed format_version differs.
+pub const PRE_ROLLING_SWEEP_SNAPSHOT_SECTION: hopnet_common::SectionSpec =
+    hopnet_common::SectionSpec {
+        name: "storage",
+        format_version: 4,
         tables: STORAGE_TABLES,
     };
 
@@ -187,7 +201,7 @@ pub const PRE_LIFECYCLE_SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_co
 };
 
 /// Node-local tables — outside the snapshot universe entirely.
-pub const NODE_LOCAL_TABLES: &[&str] = &["hopnet_storage_pins"];
+pub const NODE_LOCAL_TABLES: &[&str] = &["hopnet_storage_pins", "hopnet_storage_sweep_cursor"];
 
 /// This module's schema chain (RFC-020): replay is the only installer.
 /// Head ordinal == SNAPSHOT_SECTION.format_version, pinned by host
@@ -214,6 +228,11 @@ pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
             4,
             "scan_indexes",
             include_str!("../migrations/storage/0004_scan_indexes.sql"),
+        ),
+        hopnet_common::Step::sql(
+            5,
+            "sweep_cursor",
+            include_str!("../migrations/storage/0005_sweep_cursor.sql"),
         ),
     ],
 };

@@ -295,6 +295,14 @@ CREATE INDEX idx_fragment_inventory_verified ON fragment_inventory (node_id, ver
 
 CREATE INDEX idx_fragment_hashes_local ON fragment_hashes (fragment_hash) WHERE stored_locally = 1;
 
+CREATE TABLE hopnet_storage_sweep_cursor (
+    id                      INTEGER PRIMARY KEY CHECK (id = 1),
+    next_shard              INTEGER NOT NULL CHECK (next_shard BETWEEN 0 AND 255),
+    rotation                INTEGER NOT NULL DEFAULT 0,
+    rotation_started_unix   INTEGER NOT NULL,
+    rotation_started_height INTEGER NOT NULL
+);
+
 CREATE TABLE inodes (
             -- stable identifier for FileProvider (UUIDv7 encodes creation time)
             id              TEXT UNIQUE NOT NULL,
