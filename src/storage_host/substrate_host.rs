@@ -55,6 +55,9 @@ pub fn spawn_storage_engine(app_state: &AppState) {
     );
     // Lost race = another spawner won; their engine is equivalent.
     let _ = app_state.storage.set(handle);
+    // The planner is what wakes the worker for the in-flight set; the
+    // policy tick restarts it if it ever stops.
+    crate::storage_host::pull_planner::ensure_running(app_state);
 }
 
 /// Seam bundle for the crate's get path (api::get) — one shared adapter

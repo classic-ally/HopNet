@@ -157,12 +157,11 @@ async fn cleanup_orphaned_data_blocks(
 }
 
 /// The operator's AWAITED obligation check (`POST /maintenance/rebalance-network`,
-/// RFC-STORAGE-003 S3): run up to `max_data_blocks` in-flight blobs — goal
-/// not yet confirmed, oldest goal first — through this node's reconciler
-/// and report what it pulled. The tick does not use this: it wakes the
-/// worker without waiting (`kick_in_flight`). Every kick is idempotent;
-/// the in-flight set is the work-list and a blob leaves it at confirm, so
-/// no cursor exists to starve. `min_age_heights` is accepted for the
+/// RFC-STORAGE-003 S3): run up to `max_data_blocks` in-flight blobs
+/// through this node's reconciler, in the pull planner's order (blobs
+/// this node owes, at-risk first), and report what it pulled. The planner
+/// itself feeds the worker continuously; this is the operator's awaited
+/// drain over the same plan. `min_age_heights` is accepted for the
 /// route's compatibility and ignored: need is need.
 pub async fn run_network_rebalancing(
     app_state: &AppState,
@@ -184,21 +183,19 @@ pub async fn run_network_rebalancing(
         }
     };
 
-    // Scoped checkout, dropped before the engine's data plane runs.
-    let in_flight = {
-        let conn = app_state.db_pool.get().map_err(|e| {
-            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
-                "Failed to get database connection: {:?}",
-                e
-            )))))
-        })?;
-        hopnet_storage::lifecycle::in_flight_blobs(&conn, max_data_blocks.max(0) as usize).map_err(
-            |e| {
-                Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
-                    "Failed to select in-flight blobs: {e}"
-                )))))
-            },
-        )?
+    // One planning pass on the blocking pool (a fresh connection per
+    // page), dropped before the engine's data plane runs.
+    let in_flight: Vec<hopnet_storage::BlobId> = {
+        let app_state = app_state.clone();
+        tokio::task::spawn_blocking(move || crate::storage_host::pull_planner::plan(&app_state))
+            .await
+            .map_err(|e| Error::Failed(Arc::new(format!("plan join: {e}").into())))?
+            .map_err(|e| Error::Failed(Arc::new(format!("plan: {e}").into())))?
+            .0
+            .into_iter()
+            .take(max_data_blocks.max(0) as usize)
+            .map(|item| item.blob_id)
+            .collect()
     };
 
     let Some(storage) = app_state.storage.get() else {
@@ -276,38 +273,6 @@ pub async fn propose_ready_confirmations(
         }
     }
     Ok(proposed)
-}
-
-/// The tick's in-flight re-kick (RFC-STORAGE-003 S3): wake this node's
-/// reconciler for up to `limit` in-flight blobs, oldest goal first, and
-/// return at once with how many were enqueued. NON-BLOCKING — the worker
-/// pulls (and attests, and proposes for births and moved bytes) on its own
-/// time; the tick never waits on a consensus round it did not submit.
-/// Level-triggered: any blob a hint missed is found here next tick.
-async fn kick_in_flight(app_state: &AppState, limit: usize) -> Result<usize, Error> {
-    // Scoped checkout on the blocking pool, dropped before the engine is
-    // touched.
-    let blob_ids = {
-        let pool = app_state.db_pool.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
-            hopnet_storage::lifecycle::in_flight_blobs(&conn, limit)
-                .map_err(|e| format!("in-flight page: {e}"))
-        })
-        .await
-        .map_err(|e| Error::Failed(Arc::new(format!("in-flight join: {e}").into())))?
-        .map_err(|e| Error::Failed(Arc::new(e.into())))?
-    };
-    let Some(storage) = app_state.storage.get() else {
-        return Err(Error::Failed(Arc::new(
-            "storage engine not running".to_string().into(),
-        )));
-    };
-    let kicked = blob_ids.len();
-    for blob_id in blob_ids {
-        storage.notify_blob_committed(blob_id);
-    }
-    Ok(kicked)
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -1302,8 +1267,9 @@ pub struct PolicyTickReport {
     pub lazy_chunks_owed: usize,
     pub urgent_reencodes: usize,
     pub lazy_reencodes: usize,
-    /// In-flight blobs handed to the reconciler this tick (a wake-up, not
-    /// a result — the worker pulls on its own time).
+    /// Blobs the pull planner has handed the reconciler since its current
+    /// pass started (a wake-up, not a result — the worker pulls on its
+    /// own time).
     pub pull_kicks: usize,
     /// Confirmations proposed by the fulfillment pass, across its rounds.
     pub confirms_proposed: usize,
@@ -1312,6 +1278,8 @@ pub struct PolicyTickReport {
     /// Wall time of the repair scan (plus its goal lookups), so a tick that
     /// overruns its 5-minute cron is visible without a profiler.
     pub scan_ms: u64,
+    /// The pull planner's last pass and its feed (RFC-STORAGE-003 S3).
+    pub planner: crate::storage_host::pull_planner::PlannerReport,
 }
 
 /// The engine policy tick (RFC-STORAGE-001 Repair; RFC-STORAGE-002 S6):
@@ -1534,21 +1502,15 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
         0
     });
 
-    // (3b) The obligation check (RFC-STORAGE-003 S3): wake the reconciler
-    // for a bounded page of in-flight blobs, oldest goal first — it pulls
-    // what each goal owes this node, attests, and proposes for births and
-    // moved bytes. Non-blocking: the tick returns in seconds whatever the
-    // worker's backlog. Level-triggered: any blob a hint missed is found
-    // here next tick.
-    let pull_kicks = kick_in_flight(
-        app_state,
-        hopnet_storage::engine::policy::PULL_KICKS_PER_TICK,
-    )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!("in-flight re-kick failed: {e}");
-        0
-    });
+    // (3b) The obligation check (RFC-STORAGE-003 S3) is the pull planner's
+    // (`pull_planner`): it walks the whole in-flight set, keeps what this
+    // node owes, orders it at-risk first and feeds the worker as it
+    // drains. The tick only keeps it alive and reports on it.
+    if crate::storage_host::pull_planner::ensure_running(app_state) {
+        tracing::info!("policy tick: pull planner started");
+    }
+    let planner = crate::storage_host::pull_planner::report(app_state);
+    let pull_kicks = planner.offered;
 
     // (4) Eviction check (statvfs no-op below the high watermark). The
     //     prompt surplus release is not here: it rides the rolling
@@ -1569,6 +1531,7 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
         grace_declared,
         eviction,
         scan_ms,
+        planner,
     };
     *app_state.last_tick.lock().unwrap() = Some(report.clone());
     Ok(report)

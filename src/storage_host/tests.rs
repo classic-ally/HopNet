@@ -877,3 +877,63 @@ fn shard_fragment_flags_read_only_the_shard() {
         vec![(h(0xff, 0x00), true)]
     );
 }
+
+// Impact: the planner replaced the tick's stuck 64-blob kick; its pass is
+// raw SQL over the host schema, so this pins it to the real tables.
+// Should: plan an in-flight blob whose goal assigns this node an unheld
+// class, with the owed count from the manifest.
+// Should not: plan a confirmed blob, or one whose assigned classes are
+// already on this node's disk.
+#[test]
+fn planner_pass_plans_owed_blobs_on_the_host_schema() {
+    use hopnet_storage::lifecycle::{ViewSnapshot, record_transition};
+
+    let app_state = crate::consensus::tests::create_test_app_state();
+    let _ = app_state.node_id.set(1);
+    let view = ViewSnapshot {
+        members: vec![1],
+        weights: [(1, 1)].into(),
+    };
+    let blob = |n: u8| {
+        CustomUUID::from_str(&format!("01890a5d-ac96-774b-b9aa-9f8b24f0c9{n:02x}")).unwrap()
+    };
+    let mut conn = app_state.db_pool.get().unwrap();
+    {
+        let tx = conn.transaction().unwrap();
+        record_transition(&tx, 5, &view).unwrap();
+        tx.commit().unwrap();
+    }
+    // Blob 1 in flight, nothing held; blob 2 in flight, everything held;
+    // blob 3 confirmed at its goal.
+    for (n, placed, local) in [(1u8, None, false), (2, None, true), (3, Some(9i64), false)] {
+        conn.execute(
+            "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes,
+             placement_height, file_size, desired_placement_height)
+             VALUES (?, X'01', 3, 0, ?, 10, 9)",
+            params![blob(n), placed],
+        )
+        .unwrap();
+        for i in 0..3i64 {
+            conn.execute(
+                "INSERT INTO fragment_hashes (data_block_id, chunk_number, local_index,
+                 fragment_id, fragment_hash, chunk_type, stored_locally)
+                 VALUES (?, 0, ?, ?, ?, ?, ?)",
+                params![
+                    blob(n),
+                    i,
+                    format!("f{n}-{i}"),
+                    Blake3Hash::new(blake3::hash(format!("{n}-{i}").as_bytes())),
+                    if i < 2 { 0 } else { 1 },
+                    local
+                ],
+            )
+            .unwrap();
+        }
+    }
+    drop(conn);
+
+    let (plan, scanned) = crate::storage_host::pull_planner::plan(&app_state).unwrap();
+    assert_eq!(scanned, 2, "the confirmed blob is not in flight");
+    let owed: Vec<(CustomUUID, usize)> = plan.into_iter().map(|i| (i.blob_id, i.owed)).collect();
+    assert_eq!(owed, vec![(blob(1), 3)]);
+}
