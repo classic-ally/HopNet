@@ -330,6 +330,29 @@ pub fn seen_age(view: Option<&PeerEvidenceView>, origin: Instant, now: Instant) 
     }
 }
 
+/// The candidates this node has seen first-hand within `grace`, on the
+/// visibility clock (`seen_age`). A peer with no entry ages from
+/// `origin`, so every peer is within grace for `grace` after this node
+/// boots — after an epoch crossing, when every node reboots at once, the
+/// whole mesh is. Urgent repair counts these as live: the replicated
+/// availability grid marks a rebooted node offline until its own next
+/// metrics sample (up to ten minutes), and a reboot is not a departure.
+pub fn seen_within(
+    snapshot: &[(i32, PeerEvidenceView)],
+    origin: Instant,
+    now: Instant,
+    grace: Duration,
+    candidates: impl IntoIterator<Item = i32>,
+) -> std::collections::HashSet<i32> {
+    candidates
+        .into_iter()
+        .filter(|id| {
+            let view = snapshot.iter().find(|(n, _)| n == id).map(|(_, v)| v);
+            seen_age(view, origin, now) < grace
+        })
+        .collect()
+}
+
 /// The RFC-025 banner rows, derived per request from the snapshot (the
 /// awaiting_upgrade precedent: a predicate over persistent state, never
 /// a stored flag — the next matched pong overwrites the stamp and the
@@ -1351,6 +1374,54 @@ mod tests {
             last_pong: None,
             last_defuse_at: None,
         }
+    }
+
+    // Should: count a peer seen within the grace as live for repair, on
+    // the visibility clock (any sighting, not only liveness contact).
+    #[test]
+    fn a_peer_seen_within_the_grace_counts_as_live_for_repair() {
+        let origin = Instant::now();
+        let now = origin + Duration::from_secs(3600);
+        let mut chatty = view(origin);
+        chatty.last_seen = Some(now - Duration::from_secs(60));
+        let snap = vec![(2, chatty)];
+        let live = seen_within(&snap, origin, now, Duration::from_secs(900), [2]);
+        assert!(live.contains(&2));
+    }
+
+    // Impact: the 2026.10.8 crossing — every node rebooted within a
+    // minute, the availability grid called two peers offline for ~10 min,
+    // and urgent re-encodes of byte-identical copies starved pulls for
+    // hours.
+    // Should: keep every peer within grace until the grace has passed
+    // since this node booted, including peers it has never heard from.
+    // Should not: keep a never-seen peer once the grace since boot has run
+    // out.
+    #[test]
+    fn every_peer_is_in_grace_until_the_grace_has_passed_since_boot() {
+        let origin = Instant::now();
+        let grace = Duration::from_secs(900);
+        let early = seen_within(
+            &[],
+            origin,
+            origin + Duration::from_secs(60),
+            grace,
+            [1, 2, 3],
+        );
+        assert_eq!(early.len(), 3);
+        let late = seen_within(&[], origin, origin + grace, grace, [1, 2, 3]);
+        assert!(late.is_empty());
+    }
+
+    // Should not: keep a peer live for repair once it has gone unseen for
+    // longer than the grace, however long ago this node booted.
+    #[test]
+    fn a_peer_unseen_past_the_grace_is_not_kept_live() {
+        let origin = Instant::now();
+        let now = origin + Duration::from_secs(7200);
+        let snap = vec![(2, view(now - Duration::from_secs(901)))];
+        let live = seen_within(&snap, origin, now, Duration::from_secs(900), [2]);
+        assert!(live.is_empty());
     }
 
     // Impact: this pin IS the vote-out shield — compat chatter

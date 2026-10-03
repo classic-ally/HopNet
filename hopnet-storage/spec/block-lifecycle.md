@@ -1247,6 +1247,30 @@ optimization and carries no proof obligation.
       member: its classes are never rebuilt around and blobs that need
       them stay parked. Open item for the next release: make availability
       reflect serving, so such a node decays out of the view.
+    - Repair storm at the 2026.10.8 crossing (2026-10-03). Every node
+      rebooted within a minute; the availability grid marks a rebooted
+      node offline until its own next metrics sample (a 10-minute cron
+      at a random offset), and the macbook had probed thor and laptop
+      mid-boot. Desktop's first tick saw `online=2`; with v=4 and ~8
+      of 30 classes per member, two members down puts every chunk
+      below W=18, so it queued urgent re-encodes of every chunk with a
+      class on them — copies that were only rebooting. Re-encodes run
+      on the engine's dispatch loop, so pulls on desktop and thor
+      stopped until each was restarted by hand (desktop regenerated
+      3,399 chunks in 12 minutes; thor's backlog was hours).
+      Fix (node-local, no consensus rule or schema change): repair
+      counts as up the grid's online set plus every member this node
+      has seen first-hand (`last_seen`, any authenticated sighting)
+      within `REPAIR_GRACE` — 15 minutes, `HOPNET_REPAIR_GRACE_SECS`,
+      0 turns it off. A peer with no evidence ages from this node's
+      boot, so after a crossing the whole mesh is in grace. Grace only
+      adds holders back: a grid-online node is never dropped, and a
+      node that has left the storage view is never revived, so repair
+      after a real departure is unchanged. No tolerance-0 bypass: it
+      would fire on every chunk in exactly the crossing case. The tick
+      report carries `repair_grace_online`. Still open: re-encode
+      off the pull dispatch loop (its own budget), and a `GRACE`
+      constant in `spec/storage_policy.qnt`.
   - Rehearsal (2026-09-27): `orchestrator test --test
     lifecycle-cutover-drain --flags blobs=N` — a mesh born on the
     deployed release image, populated, crosses into the build under

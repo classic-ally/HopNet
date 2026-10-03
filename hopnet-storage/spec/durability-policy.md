@@ -120,7 +120,12 @@ Every tier is biased long because the costs are asymmetric: a false
 "gone" costs one bounded re-encode round; a false "returning" costs
 margin-days — free while the chunk stays above W, since the watermark
 repairs urgently regardless of tier. Safety is independent of the tier
-choice; tiers tune cost only.
+choice; tiers tune cost only. One short node-local grace sits in front
+of the watermark: a member the repairer has seen first-hand within the
+last 15 minutes (or any member, for 15 minutes after the repairer boots)
+counts as up, because the availability grid marks a rebooted node
+offline until its own next metrics sample — a reboot is not a departure
+(`REPAIR_GRACE`, block-lifecycle.md, the 2026.10.8 crossing record).
 
 Assignment: smallest tier above ~P95 of the node's offline-duration
 history, computed from replicated records (every node derives the same

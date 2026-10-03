@@ -607,6 +607,11 @@ apply functions inside consensus handlers.
       that stops voting, and (known 10.8 limitation) availability that
       reflects serving: a member that answers probes but cannot serve
       fragments stays in the storage view and is never rebuilt around.
+      [~] Repair grace (next release): urgent repair counts a member
+      seen first-hand within 15 minutes as up (`HOPNET_REPAIR_GRACE_SECS`),
+      so a crossing's simultaneous reboots no longer trigger re-encodes
+      of every chunk (the 2026.10.8 storm); re-encode off the pull
+      dispatch loop remains open.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage
