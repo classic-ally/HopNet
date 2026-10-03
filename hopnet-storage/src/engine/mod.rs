@@ -141,6 +141,10 @@ pub struct PullStats {
     pub failed: usize,
     /// Classes held back by the pull floor.
     pub held_for_space: usize,
+    /// The node was below its pull floor: nothing was queued or awaited.
+    pub held_back: bool,
+    /// Blobs not answered before the deadline (still queued).
+    pub timed_out: usize,
     /// Blobs whose evidence went to the evidence lane.
     pub evidence_queued: usize,
 }
@@ -306,10 +310,23 @@ impl EngineHandle {
     }
 
     /// Pull checks for a batch of blobs, aggregated. All are queued at once
-    /// (the window runs them in parallel), then awaited. Engine-gone counts
-    /// as a failure — a later pass retries the blob.
-    pub async fn pull_blobs(&self, blob_ids: impl IntoIterator<Item = BlobId> + Send) -> PullStats {
+    /// (the window runs them in parallel), then awaited for at most
+    /// `deadline` (a blob still unanswered counts in `timed_out` and keeps
+    /// its place in the queue). Below the pull floor nothing is queued or
+    /// awaited: the call returns `held_back` at once, since the paused
+    /// engine would not answer until free space is back. Engine-gone
+    /// counts as a failure — a later pass retries the blob.
+    pub async fn pull_blobs(
+        &self,
+        blob_ids: impl IntoIterator<Item = BlobId> + Send,
+        deadline: std::time::Duration,
+    ) -> PullStats {
         let mut stats = PullStats::default();
+        if self.sched.space.paused() {
+            stats.held_back = true;
+            return stats;
+        }
+        let until = tokio::time::Instant::now() + deadline;
         let mut waiting = Vec::new();
         for blob_id in blob_ids {
             let (tx, rx) = oneshot::channel();
@@ -318,7 +335,11 @@ impl EngineHandle {
         }
         for (blob_id, rx) in waiting {
             stats.checked += 1;
-            match rx.await.ok() {
+            let Ok(answer) = tokio::time::timeout_at(until, rx).await else {
+                stats.timed_out += 1;
+                continue;
+            };
+            match answer.ok() {
                 Some(o) => {
                     stats.owed += o.owed;
                     stats.pulled += o.pulled;
@@ -338,10 +359,21 @@ impl EngineHandle {
 
     /// Enqueue one chunk re-encode on the serial worker. Urgent (live
     /// classes below the watermark) preempts pulls and lazy work; lazy
-    /// items drain one at a time behind everything else. An urgent chunk
-    /// already queued or running is not queued again. Returns whether it
-    /// was queued.
+    /// items drain one at a time behind everything else. Returns whether
+    /// it was queued:
+    ///
+    /// - an urgent chunk already queued or running is not queued again
+    ///   (`urgent_pending`; at dequeue it runs the classes the latest tick
+    ///   owes, see [`EngineHandle::set_urgent_reencodes`]);
+    /// - a lazy command is not queued while the node is held back for space:
+    ///   the paused loop does not drain the lazy channel, and the policy
+    ///   tick re-derives the work every tick, so queuing would only pile up
+    ///   duplicates. Urgent repair is never held back here — it may write
+    ///   down to the ingest floor (`WriteClass::Repair`).
     pub fn enqueue_reencode(&self, cmd: ReencodeCmd, urgent: bool) -> bool {
+        if !urgent && self.sched.space.paused() {
+            return false;
+        }
         let key = (cmd.blob_id.clone(), cmd.chunk_number);
         let tx = if urgent {
             if !self.urgent_pending.lock().unwrap().insert(key.clone()) {
@@ -885,6 +917,14 @@ where
             tracing::debug!("pull: blob {blob_id} waits for a rebuild slot");
         } else if outcome.failed == 0 {
             sched.unpark_blob(blob_id);
+        }
+        // Held for space: the feeder already popped it, so without this it
+        // would be lost until the planner's cursor came back around (the
+        // at-risk blobs first among them). Re-offered after a re-probe
+        // interval, it waits in the queue — the paused loop takes nothing
+        // — and runs first thing after the resume.
+        if outcome.held_for_space > 0 && outcome.retry_after.is_none() {
+            outcome.retry_after = Some(SPACE_REPROBE);
         }
     }
 
@@ -2689,5 +2729,182 @@ mod tests {
         .unwrap();
         assert_eq!(urgent.regenerated, 2);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: review of #100 — the pre-fetch check covered only lazy work,
+    // so an urgent repair below the ingest floor downloaded K shards and
+    // was refused at the write, every tick.
+    // Should: refuse an urgent repair below the ingest floor before
+    // fetching a single shard.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_urgent_repair_below_the_ingest_floor_fetches_nothing() {
+        let base = std::env::temp_dir().join(format!("hopnet-reenc-full-{}", std::process::id()));
+        let dir = base.to_str().unwrap().to_string();
+        let (blob_id, _outcome, mut manifest) = encoded_blob(&dir).await;
+        // Only five classes local: a rebuild has to fetch the rest.
+        let chunk = manifest.chunks.get_mut(&0).unwrap();
+        for map in [&mut chunk.0, &mut chunk.1] {
+            for (idx, entry) in map.iter_mut() {
+                entry.2 = *idx >= 25;
+            }
+        }
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        // Free space below even the repair floor.
+        let space = crate::admission::SpaceGuard::new(
+            crate::admission::PullFloor {
+                min_free_bytes: 1 << 30,
+                min_free_basis_points: 0,
+                resume_gap_bytes: Some(0),
+            },
+            Some(1 << 30),
+            Box::new(|_| Ok((1 << 20, 1 << 40))),
+            Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0))),
+        );
+        let fetches = std::sync::atomic::AtomicUsize::new(0);
+        let urgent = reencode::reencode_chunk_via(
+            net.as_ref(),
+            net.as_ref(),
+            &dir,
+            &blob_id,
+            0,
+            &[3, 17],
+            (&space, WriteClass::Repair),
+            |_, _, _| {
+                fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(None)
+            },
+        )
+        .await;
+        assert!(matches!(urgent, Err(EngineError::NoSpace)), "{urgent:?}");
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: review of #100 — blobs already admitted when the pause began
+    // were marked held and left the queue with no retry: the feeder had
+    // already popped them, so the most at-risk blobs were lost until the
+    // planner's cursor came back around.
+    // Should: ask for a blob held for space to be offered again after a
+    // re-probe interval.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_held_for_space_is_offered_again() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-held-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, outcome, manifest) = encoded_blob(&dir_src).await;
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        for f in &outcome.fragments {
+            let bytes = fragstore::read_fragment(&dir_src, &f.fragment_hash).unwrap();
+            net.served.lock().unwrap().insert(f.fragment_hash, bytes);
+        }
+        let space = space_over(10, 1 << 20, 1 << 20, Arc::default());
+        assert!(space.reserve(&dir_dst, 1, WriteClass::Pull).is_err());
+        let sched = FetchScheduler::with_space(PullLimits::default(), space);
+        let (result, _) = pull_with_sched(&seams(net), &dir_dst, &blob_id, &sched).await;
+        assert_eq!(result.held_for_space, 30);
+        assert_eq!(result.retry_after, Some(SPACE_REPROBE));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: review of #100 — POST /maintenance/rebalance-network awaited
+    // every queued blob with no deadline, and a paused engine answers none
+    // of them: the request hung until free space came back.
+    // Should: return held back at once, queuing nothing, while paused.
+    // Should: give up waiting at the deadline, counting the unanswered blobs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pull_blobs_never_hangs_on_a_paused_or_slow_engine() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-hang-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.to_str().unwrap().to_string();
+        let space = space_over(10, 100, 50, Arc::default());
+        assert!(space.reserve(&dir, 1, WriteClass::Pull).is_err());
+        let engine = EngineHandle::spawn(
+            seams(idle_net()),
+            EngineConfig {
+                space: Some(space),
+                fragments_dir: dir.clone(),
+                limits: PullLimits::default(),
+            },
+            tokio::runtime::Handle::current(),
+        );
+        let a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        let held = engine
+            .pull_blobs([a.clone()], std::time::Duration::from_secs(600))
+            .await;
+        assert!(held.held_back);
+        assert_eq!((held.checked, engine.queued_len()), (0, 0));
+
+        // An open engine whose pull check is stuck on a slow storage view.
+        let (src, _o, manifest) = encoded_blob(base.join("s").to_str().unwrap()).await;
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        let slow = EngineHandle::spawn(
+            Seams {
+                transport: net.clone(),
+                state: Arc::new(HeldOnTwo {
+                    net: net.clone(),
+                    two_reachable: true,
+                    two_member: true,
+                    panic_manifest: false,
+                    view_delay: std::time::Duration::from_secs(3),
+                    held_on_three: HashSet::new(),
+                    view_fails: false.into(),
+                    view_calls: 0.into(),
+                }),
+                submitter: net.clone(),
+                local_state: net,
+            },
+            EngineConfig {
+                space: Some(space_over(1 << 40, 0, 0, Arc::default())),
+                fragments_dir: dir,
+                limits: PullLimits::default(),
+            },
+            tokio::runtime::Handle::current(),
+        );
+        let started = std::time::Instant::now();
+        let stats = slow
+            .pull_blobs([src], std::time::Duration::from_millis(200))
+            .await;
+        assert_eq!(stats.timed_out, 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: review of #100 — the paused loop does not drain the lazy
+    // channel, and the tick sent another (usually duplicate) lazy command
+    // every tick, so it grew for as long as the node was held back.
+    // Should not: queue a lazy re-encode while held back for space.
+    // Should: still queue an urgent one.
+    #[tokio::test]
+    async fn lazy_reencodes_are_not_queued_while_held_back() {
+        let space = space_over(10, 100, 50, Arc::default());
+        assert!(space.reserve("/x", 1, WriteClass::Pull).is_err());
+        let engine = EngineHandle::spawn(
+            seams(idle_net()),
+            EngineConfig {
+                space: Some(space),
+                fragments_dir: String::new(),
+                limits: PullLimits::default(),
+            },
+            tokio::runtime::Handle::current(),
+        );
+        let cmd = || ReencodeCmd {
+            blob_id: BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap(),
+            chunk_number: 0,
+            missing_classes: vec![3],
+        };
+        assert!(!engine.enqueue_reencode(cmd(), false));
+        assert!(engine.enqueue_reencode(cmd(), true));
     }
 }

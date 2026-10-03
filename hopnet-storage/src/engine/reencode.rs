@@ -218,8 +218,12 @@ where
             fetched: 0,
         });
     }
-    // Held for space: don't fetch K shards to write nothing.
-    if write_class == WriteClass::Pull && space.paused() {
+    // Held for space: don't fetch K shards to write nothing. Asked against
+    // this write's own floor (an urgent repair's is the ingest floor), at
+    // the worst-case size of the classes it will store.
+    let worst_case =
+        targets.len() as u64 * admission::fragment_file_bytes(crate::rs::MAX_FRAGMENT_SIZE);
+    if !space.would_admit(fragments_dir, worst_case, write_class) {
         return Err(EngineError::NoSpace);
     }
 

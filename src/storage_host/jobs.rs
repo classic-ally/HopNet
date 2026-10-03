@@ -204,14 +204,19 @@ pub async fn run_network_rebalancing(
         )))));
     };
 
-    let stats = storage.pull_blobs(in_flight).await;
+    let stats = storage.pull_blobs(in_flight, REBALANCE_DEADLINE).await;
     let result = NetworkRebalancingResult {
         consensus_height,
         data_blocks_checked: stats.checked,
         data_blocks_rebalanced: stats.evidence_queued,
         data_blocks_failed: stats.failed,
         total_fragments_migrated: stats.pulled + stats.rebuilt,
+        held_for_space: stats.held_back,
+        data_blocks_timed_out: stats.timed_out,
     };
+    if stats.held_back {
+        tracing::info!("In-flight pull check skipped: this node is below its pull floor");
+    }
     if stats.checked > 0 {
         tracing::info!("In-flight pull check completed: {:?}", result);
     }
@@ -282,7 +287,15 @@ pub struct NetworkRebalancingResult {
     pub data_blocks_rebalanced: usize,
     pub data_blocks_failed: usize,
     pub total_fragments_migrated: usize,
+    /// The node was below its pull floor: nothing was checked (the paused
+    /// engine would not answer until free space is back).
+    pub held_for_space: bool,
+    /// Blobs still unanswered at `REBALANCE_DEADLINE` (they stay queued).
+    pub data_blocks_timed_out: usize,
 }
+
+/// How long the operator re-kick waits on the engine before answering.
+pub const REBALANCE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Operator re-kick (RFC-STORAGE-003 S3): wake this node's reconciler for
 /// up to `limit` in-flight blobs, oldest goal first — the same check the
@@ -1586,8 +1599,7 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
                 }
             }
             if let Some(cmd) = lazy_pick {
-                engine.enqueue_reencode(cmd, false);
-                lazy_enqueued = 1;
+                lazy_enqueued = usize::from(engine.enqueue_reencode(cmd, false));
             }
         }
     } else if let Some(engine) = app_state.storage.get() {
