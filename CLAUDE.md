@@ -39,7 +39,7 @@ When making changes to the codebase:
 # Database Writes
 - Always use `crate::db::shared::commit_timed(tx)` instead of `tx.commit()`. It records commit latency into the always-on histogram exposed at `GET /debug/db-stats`. Same signature as `Transaction::commit`.
 - Pragma tuning is via `HOPNET_DB_*` env vars (see `src/db/shared.rs::env_pragma_overrides`); orchestrator forwards them to containers automatically.
-- Pull concurrency is via `HOPNET_PULL_WINDOW` / `HOPNET_PULL_FETCH_GLOBAL` / `HOPNET_PULL_FETCH_PER_PEER` / `HOPNET_PULL_URGENT_RESERVE` (defaults 64/24/8/4, see `hopnet-storage/src/engine/fetch.rs::PullLimits`); orchestrator forwards `HOPNET_PULL_*` too.
+- Pull concurrency is via `HOPNET_PULL_WINDOW` / `HOPNET_PULL_FETCH_GLOBAL` / `HOPNET_PULL_FETCH_PER_PEER` / `HOPNET_PULL_URGENT_RESERVE` / `HOPNET_PULL_REBUILDS` (defaults 64/24/8/4/2, see `hopnet-storage/src/engine/fetch.rs::PullLimits`); orchestrator forwards `HOPNET_PULL_*` too.
 
 # Debugging
 - macOS debugging with the `log` command requires the use of sudo

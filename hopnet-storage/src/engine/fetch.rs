@@ -41,6 +41,9 @@ pub struct PullLimits {
     /// Failures from one peer inside this window count as one strike: a
     /// burst of concurrent fetches failing together is one event.
     pub strike_window: Duration,
+    /// Pull-path rebuilds running at once (`HOPNET_PULL_REBUILDS`, default 2):
+    /// each holds a chunk of shards (tens of MB) in memory.
+    pub rebuilds: usize,
 }
 
 impl Default for PullLimits {
@@ -52,6 +55,7 @@ impl Default for PullLimits {
             urgent_reserve: 4,
             fetch_timeout: Duration::from_secs(PULL_FETCH_TIMEOUT_SECS),
             strike_window: Duration::from_secs(PEER_STRIKE_WINDOW_SECS),
+            rebuilds: 2,
         }
     }
 }
@@ -100,6 +104,7 @@ impl PullLimits {
                 .unwrap_or(d.urgent_reserve),
             fetch_timeout: d.fetch_timeout,
             strike_window: d.strike_window,
+            rebuilds: read("HOPNET_PULL_REBUILDS", d.rebuilds),
         }
     }
 
@@ -167,6 +172,8 @@ pub struct FetchScheduler {
     pub limits: PullLimits,
     pub window: Arc<Semaphore>,
     global: Arc<Semaphore>,
+    /// Pull-path rebuilds in flight (`PullLimits::rebuilds`).
+    pub rebuild: Arc<Semaphore>,
     per_peer: Mutex<HashMap<i32, Arc<Semaphore>>>,
     /// One-permit gates for peers marked slow.
     slow_gates: Mutex<HashMap<i32, Arc<Semaphore>>>,
@@ -180,6 +187,7 @@ impl FetchScheduler {
             limits,
             window: Arc::new(Semaphore::new(limits.window.max(1))),
             global: Arc::new(Semaphore::new(limits.pull_permits())),
+            rebuild: Arc::new(Semaphore::new(limits.rebuilds.max(1))),
             per_peer: Mutex::new(HashMap::new()),
             slow_gates: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
@@ -637,6 +645,7 @@ mod tests {
             fetch_timeout: Duration::from_millis(timeout_ms),
             // Every failure is its own strike in these tests.
             strike_window: Duration::ZERO,
+            rebuilds: 1,
         }
     }
 
@@ -651,6 +660,7 @@ mod tests {
             ("HOPNET_PULL_FETCH_GLOBAL", "6"),
             ("HOPNET_PULL_FETCH_PER_PEER", "0"),
             ("HOPNET_PULL_URGENT_RESERVE", "2"),
+            ("HOPNET_PULL_REBUILDS", "1"),
         ]
         .into();
         let l = PullLimits::from_lookup(|k| env.get(k).map(|v| v.to_string()));
@@ -660,6 +670,8 @@ mod tests {
         );
         assert_eq!(l.pull_permits(), 4);
         assert_eq!(l.per_blob(), 2);
+        assert_eq!(l.rebuilds, 1);
+        assert_eq!(PullLimits::default().rebuilds, 2);
         assert_eq!(PullLimits::from_lookup(|_| None), PullLimits::default());
         assert_eq!(PullLimits::default().per_blob(), 6);
     }

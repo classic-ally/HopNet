@@ -499,14 +499,15 @@ where
                 });
             }
         }
-        let mut unserved_by_chunk: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-        let mut unreachable = false;
+        // chunk -> (classes not fetched, any of them only on dark holders)
+        let mut unserved_by_chunk: BTreeMap<u32, (Vec<u32>, bool)> = BTreeMap::new();
         while let Some(joined) = fetches.join_next().await {
             match joined {
                 Ok((_, _, Ok(()))) => outcome.pulled += 1,
                 Ok((chunk, class, Err(miss))) => {
-                    unreachable |= miss == FetchMiss::Unreachable;
-                    unserved_by_chunk.entry(chunk).or_default().push(class);
+                    let entry = unserved_by_chunk.entry(chunk).or_default();
+                    entry.0.push(class);
+                    entry.1 |= miss == FetchMiss::Unreachable;
                 }
                 Err(e) => {
                     tracing::warn!("pull: blob {blob_id}: fetch task failed: {e}");
@@ -515,23 +516,45 @@ where
             }
         }
 
-        let mut rebuild_failed = false;
-        for (chunk, mut unserved) in unserved_by_chunk {
+        let mut park = false;
+        for (chunk, (mut unserved, unreachable)) in unserved_by_chunk {
             unserved.sort_unstable();
-            let chunk = &chunk;
-            // Recovery is the fetch fallback: rebuild the classes nobody
-            // served from any K live classes (local shards first).
-            match reencode::reencode_chunk(
-                &seams.transport,
+            if unreachable {
+                // Its holders are dark or parked, not its bytes gone: a
+                // rebuild would hold a chunk of shards for nothing the
+                // holders will not serve once back. Park and retry.
+                outcome.failed += unserved.len();
+                park = true;
+                continue;
+            }
+            // Genuinely unserved: rebuild from any K live classes (local
+            // shards first), a bounded number at once, with every shard
+            // fetch under the scheduler's caps and deadline and dark or
+            // parked peers skipped.
+            let Ok(_rebuild) = sched.rebuild.clone().acquire_owned().await else {
+                outcome.failed += unserved.len();
+                continue;
+            };
+            let (transport, dark) = (&seams.transport, &dark);
+            let rebuilt = reencode::reencode_chunk_via(
                 seams.state.as_ref(),
                 seams.local_state.as_ref(),
                 fragments_dir,
                 blob_id,
-                *chunk,
+                chunk,
                 &unserved,
+                |hash, hint, members| async move {
+                    let usable = |p: &crate::traits::PeerRef| !dark.contains(&p.node_id);
+                    let attested: Vec<_> = hint.into_iter().filter(usable).collect();
+                    let others: Vec<_> = members.into_iter().filter(usable).collect();
+                    fetch::fetch_class(transport, sched, &hash, &attested, &others)
+                        .await
+                        .ok()
+                        .map(|fetched| fetched.data)
+                },
             )
-            .await
-            {
+            .await;
+            match rebuilt {
                 Ok(r) => {
                     outcome.rebuilt += r.regenerated;
                     outcome.failed += unserved.len().saturating_sub(r.regenerated);
@@ -542,16 +565,15 @@ where
                         unserved.len()
                     );
                     outcome.failed += unserved.len();
-                    rebuild_failed = true;
                 }
             }
         }
 
-        // A class whose known holders are all dark, and no rebuild: park the
-        // blob so the window admits blobs that can move. Progress (or a
-        // blob owing nothing more) clears the park.
+        // A class whose known holders are all dark parks the blob so the
+        // window admits blobs that can move. A blob with nothing left
+        // failing leaves the park book.
         let now = std::time::Instant::now();
-        if unreachable && rebuild_failed && outcome.pulled + outcome.rebuilt == 0 {
+        if park {
             sched.park_blob(blob_id, now);
             tracing::debug!("pull: blob {blob_id} parked: its sources are unreachable");
         } else if outcome.failed == 0 {
@@ -828,14 +850,127 @@ mod tests {
         X: TxSubmitter,
         L: LocalStateSink + 'static,
     {
-        let (lane, mut rx) = evidence::EvidenceLane::channel();
         let sched = FetchScheduler::new(PullLimits::default());
-        let outcome = pull_owed(seams, dir, blob_id, &lane, &sched).await.unwrap();
+        pull_with_sched(seams, dir, blob_id, &sched).await
+    }
+
+    async fn pull_with_sched<T, S, X, L>(
+        seams: &Seams<T, S, X, L>,
+        dir: &str,
+        blob_id: &BlobId,
+        sched: &Arc<FetchScheduler>,
+    ) -> (PullOutcome, Vec<evidence::EvidenceItem>)
+    where
+        T: Transport + 'static,
+        S: StateReader,
+        X: TxSubmitter,
+        L: LocalStateSink + 'static,
+    {
+        let (lane, mut rx) = evidence::EvidenceLane::channel();
+        let outcome = pull_owed(seams, dir, blob_id, &lane, sched).await.unwrap();
         let mut items = Vec::new();
         while let Ok(item) = rx.try_recv() {
             items.push(item);
         }
         (outcome, items)
+    }
+
+    /// PullNet's state, except that every fragment is attested on node 2,
+    /// which the host's liveness evidence calls reachable or not.
+    struct HeldOnTwo {
+        net: Arc<PullNet>,
+        two_reachable: bool,
+    }
+
+    impl StateReader for HeldOnTwo {
+        fn placement_inputs(&self) -> Result<PlacementInputs, StorageError> {
+            self.net.placement_inputs()
+        }
+        fn placement_inputs_at(&self, height: u64) -> Result<PlacementInputs, StorageError> {
+            self.net.placement_inputs_at(height)
+        }
+        fn fragment_sources(
+            &self,
+            fragment_hashes: &[Blake3Hash],
+        ) -> Result<HashMap<Blake3Hash, Vec<PeerRef>>, StorageError> {
+            Ok(fragment_hashes.iter().map(|h| (*h, peers(&[2]))).collect())
+        }
+        fn all_peers(&self) -> Result<Vec<PeerRef>, StorageError> {
+            self.net.all_peers()
+        }
+        fn pull_target(&self, blob_id: &BlobId) -> Result<Option<PullTarget>, StorageError> {
+            self.net.pull_target(blob_id)
+        }
+        fn self_check_report(&self) -> Result<crate::types::SelfCheckFragments, StorageError> {
+            self.net.self_check_report()
+        }
+        fn blob_self_check_report(
+            &self,
+            blob_id: &BlobId,
+        ) -> Result<crate::types::SelfCheckFragments, StorageError> {
+            self.net.blob_self_check_report(blob_id)
+        }
+        fn confirm_ready(&self, blob_id: &BlobId) -> Result<Option<u64>, StorageError> {
+            self.net.confirm_ready(blob_id)
+        }
+        fn current_height(&self) -> Result<u64, StorageError> {
+            self.net.current_height()
+        }
+        fn blob_manifest(
+            &self,
+            blob_id: &BlobId,
+        ) -> Result<Option<crate::store::BlobManifest>, StorageError> {
+            self.net.blob_manifest(blob_id)
+        }
+        fn local_node_id(&self) -> Option<i32> {
+            self.net.local_node_id()
+        }
+        fn peer_reachable(&self, node_id: i32) -> bool {
+            node_id != 2 || self.two_reachable
+        }
+    }
+
+    // Impact: review of #96 — each of the 64 window tasks rebuilt chunks
+    // when a holder was merely dark, holding ~40-120 MB of shards apiece
+    // outside every cap, for classes the holder would serve once back.
+    // Should: park a blob whose unserved classes are held only by dark
+    // peers, without rebuilding.
+    // Should: still try a rebuild (and not park) when the holders answer
+    // but do not serve the class.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dark_holders_park_the_blob_instead_of_rebuilding() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-dark-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, _outcome, manifest) = encoded_blob(&dir_src).await;
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+
+        for (two_reachable, parks) in [(false, true), (true, false)] {
+            let seams = Seams {
+                transport: net.clone(),
+                state: Arc::new(HeldOnTwo {
+                    net: net.clone(),
+                    two_reachable,
+                }),
+                submitter: net.clone(),
+                local_state: net.clone(),
+            };
+            let sched = FetchScheduler::new(PullLimits::default());
+            let (result, _) = pull_with_sched(&seams, &dir_dst, &blob_id, &sched).await;
+            assert_eq!(result.failed, 30);
+            assert_eq!(result.rebuilt, 0);
+            assert_eq!(
+                sched.blob_parked(&blob_id, std::time::Instant::now()),
+                parks,
+                "node 2 reachable: {two_reachable}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Flush queued evidence the way the lane task does.
