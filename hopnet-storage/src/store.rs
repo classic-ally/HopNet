@@ -612,6 +612,46 @@ pub fn compute_inventory_differential(
     })
 }
 
+/// The rolling sweep's resume point, if this node has swept before.
+pub fn read_sweep_cursor(
+    conn: &rusqlite::Connection,
+) -> Result<Option<crate::sweep::SweepCursor>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT next_shard, rotation, rotation_started_unix, rotation_started_height
+         FROM hopnet_storage_sweep_cursor WHERE id = 1",
+        [],
+        |row| {
+            Ok(crate::sweep::SweepCursor {
+                next_shard: row.get::<_, u8>(0)?,
+                rotation: row.get::<_, i64>(1)? as u64,
+                started_unix: row.get::<_, i64>(2)? as u64,
+                started_height: row.get::<_, i64>(3)? as u64,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Persist the rolling sweep's resume point (one row, replaced).
+pub fn write_sweep_cursor(
+    conn: &rusqlite::Connection,
+    cursor: &crate::sweep::SweepCursor,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO hopnet_storage_sweep_cursor
+         (id, next_shard, rotation, rotation_started_unix, rotation_started_height)
+         VALUES (1, ?1, ?2, ?3, ?4)",
+        params![
+            cursor.next_shard,
+            cursor.rotation as i64,
+            cursor.started_unix as i64,
+            cursor.started_height as i64
+        ],
+    )
+    .map(|_| ())
+}
+
 /// SQL bounding `col` to one rolling-sweep shard, binding `?1` (and `?2`
 /// unless it is the last shard). Pair with `sweep::shard_bounds`.
 fn shard_clause(col: &str, last: bool) -> String {
@@ -1509,6 +1549,30 @@ mod tests {
         assert_eq!(report.previous_count, 0);
         assert!(report.fragments_removed.is_empty());
         assert_eq!(report.fragments_added, vec![h(2), h(1), h(5)]);
+    }
+
+    // Should: read nothing before the first write, then read back the one
+    // cursor row, replaced in place by each write.
+    #[test]
+    fn sweep_cursor_round_trips_as_one_row() {
+        let conn = test_conn();
+        conn.execute_batch(include_str!("../migrations/storage/0005_sweep_cursor.sql"))
+            .unwrap();
+        assert_eq!(read_sweep_cursor(&conn).unwrap(), None);
+        let first = crate::sweep::SweepCursor::fresh(1_000, 50);
+        write_sweep_cursor(&conn, &first).unwrap();
+        assert_eq!(read_sweep_cursor(&conn).unwrap(), Some(first));
+        let (next, _) = first.advance(1_010, 51);
+        write_sweep_cursor(&conn, &next).unwrap();
+        assert_eq!(read_sweep_cursor(&conn).unwrap(), Some(next));
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM hopnet_storage_sweep_cursor",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     // Impact: the rolling sweep pages belief per shard; a range that

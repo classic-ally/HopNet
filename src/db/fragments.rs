@@ -144,8 +144,8 @@ pub struct DiskFragmentInfo {
 }
 
 /// Every fragment row's hash and this node's `stored_locally` flag — the
-/// disk-truth sweep's table side (RFC-STORAGE-003 S5). A full-table read
-/// once per sweep; the walk it is diffed against is the same size.
+/// epoch join's fragment reconcile reads the whole table once; the
+/// rolling sweep reads it shard by shard (`shard_fragment_flags`).
 pub fn all_fragment_flags(
     conn: &rusqlite::Connection,
 ) -> Result<Vec<(crate::types::Blake3Hash, bool)>, DatabaseError> {

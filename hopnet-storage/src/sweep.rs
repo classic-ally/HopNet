@@ -163,6 +163,56 @@ pub struct SweepReport {
     pub belief_pages: usize,
     #[serde(default)]
     pub belief_failed_pages: usize,
+    /// Shards whose step failed (logged; retried next rotation).
+    #[serde(default)]
+    pub failed_shards: usize,
+}
+
+/// Where a node's rolling sweep resumes (`hopnet_storage_sweep_cursor`,
+/// node-local).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepCursor {
+    pub next_shard: u8,
+    pub rotation: u64,
+    pub started_unix: u64,
+    /// The consensus height when this rotation began.
+    pub started_height: u64,
+}
+
+impl SweepCursor {
+    /// A first rotation, starting at shard 0.
+    pub fn fresh(now: u64, height: u64) -> Self {
+        SweepCursor {
+            next_shard: 0,
+            rotation: 0,
+            started_unix: now,
+            started_height: height,
+        }
+    }
+
+    /// The cursor after `next_shard` was swept, and whether that step
+    /// completed the rotation (a new one starts at shard 0, stamped `now`
+    /// and `height`).
+    pub fn advance(self, now: u64, height: u64) -> (Self, bool) {
+        match self.next_shard.checked_add(1) {
+            Some(next) => (
+                SweepCursor {
+                    next_shard: next,
+                    ..self
+                },
+                false,
+            ),
+            None => (
+                SweepCursor {
+                    next_shard: 0,
+                    rotation: self.rotation + 1,
+                    started_unix: now,
+                    started_height: height,
+                },
+                true,
+            ),
+        }
+    }
 }
 
 /// The temp files old enough to reap: an in-flight store is seconds old,
@@ -484,6 +534,41 @@ mod tests {
         assert_eq!(rest, vec![h(4)]);
         assert!(buf.take_page(3).is_none());
         assert!(!buf.due(9_999, 4, 60));
+    }
+
+    // Impact: a node that restarts mid-rotation resumes where it stopped,
+    // so even one restarting every few minutes completes rotations.
+    // Should: step to the next shard within a rotation, keeping its start.
+    // Should: wrap after shard 255 into a new rotation stamped with the
+    // wrap's time and height, and report the rotation as complete.
+    #[test]
+    fn cursor_advances_and_wraps_into_a_new_rotation() {
+        let start = SweepCursor::fresh(1_000, 50);
+        let (next, done) = start.advance(1_010, 51);
+        assert!(!done);
+        assert_eq!(
+            next,
+            SweepCursor {
+                next_shard: 1,
+                ..start
+            }
+        );
+
+        let last = SweepCursor {
+            next_shard: 255,
+            ..start
+        };
+        let (wrapped, done) = last.advance(4_600, 900);
+        assert!(done);
+        assert_eq!(
+            wrapped,
+            SweepCursor {
+                next_shard: 0,
+                rotation: 1,
+                started_unix: 4_600,
+                started_height: 900
+            }
+        );
     }
 
     // Should: page removals and additions into reports of at most a page,

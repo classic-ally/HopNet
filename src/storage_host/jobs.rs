@@ -395,261 +395,192 @@ pub struct UnplacedDrainResult {
     pub limit: i32,
 }
 
-/// Scheduled job handler for the disk-truth sweep + self-check (every 30
-/// minutes at a per-node random offset): every self-check is disk-backed
-/// (RFC-STORAGE-003 S5). A failed sweep is logged here: the job runner
-/// drops the error silently, which hid thor's aborted sweeps for a day.
-pub async fn handle_fragment_inventory_self_check(
-    job: TaskId,
-    ctx: Data<AppState>,
-) -> Result<(), Error> {
-    run_disk_truth_sweep(&ctx, SWEEP_ORPHAN_GRACE_SECS)
-        .await
-        .map(|_| ())
-        .inspect_err(|e| tracing::warn!("sweep failed: {e}"))
-}
-
 /// Orphan grace: a rowless file younger than this is an in-flight store,
 /// not an orphan.
 pub const SWEEP_ORPHAN_GRACE_SECS: u64 = 3600;
-/// Day stamp of the last scrub slice (one slice per day, full walk weekly),
-/// now ridden by the sweep's walk.
-static LAST_SCRUB_DAY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
-/// The disk-truth sweep (RFC-STORAGE-003 S5) — discharges `invView' =
-/// copies`, repairing the record, never the data. One readdir walk:
-///   1. diff disk against `fragment_hashes` and repair `stored_locally`
-///      both ways (awaited marks);
-///   2. delete orphan files older than the grace period (the former
-///      two-call scan/delete API, folded in);
-///   3. on the day's turn, verify one weekly scrub slice's content on the
-///      same listing — corrupt bytes are deleted and un-marked;
-///   4. run the self-check differential (now reading repaired flags) and
-///      submit it — belief for what we hold;
-///   5. submit `attest_fragments` for every file with a row — disk truth,
-///      stamped with the current height.
-///
-/// The report is kept for the operator route. Belief is dishonest for at
-/// most one cycle of this job.
-pub async fn run_disk_truth_sweep(
+/// One rotation of the rolling sweep visits every shard in about this
+/// long, paced per shard; a slow disk stretches the rotation, it never
+/// bursts. At drain traffic (~45 heights a minute) an hour is ~2,700
+/// heights, well inside `ATTESTATION_RECENCY_HEIGHTS` (8192).
+pub const ROTATION_TARGET_SECS: u64 = 3600;
+
+/// A buffered belief or attestation page is submitted part-full once its
+/// oldest hash has waited this long: the bound on how long a fragment the
+/// walk saw waits for its stamp.
+pub const MAX_BUFFER_AGE_SECS: u64 = 60;
+
+/// Shards whose content was scrubbed today: `(day, flags)`. Each shard is
+/// read once on its day of seven (`sweep::scrub_due`); in memory, as the
+/// single scrub-day flag was before the rolling sweep.
+static SCRUBBED: std::sync::Mutex<(i64, [bool; 256])> = std::sync::Mutex::new((-1, [false; 256]));
+
+/// Claim `shard`'s scrub for `day`: true exactly once per shard per day.
+fn claim_scrub(day: i64, shard: u8) -> bool {
+    let mut scrubbed = SCRUBBED.lock().unwrap_or_else(|p| p.into_inner());
+    if scrubbed.0 != day {
+        *scrubbed = (day, [false; 256]);
+    }
+    !std::mem::replace(&mut scrubbed.1[usize::from(shard)], true)
+}
+
+/// The walker and the operator's full rotation never sweep a shard at the
+/// same time. Taken per shard, so a requested rotation interleaves with
+/// the walker instead of waiting out its hour.
+static SWEEP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn current_height(app_state: &AppState) -> Result<u64, Error> {
+    let conn = app_state
+        .db_pool
+        .get()
+        .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
+    crate::db::consensus::get_current_consensus_height(&conn)
+        .map_err(|e| Error::Failed(Arc::new(format!("height: {e:?}").into())))
+}
+
+/// One rotation's working state: the running report and the page buffers.
+pub(crate) struct Rotation {
+    node_id: i32,
+    report: hopnet_storage::sweep::SweepReport,
+    belief: hopnet_storage::sweep::BeliefBuffer,
+    truth: hopnet_storage::sweep::PageBuffer,
+    /// The rotation's prompt surplus release budget.
+    surplus_left: usize,
+}
+
+impl Rotation {
+    pub(crate) fn new(node_id: i32, started_unix: u64) -> Self {
+        Rotation {
+            node_id,
+            report: hopnet_storage::sweep::SweepReport {
+                swept_at: started_unix as i64,
+                ..Default::default()
+            },
+            belief: Default::default(),
+            truth: Default::default(),
+            surplus_left: SURPLUS_RELEASE_MAX_PER_SWEEP,
+        }
+    }
+}
+
+/// The rolling disk-truth sweep (RFC-STORAGE-003 S5) — discharges
+/// `invView' = copies`, repairing the record, never the data. Runs for
+/// the node's lifetime, one shard (the hash's first byte, one first-level
+/// directory of the store) per step, paced so a rotation over all 256
+/// takes `ROTATION_TARGET_SECS`. The cursor is persisted after every
+/// step, so a restart resumes where it stopped. Belief is dishonest for
+/// at most one rotation.
+pub async fn run_rolling_sweep(app_state: AppState) {
+    let per_shard = std::time::Duration::from_secs(ROTATION_TARGET_SECS)
+        / hopnet_storage::sweep::SHARD_COUNT as u32;
+    let host = SubstrateHost::new(app_state.clone());
+    let mut state: Option<(hopnet_storage::sweep::SweepCursor, Rotation)> = None;
+    loop {
+        let step_started = std::time::Instant::now();
+        let (cursor, rotation) = match &mut state {
+            Some(s) => s,
+            None => match start_walker(&app_state) {
+                Ok(s) => state.insert(s),
+                Err(e) => {
+                    tracing::debug!("sweep: not ready: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    continue;
+                }
+            },
+        };
+
+        {
+            let _guard = SWEEP_LOCK.lock().await;
+            if let Err(e) = sweep_shard(
+                &app_state,
+                &host,
+                rotation,
+                cursor.next_shard,
+                SWEEP_ORPHAN_GRACE_SECS,
+            )
+            .await
+            {
+                tracing::warn!("sweep: shard {:02x} failed: {e}", cursor.next_shard);
+                rotation.report.failed_shards += 1;
+            }
+        }
+        flush_buffers(&host, rotation, false).await;
+
+        let height = current_height(&app_state).unwrap_or(cursor.started_height);
+        let (next, completed) = cursor.advance(unix_now(), height);
+        if completed {
+            flush_buffers(&host, rotation, true).await;
+            let fresh = Rotation::new(rotation.node_id, next.started_unix);
+            let done = std::mem::replace(rotation, fresh);
+            finish_rotation(&app_state, done, cursor.started_height);
+        }
+        *cursor = next;
+        if let Err(e) = app_state
+            .db_pool
+            .get()
+            .map_err(|e| e.to_string())
+            .and_then(|conn| {
+                hopnet_storage::store::write_sweep_cursor(&conn, cursor).map_err(|e| e.to_string())
+            })
+        {
+            tracing::warn!("sweep: cursor not saved: {e}");
+        }
+
+        tokio::time::sleep(per_shard.saturating_sub(step_started.elapsed())).await;
+    }
+}
+
+/// The walker's starting point: the saved cursor, or a fresh rotation.
+fn start_walker(
     app_state: &AppState,
-    orphan_grace_secs: u64,
-) -> Result<hopnet_storage::sweep::SweepReport, Error> {
-    use hopnet_storage::traits::LocalStateSink;
-
+) -> Result<(hopnet_storage::sweep::SweepCursor, Rotation), Error> {
     let node_id = app_state
         .get_node_id()
         .map_err(|_| Error::Failed(Arc::new("node id not set".to_string().into())))?;
-    let fragments_dir = app_state.fragments_dir.clone();
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // (1) The walk (blocking IO off the async thread) and the table.
-    let dir = fragments_dir.clone();
-    let walk = tokio::task::spawn_blocking(move || {
-        hopnet_storage::fragstore::scan_fragments_with_temps(&dir)
-    })
-    .await
-    .map_err(|e| Error::Failed(Arc::new(format!("sweep join: {e}").into())))?
-    .map_err(|e| Error::Failed(Arc::new(format!("sweep walk: {e}").into())))?;
-    let listing = walk.fragments;
-    let rows = {
+    let saved = {
         let conn = app_state
             .db_pool
             .get()
             .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-        crate::db::fragments::all_fragment_flags(&conn)
-            .map_err(|e| Error::Failed(Arc::new(format!("fragment flags: {e:?}").into())))?
+        hopnet_storage::store::read_sweep_cursor(&conn)
+            .map_err(|e| Error::Failed(Arc::new(format!("cursor: {e}").into())))?
     };
-    let diff =
-        hopnet_storage::sweep::diff(&listing, &rows, now_unix.saturating_sub(orphan_grace_secs));
-
-    // Repair the flag both ways.
-    let host = SubstrateHost::new(app_state.clone());
-    if !diff.present_unflagged.is_empty() {
-        tracing::info!(
-            "sweep: {} fragments on disk but unflagged — re-flagging",
-            diff.present_unflagged.len()
-        );
-        for hash in &diff.present_unflagged {
-            host.mark_local(*hash).await;
-        }
-    }
-    if !diff.flagged_missing.is_empty() {
-        tracing::warn!(
-            "sweep: {} fragments flagged but gone from disk — un-flagging",
-            diff.flagged_missing.len()
-        );
-        host.mark_remote_batch(diff.flagged_missing.clone()).await;
-    }
-
-    // (2) Orphans past grace — and the temp files of interrupted stores,
-    //     which have no row to be judged by and were never reaped before.
-    let mut temps_deleted = 0usize;
-    for path in
-        hopnet_storage::sweep::stale_temps(&walk.temps, now_unix.saturating_sub(orphan_grace_secs))
-    {
-        match std::fs::remove_file(&path) {
-            Ok(()) => temps_deleted += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => temps_deleted += 1,
-            Err(e) => tracing::warn!("sweep: delete temp file {} failed: {e}", path.display()),
-        }
-    }
-    let mut orphans_deleted = 0usize;
-    let mut orphan_bytes_freed = 0u64;
-    for (hash, size) in &diff.orphans {
-        match hopnet_storage::fragstore::delete_fragment(&fragments_dir, hash) {
-            Ok(()) => {
-                orphans_deleted += 1;
-                orphan_bytes_freed += size;
-            }
-            Err(e) => tracing::warn!("sweep: delete orphan {} failed: {e}", hash.to_hex()),
-        }
-    }
-
-    // (3) The weekly scrub slice shares the walk — minus the orphans step
-    // (2) just deleted, which would otherwise read back as missing. Only
-    // a content hash mismatch is corruption; a file that vanished or a
-    // read the OS refused is counted, never deleted or un-flagged.
-    let day = (now_unix / 86400) as i64;
-    let mut corrupt_deleted = 0usize;
-    let mut scrub_unreadable = 0usize;
-    let mut present = diff.present.clone();
-    if LAST_SCRUB_DAY.swap(day, std::sync::atomic::Ordering::SeqCst) != day {
-        let slice = (day % 7) as u8;
-        let dir = fragments_dir.clone();
-        let deleted: std::collections::HashSet<_> = diff.orphans.iter().map(|(h, _)| *h).collect();
-        let listing_for_scrub: Vec<_> = listing
-            .iter()
-            .filter(|d| !deleted.contains(&d.hash))
-            .copied()
-            .collect();
-        let outcome = tokio::task::spawn_blocking(move || {
-            hopnet_storage::fragstore::verify_listing(&dir, &listing_for_scrub, slice, 7)
-        })
-        .await
-        .map_err(|e| Error::Failed(Arc::new(format!("scrub join: {e}").into())))?;
-        if outcome.vanished > 0 || outcome.unreadable > 0 {
-            tracing::debug!(
-                "scrub: slice {slice}: {} vanished since the walk, {} unreadable",
-                outcome.vanished,
-                outcome.unreadable
-            );
-        }
-        scrub_unreadable = outcome.unreadable;
-        if !outcome.corrupt.is_empty() {
-            tracing::warn!(
-                "scrub: {} corrupt fragments on slice {slice}",
-                outcome.corrupt.len()
-            );
-            for hash in &outcome.corrupt {
-                let _ = hopnet_storage::fragstore::delete_fragment(&fragments_dir, hash);
-            }
-            let gone: std::collections::HashSet<_> = outcome.corrupt.iter().collect();
-            present.retain(|h| !gone.contains(h));
-            corrupt_deleted = outcome.corrupt.len();
-            host.mark_remote_batch(outcome.corrupt).await;
-        }
-    }
-
-    // (3b) Surplus release on this walk's listing: copies the guard calls
-    //      surplus (placement confirmed elsewhere, another member's copy
-    //      disk-verified within the recency window) go now. Before the
-    //      differential and the attestation on purpose: the self-check
-    //      below carries the removals to consensus in this same pass, and
-    //      the attestation never stamps a file this pass deleted — no
-    //      stale attested row. A failure here must not cost the sweep its
-    //      belief and truth steps.
-    let mut surplus_released = 0usize;
-    let mut surplus_bytes_freed = 0u64;
-    let release_input = hopnet_storage::sweep::release_listing(
-        &listing,
-        &present,
-        now_unix.saturating_sub(SURPLUS_RELEASE_GRACE_SECS),
-    );
-    match release_surplus(app_state, &fragments_dir, release_input).await {
-        Ok(outcome) => {
-            if !outcome.released.is_empty() {
-                let gone: std::collections::HashSet<_> = outcome.released.iter().collect();
-                present.retain(|h| !gone.contains(h));
-            }
-            surplus_released = outcome.released.len();
-            surplus_bytes_freed = outcome.bytes_freed;
-        }
-        Err(e) => tracing::warn!("sweep: surplus release failed: {e}"),
-    }
-
-    // (4) Belief: the differential over repaired flags.
-    let differential =
-        crate::db::inventory::compute_inventory_differential(app_state.db_pool.get(), node_id)
-            .map_err(|e| {
-                Error::Failed(Arc::new(format!("inventory differential: {e:?}").into()))
-            })?;
-    if !differential.is_empty() {
-        let payload = bincode::serde::encode_to_vec(&differential, bincode::config::standard())
-            .map_err(|e| Error::Failed(Arc::new(format!("self-check encode: {e}").into())))?;
-        // Belief and truth are independent: attestation stamps only rows
-        // that already exist, so a differential that did not land costs
-        // the new rows their stamps until the next cycle. Aborting here
-        // left a node whose self-check kept timing out with no fresh
-        // attestation at all.
-        if let Err(e) = host
-            .submit(hopnet_storage::engine::policy::SELF_CHECK_FN, payload)
-            .await
-        {
-            tracing::warn!("sweep: self-check submit failed, attesting anyway: {e:?}");
-        }
-    }
-
-    // (5) Truth: attest everything seen on disk this cycle, one awaited
-    // page at a time (ATTEST_PAGE_SIZE): a page that commits stays
-    // committed, and a page that fails does not stop the rest.
-    let mut attested_pages = 0usize;
-    let mut attest_failed_pages = 0usize;
-    if !present.is_empty() {
-        let height = {
-            let conn = app_state
-                .db_pool
-                .get()
-                .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-            crate::db::consensus::get_current_consensus_height(&conn)
-                .map_err(|e| Error::Failed(Arc::new(format!("height: {e:?}").into())))?
-        };
-        let pages = hopnet_storage::sweep::attestation_pages(
-            node_id,
-            height,
-            &present,
-            hopnet_storage::engine::policy::ATTEST_PAGE_SIZE,
-        );
-        (attested_pages, attest_failed_pages) = submit_attestation_pages(&host, pages).await;
-        tracing::info!(
-            "sweep: attested {} fragments in {attested_pages} pages ({attest_failed_pages} failed)",
-            present.len()
-        );
-    }
-
-    let report = hopnet_storage::sweep::SweepReport {
-        swept_at: now_unix as i64,
-        files_on_disk: listing.len(),
-        present: present.len(),
-        reflagged: diff.present_unflagged.len(),
-        unflagged: diff.flagged_missing.len(),
-        orphans_deleted,
-        orphan_bytes_freed,
-        young_orphans: diff.young_orphans,
-        corrupt_deleted,
-        scrub_unreadable,
-        attested_pages,
-        surplus_released,
-        surplus_bytes_freed,
-        temps_deleted,
-        attest_failed_pages,
-        ..Default::default()
+    let cursor = match saved {
+        Some(c) => c,
+        None => hopnet_storage::sweep::SweepCursor::fresh(unix_now(), current_height(app_state)?),
     };
     tracing::info!(
-        "sweep: {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} corrupt deleted, {} surplus released, {} temp files deleted, {} attestation pages failed",
+        "sweep: rolling walker resuming rotation {} at shard {:02x}",
+        cursor.rotation,
+        cursor.next_shard
+    );
+    Ok((cursor, Rotation::new(node_id, cursor.started_unix)))
+}
+
+/// Close a rotation: stamp its duration and height span, log it once, and
+/// keep it as the operator's last report.
+fn finish_rotation(
+    app_state: &AppState,
+    rotation: Rotation,
+    started_height: u64,
+) -> hopnet_storage::sweep::SweepReport {
+    let mut report = rotation.report;
+    report.rotation_secs = unix_now().saturating_sub(report.swept_at as u64);
+    report.rotation_heights = current_height(app_state)
+        .map(|tip| tip.saturating_sub(started_height))
+        .unwrap_or(0);
+    tracing::info!(
+        "sweep: rotation of {} shards in {}s ({} heights): {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} corrupt deleted, {} surplus released, {} temp files deleted, {} belief pages ({} failed), {} attestation pages ({} failed), {} shards failed",
+        report.shards,
+        report.rotation_secs,
+        report.rotation_heights,
         report.files_on_disk,
         report.present,
         report.reflagged,
@@ -658,12 +589,279 @@ pub async fn run_disk_truth_sweep(
         report.corrupt_deleted,
         report.surplus_released,
         report.temps_deleted,
-        report.attest_failed_pages
+        report.belief_pages,
+        report.belief_failed_pages,
+        report.attested_pages,
+        report.attest_failed_pages,
+        report.failed_shards,
     );
+    if report.rotation_heights > hopnet_storage::lifecycle::ATTESTATION_RECENCY_HEIGHTS / 2 {
+        tracing::warn!(
+            "sweep: a rotation spanned {} heights, more than half the {}-height attestation window",
+            report.rotation_heights,
+            hopnet_storage::lifecycle::ATTESTATION_RECENCY_HEIGHTS
+        );
+    }
+    if report.unexpected_names > 0 {
+        tracing::warn!(
+            "sweep: {} files with names that are neither fragments nor temp files were left alone",
+            report.unexpected_names
+        );
+    }
     *app_state.last_sweep.lock().unwrap() = Some(report.clone());
-    if attested_pages == 0 && attest_failed_pages > 0 {
+    report
+}
+
+/// One shard of the sweep, in the order the whole-store sweep used:
+///   1. read the consensus height BEFORE listing — every stamp from this
+///      step is no later than the moment its file was seen;
+///   2. list the shard, diff it against its `fragment_hashes` rows and
+///      repair `stored_locally` both ways (awaited marks);
+///   3. delete orphan and temp files older than the grace period;
+///   4. on the shard's day of seven, verify its content — corrupt bytes
+///      are deleted and un-marked;
+///   5. release surplus copies from the rotation's budget;
+///   6. buffer the shard's belief differential (over repaired flags) and
+///      its present hashes; `flush_buffers` pages them out.
+pub(crate) async fn sweep_shard(
+    app_state: &AppState,
+    host: &SubstrateHost,
+    rotation: &mut Rotation,
+    shard: u8,
+    orphan_grace_secs: u64,
+) -> Result<(), Error> {
+    use hopnet_storage::traits::LocalStateSink;
+
+    let fail = |what: &str, e: String| Error::Failed(Arc::new(format!("{what}: {e}").into()));
+    let fragments_dir = app_state.fragments_dir.clone();
+    let now = unix_now();
+
+    // (1)
+    let height = current_height(app_state)?;
+
+    // (2)
+    let dir = fragments_dir.clone();
+    let walk =
+        tokio::task::spawn_blocking(move || hopnet_storage::fragstore::scan_shard(&dir, shard))
+            .await
+            .map_err(|e| fail("walk join", e.to_string()))?
+            .map_err(|e| fail("walk", e.to_string()))?;
+    let listing = walk.fragments;
+    let rows = {
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|e| fail("pool", e.to_string()))?;
+        crate::db::fragments::shard_fragment_flags(&conn, shard)
+            .map_err(|e| fail("fragment flags", format!("{e:?}")))?
+    };
+    let diff = hopnet_storage::sweep::diff(&listing, &rows, now.saturating_sub(orphan_grace_secs));
+    for hash in &diff.present_unflagged {
+        host.mark_local(*hash).await;
+    }
+    if !diff.flagged_missing.is_empty() {
+        host.mark_remote_batch(diff.flagged_missing.clone()).await;
+    }
+
+    // (3)
+    let report = &mut rotation.report;
+    for path in
+        hopnet_storage::sweep::stale_temps(&walk.temps, now.saturating_sub(orphan_grace_secs))
+    {
+        match std::fs::remove_file(&path) {
+            Ok(()) => report.temps_deleted += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => report.temps_deleted += 1,
+            Err(e) => tracing::warn!("sweep: delete temp file {} failed: {e}", path.display()),
+        }
+    }
+    for (hash, size) in &diff.orphans {
+        match hopnet_storage::fragstore::delete_fragment(&fragments_dir, hash) {
+            Ok(()) => {
+                report.orphans_deleted += 1;
+                report.orphan_bytes_freed += size;
+            }
+            Err(e) => tracing::warn!("sweep: delete orphan {} failed: {e}", hash.to_hex()),
+        }
+    }
+
+    // (4) Only a content hash mismatch is corruption; a file that vanished
+    // or a read the OS refused is counted, never deleted or un-flagged.
+    let day = (now / 86400) as i64;
+    let mut present = diff.present.clone();
+    if hopnet_storage::sweep::scrub_due(shard, day) && claim_scrub(day, shard) {
+        let dir = fragments_dir.clone();
+        let deleted: std::collections::HashSet<_> = diff.orphans.iter().map(|(h, _)| *h).collect();
+        let to_scrub: Vec<_> = listing
+            .iter()
+            .filter(|d| !deleted.contains(&d.hash))
+            .copied()
+            .collect();
+        let outcome = tokio::task::spawn_blocking(move || {
+            hopnet_storage::fragstore::verify_listing(
+                &dir,
+                &to_scrub,
+                shard % hopnet_storage::sweep::SCRUB_SLICES,
+                hopnet_storage::sweep::SCRUB_SLICES,
+            )
+        })
+        .await
+        .map_err(|e| fail("scrub join", e.to_string()))?;
+        report.scrub_unreadable += outcome.unreadable;
+        if !outcome.corrupt.is_empty() {
+            tracing::warn!(
+                "scrub: {} corrupt fragments in shard {shard:02x}",
+                outcome.corrupt.len()
+            );
+            for hash in &outcome.corrupt {
+                let _ = hopnet_storage::fragstore::delete_fragment(&fragments_dir, hash);
+            }
+            let gone: std::collections::HashSet<_> = outcome.corrupt.iter().collect();
+            present.retain(|h| !gone.contains(h));
+            report.corrupt_deleted += outcome.corrupt.len();
+            host.mark_remote_batch(outcome.corrupt).await;
+        }
+    }
+
+    // (5) Before the belief: the shard's differential below carries the
+    // removals, and the attestation never stamps a file this step deleted.
+    if rotation.surplus_left > 0 {
+        let input = hopnet_storage::sweep::release_listing(
+            &listing,
+            &present,
+            now.saturating_sub(SURPLUS_RELEASE_GRACE_SECS),
+        );
+        match release_surplus(app_state, &fragments_dir, input, rotation.surplus_left).await {
+            Ok(outcome) => {
+                if !outcome.released.is_empty() {
+                    let gone: std::collections::HashSet<_> = outcome.released.iter().collect();
+                    present.retain(|h| !gone.contains(h));
+                }
+                rotation.surplus_left =
+                    rotation.surplus_left.saturating_sub(outcome.released.len());
+                rotation.report.surplus_released += outcome.released.len();
+                rotation.report.surplus_bytes_freed += outcome.bytes_freed;
+            }
+            Err(e) => tracing::warn!("sweep: surplus release failed: {e}"),
+        }
+    }
+
+    // (6) Belief and truth, both at the height read before the listing.
+    let pool = app_state.db_pool.clone();
+    let node_id = rotation.node_id;
+    let differential = tokio::task::spawn_blocking(move || {
+        let mut conn = pool.get().map_err(|e| e.to_string())?;
+        crate::db::inventory::compute_shard_inventory_differential(
+            &mut conn, node_id, shard, height,
+        )
+        .map_err(|e| format!("{e:?}"))
+    })
+    .await
+    .map_err(|e| fail("differential join", e.to_string()))?
+    .map_err(|e| fail("inventory differential", e))?;
+    rotation
+        .belief
+        .added
+        .push(height, now, differential.fragments_added);
+    rotation
+        .belief
+        .removed
+        .push(height, now, differential.fragments_removed);
+    rotation.truth.push(height, now, present.iter().copied());
+
+    let report = &mut rotation.report;
+    report.shards += 1;
+    report.files_on_disk += listing.len();
+    report.present += present.len();
+    report.reflagged += diff.present_unflagged.len();
+    report.unflagged += diff.flagged_missing.len();
+    report.young_orphans += diff.young_orphans;
+    report.unexpected_names += walk.unexpected;
+    Ok(())
+}
+
+/// Page out the buffers once either is due (a full page, or an oldest
+/// hash older than `MAX_BUFFER_AGE_SECS`), or unconditionally when
+/// `force`. Belief first: attestation stamps only rows that already exist.
+/// A failed belief page never blocks the truth pages, and a failed
+/// attestation page never blocks the next.
+pub(crate) async fn flush_buffers<S: hopnet_storage::traits::TxSubmitter>(
+    submitter: &S,
+    rotation: &mut Rotation,
+    force: bool,
+) {
+    let page = hopnet_storage::engine::policy::ATTEST_PAGE_SIZE;
+    let now = unix_now();
+    if !force
+        && !rotation.truth.due(now, page, MAX_BUFFER_AGE_SECS)
+        && !rotation.belief.due(now, page, MAX_BUFFER_AGE_SECS)
+    {
+        return;
+    }
+    while let Some(report) = rotation.belief.take_report(rotation.node_id, page) {
+        let submitted = match bincode::serde::encode_to_vec(&report, bincode::config::standard()) {
+            Ok(payload) => submitter
+                .submit(hopnet_storage::engine::policy::SELF_CHECK_FN, payload)
+                .await
+                .map_err(|e| format!("{e:?}")),
+            Err(e) => Err(e.to_string()),
+        };
+        match submitted {
+            Ok(()) => rotation.report.belief_pages += 1,
+            Err(e) => {
+                tracing::warn!("sweep: self-check page failed, attesting anyway: {e}");
+                rotation.report.belief_failed_pages += 1;
+            }
+        }
+    }
+    let mut pages = Vec::new();
+    while let Some((height, present)) = rotation.truth.take_page(page) {
+        pages.push(hopnet_storage::FragmentAttestation {
+            node_id: rotation.node_id,
+            height,
+            present,
+            suspect: Vec::new(),
+        });
+    }
+    let (committed, failed) = submit_attestation_pages(submitter, pages).await;
+    rotation.report.attested_pages += committed;
+    rotation.report.attest_failed_pages += failed;
+}
+
+/// One full rotation now, unpaced — the operator routes and orchestrator
+/// tests (`POST /maintenance/fragment-inventory-self-check`, `GET
+/// /maintenance/orphaned-fragments?run=true`). Interleaves with the
+/// walker shard by shard and leaves its cursor alone.
+pub async fn run_disk_truth_sweep(
+    app_state: &AppState,
+    orphan_grace_secs: u64,
+) -> Result<hopnet_storage::sweep::SweepReport, Error> {
+    let node_id = app_state
+        .get_node_id()
+        .map_err(|_| Error::Failed(Arc::new("node id not set".to_string().into())))?;
+    let host = SubstrateHost::new(app_state.clone());
+    let started_height = current_height(app_state)?;
+    let mut rotation = Rotation::new(node_id, unix_now());
+    for shard in 0..=u8::MAX {
+        {
+            let _guard = SWEEP_LOCK.lock().await;
+            if let Err(e) =
+                sweep_shard(app_state, &host, &mut rotation, shard, orphan_grace_secs).await
+            {
+                tracing::warn!("sweep: shard {shard:02x} failed: {e}");
+                rotation.report.failed_shards += 1;
+            }
+        }
+        flush_buffers(&host, &mut rotation, false).await;
+    }
+    flush_buffers(&host, &mut rotation, true).await;
+    let report = finish_rotation(app_state, rotation, started_height);
+    if report.attested_pages == 0 && report.attest_failed_pages > 0 {
         return Err(Error::Failed(Arc::new(
-            format!("attestation: all {attest_failed_pages} pages failed").into(),
+            format!(
+                "attestation: all {} pages failed",
+                report.attest_failed_pages
+            )
+            .into(),
         )));
     }
     Ok(report)
@@ -721,12 +919,11 @@ pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(
 /// race the grace exists for cannot apply to them.
 pub const SURPLUS_RELEASE_GRACE_SECS: u64 = 600;
 
-/// Most fragments one prompt surplus release deletes. The release rides
-/// the disk-truth sweep (20–90 min apart, not the 5-min tick): an origin
-/// that ingested a library holds ~100k surplus files, and a few thousand
-/// per sweep would take a day to drain. 10k unlinks is seconds, and the
-/// self-check differential that carries them is one hash list (~320 KB),
-/// well under the per-transaction payload limit.
+/// Most fragments the prompt surplus release deletes per rotation of the
+/// rolling sweep (and per manual release): an origin that ingested a
+/// library holds ~100k surplus files, and a few thousand per rotation
+/// would take a day to drain. 10k unlinks is seconds, and the belief
+/// pages that carry their removals stay under the payload limit.
 pub const SURPLUS_RELEASE_MAX_PER_SWEEP: usize = 10_000;
 
 /// The guard's facts for the given on-disk fragments (`(hash, size)`,
@@ -988,11 +1185,12 @@ async fn release_surplus(
     app_state: &AppState,
     fragments_dir: &str,
     disk: Vec<(crate::types::Blake3Hash, u64)>,
+    max: usize,
 ) -> Result<SurplusRelease, Error> {
     use hopnet_storage::eviction::plan_surplus_release;
     use hopnet_storage::traits::StateReader;
 
-    if disk.is_empty() {
+    if disk.is_empty() || max == 0 {
         return Ok(SurplusRelease {
             released: Vec::new(),
             bytes_freed: 0,
@@ -1008,8 +1206,8 @@ async fn release_surplus(
 
     let candidates = gather_eviction_candidates(app_state, &disk, Some(recent)).await?;
     let sizes: std::collections::HashMap<_, _> = disk.into_iter().collect();
-    let planned = plan_surplus_release(candidates, SURPLUS_RELEASE_MAX_PER_SWEEP);
-    let capped = planned.len() >= SURPLUS_RELEASE_MAX_PER_SWEEP;
+    let planned = plan_surplus_release(candidates, max);
+    let capped = planned.len() >= max;
     let (released, bytes_freed) = delete_and_mark(app_state, fragments_dir, &planned, &sizes).await;
     if !released.is_empty() {
         tracing::info!(
@@ -1042,7 +1240,13 @@ pub async fn run_surplus_release(
         now_unix - grace_secs.unwrap_or(SURPLUS_RELEASE_GRACE_SECS),
     )
     .map_err(|e| Error::Failed(Arc::new(format!("disk scan: {e}").into())))?;
-    let outcome = release_surplus(app_state, &fragments_dir, disk).await?;
+    let outcome = release_surplus(
+        app_state,
+        &fragments_dir,
+        disk,
+        SURPLUS_RELEASE_MAX_PER_SWEEP,
+    )
+    .await?;
     Ok(serde_json::json!({
         "released": outcome.released.len(), "bytes_freed": outcome.bytes_freed,
         "capped": outcome.capped,
@@ -1329,8 +1533,8 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
     });
 
     // (4) Eviction check (statvfs no-op below the high watermark). The
-    //     prompt surplus release is not here: it rides the disk-truth
-    //     sweep's walk (`run_disk_truth_sweep`, step 3b).
+    //     prompt surplus release is not here: it rides the rolling
+    //     sweep's walk (`sweep_shard`, step 5).
     let eviction = run_watermark_eviction(app_state, None, None).await?;
 
     let report = PolicyTickReport {
@@ -1350,4 +1554,92 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
     };
     *app_state.last_tick.lock().unwrap() = Some(report.clone());
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hopnet_storage::types::Blake3Hash;
+
+    /// Records every submit as (function, payload); fails the listed
+    /// 1-based call numbers.
+    #[derive(Default)]
+    struct Recorder {
+        calls: std::sync::Mutex<Vec<(&'static str, Vec<u8>)>>,
+        fail_on: Vec<usize>,
+    }
+
+    impl TxSubmitter for Recorder {
+        async fn submit(
+            &self,
+            function: &'static str,
+            payload: Vec<u8>,
+        ) -> Result<(), hopnet_storage::traits::SubmitError> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((function, payload));
+            if self.fail_on.contains(&calls.len()) {
+                Err(hopnet_storage::traits::SubmitError::Transient(
+                    "timeout".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn h(b: u8) -> Blake3Hash {
+        Blake3Hash::from_bytes([b; 32])
+    }
+
+    // Impact: attestation stamps only rows that exist, so belief must go
+    // out before truth; and a page stamped later than its fragments were
+    // seen would overstate freshness (rolling-sweep decision 2).
+    // Should: submit belief pages before attestation pages, each stamped
+    // with the lowest height its hashes were observed at.
+    // Should: carry on to the attestation when a belief page fails.
+    // Should not: submit anything while neither buffer is due.
+    #[tokio::test]
+    async fn flush_sends_belief_then_truth_at_the_heights_seen() {
+        let rec = Recorder {
+            fail_on: vec![1],
+            ..Default::default()
+        };
+        let mut rot = Rotation::new(7, 0);
+        let now = unix_now();
+        rot.belief.added.push(40, now, [h(1)]);
+        rot.truth.push(42, now, [h(1)]);
+        rot.truth.push(41, now, [h(2)]);
+        flush_buffers(&rec, &mut rot, false).await;
+        assert!(rec.calls.lock().unwrap().is_empty(), "nothing due yet");
+
+        flush_buffers(&rec, &mut rot, true).await;
+        let calls = rec.calls.lock().unwrap();
+        let functions: Vec<_> = calls.iter().map(|(f, _)| *f).collect();
+        assert_eq!(
+            functions,
+            vec![
+                hopnet_storage::engine::policy::SELF_CHECK_FN,
+                hopnet_storage::engine::policy::ATTEST_FN
+            ]
+        );
+        let (attestation, _): (hopnet_storage::FragmentAttestation, _) =
+            bincode::serde::decode_from_slice(&calls[1].1, bincode::config::standard()).unwrap();
+        assert_eq!(attestation.height, 41);
+        assert_eq!(attestation.present, vec![h(1), h(2)]);
+        assert_eq!(
+            (rot.report.belief_failed_pages, rot.report.attested_pages),
+            (1, 1)
+        );
+    }
+
+    // Should: hand each shard's scrub out once per day, and again on a
+    // new day.
+    #[test]
+    fn scrub_is_claimed_once_per_shard_per_day() {
+        let day = 1_000_000;
+        assert!(claim_scrub(day, 3));
+        assert!(!claim_scrub(day, 3));
+        assert!(claim_scrub(day, 4));
+        assert!(claim_scrub(day + 1, 3));
+    }
 }
