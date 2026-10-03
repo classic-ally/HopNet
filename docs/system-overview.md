@@ -604,7 +604,9 @@ apply functions inside consensus handlers.
       and per-peer caps with peer and blob parking, so an offline origin
       cannot stall it (`HOPNET_PULL_*` knobs, thor narrower). Still open
       for design: a free-space floor on pulls, unseating a validator
-      that stops voting.
+      that stops voting, and (known 10.8 limitation) availability that
+      reflects serving: a member that answers probes but cannot serve
+      fragments stays in the storage view and is never rebuilt around.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage

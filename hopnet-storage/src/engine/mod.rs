@@ -527,8 +527,8 @@ where
                 .filter(|p| !dark.contains(&p.node_id))
                 .collect(),
         );
-        // Inventory rows of departed nodes (voted out, decayed out of the
-        // storage view) outlive them: they are not holders to wait for. A
+        // Inventory rows of nodes that have left the storage view (decayed
+        // out on availability) outlive them: they are not holders to wait for. A
         // class held only by non-members is unserved, so it rebuilds; a
         // live non-member is still reached through discovery.
         let members = sched.members(&seams.state, std::time::Instant::now()).await;
@@ -626,9 +626,16 @@ where
         // left the storage view (filtered out above, so it arrives here as
         // unserved) or every reachable holder says it does not have it.
         // A member that is dark, parked, slow or busy is never rebuilt
-        // around: the blob parks with backoff. A member dark for long
-        // enough is voted out, and then its classes become rebuildable
-        // through the membership filter.
+        // around: the blob parks with backoff. Its classes become
+        // rebuildable only once it leaves the storage view, and storage
+        // membership is derived from replicated availability
+        // (`membership::derive_view` over the availability history, the
+        // MAX of `available` across observers), not from consensus
+        // vote-out. KNOWN LIMITATION (2026.10.8): a node that still
+        // answers availability probes but cannot serve fragments (wedged
+        // store, full disk) stays a member, so its classes are never
+        // rebuilt around and its blobs stay parked. The next release makes
+        // availability reflect serving.
         for (chunk, (mut unserved, unreachable)) in unserved_by_chunk {
             unserved.sort_unstable();
             if unreachable {
@@ -1119,8 +1126,9 @@ mod tests {
     // Impact: inventory rows of departed nodes counted as holders to wait
     // for, so their classes were never rebuilt; and rebuilding around a
     // member that is merely dark spends memory and makes copies its holder
-    // will serve again once back (decided with Allison: a member dark for
-    // long enough is voted out, and only then rebuilt around).
+    // will serve again once back (decided with Allison: a member is rebuilt
+    // around only once it decays out of the availability-derived storage
+    // view; a wedged-but-available member is a known 10.8 limitation).
     // Should: rebuild (not park) a class whose only holder has left the
     // storage view, even while that node is dark.
     // Should not: rebuild around a member holder, however long it has been
