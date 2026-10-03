@@ -164,6 +164,47 @@ pub fn all_fragment_flags(
         .map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))
 }
 
+/// `all_fragment_flags` for one rolling-sweep shard: the rows whose hash
+/// starts with `shard`, a range scan on `idx_fragment_hash`.
+pub fn shard_fragment_flags(
+    conn: &rusqlite::Connection,
+    shard: u8,
+) -> Result<Vec<(crate::types::Blake3Hash, bool)>, DatabaseError> {
+    let (lo, hi) = hopnet_storage::sweep::shard_bounds(shard);
+    let map = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, crate::types::Blake3Hash>(0)?,
+            row.get::<_, Option<bool>>(1)?.unwrap_or(false),
+        ))
+    };
+    let classify = |e: rusqlite::Error| DatabaseError::classified(&e, DatabaseError::RecallError);
+    let rows = match hi {
+        Some(hi) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT fragment_hash, stored_locally FROM fragment_hashes
+                     WHERE fragment_hash >= ?1 AND fragment_hash < ?2",
+                )
+                .map_err(classify)?;
+            stmt.query_map(rusqlite::params![lo, hi], map)
+                .map_err(classify)?
+                .collect::<Result<Vec<_>, _>>()
+        }
+        None => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT fragment_hash, stored_locally FROM fragment_hashes
+                     WHERE fragment_hash >= ?1",
+                )
+                .map_err(classify)?;
+            stmt.query_map(rusqlite::params![lo], map)
+                .map_err(classify)?
+                .collect::<Result<Vec<_>, _>>()
+        }
+    };
+    rows.map_err(|e| DatabaseError::classified(&e, DatabaseError::ProcessingError))
+}
+
 /// Look up (blob, class) for on-disk fragment hashes. Hashes absent from
 /// fragment_hashes are orphans — the disk-truth sweep owns those, not
 /// eviction.

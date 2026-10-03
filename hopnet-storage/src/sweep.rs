@@ -113,9 +113,9 @@ pub fn attestation_pages(
         .collect()
 }
 
-/// What one sweep did — the operator's report (the former two-call orphan
-/// scan/delete API collapses into this).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What one rotation of the sweep did — the operator's report (the former
+/// two-call orphan scan/delete API collapses into this).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SweepReport {
     pub swept_at: i64,
     pub files_on_disk: usize,
@@ -144,6 +144,25 @@ pub struct SweepReport {
     /// them and the next cycle re-covers their hashes.
     #[serde(default)]
     pub attest_failed_pages: usize,
+    /// Shards this report covers (256 for a completed rotation of the
+    /// rolling sweep).
+    #[serde(default)]
+    pub shards: usize,
+    /// Wall time of the rotation.
+    #[serde(default)]
+    pub rotation_secs: u64,
+    /// Consensus heights the tip moved during the rotation — what the
+    /// attestation recency window is measured in.
+    #[serde(default)]
+    pub rotation_heights: u64,
+    /// Files whose name is neither a fragment nor a temp file.
+    #[serde(default)]
+    pub unexpected_names: usize,
+    /// `self_check_fragments` pages committed and failed.
+    #[serde(default)]
+    pub belief_pages: usize,
+    #[serde(default)]
+    pub belief_failed_pages: usize,
 }
 
 /// The temp files old enough to reap: an in-flight store is seconds old,
@@ -174,6 +193,135 @@ pub fn release_listing(
         .filter(|d| d.mtime < grace_cutoff && present.contains(&d.hash))
         .map(|d| (d.hash, d.size))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Rolling sweep primitives
+
+/// The rolling sweep's unit: the first byte of a fragment hash, which is
+/// also the store's first-level directory (`fragstore::get_fragment_dir`).
+/// One rotation visits all 256.
+pub const SHARD_COUNT: usize = 256;
+
+/// The shard a fragment belongs to.
+pub fn shard_of(hash: &Blake3Hash) -> u8 {
+    hash.as_bytes()[0]
+}
+
+/// The shard's bounds over a BLOB hash column, `[lo, hi)`; `hi` is `None`
+/// for the last shard. SQLite orders BLOBs by memcmp then length, so the
+/// one-byte bounds bracket exactly the 32-byte hashes with that prefix.
+pub fn shard_bounds(shard: u8) -> (Vec<u8>, Option<Vec<u8>>) {
+    (vec![shard], shard.checked_add(1).map(|next| vec![next]))
+}
+
+/// The scrub reads one seventh of the store per UTC day, as before the
+/// rolling sweep: the shards whose index is the day's slice.
+pub const SCRUB_SLICES: u8 = 7;
+
+/// Is `shard` in the scrub slice of `day` (days since the unix epoch)?
+pub fn scrub_due(shard: u8, day: i64) -> bool {
+    i64::from(shard % SCRUB_SLICES) == day.rem_euclid(i64::from(SCRUB_SLICES))
+}
+
+/// Hashes waiting to ride a page-sized transaction, with the lowest
+/// height any of them was observed at. A page is stamped with that
+/// height, so it never claims a hash was seen later than it was.
+#[derive(Debug, Default)]
+pub struct PageBuffer {
+    hashes: Vec<Blake3Hash>,
+    min_height: Option<u64>,
+    /// When the oldest hash still waiting arrived (unix seconds).
+    opened_at: Option<u64>,
+}
+
+impl PageBuffer {
+    /// Add hashes observed at `height`.
+    pub fn push(&mut self, height: u64, now: u64, hashes: impl IntoIterator<Item = Blake3Hash>) {
+        let before = self.hashes.len();
+        self.hashes.extend(hashes);
+        if self.hashes.len() == before {
+            return;
+        }
+        self.min_height = Some(self.min_height.map_or(height, |h| h.min(height)));
+        self.opened_at.get_or_insert(now);
+    }
+
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+
+    /// A full page is waiting, or the oldest hash has waited `max_age`.
+    pub fn due(&self, now: u64, page: usize, max_age_secs: u64) -> bool {
+        self.hashes.len() >= page
+            || self
+                .opened_at
+                .is_some_and(|t| now.saturating_sub(t) >= max_age_secs)
+    }
+
+    /// Take up to `page` hashes with the height to stamp them at. What
+    /// stays keeps the same floor height (conservative) and age.
+    pub fn take_page(&mut self, page: usize) -> Option<(u64, Vec<Blake3Hash>)> {
+        let height = self.min_height?;
+        let n = page.max(1).min(self.hashes.len());
+        let taken: Vec<_> = self.hashes.drain(..n).collect();
+        if self.hashes.is_empty() {
+            self.min_height = None;
+            self.opened_at = None;
+        }
+        Some((height, taken))
+    }
+}
+
+/// The belief side of the rolling sweep: additions and removals buffered
+/// separately, paged into `self_check_fragments` reports.
+#[derive(Debug, Default)]
+pub struct BeliefBuffer {
+    pub added: PageBuffer,
+    pub removed: PageBuffer,
+}
+
+impl BeliefBuffer {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+
+    pub fn due(&self, now: u64, page: usize, max_age_secs: u64) -> bool {
+        self.added.len() + self.removed.len() >= page
+            || self.added.due(now, usize::MAX, max_age_secs)
+            || self.removed.due(now, usize::MAX, max_age_secs)
+    }
+
+    /// One report of at most `page` hashes, removals first (they are the
+    /// smaller side and the ones whose delay keeps a stale row). Its height
+    /// is the lower of the two floors: for removals the apply's CAS then
+    /// errs toward keeping a row, never toward deleting newer evidence.
+    pub fn take_report(&mut self, node_id: i32, page: usize) -> Option<crate::SelfCheckFragments> {
+        if self.is_empty() {
+            return None;
+        }
+        let (removed_height, removed) = self
+            .removed
+            .take_page(page)
+            .unwrap_or((u64::MAX, Vec::new()));
+        let room = page.saturating_sub(removed.len());
+        let (added_height, added) = if room > 0 {
+            self.added.take_page(room).unwrap_or((u64::MAX, Vec::new()))
+        } else {
+            (u64::MAX, Vec::new())
+        };
+        Some(crate::SelfCheckFragments {
+            node_id,
+            self_verified_height: removed_height.min(added_height),
+            previous_count: 0,
+            fragments_added: added,
+            fragments_removed: removed,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -281,5 +429,81 @@ mod tests {
             .iter()
             .all(|p| p.node_id == 2 && p.height == 77 && p.suspect.is_empty()));
         assert!(attestation_pages(2, 77, &[], 4).is_empty());
+    }
+
+    // Should: place a hash in the shard of its first byte, and bound each
+    // shard so the first and last shards are covered at their edges.
+    #[test]
+    fn shard_bounds_bracket_the_first_byte() {
+        let mut bytes = [0xabu8; 32];
+        assert_eq!(shard_of(&Blake3Hash::from_bytes(bytes)), 0xab);
+        assert_eq!(shard_bounds(0x00), (vec![0x00], Some(vec![0x01])));
+        assert_eq!(shard_bounds(0xab), (vec![0xab], Some(vec![0xac])));
+        assert_eq!(shard_bounds(0xff), (vec![0xff], None));
+        // memcmp-then-length ordering, as SQLite compares BLOBs.
+        bytes[1..].fill(0xff);
+        assert!(vec![0xab] <= bytes.to_vec() && bytes.to_vec() < vec![0xac]);
+        bytes[1..].fill(0x00);
+        assert!(vec![0xab] <= bytes.to_vec());
+    }
+
+    // Impact: the scrub keeps its old budget (one seventh of the store per
+    // UTC day) now that shards are visited many times a day.
+    // Should: put each shard in exactly one of the seven daily slices.
+    #[test]
+    fn every_shard_is_scrubbed_on_exactly_one_day_of_seven() {
+        for shard in 0..=u8::MAX {
+            let days: Vec<i64> = (100..107).filter(|d| scrub_due(shard, *d)).collect();
+            assert_eq!(days.len(), 1, "shard {shard}");
+        }
+    }
+
+    // Impact: decision 2 of the rolling sweep — a page must never claim a
+    // fragment was seen later than it was, or freshness is overstated.
+    // Should: stamp a page with the lowest height among the hashes in it.
+    // Should: be due at a full page or once the oldest hash has waited the
+    // maximum age, and reset once drained.
+    // Should not: be due when empty.
+    #[test]
+    fn page_buffer_stamps_the_floor_height_and_flushes_on_size_or_age() {
+        let mut buf = PageBuffer::default();
+        assert!(!buf.due(1_000, 4, 60));
+        buf.push(50, 1_000, [h(1), h(2)]);
+        buf.push(40, 1_010, [h(3)]);
+        buf.push(60, 1_020, []);
+        assert!(!buf.due(1_030, 4, 60));
+        assert!(buf.due(1_060, 4, 60), "the oldest hash waited 60 s");
+        buf.push(70, 1_030, [h(4)]);
+        assert!(buf.due(1_030, 4, 60), "a full page");
+
+        let (height, page) = buf.take_page(3).unwrap();
+        assert_eq!(height, 40);
+        assert_eq!(page, vec![h(1), h(2), h(3)]);
+        let (height, rest) = buf.take_page(3).unwrap();
+        assert_eq!(height, 40, "what stays keeps the conservative floor");
+        assert_eq!(rest, vec![h(4)]);
+        assert!(buf.take_page(3).is_none());
+        assert!(!buf.due(9_999, 4, 60));
+    }
+
+    // Should: page removals and additions into reports of at most a page,
+    // removals first, at the lower of the two floor heights.
+    #[test]
+    fn belief_buffer_pages_removals_first_at_the_floor_height() {
+        let mut buf = BeliefBuffer::default();
+        assert!(buf.take_report(7, 4).is_none());
+        buf.added.push(30, 0, [h(1), h(2), h(3)]);
+        buf.removed.push(20, 0, [h(9), h(8)]);
+
+        let first = buf.take_report(7, 4).unwrap();
+        assert_eq!(first.node_id, 7);
+        assert_eq!(first.self_verified_height, 20);
+        assert_eq!(first.fragments_removed, vec![h(9), h(8)]);
+        assert_eq!(first.fragments_added, vec![h(1), h(2)]);
+        let second = buf.take_report(7, 4).unwrap();
+        assert_eq!(second.self_verified_height, 30);
+        assert_eq!(second.fragments_added, vec![h(3)]);
+        assert!(second.fragments_removed.is_empty());
+        assert!(buf.take_report(7, 4).is_none());
     }
 }

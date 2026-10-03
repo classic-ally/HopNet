@@ -593,6 +593,60 @@ pub fn compute_inventory_differential(
     })
 }
 
+/// SQL bounding `col` to one rolling-sweep shard, binding `?1` (and `?2`
+/// unless it is the last shard). Pair with `sweep::shard_bounds`.
+fn shard_clause(col: &str, last: bool) -> String {
+    if last {
+        format!("{col} >= ?1")
+    } else {
+        format!("{col} >= ?1 AND {col} < ?2")
+    }
+}
+
+/// `compute_inventory_differential` over one rolling-sweep shard: this
+/// node's belief rows against its stored-locally flags, restricted to the
+/// hashes whose first byte is `shard`. Both sides are range scans on
+/// indexes (`idx_fragment_hashes_local`, `idx_fragment_inventory_node`).
+/// `previous_count` is 0 (informational on the wire).
+pub fn compute_shard_inventory_differential(
+    tx: &rusqlite::Transaction<'_>,
+    node_id: i32,
+    shard: u8,
+    self_verified_height: u64,
+) -> Result<SelfCheckFragments, rusqlite::Error> {
+    let (lo, hi) = crate::sweep::shard_bounds(shard);
+    let last = hi.is_none();
+    let range = shard_clause("fragment_hash", last);
+    let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&lo];
+    if let Some(hi) = &hi {
+        bound.push(hi);
+    }
+    bound.push(&node_id);
+    let query = |sql: &str| -> Result<Vec<Blake3Hash>, rusqlite::Error> {
+        let mut stmt = tx.prepare(sql)?;
+        let rows = stmt.query_map(bound.as_slice(), |row| row.get(0))?;
+        rows.collect()
+    };
+    let node = if last { "?2" } else { "?3" };
+    let fragments_added = query(&format!(
+        "SELECT fragment_hash FROM fragment_hashes WHERE stored_locally = 1 AND {range}
+         EXCEPT
+         SELECT fragment_hash FROM fragment_inventory WHERE node_id = {node} AND {range}"
+    ))?;
+    let fragments_removed = query(&format!(
+        "SELECT fragment_hash FROM fragment_inventory WHERE node_id = {node} AND {range}
+         EXCEPT
+         SELECT fragment_hash FROM fragment_hashes WHERE stored_locally = 1 AND {range}"
+    ))?;
+    Ok(SelfCheckFragments {
+        node_id,
+        self_verified_height,
+        previous_count: 0,
+        fragments_added,
+        fragments_removed,
+    })
+}
+
 /// Blob-scoped belief for the prompt path (RFC-STORAGE-003 S3/S5): the
 /// hashes of ONE blob this node holds (`stored_locally`) that have no
 /// inventory row for it yet — the classes a pull just landed or rebuilt
@@ -1436,5 +1490,67 @@ mod tests {
         assert_eq!(report.previous_count, 0);
         assert!(report.fragments_removed.is_empty());
         assert_eq!(report.fragments_added, vec![h(2), h(1), h(5)]);
+    }
+
+    // Impact: the rolling sweep pages belief per shard; a range that
+    // leaked into a neighbour, or missed the last shard, would assert or
+    // remove belief for fragments the shard's walk never looked at.
+    // Should: add this node's held hashes in the shard that lack its row,
+    // and remove its rows in the shard whose hash is not held.
+    // Should not: touch another shard's hashes, an un-held hash that has
+    // no row, or another node's rows.
+    #[test]
+    fn shard_differential_covers_exactly_the_shard() {
+        let mut conn = test_conn();
+        inventory_schema(&conn);
+        let blob = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap();
+        let h = |first: u8, rest: u8| {
+            let mut b = [rest; 32];
+            b[0] = first;
+            Blake3Hash::from_bytes(b)
+        };
+        // (hash, stored_locally)
+        for (i, (hash, local)) in [
+            (h(0xab, 0x00), true),  // held, no row → added
+            (h(0xab, 0xff), true),  // held, my row → nothing
+            (h(0xab, 0x11), false), // not held, my row → removed
+            (h(0xab, 0x22), false), // not held, no row → nothing
+            (h(0xaa, 0xff), true),  // previous shard → untouched
+            (h(0xac, 0x00), true),  // next shard → untouched
+            (h(0xff, 0x01), true),  // last shard, held, no row
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO fragment_hashes
+                 (data_block_id, chunk_number, local_index, fragment_hash, stored_locally)
+                 VALUES (?, 0, ?, ?, ?)",
+                params![blob, i as i64, hash, local],
+            )
+            .unwrap();
+        }
+        for (hash, node) in [
+            (h(0xab, 0xff), 1),
+            (h(0xab, 0x11), 1),
+            (h(0xab, 0x33), 2), // another node's row, not held here
+            (h(0xac, 0x11), 1), // next shard's stale row
+        ] {
+            conn.execute(
+                "INSERT INTO fragment_inventory (fragment_hash, node_id) VALUES (?, ?)",
+                params![hash, node],
+            )
+            .unwrap();
+        }
+
+        let tx = conn.transaction().unwrap();
+        let report = compute_shard_inventory_differential(&tx, 1, 0xab, 9).unwrap();
+        assert_eq!(report.self_verified_height, 9);
+        assert_eq!(report.fragments_added, vec![h(0xab, 0x00)]);
+        assert_eq!(report.fragments_removed, vec![h(0xab, 0x11)]);
+
+        let last = compute_shard_inventory_differential(&tx, 1, 0xff, 9).unwrap();
+        assert_eq!(last.fragments_added, vec![h(0xff, 0x01)]);
+        assert!(last.fragments_removed.is_empty());
     }
 }

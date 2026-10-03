@@ -646,6 +646,7 @@ pub async fn run_disk_truth_sweep(
         surplus_bytes_freed,
         temps_deleted,
         attest_failed_pages,
+        ..Default::default()
     };
     tracing::info!(
         "sweep: {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} corrupt deleted, {} surplus released, {} temp files deleted, {} attestation pages failed",
