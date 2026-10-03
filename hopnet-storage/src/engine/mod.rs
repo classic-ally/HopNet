@@ -469,17 +469,19 @@ where
                     if all_dark {
                         return (chunk, class, Err(FetchMiss::Unreachable));
                     }
-                    let data =
+                    let fetch::Fetched { data, slot } =
                         match fetch::fetch_class(&transport, &sched, &hash, &attested, &others)
                             .await
                         {
-                            Ok(data) => data,
+                            Ok(fetched) => fetched,
                             Err(miss) => return (chunk, class, Err(miss)),
                         };
+                    // The global slot is held until the bytes are on disk.
                     let stored = tokio::task::spawn_blocking(move || {
                         fragstore::store_fragment(&dir, &hash, data)
                     })
                     .await;
+                    drop(slot);
                     match stored {
                         Ok(Ok(())) => {
                             local_state.mark_local(hash).await;

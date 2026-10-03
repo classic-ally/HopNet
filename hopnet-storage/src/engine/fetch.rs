@@ -382,17 +382,25 @@ pub enum FetchMiss {
     Unreachable,
 }
 
+/// Verified fragment bytes, still holding their global fetch slot: the
+/// caller keeps this alive until the bytes are on disk, so the global cap
+/// bounds bytes awaiting a write, not only bytes on the wire.
+pub struct Fetched {
+    pub data: Vec<u8>,
+    pub slot: tokio::sync::OwnedSemaphorePermit,
+}
+
 /// Fetch one class: attested holders first, least-loaded first, each
 /// under the global and per-peer caps and the fetch deadline; the bytes
 /// are verified against the manifest hash. Then reactive discovery over
-/// the other reachable peers. `None` on success with the verified bytes.
+/// the other reachable peers.
 pub async fn fetch_class<T: Transport + 'static>(
     transport: &Arc<T>,
     sched: &FetchScheduler,
     hash: &Blake3Hash,
     attested: &[PeerRef],
     others: &[PeerRef],
-) -> Result<Vec<u8>, FetchMiss> {
+) -> Result<Fetched, FetchMiss> {
     let now = Instant::now();
     let mut holders: Vec<PeerRef> = attested
         .iter()
@@ -425,7 +433,7 @@ pub async fn fetch_class<T: Transport + 'static>(
         } else {
             None
         };
-        let Ok(_global) = sched.global.acquire().await else {
+        let Ok(global) = sched.global.clone().acquire_owned().await else {
             return Err(FetchMiss::NotServed);
         };
         match tokio::time::timeout(
@@ -436,7 +444,7 @@ pub async fn fetch_class<T: Transport + 'static>(
         {
             Ok(Ok(data)) if Blake3Hash::new(blake3::hash(&data)) == *hash => {
                 sched.record_peer_success(peer.node_id, Instant::now());
-                return Ok(data);
+                return Ok(Fetched { data, slot: global });
             }
             Ok(Ok(_)) => {
                 tracing::warn!(
@@ -470,7 +478,7 @@ pub async fn fetch_class<T: Transport + 'static>(
         .filter(|p| !sched.peer_parked(p.node_id, now))
         .collect();
     if !rest.is_empty() {
-        let Ok(_global) = sched.global.acquire().await else {
+        let Ok(global) = sched.global.clone().acquire_owned().await else {
             return Err(FetchMiss::NotServed);
         };
         if let Ok(Some(data)) = tokio::time::timeout(
@@ -479,7 +487,7 @@ pub async fn fetch_class<T: Transport + 'static>(
         )
         .await
         {
-            return Ok(data);
+            return Ok(Fetched { data, slot: global });
         }
     }
     // Unreachable only when the class HAS known holders and none of them
@@ -699,8 +707,10 @@ mod tests {
         for n in 0..3 {
             let hash = register(2000 + n);
             assert_eq!(
-                fetch_class(&net, &sched, &hash, &[peer(2)], &[]).await,
-                Err(FetchMiss::Unreachable)
+                fetch_class(&net, &sched, &hash, &[peer(2)], &[])
+                    .await
+                    .err(),
+                Some(FetchMiss::Unreachable)
             );
         }
         assert!(sched.peer_parked(2, Instant::now()));
@@ -805,6 +815,25 @@ mod tests {
         assert!(!sched.blob_parked(&blob, t1));
     }
 
+    // Impact: review of #96 — fragment buffers outlived their global slot
+    // while the blocking store ran, so the cap no longer bounded the bytes
+    // held in memory.
+    // Should: keep a fetch's global slot taken until its bytes are dropped
+    // (stored), and free it after.
+    #[tokio::test]
+    async fn fetched_bytes_hold_their_global_slot_until_dropped() {
+        let net = Net::new(&[(3, Peer::Serves)], 1);
+        let sched = FetchScheduler::new(limits(4, 2, 1_000));
+        let hash = register(4000);
+        let fetched = fetch_class(&net, &sched, &hash, &[peer(3)], &[])
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(sched.stats(Instant::now()).fetches_in_flight, 1);
+        drop(fetched);
+        assert_eq!(sched.stats(Instant::now()).fetches_in_flight, 0);
+    }
+
     // Should: give up on a fetch at its deadline and release its global
     // and per-peer slots.
     // Should not: let a hung peer hold slots past the deadline.
@@ -815,7 +844,7 @@ mod tests {
         let hash = register(3000);
         let started = Instant::now();
         let got = fetch_class(&net, &sched, &hash, &[peer(2)], &[]).await;
-        assert_eq!(got, Err(FetchMiss::Unreachable));
+        assert_eq!(got.err(), Some(FetchMiss::Unreachable));
         assert!(started.elapsed() < Duration::from_secs(2));
         let stats = sched.stats(Instant::now());
         assert_eq!(stats.fetches_in_flight, 0);
