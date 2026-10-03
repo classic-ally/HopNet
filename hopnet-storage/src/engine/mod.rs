@@ -145,6 +145,11 @@ type PullRequest = BlobId;
 /// queued again.
 type UrgentPending = Arc<std::sync::Mutex<std::collections::HashSet<(BlobId, u32)>>>;
 
+/// The urgent set the latest policy tick owed, by (blob, chunk); `None`
+/// until a tick publishes one. A queued urgent re-encode outside it is
+/// dropped unrun.
+type UrgentLatest = Arc<std::sync::Mutex<Option<std::collections::HashSet<(BlobId, u32)>>>>;
+
 /// Blobs queued for (or in) a pull check, each with the callers waiting
 /// on its outcome. One entry per blob: a second request for a queued blob
 /// waits on the same check instead of queueing a duplicate.
@@ -225,6 +230,7 @@ pub struct EngineHandle {
     /// queued are dropped, and the planner paces itself on the count.
     queued: PullQueue,
     urgent_pending: UrgentPending,
+    urgent_latest: UrgentLatest,
     sched: Arc<FetchScheduler>,
 }
 
@@ -343,6 +349,15 @@ impl EngineHandle {
         self.urgent_pending.lock().unwrap().len()
     }
 
+    /// The urgent set the latest policy tick owes, replacing the last one.
+    /// The tick publishes it every pass (empty included) BEFORE queueing
+    /// it; the dispatcher drops a queued urgent chunk outside it, so a
+    /// backlog built on a wrong view drains on the next tick that sees
+    /// the holders back.
+    pub fn set_urgent_reencodes(&self, owed: std::collections::HashSet<(BlobId, u32)>) {
+        *self.urgent_latest.lock().unwrap() = Some(owed);
+    }
+
     /// Spawn the engine on `data_rt`: one dispatch loop running the duty
     /// ladder as priority order — urgent re-encode > pull admission > lazy
     /// re-encode. Pulls run in a bounded window of blobs whose fetches
@@ -370,6 +385,8 @@ impl EngineHandle {
         let worker_queued = queued.clone();
         let urgent_pending: UrgentPending = Default::default();
         let worker_urgent = urgent_pending.clone();
+        let urgent_latest: UrgentLatest = Default::default();
+        let worker_latest = urgent_latest.clone();
         let sched = FetchScheduler::new(config.limits);
         let worker_sched = sched.clone();
         // Weak, so the loop still ends when every handle is dropped.
@@ -385,7 +402,15 @@ impl EngineHandle {
                     cmd = reencode_urgent_rx.recv() => {
                         let Some(cmd) = cmd else { break };
                         let key = (cmd.blob_id.clone(), cmd.chunk_number);
-                        run_reencode_guarded(&seams, &fragments_dir, cmd).await;
+                        if still_owed(&worker_latest, &key) {
+                            run_reencode_guarded(&seams, &fragments_dir, cmd).await;
+                        } else {
+                            tracing::debug!(
+                                "re-encode: blob {} chunk {} no longer owed — dropped",
+                                key.0,
+                                key.1
+                            );
+                        }
                         worker_urgent.lock().unwrap().remove(&key);
                     }
                     Some(_) = running.join_next(), if !running.is_empty() => {}
@@ -450,9 +475,20 @@ impl EngineHandle {
             reencode_lazy_tx,
             queued,
             urgent_pending,
+            urgent_latest,
             sched,
         }
     }
+}
+
+/// Whether the latest tick still owes this urgent chunk; before any tick
+/// has published a set, everything queued is.
+fn still_owed(latest: &UrgentLatest, key: &(BlobId, u32)) -> bool {
+    latest
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_none_or(|owed| owed.contains(key))
 }
 
 /// Run one re-encode command as its own task and wait for it: still one
@@ -1777,6 +1813,7 @@ mod tests {
             reencode_lazy_tx,
             queued: Default::default(),
             urgent_pending: Default::default(),
+            urgent_latest: Default::default(),
             sched: FetchScheduler::new(PullLimits::default()),
         };
         (handle, urgent_rx, lazy_rx)
@@ -1812,6 +1849,69 @@ mod tests {
         assert!(engine.enqueue_reencode(reencode_cmd(&a, 0), false));
         assert!(lazy_rx.recv().await.is_some());
         assert!(lazy_rx.recv().await.is_some());
+    }
+
+    // Impact: 2026.10.8 crossing — urgent re-encodes queued while peers
+    // rebooted kept running long after the next tick saw them back,
+    // starving pulls for hours.
+    // Should: drop, unrun, a queued urgent re-encode that the latest tick
+    // no longer owes, and release its pending mark.
+    // Should: run one the latest tick still owes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_urgent_reencode_missing_from_the_latest_tick_is_dropped() {
+        let base = std::env::temp_dir().join(format!("hopnet-stale-urgent-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, _outcome, manifest) = encoded_blob(&dir_src).await;
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        // A re-encode that runs finds no local shards and derives the
+        // storage view to look for peers: `view_calls` says it ran.
+        let state = Arc::new(HeldOnTwo {
+            net: net.clone(),
+            two_reachable: true,
+            two_member: true,
+            panic_manifest: false,
+            view_delay: std::time::Duration::ZERO,
+            held_on_three: HashSet::new(),
+            view_fails: false.into(),
+            view_calls: 0.into(),
+        });
+        let seams = Seams {
+            transport: net.clone(),
+            state: state.clone(),
+            submitter: net.clone(),
+            local_state: net.clone(),
+        };
+        let engine = EngineHandle::spawn(
+            seams,
+            EngineConfig {
+                fragments_dir: dir_dst,
+                limits: PullLimits::default(),
+            },
+            tokio::runtime::Handle::current(),
+        );
+        // A blob with no goal: its pull check answers without reading
+        // anything, after the urgent branch has had its turn.
+        let other = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c902").unwrap();
+
+        engine.set_urgent_reencodes(HashSet::new());
+        assert!(engine.enqueue_reencode(reencode_cmd(&blob_id, 0), true));
+        engine.pull_blob(other.clone()).await.unwrap();
+        assert_eq!(
+            state.view_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(engine.urgent_reencodes_pending(), 0);
+
+        engine.set_urgent_reencodes(HashSet::from([(blob_id.clone(), 0)]));
+        assert!(engine.enqueue_reencode(reencode_cmd(&blob_id, 0), true));
+        engine.pull_blob(other).await.unwrap();
+        assert!(state.view_calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // Impact: review of #96 — park entries for blobs that stopped being

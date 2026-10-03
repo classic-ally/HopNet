@@ -1482,6 +1482,7 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
         if let Some(engine) = app_state.storage.get() {
             let up: std::collections::BTreeSet<i32> = online.iter().copied().collect();
             let mut lazy_pick: Option<ReencodeCmd> = None;
+            let mut urgent_cmds: Vec<ReencodeCmd> = Vec::new();
             for cand in candidates {
                 // No goal on record: nothing is owed until the record
                 // reaches it (the staleness pass will re-goal it).
@@ -1531,12 +1532,7 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
                     missing_classes: owed,
                 };
                 if urgent {
-                    urgent_owed += 1;
-                    // A chunk still queued from an earlier tick is not
-                    // queued twice.
-                    if engine.enqueue_reencode(cmd, true) {
-                        urgent_enqueued += 1;
-                    }
+                    urgent_cmds.push(cmd);
                 } else {
                     lazy_owed += 1;
                     if lazy_pick.is_none() {
@@ -1544,11 +1540,32 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
                     }
                 }
             }
+            // Publish this tick's urgent set before queueing it: the
+            // engine drops a queued urgent chunk this tick no longer owes
+            // (its holders came back), so a wrong tick costs at most one
+            // tick's work.
+            urgent_owed = urgent_cmds.len();
+            engine.set_urgent_reencodes(
+                urgent_cmds
+                    .iter()
+                    .map(|c| (c.blob_id.clone(), c.chunk_number))
+                    .collect(),
+            );
+            for cmd in urgent_cmds {
+                // A chunk still queued from an earlier tick is not
+                // queued twice.
+                if engine.enqueue_reencode(cmd, true) {
+                    urgent_enqueued += 1;
+                }
+            }
             if let Some(cmd) = lazy_pick {
                 engine.enqueue_reencode(cmd, false);
                 lazy_enqueued = 1;
             }
         }
+    } else if let Some(engine) = app_state.storage.get() {
+        // Re-encode turned off: nothing queued is owed any more.
+        engine.set_urgent_reencodes(Default::default());
     }
 
     // (2b) The staleness pass's grace rung (S4): if no proposer has run
