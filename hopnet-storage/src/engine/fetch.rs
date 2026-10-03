@@ -38,6 +38,9 @@ pub struct PullLimits {
     pub fetch_per_peer: usize,
     pub urgent_reserve: usize,
     pub fetch_timeout: Duration,
+    /// Failures from one peer inside this window count as one strike: a
+    /// burst of concurrent fetches failing together is one event.
+    pub strike_window: Duration,
 }
 
 impl Default for PullLimits {
@@ -48,14 +51,23 @@ impl Default for PullLimits {
             fetch_per_peer: 8,
             urgent_reserve: 4,
             fetch_timeout: Duration::from_secs(PULL_FETCH_TIMEOUT_SECS),
+            strike_window: Duration::from_secs(PEER_STRIKE_WINDOW_SECS),
         }
     }
 }
 
 /// A fetch that has not answered in this long releases its slots.
 pub const PULL_FETCH_TIMEOUT_SECS: u64 = 30;
-/// Consecutive transport failures before a source peer is parked.
+/// Consecutive strikes (failure bursts, `strike_window` apart) before a
+/// source peer is parked.
 pub const PEER_FAIL_PARK: u32 = 3;
+/// See `PullLimits::strike_window`.
+pub const PEER_STRIKE_WINDOW_SECS: u64 = 5;
+/// A peer that served a fetch this recently is slow, not dark, when it
+/// times out: it is throttled to one fetch at a time, never parked.
+pub const PEER_RECENT_SUCCESS: Duration = Duration::from_secs(120);
+/// How long a slow peer stays throttled after its last timeout.
+pub const PEER_SLOW_FOR: Duration = Duration::from_secs(60);
 /// First peer park; doubles per repeat, capped.
 pub const PEER_PARK_BASE: Duration = Duration::from_secs(30);
 pub const PEER_PARK_CAP: Duration = Duration::from_secs(600);
@@ -87,6 +99,7 @@ impl PullLimits {
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .unwrap_or(d.urgent_reserve),
             fetch_timeout: d.fetch_timeout,
+            strike_window: d.strike_window,
         }
     }
 
@@ -104,9 +117,24 @@ impl PullLimits {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct PeerPark {
+    /// Consecutive strikes since the last success or park expiry.
     failures: u32,
+    /// Parks since the last success (sets the backoff).
     parks: u32,
     until: Option<Instant>,
+    last_strike: Option<Instant>,
+    last_success: Option<Instant>,
+    /// Throttled to one fetch at a time until then.
+    slow_until: Option<Instant>,
+}
+
+/// How a fetch from a peer failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerFailure {
+    /// No answer before the deadline.
+    Timeout,
+    /// The transport failed outright (refused, reset, unroutable).
+    Transport,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +168,8 @@ pub struct FetchScheduler {
     pub window: Arc<Semaphore>,
     global: Arc<Semaphore>,
     per_peer: Mutex<HashMap<i32, Arc<Semaphore>>>,
+    /// One-permit gates for peers marked slow.
+    slow_gates: Mutex<HashMap<i32, Arc<Semaphore>>>,
     peers: Mutex<HashMap<i32, PeerPark>>,
     blobs: Mutex<HashMap<BlobId, BlobPark>>,
 }
@@ -151,9 +181,19 @@ impl FetchScheduler {
             window: Arc::new(Semaphore::new(limits.window.max(1))),
             global: Arc::new(Semaphore::new(limits.pull_permits())),
             per_peer: Mutex::new(HashMap::new()),
+            slow_gates: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
             blobs: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn slow_gate(&self, node_id: i32) -> Arc<Semaphore> {
+        self.slow_gates
+            .lock()
+            .unwrap()
+            .entry(node_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(1)))
+            .clone()
     }
 
     fn peer_semaphore(&self, node_id: i32) -> Arc<Semaphore> {
@@ -179,22 +219,63 @@ impl FetchScheduler {
             .is_some_and(|until| until > now)
     }
 
-    pub fn record_peer_success(&self, node_id: i32) {
+    /// Throttled to one fetch at a time (it has been timing out while it
+    /// still serves).
+    pub fn peer_slow(&self, node_id: i32, now: Instant) -> bool {
+        self.peers
+            .lock()
+            .unwrap()
+            .get(&node_id)
+            .and_then(|p| p.slow_until)
+            .is_some_and(|until| until > now)
+    }
+
+    pub fn record_peer_success(&self, node_id: i32, now: Instant) {
         let mut peers = self.peers.lock().unwrap();
-        if let Some(p) = peers.get_mut(&node_id) {
-            let was_parked = p.until.is_some();
-            *p = PeerPark::default();
-            if was_parked {
-                tracing::info!(node = node_id, "pull: source peer unparked");
-            }
+        let p = peers.entry(node_id).or_default();
+        let was_parked = p.until.is_some();
+        p.failures = 0;
+        p.parks = 0;
+        p.until = None;
+        p.last_strike = None;
+        p.last_success = Some(now);
+        if was_parked {
+            tracing::info!(node = node_id, "pull: source peer unparked");
         }
     }
 
-    pub fn record_peer_failure(&self, node_id: i32, now: Instant) {
+    /// Account one failed fetch. Concurrent failures inside the strike
+    /// window are one strike; a park that has expired starts the count
+    /// over; a timeout from a peer that served recently marks it slow
+    /// (one fetch at a time) instead of striking it, so a slow disk is
+    /// throttled, never parked by its peers.
+    pub fn record_peer_failure(&self, node_id: i32, kind: PeerFailure, now: Instant) {
         let mut peers = self.peers.lock().unwrap();
         let p = peers.entry(node_id).or_default();
+        if p.until.is_some_and(|u| u <= now) {
+            p.until = None;
+            p.failures = 0;
+            p.last_strike = None;
+        }
+        if kind == PeerFailure::Timeout
+            && p.last_success
+                .is_some_and(|t| now.saturating_duration_since(t) < PEER_RECENT_SUCCESS)
+        {
+            if p.slow_until.is_none_or(|u| u <= now) {
+                tracing::info!(node = node_id, "pull: source peer slow; throttled");
+            }
+            p.slow_until = Some(now + PEER_SLOW_FOR);
+            return;
+        }
+        if p.until.is_some()
+            || p.last_strike
+                .is_some_and(|t| now.saturating_duration_since(t) < self.limits.strike_window)
+        {
+            return;
+        }
+        p.last_strike = Some(now);
         p.failures += 1;
-        if p.failures >= PEER_FAIL_PARK && p.until.is_none_or(|u| u <= now) {
+        if p.failures >= PEER_FAIL_PARK {
             let backoff = backoff(PEER_PARK_BASE, PEER_PARK_CAP, p.parks);
             p.parks += 1;
             p.until = Some(now + backoff);
@@ -331,6 +412,19 @@ pub async fn fetch_class<T: Transport + 'static>(
             any_answer = true;
             continue;
         };
+        // A slow peer serves one fetch at a time.
+        let _slow = if sched.peer_slow(peer.node_id, Instant::now()) {
+            let gate = sched.slow_gate(peer.node_id);
+            match tokio::time::timeout(sched.limits.fetch_timeout, gate.acquire_owned()).await {
+                Ok(Ok(permit)) => Some(permit),
+                _ => {
+                    any_answer = true;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         let Ok(_global) = sched.global.acquire().await else {
             return Err(FetchMiss::NotServed);
         };
@@ -341,7 +435,7 @@ pub async fn fetch_class<T: Transport + 'static>(
         .await
         {
             Ok(Ok(data)) if Blake3Hash::new(blake3::hash(&data)) == *hash => {
-                sched.record_peer_success(peer.node_id);
+                sched.record_peer_success(peer.node_id, Instant::now());
                 return Ok(data);
             }
             Ok(Ok(_)) => {
@@ -354,11 +448,14 @@ pub async fn fetch_class<T: Transport + 'static>(
             }
             Ok(Err(TransportError::Peer(_))) => {
                 // The peer answered: reachable, just not holding it.
-                sched.record_peer_success(peer.node_id);
+                sched.record_peer_success(peer.node_id, Instant::now());
                 any_answer = true;
             }
-            Ok(Err(TransportError::Transport(_))) | Err(_) => {
-                sched.record_peer_failure(peer.node_id, Instant::now());
+            Ok(Err(TransportError::Transport(_))) => {
+                sched.record_peer_failure(peer.node_id, PeerFailure::Transport, Instant::now());
+            }
+            Err(_) => {
+                sched.record_peer_failure(peer.node_id, PeerFailure::Timeout, Instant::now());
             }
         }
     }
@@ -530,6 +627,8 @@ mod tests {
             fetch_per_peer: per_peer,
             urgent_reserve: 0,
             fetch_timeout: Duration::from_millis(timeout_ms),
+            // Every failure is its own strike in these tests.
+            strike_window: Duration::ZERO,
         }
     }
 
@@ -612,25 +711,79 @@ mod tests {
         assert!(!sched.peer_parked(3, Instant::now()));
     }
 
-    // Should: park a peer for 30 s on its third consecutive failure,
-    // double the park on a repeat, and clear it on any success.
+    fn strikes(sched: &FetchScheduler, node: i32, from: Instant, n: u64) -> Instant {
+        let mut t = from;
+        for i in 0..n {
+            t = from + Duration::from_secs(10 * i);
+            sched.record_peer_failure(node, PeerFailure::Transport, t);
+        }
+        t
+    }
+
+    // Should: park a peer for 30 s on its third strike, double the next
+    // park, and clear it on any success.
     #[test]
     fn parked_peer_backs_off_and_recovers_on_success() {
         let sched = FetchScheduler::new(PullLimits::default());
-        let t0 = Instant::now();
-        for _ in 0..3 {
-            sched.record_peer_failure(7, t0);
-        }
+        let t0 = strikes(&sched, 7, Instant::now(), 3);
         assert!(sched.peer_parked(7, t0 + Duration::from_secs(29)));
         assert!(!sched.peer_parked(7, t0 + Duration::from_secs(31)));
-        let t1 = t0 + Duration::from_secs(31);
-        sched.record_peer_failure(7, t1);
+        let t1 = strikes(&sched, 7, t0 + Duration::from_secs(31), 3);
         assert!(
             sched.peer_parked(7, t1 + Duration::from_secs(59)),
             "doubled"
         );
-        sched.record_peer_success(7);
+        sched.record_peer_success(7, t1);
         assert!(!sched.peer_parked(7, t1));
+    }
+
+    // Impact: review of #96 — eight concurrent timeouts from one peer
+    // tripped the three-strike park at once, and the count survived the
+    // park, so one failure after expiry re-parked the peer.
+    // Should: count a burst of failures inside the strike window as one
+    // strike; start the count over when a park expires.
+    // Should not: park a peer for one burst, or for a single failure after
+    // its park ran out.
+    #[test]
+    fn a_failure_burst_is_one_strike_and_park_expiry_resets_the_count() {
+        let sched = FetchScheduler::new(PullLimits::default());
+        let t0 = Instant::now();
+        for _ in 0..8 {
+            sched.record_peer_failure(4, PeerFailure::Transport, t0);
+        }
+        assert!(!sched.peer_parked(4, t0), "one burst, one strike");
+
+        let t1 = strikes(&sched, 5, t0, 3);
+        assert!(sched.peer_parked(5, t1));
+        let after = t1 + Duration::from_secs(31);
+        sched.record_peer_failure(5, PeerFailure::Transport, after);
+        assert!(!sched.peer_parked(5, after), "count restarted after expiry");
+    }
+
+    // Impact: thor's HDD serves slowly; its peers must not park it for
+    // timing out while it is still serving.
+    // Should: throttle a peer that timed out soon after serving to one
+    // fetch at a time.
+    // Should not: park it, however many timeouts follow.
+    #[test]
+    fn a_slow_peer_that_still_serves_is_throttled_not_parked() {
+        let sched = FetchScheduler::new(PullLimits::default());
+        let t0 = Instant::now();
+        sched.record_peer_success(1, t0);
+        for i in 1..=6 {
+            sched.record_peer_failure(1, PeerFailure::Timeout, t0 + Duration::from_secs(10 * i));
+        }
+        let t = t0 + Duration::from_secs(60);
+        assert!(!sched.peer_parked(1, t));
+        assert!(sched.peer_slow(1, t));
+        assert!(!sched.peer_slow(1, t + PEER_SLOW_FOR));
+
+        // A peer that never served is not "slow": its timeouts strike.
+        let t1 = t0;
+        for i in 0..3 {
+            sched.record_peer_failure(2, PeerFailure::Timeout, t1 + Duration::from_secs(10 * i));
+        }
+        assert!(sched.peer_parked(2, t1 + Duration::from_secs(20)));
     }
 
     // Should: hold a parked blob out until its backoff passes, double the
