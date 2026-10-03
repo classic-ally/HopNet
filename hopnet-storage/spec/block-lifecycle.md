@@ -1328,7 +1328,19 @@ optimization and carries no proof obligation.
         30 min.
       - Urgent re-encode (a chunk below the watermark) may still write
         into the reserve between the pull floor and the ingest floor,
-        never below it.
+        never below it. Every re-encode asks the guard against its own
+        floor before gathering shards, so a refusal costs no download.
+      - On a small volume the marks are clamped (the floor to a quarter
+        of the volume, the resume mark to half, WARN at boot): unclamped,
+        a ~30 GiB volume's resume mark sat at or above its own size and a
+        paused node never resumed. A free-space probe failure holds back
+        (fail safe) with a WARN at most every 5 min.
+      - Held blobs are not lost: a blob held for space is re-offered after
+        a re-probe interval and waits in the queue, running first after
+        the resume. Lazy re-encodes are not queued while held back (the
+        tick re-derives them). The operator re-kick
+        (`POST /maintenance/rebalance-network`) answers `held_for_space`
+        at once while paused and stops waiting after 600 s.
       - A held class is `FetchMiss::NoSpace` (`PullOutcome::held_for_space`),
         never `NotServed`; an ENOSPC store maps to it as well and pauses
         the guard.
