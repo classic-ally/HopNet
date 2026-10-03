@@ -156,7 +156,7 @@ pub fn plan_blob(
 #[derive(Debug, Default)]
 pub struct PlannedPage {
     pub items: Vec<PlanItem>,
-    pub next: Option<(u64, BlobId)>,
+    pub next: Option<BlobId>,
     pub scanned: usize,
 }
 
@@ -166,11 +166,11 @@ pub struct PlannedPage {
 /// in-flight blobs were scanned.
 pub fn plan_pass<F>(mut read_page: F) -> Result<(Vec<PlanItem>, usize), StorageError>
 where
-    F: FnMut(Option<(u64, BlobId)>) -> Result<PlannedPage, StorageError>,
+    F: FnMut(Option<BlobId>) -> Result<PlannedPage, StorageError>,
 {
     let mut plan = Vec::new();
     let mut scanned = 0usize;
-    let mut cursor: Option<(u64, BlobId)> = None;
+    let mut cursor: Option<BlobId> = None;
     loop {
         let page = read_page(cursor.take())?;
         scanned += page.scanned;
@@ -187,7 +187,7 @@ where
 /// One planning page on `conn`: the in-flight blobs after `after`, planned.
 pub fn plan_page(
     conn: &rusqlite::Connection,
-    after: Option<(u64, &BlobId)>,
+    after: Option<&BlobId>,
     me: i32,
     members: &BTreeSet<i32>,
     snapshots: &mut HashMap<u64, Option<ViewSnapshot>>,
@@ -197,7 +197,7 @@ pub fn plan_page(
     let next = if scanned < PLAN_PAGE_SIZE {
         None
     } else {
-        page.last().cloned()
+        page.last().map(|(_, id)| id.clone())
     };
     let mut items = Vec::new();
     for (desired, blob_id) in &page {
@@ -398,16 +398,9 @@ mod tests {
         insert_blob(&conn, &blob(2), 2, 4, &[], &lumped);
 
         let mut snapshots = HashMap::new();
-        let (plan, scanned) = plan_pass(|after| {
-            plan_page(
-                &conn,
-                after.as_ref().map(|(h, id)| (*h, id)),
-                1,
-                &members,
-                &mut snapshots,
-            )
-        })
-        .unwrap();
+        let (plan, scanned) =
+            plan_pass(|after| plan_page(&conn, after.as_ref(), 1, &members, &mut snapshots))
+                .unwrap();
         assert_eq!(scanned, 2);
         let got: Vec<(BlobId, i32)> = plan.into_iter().map(|i| (i.blob_id, i.tolerance)).collect();
         assert_eq!(got, vec![(blob(2), 0), (blob(1), 1)]);

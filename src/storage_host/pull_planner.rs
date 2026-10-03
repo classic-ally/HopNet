@@ -167,13 +167,7 @@ pub fn plan(app_state: &AppState) -> Result<(Vec<PlanItem>, usize), String> {
             .db_pool
             .get()
             .map_err(|e| hopnet_storage::StorageError::Host(format!("pool: {e}")))?;
-        planner::plan_page(
-            &conn,
-            after.as_ref().map(|(h, id)| (*h, id)),
-            me,
-            &members,
-            &mut snapshots,
-        )
+        planner::plan_page(&conn, after.as_ref(), me, &members, &mut snapshots)
     })
     .map_err(|e| e.to_string())
 }

@@ -443,38 +443,40 @@ pub fn in_flight_blobs(
     Ok(ids)
 }
 
-/// One page of the in-flight set in `(desired_placement_height, id)` order,
-/// strictly after `after` (a keyset cursor; `None` starts from the
-/// beginning). Returns each blob with its goal height so the caller can
-/// resume from the last row. An empty page means the walk reached the end.
-/// Each call is its own short read, so a walk over the whole set never
-/// holds one long reader (which would pin the WAL).
+const IN_FLIGHT_PAGE_SQL: &str = "SELECT desired_placement_height, id FROM data_blocks
+     WHERE (placement_height IS NULL OR placement_height != desired_placement_height)
+       AND id > ?
+     ORDER BY id ASC
+     LIMIT ?";
+
+/// One page of the in-flight set in primary-key (`id`) order, strictly
+/// after `after` (a keyset cursor; `None` starts from the beginning).
+/// Returns each blob with its goal height. An empty or short page means
+/// the walk reached the end. Paged by the PK alone so every page is an
+/// index range scan: ordering by `(desired_placement_height, id)` has no
+/// covering index and sorted the whole same-height set (a temp B-tree)
+/// for every page. Callers that need an order (the pull planner's risk
+/// order) sort what they collect. Each call is its own short read, so a
+/// walk over the whole set never holds one long reader (which would pin
+/// the WAL).
 pub fn in_flight_page_after(
     conn: &rusqlite::Connection,
-    after: Option<(u64, &BlobId)>,
+    after: Option<&BlobId>,
     limit: usize,
 ) -> Result<Vec<(u64, BlobId)>, StorageError> {
     let map_row = |row: &rusqlite::Row| -> rusqlite::Result<(u64, BlobId)> {
         Ok((height_from_db(row.get(0)?), row.get(1)?))
     };
-    // Without a cursor, start below every real key: heights are >= 0 and
-    // ids are non-empty text, so (-1, '') sorts first.
-    let start: (i64, &dyn rusqlite::ToSql) = match after {
-        Some((h, id)) => (height_to_db(h), id),
-        None => (-1, &""),
+    // Without a cursor, start below every real key: ids are non-empty text.
+    let id: &dyn rusqlite::ToSql = match after {
+        Some(id) => id,
+        None => &"",
     };
-    let (height, id) = start;
     let mut stmt = conn
-        .prepare_cached(
-            "SELECT desired_placement_height, id FROM data_blocks
-             WHERE (placement_height IS NULL OR placement_height != desired_placement_height)
-               AND (desired_placement_height, id) > (?, ?)
-             ORDER BY desired_placement_height ASC, id ASC
-             LIMIT ?",
-        )
+        .prepare_cached(IN_FLIGHT_PAGE_SQL)
         .map_err(db_err("prepare in-flight page"))?;
     let rows = stmt
-        .query_map(params![height, id, limit as i64], map_row)
+        .query_map(params![id, limit as i64], map_row)
         .map_err(db_err("read in-flight page"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err("read in-flight page row"))?;
@@ -1251,7 +1253,7 @@ mod tests {
     // height, so the tick's LIMIT-64 kick returned the same lowest ids
     // forever and the other ~68.8k blobs were never pulled.
     // Should: return disjoint pages that together cover every in-flight
-    // blob exactly once, in (goal, id) order, across a shared goal height.
+    // blob exactly once, in id order, with each blob's goal height.
     // Should not: return a quiescent blob, or anything after the last page.
     #[test]
     fn in_flight_page_after_walks_every_blob_once() {
@@ -1264,20 +1266,39 @@ mod tests {
         insert_blob(&tx, &blob(9), 9, Some(9)); // quiescent
 
         let mut seen = Vec::new();
-        let mut cursor: Option<(u64, BlobId)> = None;
+        let mut cursor: Option<BlobId> = None;
         loop {
-            let page =
-                in_flight_page_after(&tx, cursor.as_ref().map(|(h, id)| (*h, id)), 3).unwrap();
+            let page = in_flight_page_after(&tx, cursor.as_ref(), 3).unwrap();
             if page.is_empty() {
                 break;
             }
-            cursor = page.last().cloned();
+            cursor = page.last().map(|(_, id)| id.clone());
             seen.extend(page);
         }
 
-        let mut expected = vec![(4, blob(8))];
-        expected.extend((1..=7u8).map(|n| (9, blob(n))));
+        let mut expected: Vec<(u64, BlobId)> = (1..=7u8).map(|n| (9, blob(n))).collect();
+        expected.push((4, blob(8)));
         assert_eq!(seen, expected);
+    }
+
+    // Impact: ordering pages by (goal, id) had no covering index, so every
+    // 512-blob page sorted the whole same-height in-flight set (~68.8k
+    // rows in production) in a temp B-tree: the walk was quadratic.
+    // Should: page by the primary-key index.
+    // Should not: build a temp B-tree to order a page.
+    #[test]
+    fn in_flight_page_uses_the_primary_key_without_a_sort() {
+        let conn = test_conn();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {IN_FLIGHT_PAGE_SQL}"))
+            .unwrap()
+            .query_map(params!["", 10], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let plan = plan.join(" | ");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        assert!(plan.contains("sqlite_autoindex_data_blocks"), "{plan}");
     }
 
     // Should: page the blobs whose goal predates T, oldest goal first, as
