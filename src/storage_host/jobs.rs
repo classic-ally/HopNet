@@ -977,7 +977,8 @@ struct SurplusRelease {
 /// ingesting node's local fragments a sweep or so after its blobs are
 /// confirmed elsewhere — a non-member origin ends up holding nothing.
 /// Stricter than the watermark path on evidence: another member's copy
-/// must have been disk-verified within the confirmation recency window.
+/// must have been disk-verified within the confirmation recency window
+/// (hours since 2026.10.5, deliberately the same window as confirmation).
 /// Bounded per call. Rides the disk-truth sweep's walk; the operator route
 /// pays for its own.
 async fn release_surplus(

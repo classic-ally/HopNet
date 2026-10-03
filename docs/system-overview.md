@@ -549,7 +549,7 @@ apply functions inside consensus handlers.
       two-call orphan API is gone), scrubbing the weekly slice on the same
       walk and attesting what it saw; the pull path attests the blob's
       local fragments before proposing; confirmation evidence must be
-      verified within 1024 heights and not suspect. S6 (2026-09-27):
+      verified within 8192 heights (1024 before 2026.10.5) and not suspect. S6 (2026-09-27):
       lifecycle closure — orphan deletion drops the deleted blobs'
       inventory rows for every node, the orphaned data-block cleanup runs
       daily per node (bounded batches), and the availability-class branch
@@ -587,9 +587,12 @@ apply functions inside consensus handlers.
       the blocking pool (storage step 0004), SQLite defaults to a 256 MiB
       cache and a 1 GiB WAL limit, temp fragments are reaped, the ETA uses
       the sustained drain rate, 507s log at debug, the ingress daemon backs
-      off while parked. Still open for design: a free-space floor on pulls,
-      the 1024-height recency window vs sweep cadence, unseating a
-      validator that stops voting, a paged sweep.
+      off while parked. The recency window is 8192 heights (was 1024),
+      the sweep attests even when its self-check submit fails and logs a
+      failed sweep (thor had attested nothing for a day), and
+      attestation stamps are capped at the deciding height and only rise
+      (consensus-bugs.md 18). Still open for design: a free-space floor on
+      pulls, unseating a validator that stops voting, a paged sweep.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage

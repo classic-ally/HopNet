@@ -83,10 +83,12 @@ pub fn lifecycle_counts(
 // In-flight ages
 
 /// Bucket edges for in-flight age (heights since the goal was set):
-/// `[0,8) [8,64) [64,256) [256,1024) [1024,∞)`.
-pub const INFLIGHT_AGE_EDGES: [u64; 4] = [8, 64, 256, 1024];
+/// `[0,8) [8,256) [256,1024) [1024,window) [window,∞)`, the last edge
+/// being the attestation window so the oldest bucket is exactly the stale
+/// one.
+pub const INFLIGHT_AGE_EDGES: [u64; 4] = [8, 256, 1024, ATTESTATION_RECENCY_HEIGHTS];
 /// Labels for the buckets above, youngest first.
-pub const INFLIGHT_AGE_LABELS: [&str; 5] = ["<8", "<64", "<256", "<1k", "≥1k"];
+pub const INFLIGHT_AGE_LABELS: [&str; 5] = ["<8", "<256", "<1k", "<8k", "≥8k"];
 /// A goal this old and still unconfirmed is past explainable-as-in-flight:
 /// a pull page is 64 blobs per 5-minute tick, so 256 heights of traffic
 /// is many ticks.
@@ -570,15 +572,17 @@ mod tests {
     #[test]
     fn in_flight_ages_bucket_by_heights_since_goal() {
         let conn = test_conn();
-        let tip = 2000;
+        let tip = 10_000;
         for (n, age) in [
             (1u8, 0u64),
             (2, 7),
             (3, 8),
-            (4, 63),
-            (5, 64),
+            (4, 255),
+            (5, 256),
             (6, 1023),
             (7, 1024),
+            (10, 8191),
+            (11, 8192),
         ] {
             insert_blob(&conn, &blob(n), tip - age, None, 100);
         }
@@ -586,7 +590,7 @@ mod tests {
         insert_blob(&conn, &blob(9), tip - 500, Some(tip - 500), 100); // quiescent
         let b = in_flight_age_buckets(&conn, tip).unwrap();
         let counts: Vec<u64> = b.iter().map(|x| x.blobs).collect();
-        assert_eq!(counts, vec![3, 2, 1, 1, 1]);
+        assert_eq!(counts, vec![3, 2, 2, 2, 1]);
         assert_eq!(b[0].bytes, 300);
         assert_eq!(
             b.iter().map(|x| x.label).collect::<Vec<_>>(),
@@ -597,7 +601,7 @@ mod tests {
             vec![
                 None,
                 None,
-                None,
+                Some(AgeSeverity::Warn),
                 Some(AgeSeverity::Warn),
                 Some(AgeSeverity::Stale)
             ]

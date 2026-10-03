@@ -35,15 +35,17 @@ pub const DECLARE_TX_FN: &str = "declare_placement_target";
 pub const CONFIRM_TX_FN: &str = "confirm_placement";
 
 /// Confirmation evidence must have been disk-verified within this many
-/// heights of the deciding block (S5). Sized against the sweep cadence
-/// (every self-check, ~30 min) with a wide margin: heights only advance
-/// with traffic, and metrics alone make ~144 a day. The drain's own
-/// traffic must stay inside that budget — confirms ride batched
-/// fulfillment rounds and the worker attests only births and moved
-/// bytes, because a round per blob (the 2026-09-27 rehearsal) ran the
-/// chain at ~45 heights a minute and aged the sweep's rows out of this
-/// window in 23 minutes.
-pub const ATTESTATION_RECENCY_HEIGHTS: u64 = 1024;
+/// heights of the deciding block (S5); surplus release demands the same
+/// recency of another member's copy. Sized for the slowest member, not
+/// the typical one: an HDD node's sweep takes ~50 minutes, runs on a
+/// 30-minute cron, and must survive one failed sweep, at drain traffic
+/// (~45 heights a minute, the 2026-09-27 rehearsal). 8192 heights is
+/// ~3 hours at that rate and ~10 at the ~14 a minute of a quiet mesh.
+/// The first value, 1024, aged a healthy sweep's rows out in 23 minutes
+/// under drain and left the 2026-10-02 mesh with no confirmable blob.
+/// A consensus rule (`evidence_complete` runs in the confirm apply): it
+/// changes only at an epoch crossing.
+pub const ATTESTATION_RECENCY_HEIGHTS: u64 = 8192;
 
 /// One blob's re-goal: compare-and-swap `desired_placement_height` from
 /// `from` to `to`.
