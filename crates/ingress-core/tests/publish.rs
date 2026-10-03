@@ -2213,3 +2213,261 @@ async fn parked_pass_probes_once_before_reopening_the_window() {
     assert_eq!(report.published, 6);
     assert_eq!(answering.calls.load(Ordering::Relaxed), 6);
 }
+
+// ---------------------------------------------------- spool soft cap (#101)
+
+/// Register an asset's bytes and seed it pending, without draining.
+/// `video` makes it a Live Photo (two resources); `Some(None)` leaves the
+/// paired video unregistered, so its fetch never succeeds.
+async fn seed_capped(
+    rig: &Rig,
+    local_id: &str,
+    original: &[u8],
+    video: Option<Option<&[u8]>>,
+    scope: ingress_core::descriptor::LibraryScope,
+) -> PhotoId {
+    let builder = if video.is_some() {
+        AssetDescriptorBuilder::live_photo()
+    } else {
+        AssetDescriptorBuilder::simple_image()
+    };
+    let desc = builder
+        .with_cloud_id(&format!("cloud-{local_id}"))
+        .with_local_id(local_id)
+        .scope(scope)
+        .build();
+    rig.fetcher
+        .descriptors
+        .lock()
+        .unwrap()
+        .insert(desc.local_id.clone(), desc.clone());
+    {
+        let mut bytes = rig.fetcher.bytes.lock().unwrap();
+        bytes.insert((desc.local_id.clone(), 1), original.to_vec());
+        if let Some(Some(v)) = video {
+            bytes.insert((desc.local_id.clone(), 9), v.to_vec());
+        }
+    }
+    match seed_descriptor(&rig.store, &desc).await.unwrap() {
+        SeedOutcome::MintedPending { photo_id, .. } => photo_id,
+        other => panic!("expected MintedPending, got {other:?}"),
+    }
+}
+
+/// A scheduler with the spool soft cap at `cap` bytes, publisher attached
+/// or not (the cap applies only to a run that publishes).
+fn capped_scheduler(rig: &Rig, cap: u64, publishes: bool) -> Scheduler<FakeFetcher> {
+    let mut config = rig.config.clone();
+    config.spool_soft_cap_bytes = cap;
+    let scheduler = Scheduler::new(
+        rig.store.clone(),
+        rig.data_dir.clone(),
+        rig.fetcher.clone(),
+        Arc::new(FakeProbe),
+        config,
+        rig.cancel.clone(),
+    );
+    if publishes {
+        scheduler.with_publisher(FakePublisher::ok())
+    } else {
+        scheduler
+    }
+}
+
+async fn materialized(rig: &Rig, id: &PhotoId) -> bool {
+    photo(rig, id).await.materialized_at.is_some()
+}
+
+const PERSONAL: ingress_core::descriptor::LibraryScope =
+    ingress_core::descriptor::LibraryScope::Personal;
+
+// Impact: review of #101 — the cap was checked before every resource, but
+// only complete photos publish and only published photos evict. A photo
+// held between its original and its paired video held its own bytes
+// forever: nothing evicted, nothing was ever claimed again, and a restart
+// did not help.
+// Should: run an admitted photo to completion even when its first
+// resource takes the spool over the cap.
+// Should: publish it, evict it, and then admit the next photo.
+// Should not: claim a new photo while the spool is over the cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_photo_crossing_the_cap_mid_photo_still_completes_and_publishes() {
+    let rig = rig().await;
+    let first = seed_capped(
+        &rig,
+        "big-live",
+        &[1u8; 500],
+        Some(Some(b"video")),
+        PERSONAL,
+    )
+    .await;
+    let sched = capped_scheduler(&rig, 100, true);
+    sched.drain().await.unwrap();
+    assert!(
+        materialized(&rig, &first).await,
+        "the admitted photo completes"
+    );
+
+    let second = seed_capped(&rig, "next", &[2u8; 50], None, PERSONAL).await;
+    let held = sched.drain().await.unwrap();
+    assert!(held.held_at_spool_cap);
+    assert!(!materialized(&rig, &second).await);
+
+    let publisher = FakePublisher::ok();
+    let report = pass(&rig, &publisher, &mut PublishState::default()).await;
+    assert_eq!(report.published, 1);
+    ingress_core::cleanup::evict_published_blobs(&rig.store, &rig.data_dir.spool(), 100)
+        .await
+        .unwrap();
+    assert_eq!(rig.store.unevicted_bytes().await.unwrap(), 0);
+
+    let resumed = sched.drain().await.unwrap();
+    assert!(!resumed.held_at_spool_cap);
+    assert!(materialized(&rig, &second).await);
+    // One line per crossing (inflight bytes can cross more than once while
+    // a photo streams), every `spool_full` closed by a `spool_below_cap`.
+    let full = rig.store.log_events("spool_full").await.unwrap().len();
+    assert!(full >= 1);
+    assert_eq!(
+        rig.store.log_events("spool_below_cap").await.unwrap().len(),
+        full
+    );
+}
+
+// Impact: the cap is soft so a 4K video larger than the whole cap can still
+// be ingested; a hard cap (spool + next item <= cap) would strand it forever.
+// Should: admit a single item larger than the cap while the spool is under it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_single_oversized_item_is_admitted_under_the_cap() {
+    let rig = rig().await;
+    let big = seed_capped(&rig, "huge", &[7u8; 500], None, PERSONAL).await;
+    let report = capped_scheduler(&rig, 100, true).drain().await.unwrap();
+    assert!(!report.held_at_spool_cap);
+    assert!(materialized(&rig, &big).await);
+    assert_eq!(rig.store.unevicted_bytes().await.unwrap(), 500);
+}
+
+// Impact: review of #101 — a drain held at the cap left through the
+// "queue drained" exit with a clean-looking report.
+// Should: report a drain that stopped at the spool cap with work pending
+// as held, not drained.
+// Should not: report held when the queue really drained.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_held_at_the_cap_says_so() {
+    let rig = rig().await;
+    seed_capped(&rig, "fills", &[1u8; 500], None, PERSONAL).await;
+    let sched = capped_scheduler(&rig, 100, true);
+    assert!(!sched.drain().await.unwrap().held_at_spool_cap, "drained");
+    seed_capped(&rig, "waits", &[2u8; 50], None, PERSONAL).await;
+    let report = sched.drain().await.unwrap();
+    assert!(report.held_at_spool_cap);
+    assert_eq!(rig.store.count_pending_resources().await.unwrap(), 1);
+}
+
+// Impact: review of #101 — the cap counted every unevicted byte, including
+// bytes that can never evict: once those passed the cap, all fetching
+// stopped for good with one log line.
+// Should: not count a photo whose resource gave up at the fetch retry cap
+// (it never materializes, so never publishes).
+// Should: surface those bytes as stuck in status, and log spool_stuck once.
+#[tokio::test(flavor = "multi_thread")]
+async fn given_up_resources_do_not_hold_the_cap() {
+    let rig = rig().await;
+    // The paired video is never served: it gives up at the retry cap.
+    let stuck = seed_capped(&rig, "half", &[1u8; 500], Some(None), PERSONAL).await;
+    capped_scheduler(&rig, 0, false).drain().await.unwrap();
+    assert!(!materialized(&rig, &stuck).await);
+    assert_eq!(rig.store.unevicted_bytes().await.unwrap(), 500);
+
+    let next = seed_capped(&rig, "next", &[2u8; 50], None, PERSONAL).await;
+    let report = capped_scheduler(&rig, 100, true).drain().await.unwrap();
+    assert!(!report.held_at_spool_cap);
+    assert!(materialized(&rig, &next).await);
+    let status = ingress_core::status::status(&rig.store, rig.config.retry_cap)
+        .await
+        .unwrap();
+    assert_eq!(status.pipeline.spool_stuck_bytes, 500);
+    assert_eq!(rig.store.log_events("spool_stuck").await.unwrap().len(), 1);
+}
+
+// Should: not count a scope-bound shared library with no mesh publish
+// target (its photos are never claimed for publish).
+// Should: count it again once the library is bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unbound_shared_library_does_not_hold_the_cap() {
+    let rig = rig().await;
+    add_shared_library(&rig, None).await;
+    seed_capped(
+        &rig,
+        "shared",
+        &[1u8; 500],
+        None,
+        ingress_core::descriptor::LibraryScope::Shared,
+    )
+    .await;
+    capped_scheduler(&rig, 0, false).drain().await.unwrap();
+    assert_eq!(
+        rig.store.publishable_unevicted_bytes(5, 5).await.unwrap(),
+        0
+    );
+    let next = seed_capped(&rig, "personal", &[2u8; 50], None, PERSONAL).await;
+    capped_scheduler(&rig, 100, true).drain().await.unwrap();
+    assert!(materialized(&rig, &next).await);
+
+    set_mesh_binding(&rig, Some("mesh-shared")).await;
+    assert_eq!(
+        rig.store.publishable_unevicted_bytes(5, 5).await.unwrap(),
+        550
+    );
+}
+
+// Should not: count a photo at the publish retry cap (awaiting an operator
+// reset) or a deleted unpublished photo.
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_capped_and_deleted_photos_do_not_hold_the_cap() {
+    let rig = rig().await;
+    let capped = seed_capped(&rig, "capped", &[1u8; 500], None, PERSONAL).await;
+    let deleted = seed_capped(&rig, "deleted", &[2u8; 300], None, PERSONAL).await;
+    capped_scheduler(&rig, 0, false).drain().await.unwrap();
+    assert_eq!(
+        rig.store.publishable_unevicted_bytes(5, 5).await.unwrap(),
+        800
+    );
+    sqlx::query("UPDATE photos SET publish_attempts = 5 WHERE photo_id = ?")
+        .bind(&capped)
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE photos SET deleted_at = CURRENT_TIMESTAMP WHERE photo_id = ?")
+        .bind(&deleted)
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.store.publishable_unevicted_bytes(5, 5).await.unwrap(),
+        0
+    );
+}
+
+// Impact: without a publisher nothing ever evicts, so a cap would stop
+// fetching forever once reached.
+// Should not: apply the cap to a run with no publisher attached.
+// Should: apply it to the same spool once a publisher is attached.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_publisher_the_cap_does_not_apply() {
+    let rig = rig().await;
+    seed_capped(&rig, "fills", &[1u8; 500], None, PERSONAL).await;
+    capped_scheduler(&rig, 0, false).drain().await.unwrap();
+
+    let next = seed_capped(&rig, "next", &[2u8; 50], None, PERSONAL).await;
+    assert!(
+        capped_scheduler(&rig, 100, true)
+            .drain()
+            .await
+            .unwrap()
+            .held_at_spool_cap
+    );
+    let free_run = capped_scheduler(&rig, 100, false).drain().await.unwrap();
+    assert!(!free_run.held_at_spool_cap);
+    assert!(materialized(&rig, &next).await);
+}

@@ -87,9 +87,18 @@ pub fn print_status(report: &StatusReport) {
     println!("\nPIPELINE");
     println!("  pending resources: {}", p.resources_pending);
     println!(
-        "  spool:             {}",
-        human_bytes(i64::try_from(p.spool_bytes).unwrap_or(i64::MAX))
+        "  spool:             {} ({} stuck)",
+        human_bytes(i64::try_from(p.spool_bytes).unwrap_or(i64::MAX)),
+        human_bytes(i64::try_from(p.spool_stuck_bytes).unwrap_or(i64::MAX))
     );
+    if p.spool_stuck_bytes > 0 {
+        println!(
+            "  WARNING: {} of spool can never evict without an operator \
+             (given-up fetches, publish retry cap, unbound shared library, deleted \
+             unpublished photos); it does not count against the spool cap",
+            human_bytes(i64::try_from(p.spool_stuck_bytes).unwrap_or(i64::MAX))
+        );
+    }
     println!(
         "  awaiting retry:    {} (earliest {})",
         p.retries.awaiting_retry,

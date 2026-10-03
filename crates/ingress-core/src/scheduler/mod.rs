@@ -101,6 +101,10 @@ pub struct DrainReport {
     pub awaiting_retry: i64,
     pub gave_up: i64,
     pub earliest_next_retry_at: Option<DateTime<Utc>>,
+    /// The run stopped with pending work held at the spool soft cap — not
+    /// drained. A drain never publishes, so only a publishing run (the
+    /// daemon) brings the spool back under.
+    pub held_at_spool_cap: bool,
 }
 
 #[derive(Default)]
@@ -135,6 +139,12 @@ struct Shared {
     /// daemon loop keeps publishing (which evicts) and routing events; only
     /// new fetches wait.
     spool_full: Mutex<bool>,
+    /// Stuck (unpublishable) spool bytes alone reached the cap at the last
+    /// check: `spool_stuck` is logged once per crossing.
+    spool_stuck: Mutex<bool>,
+    /// A publisher is attached: the only thing that evicts, so the spool
+    /// cap applies only then.
+    publishes: std::sync::atomic::AtomicBool,
     /// Photos with a live `photo_task`. Hoisted here (not loop-local) so the
     /// daemon's event classification can defer changes to inflight photos.
     inflight: Mutex<HashSet<PhotoId>>,
@@ -171,6 +181,8 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 counters: Mutex::new(Counters::default()),
                 pause: Mutex::new(PauseState::default()),
                 spool_full: Mutex::new(false),
+                spool_stuck: Mutex::new(false),
+                publishes: std::sync::atomic::AtomicBool::new(false),
                 inflight: Mutex::new(HashSet::new()),
             }),
             publisher: None,
@@ -181,6 +193,9 @@ impl<F: ResourceFetcher> Scheduler<F> {
     /// (`config.publish`). Drain runs never publish.
     pub fn with_publisher(mut self, publisher: Arc<dyn crate::publish::Publisher>) -> Self {
         self.publisher = Some(publisher);
+        self.shared
+            .publishes
+            .store(true, std::sync::atomic::Ordering::Release);
         self
     }
 
@@ -207,7 +222,9 @@ impl<F: ResourceFetcher> Scheduler<F> {
             let claimable = self.claim_batch(&no_skip).await?;
             if claimable.is_empty() {
                 if tasks.is_empty() {
-                    break; // queue drained (or only future retries remain)
+                    // Queue drained (or only future retries remain) — or
+                    // held at the spool cap, which the report says apart.
+                    break;
                 }
                 let _ = tasks.join_next().await; // wait for capacity/progress
                 continue;
@@ -322,6 +339,8 @@ impl<F: ResourceFetcher> Scheduler<F> {
             .store
             .retry_summary(self.shared.config.retry_cap)
             .await?;
+        let at_cap = *self.shared.spool_full.lock().expect("spool mutex");
+        let held_at_spool_cap = at_cap && self.shared.store.count_pending_resources().await? > 0;
         let c = self.shared.counters.lock().expect("counters mutex");
         Ok(DrainReport {
             photos_completed: c.photos_completed,
@@ -334,6 +353,7 @@ impl<F: ResourceFetcher> Scheduler<F> {
             awaiting_retry: summary.awaiting_retry,
             gave_up: summary.gave_up,
             earliest_next_retry_at: summary.earliest_next_retry_at,
+            held_at_spool_cap,
         })
     }
 
@@ -378,19 +398,44 @@ impl<F: ResourceFetcher> Scheduler<F> {
     }
 }
 
-/// The spool soft cap: may a new fetch start? Logs `spool_full` once on
-/// reaching the cap and `spool_below_cap` once on coming back under, so a
-/// daemon parked at the cap for hours writes two lines, not one per poll.
+/// The spool soft cap: may a new photo be claimed? Counts only
+/// publishable bytes (`StateStore::publishable_unevicted_bytes`) plus
+/// inflight writes, since only those ever evict; stuck bytes never hold
+/// the cap. Off without a publisher (nothing would ever evict). Logs
+/// `spool_full` once on reaching the cap and `spool_below_cap` once on
+/// coming back under, and `spool_stuck` once whenever the stuck bytes
+/// alone reach the cap (they need an operator, not more time).
 async fn spool_has_room(shared: &Shared) -> Result<bool> {
     let cap = shared.config.spool_soft_cap_bytes;
-    if cap == 0 {
+    if cap == 0 || !shared.publishes.load(std::sync::atomic::Ordering::Acquire) {
+        *shared.spool_full.lock().expect("spool mutex") = false;
         return Ok(true);
     }
-    let materialized = shared
+    let publishable = shared
+        .store
+        .publishable_unevicted_bytes(shared.config.retry_cap, shared.config.publish.retry_cap)
+        .await?;
+    let stuck = shared
         .store
         .unevicted_bytes()
         .await?
-        .saturating_add(shared.inflight_bytes.total());
+        .saturating_sub(publishable);
+    let stuck_over = stuck >= cap;
+    let was_stuck = std::mem::replace(
+        &mut *shared.spool_stuck.lock().expect("spool mutex"),
+        stuck_over,
+    );
+    if stuck_over && !was_stuck {
+        let _ = shared
+            .store
+            .append_log(
+                "spool_stuck",
+                None,
+                Some(serde_json::json!({ "stuck_bytes": stuck, "soft_cap": cap })),
+            )
+            .await;
+    }
+    let materialized = publishable.saturating_add(shared.inflight_bytes.total());
     let room = admission::spool_admits(materialized, cap);
     let was_full = std::mem::replace(&mut *shared.spool_full.lock().expect("spool mutex"), !room);
     if was_full == room {
@@ -507,11 +552,10 @@ async fn photo_task<F: ResourceFetcher>(
             continue;
         };
 
-        // Spool soft cap: a photo already running stops before its next
-        // resource too, and re-queues once eviction makes room.
-        if !spool_has_room(&shared).await? {
-            return Ok(());
-        }
+        // No spool cap check here: the cap gates claiming a photo, never a
+        // photo already admitted. Only complete photos publish and only
+        // published photos evict, so a photo held between resources would
+        // hold its own bytes forever and wedge the cap.
 
         // Storage-aware admission.
         let expected = match res_desc.expected_size {
