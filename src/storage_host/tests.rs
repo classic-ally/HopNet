@@ -992,3 +992,38 @@ async fn a_dead_feeder_is_respawned() {
         "a running feeder is left alone"
     )));
 }
+
+// Impact: final review of #96 — the planner held off while the book was
+// long without checking the feeder, so a feeder that died with 512+ blobs
+// in the book wedged pulls for good.
+// Should: respawn a dead feeder while holding off, and stop holding once
+// the book is no longer behind.
+#[tokio::test]
+async fn holding_off_respawns_a_dead_feeder() {
+    use crate::storage_host::pull_planner::{AbortOnDrop, BOOK_BACKLOG, hold_while_behind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut feeder = AbortOnDrop(tokio::spawn(async {}));
+    while !feeder.0.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let respawns = AtomicUsize::new(0);
+    let len = AtomicUsize::new(BOOK_BACKLOG);
+    hold_while_behind(
+        || {
+            // The respawned feeder drains the book.
+            if respawns.load(Ordering::SeqCst) > 0 {
+                len.store(0, Ordering::SeqCst);
+            }
+            len.load(Ordering::SeqCst)
+        },
+        &mut feeder,
+        || {
+            respawns.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(std::future::pending::<()>())
+        },
+        std::time::Duration::from_millis(1),
+    )
+    .await;
+    assert_eq!(respawns.load(Ordering::SeqCst), 1);
+    assert!(!feeder.0.is_finished());
+}

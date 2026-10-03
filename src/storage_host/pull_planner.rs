@@ -243,9 +243,30 @@ async fn run(app_state: AppState) {
         }
         tokio::time::sleep(pass_rest(found_work, resume.is_none(), started.elapsed())).await;
         // Then hold the next pass while the feeder is behind.
-        while !feeder_caught_up(book.lock().unwrap().len()) {
-            tokio::time::sleep(Duration::from_secs(PLANNER_MIN_REST_SECS)).await;
+        hold_while_behind(
+            || book.lock().unwrap().len(),
+            &mut feeder,
+            || tokio::spawn(feed(app_state.clone(), book.clone())),
+            Duration::from_secs(PLANNER_MIN_REST_SECS),
+        )
+        .await;
+    }
+}
+
+/// Wait while the book holds a backlog, checking the feeder on every tick:
+/// waiting on the feeder to drain the book is a wedge if the feeder has
+/// died, so a stopped feeder is respawned here too.
+pub async fn hold_while_behind(
+    book_len: impl Fn() -> usize,
+    feeder: &mut AbortOnDrop,
+    mut respawn: impl FnMut() -> tokio::task::JoinHandle<()>,
+    tick: Duration,
+) {
+    while !feeder_caught_up(book_len()) {
+        if respawn_if_finished(feeder, &mut respawn) {
+            tracing::warn!("pull planner: feeder had stopped while behind; restarted");
         }
+        tokio::time::sleep(tick).await;
     }
 }
 
