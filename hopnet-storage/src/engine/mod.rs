@@ -1353,15 +1353,30 @@ mod tests {
         assert_eq!(payload.confirmations.len(), 2);
     }
 
-    // Should: hold a partial page until it is a minute old, and flush at
+    // Impact: the lane's first cut waited out the full minute for a lone
+    // upload, and placement tests that allow ~30 s failed.
+    // Should: flush once the input has been quiet for a moment, flush a
+    // steady stream once its oldest entry is a minute old, and flush at
     // once when a full page is waiting.
+    // Should not: flush while items keep arriving inside the quiet gap.
     #[test]
-    fn lane_flushes_at_size_or_age() {
+    fn lane_flushes_at_size_quiet_or_age() {
         let mut buf = evidence::LaneBuffer::default();
         assert!(!buf.due(100));
         buf.push(item(1, 9, &[1]), 100);
-        assert!(!buf.due(100 + policy::EVIDENCE_MAX_AGE_SECS - 1));
-        assert!(buf.due(100 + policy::EVIDENCE_MAX_AGE_SECS));
+        assert!(!buf.due(100));
+        assert!(buf.due(100 + policy::EVIDENCE_QUIET_SECS), "quiet");
+
+        // A steady stream keeps it open until the age bound.
+        let mut stream = evidence::LaneBuffer::default();
+        let mut t = 100;
+        while t < 100 + policy::EVIDENCE_MAX_AGE_SECS {
+            stream.push(item(2, 9, &[2]), t);
+            assert!(!stream.due(t), "still streaming at {t}");
+            t += 1;
+        }
+        stream.push(item(2, 9, &[2]), t);
+        assert!(stream.due(t), "age bound");
 
         let mut full = evidence::LaneBuffer::default();
         full.push(
