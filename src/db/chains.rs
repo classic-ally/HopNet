@@ -1131,6 +1131,46 @@ mod tests {
         }
     }
 
+    // Impact: the epoch-10 seal was written by 2026.10.4 binaries at
+    // storage@3; 2026.10.5 rebuilt it with the v4 spec, the hashed
+    // format_version differed, and the macbook's join failed its roundtrip
+    // on every boot. Every format bump needs its frozen predecessor.
+    // Should: resolve a storage@3 artifact to the frozen v3 spec at
+    // ordinal 3, and build and verify it against its own hash.
+    #[test]
+    fn storage_v3_artifact_builds_against_its_own_hash() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        install(&conn).unwrap();
+        crate::db::snapshot::tests::seed(&conn);
+        let specs: Vec<&'static hopnet_common::SectionSpec> = crate::db::snapshot::sections()
+            .into_iter()
+            .map(|s| {
+                if s.name == "storage" {
+                    &hopnet_storage::store::PRE_SCAN_INDEX_SNAPSHOT_SECTION
+                } else {
+                    s
+                }
+            })
+            .collect();
+        let tx = conn.transaction().unwrap();
+        let (artifact, _manifest) =
+            hopnet_common::snapshot::serialize_snapshot(&tx, &specs).unwrap();
+        drop(tx);
+
+        let headers = hopnet_common::snapshot::read_section_headers(&artifact).unwrap();
+        let plan = crate::db::snapshot::resolve_import_plan(&headers).unwrap();
+        assert_eq!(plan.targets.get("storage"), Some(&3));
+
+        let scratch = rusqlite::Connection::open_in_memory().unwrap();
+        build_artifact_db(
+            &scratch,
+            &plan,
+            &artifact,
+            blake3::hash(&artifact).as_bytes(),
+        )
+        .unwrap();
+    }
+
     // Should: refuse artifact headers this binary cannot place — an
     // unmappable pre-split version, an unknown section, an ordinal
     // outside the module's chain.

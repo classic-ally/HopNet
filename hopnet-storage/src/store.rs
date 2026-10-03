@@ -90,28 +90,44 @@ pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionS
     // provenance / suspect — the replicated disk-truth record (stamped by
     // attest_fragments); the legacy self_verified_height stays excluded.
     // v4 (operational fixes 2026-10): storage step 0004 adds an index only;
-    // the covered set is unchanged, so a storage@3 artifact imports with
-    // this spec at ordinal 3 and fast-forwards (no frozen copy needed).
+    // the covered set is unchanged, but the format_version is part of the
+    // serialized bytes, so storage@3 artifacts import through the frozen
+    // v3 spec below (re-serializing at 4 cannot reproduce their hash).
     format_version: 4,
-    tables: &[
-        hopnet_common::TableSpec::exported("data_blocks"),
-        hopnet_common::TableSpec::exported("storage_view_transitions"),
-        hopnet_common::TableSpec::exported("blob_access"),
-        hopnet_common::TableSpec::exported("mesh_key"),
-        hopnet_common::TableSpec::exported("mesh_key_access"),
-        hopnet_common::TableSpec {
-            name: "fragment_hashes",
-            role: hopnet_common::TableRole::Exported,
-            excluded_columns: &["stored_locally"],
-        },
-        hopnet_common::TableSpec {
-            name: "fragment_inventory",
-            role: hopnet_common::TableRole::Exported,
-            excluded_columns: &["self_verified_height"],
-        },
-        hopnet_common::TableSpec::exported("hopnet_storage_policy"),
-    ],
+    tables: STORAGE_TABLES,
 };
+
+/// The covered tables shared by every spec since v3: the index-only v4
+/// bump changed no table or column.
+const STORAGE_TABLES: &[hopnet_common::TableSpec] = &[
+    hopnet_common::TableSpec::exported("data_blocks"),
+    hopnet_common::TableSpec::exported("storage_view_transitions"),
+    hopnet_common::TableSpec::exported("blob_access"),
+    hopnet_common::TableSpec::exported("mesh_key"),
+    hopnet_common::TableSpec::exported("mesh_key_access"),
+    hopnet_common::TableSpec {
+        name: "fragment_hashes",
+        role: hopnet_common::TableRole::Exported,
+        excluded_columns: &["stored_locally"],
+    },
+    hopnet_common::TableSpec {
+        name: "fragment_inventory",
+        role: hopnet_common::TableRole::Exported,
+        excluded_columns: &["self_verified_height"],
+    },
+    hopnet_common::TableSpec::exported("hopnet_storage_policy"),
+];
+
+/// The storage section as sealed by S5 through 2026.10.4 binaries
+/// (ordinal 3). FROZEN — the import mapping for storage@3 artifacts, such
+/// as the epoch-10 seal a 2026.10.5 joiner rebuilds from. Identical
+/// tables; only the format_version differs, and it is hashed.
+pub const PRE_SCAN_INDEX_SNAPSHOT_SECTION: hopnet_common::SectionSpec =
+    hopnet_common::SectionSpec {
+        name: "storage",
+        format_version: 3,
+        tables: STORAGE_TABLES,
+    };
 
 /// The storage section as sealed by S1–S4 binaries (ordinal 2): the v3
 /// covered set, columns as of ordinal 2. FROZEN — the import mapping for
@@ -871,8 +887,8 @@ pub fn count_unplaced_blobs(conn: &rusqlite::Connection) -> Result<i64, rusqlite
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
     use rusqlite::OptionalExtension;
+    use std::str::FromStr;
 
     fn test_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1264,7 +1280,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(rows, 1, "one row per (hash, node) however many reports assert it");
+        assert_eq!(
+            rows, 1,
+            "one row per (hash, node) however many reports assert it"
+        );
         assert_eq!(
             inventory_row(&conn, 1, &hash),
             Some((Some(9), Some(7), 1)),

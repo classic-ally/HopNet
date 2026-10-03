@@ -488,10 +488,9 @@ pub async fn run_disk_truth_sweep(
     // (2) Orphans past grace — and the temp files of interrupted stores,
     //     which have no row to be judged by and were never reaped before.
     let mut temps_deleted = 0usize;
-    for path in hopnet_storage::sweep::stale_temps(
-        &walk.temps,
-        now_unix.saturating_sub(orphan_grace_secs),
-    ) {
+    for path in
+        hopnet_storage::sweep::stale_temps(&walk.temps, now_unix.saturating_sub(orphan_grace_secs))
+    {
         match std::fs::remove_file(&path) {
             Ok(()) => temps_deleted += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => temps_deleted += 1,
@@ -680,22 +679,25 @@ pub(crate) async fn submit_attestation_pages<S: hopnet_storage::traits::TxSubmit
     let total = pages.len();
     let (mut committed, mut failed) = (0usize, 0usize);
     for (i, attestation) in pages.into_iter().enumerate() {
-        let payload =
-            match bincode::serde::encode_to_vec(&attestation, bincode::config::standard()) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("sweep: attestation encode (page {} of {total}): {e}", i + 1);
-                    failed += 1;
-                    continue;
-                }
-            };
+        let payload = match bincode::serde::encode_to_vec(&attestation, bincode::config::standard())
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("sweep: attestation encode (page {} of {total}): {e}", i + 1);
+                failed += 1;
+                continue;
+            }
+        };
         match submitter
             .submit(hopnet_storage::engine::policy::ATTEST_FN, payload)
             .await
         {
             Ok(()) => committed += 1,
             Err(e) => {
-                tracing::warn!("sweep: attestation submit (page {} of {total}): {e:?}", i + 1);
+                tracing::warn!(
+                    "sweep: attestation submit (page {} of {total}): {e:?}",
+                    i + 1
+                );
                 failed += 1;
             }
         }
@@ -1191,10 +1193,8 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
                 )
                 .map_err(|e| format!("repair scan: {e:?}"))?;
                 // Goal assignments, memoized per blob (many chunks share one).
-                let mut goals: std::collections::HashMap<
-                    hopnet_storage::BlobId,
-                    Option<Vec<i32>>,
-                > = Default::default();
+                let mut goals: std::collections::HashMap<hopnet_storage::BlobId, Option<Vec<i32>>> =
+                    Default::default();
                 for cand in &candidates {
                     if !goals.contains_key(&cand.blob_id) {
                         let assignment =

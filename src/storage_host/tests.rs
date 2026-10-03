@@ -802,7 +802,9 @@ impl hopnet_storage::traits::TxSubmitter for FlakySubmitter {
     ) -> Result<(), hopnet_storage::traits::SubmitError> {
         let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         if self.fail_on.contains(&n) {
-            Err(hopnet_storage::traits::SubmitError::Transient("timeout".into()))
+            Err(hopnet_storage::traits::SubmitError::Transient(
+                "timeout".into(),
+            ))
         } else {
             Ok(())
         }

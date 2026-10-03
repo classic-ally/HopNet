@@ -179,6 +179,18 @@ pub fn resolve_import_plan(headers: &[(String, u32)]) -> Result<ImportPlan, Stri
                 plan.targets.insert("consensus", 2);
             }
             "storage"
+                if *fv == hopnet_storage::store::PRE_SCAN_INDEX_SNAPSHOT_SECTION.format_version =>
+            {
+                // Index-only bump (storage step 0004): same tables, but the
+                // format_version is hashed, so a storage@3 artifact must be
+                // verified with the frozen v3 spec at ordinal 3, then
+                // fast-forwarded through step 0004.
+                plan.specs
+                    .push(&hopnet_storage::store::PRE_SCAN_INDEX_SNAPSHOT_SECTION);
+                plan.expected.insert(name.clone(), *fv);
+                plan.targets.insert("storage", *fv);
+            }
+            "storage"
                 if *fv == hopnet_storage::store::PRE_DISK_TRUTH_SNAPSHOT_SECTION.format_version =>
             {
                 // Covered-shape bump (RFC-STORAGE-003 S5 added the disk-

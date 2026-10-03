@@ -674,7 +674,9 @@ mod tests {
     }
 
     /// The hashes a self-check payload asserts, as a set.
-    fn self_check_hashes(payloads: &[(&'static str, Vec<u8>)]) -> std::collections::HashSet<Blake3Hash> {
+    fn self_check_hashes(
+        payloads: &[(&'static str, Vec<u8>)],
+    ) -> std::collections::HashSet<Blake3Hash> {
         payloads
             .iter()
             .filter(|(f, _)| *f == policy::SELF_CHECK_FN)
