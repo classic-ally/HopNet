@@ -20,6 +20,7 @@ pub(crate) mod photos;
 pub(crate) mod resources;
 pub(crate) mod stats;
 
+pub use blobs::SpoolStuck;
 pub use log::LogEvent;
 pub use resources::{RetrySummary, WriteCommit};
 pub use stats::LibraryStats;

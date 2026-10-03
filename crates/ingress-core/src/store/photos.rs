@@ -174,27 +174,40 @@ pub(crate) async fn delete_photo(exec: &mut sqlx::SqliteConnection, id: &PhotoId
     Ok(())
 }
 
+/// Narrowing of [`pending_photos`] for the spool soft cap.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PendingFilter {
+    /// Only photos that already hold spool bytes: some resource row with
+    /// a `content_hash`, written or reopened for a refetch (the reopened
+    /// row keeps its old hash as the superseded pointer). The cap never
+    /// holds those back — their bytes leave only by completing,
+    /// publishing and evicting, so a held photo would wedge the cap.
+    pub holding_bytes_only: bool,
+    /// Only photos of a library with a publish target (the personal
+    /// partition, or a scope-bound library with `mesh_library_id` set).
+    /// With a publisher attached an unbound library's bytes could never
+    /// evict, so they are not fetched; a publisher-less drain still
+    /// fetches them.
+    pub bound_only: bool,
+}
+
 /// The drain work queue (spec §Discovery: state.db IS the work queue):
 /// FIFO by discovery time, photos with at least one fetchable resource.
-///
-/// `started_only` keeps just the photos already started (at least one
-/// resource written). The spool soft cap never holds those back: a started
-/// photo holds spool bytes it can only release by completing, publishing
-/// and evicting.
+/// The library join stands in for `p.library_id IS NOT NULL`.
 pub(crate) async fn pending_photos<'e, E>(
     exec: E,
     retry_cap: i64,
     now: DateTime<Utc>,
     limit: i64,
-    started_only: bool,
+    filter: PendingFilter,
 ) -> Result<Vec<PhotoRecord>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
     Ok(sqlx::query_as(
         "SELECT p.* FROM photos p \
-         WHERE p.library_id IS NOT NULL \
-           AND p.materialized_at IS NULL \
+         JOIN libraries l ON l.library_id = p.library_id \
+         WHERE p.materialized_at IS NULL \
            AND p.deleted_at IS NULL \
            AND EXISTS (SELECT 1 FROM photo_resources r \
                        WHERE r.photo_id = p.photo_id \
@@ -203,13 +216,15 @@ where
                          AND (r.next_retry_at IS NULL OR r.next_retry_at <= ?)) \
            AND (? = 0 OR EXISTS (SELECT 1 FROM photo_resources w \
                                  WHERE w.photo_id = p.photo_id \
-                                   AND w.written_at IS NOT NULL)) \
+                                   AND w.content_hash IS NOT NULL)) \
+           AND (? = 0 OR l.scope_binding IS NULL OR l.mesh_library_id IS NOT NULL) \
          ORDER BY p.discovered_at, p.photo_id \
          LIMIT ?",
     )
     .bind(retry_cap)
     .bind(now)
-    .bind(started_only)
+    .bind(filter.holding_bytes_only)
+    .bind(filter.bound_only)
     .bind(limit)
     .fetch_all(exec)
     .await?)
