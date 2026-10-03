@@ -608,7 +608,7 @@ apply functions inside consensus handlers.
       reflects serving: a member that answers probes but cannot serve
       fragments stays in the storage view and is never rebuilt around.
       [~] Repair grace (next release): urgent repair counts a member
-      seen first-hand within 15 minutes as up (`HOPNET_REPAIR_GRACE_SECS`),
+      in liveness contact within 15 minutes as up (`HOPNET_REPAIR_GRACE_SECS`),
       so a crossing's simultaneous reboots no longer trigger re-encodes
       of every chunk (the 2026.10.8 storm); re-encode off the pull
       dispatch loop remains open.

@@ -1260,7 +1260,10 @@ optimization and carries no proof obligation.
       3,399 chunks in 12 minutes; thor's backlog was hours).
       Fix (node-local, no consensus rule or schema change): repair
       counts as up the grid's online set plus every member this node
-      has seen first-hand (`last_seen`, any authenticated sighting)
+      has been in liveness contact with (`last_contact`, the vote-out clock) —
+      visibility would let a straggler outside the epoch, whose status
+      pings and lineage requests refresh `last_seen` only, hold repair
+      off forever —
       within `REPAIR_GRACE` — 15 minutes, `HOPNET_REPAIR_GRACE_SECS`,
       0 turns it off. A peer with no evidence ages from this node's
       boot, so after a crossing the whole mesh is in grace. Grace only

@@ -330,14 +330,19 @@ pub fn seen_age(view: Option<&PeerEvidenceView>, origin: Instant, now: Instant) 
     }
 }
 
-/// The candidates this node has seen first-hand within `grace`, on the
-/// visibility clock (`seen_age`). A peer with no entry ages from
-/// `origin`, so every peer is within grace for `grace` after this node
-/// boots — after an epoch crossing, when every node reboots at once, the
-/// whole mesh is. Urgent repair counts these as live: the replicated
+/// The candidates urgent repair counts as up through the repair grace: in
+/// liveness contact (`contact_age`, the vote-out clock) within `grace`. A
+/// peer with no entry ages from `origin`, so every peer is within grace
+/// for `grace` after this node boots — after an epoch crossing, when
+/// every node reboots at once, the whole mesh is. The replicated
 /// availability grid marks a rebooted node offline until its own next
 /// metrics sample (up to ten minutes), and a reboot is not a departure.
-pub fn seen_within(
+///
+/// Liveness, not visibility: other-epoch status pings, regenesis lineage
+/// requests and mismatched Pongs refresh `last_seen` only, and a
+/// straggler stuck outside the epoch (grid-offline for good: it cannot
+/// commit metrics) must not hold repair off forever.
+pub fn repair_grace_peers(
     snapshot: &[(i32, PeerEvidenceView)],
     origin: Instant,
     now: Instant,
@@ -348,7 +353,7 @@ pub fn seen_within(
         .into_iter()
         .filter(|id| {
             let view = snapshot.iter().find(|(n, _)| n == id).map(|(_, v)| v);
-            seen_age(view, origin, now) < grace
+            contact_age(view, origin, now) < grace
         })
         .collect()
 }
@@ -1376,17 +1381,31 @@ mod tests {
         }
     }
 
-    // Should: count a peer seen within the grace as live for repair, on
-    // the visibility clock (any sighting, not only liveness contact).
+    // Should: count a peer in liveness contact within the grace as live
+    // for repair.
     #[test]
-    fn a_peer_seen_within_the_grace_counts_as_live_for_repair() {
+    fn a_peer_in_contact_within_the_grace_counts_as_live_for_repair() {
         let origin = Instant::now();
         let now = origin + Duration::from_secs(3600);
-        let mut chatty = view(origin);
-        chatty.last_seen = Some(now - Duration::from_secs(60));
-        let snap = vec![(2, chatty)];
-        let live = seen_within(&snap, origin, now, Duration::from_secs(900), [2]);
+        let snap = vec![(2, view(now - Duration::from_secs(60)))];
+        let live = repair_grace_peers(&snap, origin, now, Duration::from_secs(900), [2]);
         assert!(live.contains(&2));
+    }
+
+    // Impact: review of #99 — a straggler outside the epoch is
+    // grid-offline for good, yet its other-epoch status pings and lineage
+    // requests refresh the visibility clock; keyed on that, it would hold
+    // urgent repair off forever.
+    // Should not: keep a peer live for repair when it is seen only through
+    // compat pings or other-epoch traffic (visibility, not contact).
+    #[test]
+    fn a_peer_seen_only_through_compat_or_other_epoch_traffic_is_not_kept_live() {
+        let map = EvidenceMap::new();
+        let origin = map.origin();
+        let now = origin + Duration::from_secs(3600);
+        map.record_seen_at(2, Some(10), now - Duration::from_secs(5));
+        let live = repair_grace_peers(&map.snapshot(), origin, now, Duration::from_secs(900), [2]);
+        assert!(live.is_empty());
     }
 
     // Impact: the 2026.10.8 crossing — every node rebooted within a
@@ -1401,7 +1420,7 @@ mod tests {
     fn every_peer_is_in_grace_until_the_grace_has_passed_since_boot() {
         let origin = Instant::now();
         let grace = Duration::from_secs(900);
-        let early = seen_within(
+        let early = repair_grace_peers(
             &[],
             origin,
             origin + Duration::from_secs(60),
@@ -1409,18 +1428,18 @@ mod tests {
             [1, 2, 3],
         );
         assert_eq!(early.len(), 3);
-        let late = seen_within(&[], origin, origin + grace, grace, [1, 2, 3]);
+        let late = repair_grace_peers(&[], origin, origin + grace, grace, [1, 2, 3]);
         assert!(late.is_empty());
     }
 
-    // Should not: keep a peer live for repair once it has gone unseen for
+    // Should not: keep a peer live for repair once it has been out of contact for
     // longer than the grace, however long ago this node booted.
     #[test]
-    fn a_peer_unseen_past_the_grace_is_not_kept_live() {
+    fn a_peer_out_of_contact_past_the_grace_is_not_kept_live() {
         let origin = Instant::now();
         let now = origin + Duration::from_secs(7200);
         let snap = vec![(2, view(now - Duration::from_secs(901)))];
-        let live = seen_within(&snap, origin, now, Duration::from_secs(900), [2]);
+        let live = repair_grace_peers(&snap, origin, now, Duration::from_secs(900), [2]);
         assert!(live.is_empty());
     }
 

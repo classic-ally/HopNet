@@ -1246,7 +1246,7 @@ static LAST_VIEW_SUMMARY: std::sync::Mutex<Option<String>> = std::sync::Mutex::n
 /// same confirmations twice and double the consensus traffic for nothing.
 static TICK_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// How long a member this node has seen first-hand stays up for repair
+/// How long a member in liveness contact with this node stays up for repair
 /// after the availability grid calls it offline. A rebooted node is
 /// grid-offline until its own next metrics sample — up to ten minutes
 /// after boot — so the grace must outlast that; after an epoch crossing
@@ -1269,7 +1269,7 @@ fn repair_grace() -> std::time::Duration {
 }
 
 /// Who repair counts as up: the grid's online set, this node, and the
-/// members seen first-hand within the grace (`in_grace`). Grace only adds
+/// members in liveness contact within the grace (`in_grace`). Grace only adds
 /// members back — it never removes a grid-online node, and never revives
 /// a node that has left the storage view.
 fn repair_online(
@@ -1303,7 +1303,7 @@ pub struct PolicyTickReport {
     /// Members the availability grid calls online.
     pub online: usize,
     /// Members (and this node) repair counted as up although the grid
-    /// calls them offline: seen first-hand within the repair grace.
+    /// calls them offline: in liveness contact within the repair grace.
     pub repair_grace_online: usize,
     pub watermark: usize,
     /// Chunks below the watermark with a class this node owes a rebuild
@@ -1424,10 +1424,10 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
     let mut repair_grace_online = 0usize;
     if settings.reencode_enabled {
         let members: std::collections::HashSet<i32> = member_ids.iter().copied().collect();
-        // Repair's "up": the grid plus members seen first-hand within the
+        // Repair's "up": the grid plus members in liveness contact within the
         // grace, so a reboot (every node's, at a crossing) is not taken
         // for a departure.
-        let in_grace = crate::consensus::evidence::seen_within(
+        let in_grace = crate::consensus::evidence::repair_grace_peers(
             &app_state.evidence.snapshot(),
             app_state.evidence.origin(),
             std::time::Instant::now(),
