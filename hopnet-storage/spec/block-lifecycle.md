@@ -1333,8 +1333,20 @@ optimization and carries no proof obligation.
       - On a small volume the marks are clamped (the floor to a quarter
         of the volume, the resume mark to half, WARN at boot): unclamped,
         a ~30 GiB volume's resume mark sat at or above its own size and a
-        paused node never resumed. A free-space probe failure holds back
-        (fail safe) with a WARN at most every 5 min.
+        paused node never resumed. The clamp never takes the pull floor
+        below the ingest floor (pulls stop before uploads, always); where
+        the ingest floor plus the resume gap exceeds the volume, boot
+        WARNs that a paused node may not resume.
+      - Two pause reasons, in the tick report (`pause_reason`,
+        `last_probe_error`) and on the pane: `low_space` clears at the
+        resume mark; `probe_error` (free space unreadable; fail safe, WARN
+        at most every 5 min) clears on the next good probe above the pull
+        floor, so one transient EIO does not hold a node with room back.
+        The pane learns of a probe-error pause only from the node itself
+        (it is not in the replicated metrics).
+      - `would_admit` (the re-encode pre-check) is strictly read-only; a
+        refused pull-class rebuild holds the guard back, so the blob waits
+        for the pause to clear rather than retrying every 30 s.
       - Held blobs are not lost: a blob held for space is re-offered after
         a re-probe interval and waits in the queue, running first after
         the resume. Lazy re-encodes are not queued while held back (the
