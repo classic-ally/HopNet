@@ -154,6 +154,7 @@ async fn rig() -> Rig {
                 max: Duration::ZERO,
             },
             reserve_floor_bytes: 0,
+            spool_soft_cap_bytes: 0,
             pressure_pause: Duration::from_millis(10),
             storage_poll: Duration::from_millis(10),
             default_size_estimate: 1024,
@@ -320,6 +321,70 @@ async fn admission_floor_blocks_then_recovers() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+// Impact: the cap is soft so a 4K video larger than the whole cap can still
+// be ingested; a hard cap (spool + next item <= cap) would strand it forever.
+// Should: admit a single item larger than the cap while the spool is under it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_single_oversized_item_is_admitted_under_the_cap() {
+    let mut r = rig().await;
+    r.config.spool_soft_cap_bytes = 100;
+    let rig = r;
+    let desc = AssetDescriptorBuilder::simple_image().build();
+    seed_asset(&rig, &desc, &[7u8; 500], None).await;
+
+    let report = scheduler(&rig).drain().await.unwrap();
+    assert_eq!(report.photos_completed, 1);
+    assert_eq!(rig.store.unevicted_bytes().await.unwrap(), 500);
+}
+
+// Impact: the macbook's spool reached 42 GB because nothing bounded it but
+// free disk space, and the HopNet node on the same disk then had none.
+// Should: admit nothing new while the spool is at or above the cap, logging
+// spool_full once.
+// Should: resume once eviction brings the spool back under, logging
+// spool_below_cap.
+// Should not: burn retries on the held photo.
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_new_is_admitted_while_over_the_cap() {
+    let mut r = rig().await;
+    r.config.spool_soft_cap_bytes = 100;
+    let rig = r;
+    let first = AssetDescriptorBuilder::simple_image().build();
+    seed_asset(&rig, &first, &[1u8; 500], None).await;
+    // One scheduler throughout, as in the daemon: the cap state is its own.
+    let sched = scheduler(&rig);
+    assert_eq!(sched.drain().await.unwrap().photos_completed, 1);
+
+    let second = AssetDescriptorBuilder::simple_image().build();
+    seed_asset(&rig, &second, &[2u8; 50], None).await;
+    let held = sched.drain().await.unwrap();
+    assert_eq!(
+        held.photos_completed, 1,
+        "counters are per scheduler: still the first"
+    );
+    assert_eq!(held.awaiting_retry, 0);
+    assert_eq!(rig.store.log_events("spool_full").await.unwrap().len(), 1);
+    let pending = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM photo_resources WHERE written_at IS NULL",
+    )
+    .fetch_one(rig.store.raw_pool())
+    .await
+    .unwrap();
+    assert_eq!(pending, 1);
+
+    // The first photo's publish is decided: its blob is evicted.
+    sqlx::query("UPDATE blobs SET evicted_at = CURRENT_TIMESTAMP")
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+    let resumed = sched.drain().await.unwrap();
+    assert_eq!(resumed.photos_completed, 2);
+    assert_eq!(
+        rig.store.log_events("spool_below_cap").await.unwrap().len(),
+        1
     );
 }
 

@@ -74,9 +74,31 @@ pub fn admit(
         > reserve_floor)
 }
 
+/// The spool soft cap: may a new fetch start with `materialized` bytes
+/// (unevicted spool plus fetches in flight) already on its way to disk?
+/// The next item's size is deliberately not part of the check: a single
+/// item larger than the cap lands whenever the spool is under it. A cap of
+/// 0 disables the check.
+pub fn spool_admits(materialized: u64, cap: u64) -> bool {
+    cap == 0 || materialized < cap
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Should: admit while the materialized spool is under the cap, whatever
+    // the next item weighs.
+    // Should not: admit at or above the cap.
+    // Should: admit everything with the cap disabled.
+    #[test]
+    fn spool_cap_is_soft() {
+        assert!(spool_admits(0, 100));
+        assert!(spool_admits(99, 100));
+        assert!(!spool_admits(100, 100));
+        assert!(!spool_admits(500, 100));
+        assert!(spool_admits(u64::MAX, 0));
+    }
 
     struct Fixed(u64);
     impl FreeSpaceProbe for Fixed {

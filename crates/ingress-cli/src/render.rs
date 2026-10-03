@@ -87,6 +87,10 @@ pub fn print_status(report: &StatusReport) {
     println!("\nPIPELINE");
     println!("  pending resources: {}", p.resources_pending);
     println!(
+        "  spool:             {}",
+        human_bytes(i64::try_from(p.spool_bytes).unwrap_or(i64::MAX))
+    );
+    println!(
         "  awaiting retry:    {} (earliest {})",
         p.retries.awaiting_retry,
         opt(&p.retries.earliest_next_retry_at)

@@ -294,6 +294,9 @@ impl IngressSession {
                 max: std::time::Duration::from_secs(options.retry_max_secs),
             },
             reserve_floor_bytes: options.reserve_floor_gib * 1024 * 1024 * 1024,
+            spool_soft_cap_bytes: ingress_core::scheduler::spool_soft_cap_from(|k| {
+                std::env::var(k).ok()
+            }),
             pressure_pause: std::time::Duration::from_secs(options.pressure_pause_secs),
             storage_poll: std::time::Duration::from_secs(options.storage_poll_secs),
             ..SchedulerConfig::default()
@@ -483,6 +486,9 @@ impl IngressSession {
                 max: std::time::Duration::from_secs(options.retry_max_secs),
             },
             reserve_floor_bytes: options.reserve_floor_gib * 1024 * 1024 * 1024,
+            spool_soft_cap_bytes: ingress_core::scheduler::spool_soft_cap_from(|k| {
+                std::env::var(k).ok()
+            }),
             pressure_pause: std::time::Duration::from_secs(options.pressure_pause_secs),
             storage_poll: std::time::Duration::from_secs(options.storage_poll_secs),
             cleanup_interval: std::time::Duration::from_secs(options.cleanup_interval_secs.max(1)),

@@ -22,6 +22,22 @@ impl StateStore {
         )
     }
 
+    /// Bytes the spool holds materialized: one file per content hash with
+    /// an unevicted row in any library (the spool is shared across
+    /// libraries). Read fresh each time (eviction, hard deletes and fsck
+    /// repairs all move it), so it stays right across crashes and other
+    /// processes.
+    pub async fn unevicted_bytes(&self) -> Result<u64> {
+        let sum: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(size_bytes) FROM ( \
+               SELECT MAX(size_bytes) AS size_bytes FROM blobs \
+               WHERE evicted_at IS NULL GROUP BY content_hash)",
+        )
+        .fetch_one(self.pool())
+        .await?;
+        Ok(sum.unwrap_or(0).max(0) as u64)
+    }
+
     pub async fn blob(
         &self,
         library_id: &LibraryId,

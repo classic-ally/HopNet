@@ -37,6 +37,9 @@ pub struct PipelineStatus {
     pub unmapped_photos: i64,
     /// Unwritten resources that never failed a fetch.
     pub resources_pending: i64,
+    /// Materialized spool bytes (unevicted blobs): what the soft cap
+    /// (`HOPNET_INGRESS_SPOOL_SOFT_CAP_BYTES`, default 10 GiB) gates on.
+    pub spool_bytes: u64,
     #[serde(flatten)]
     pub retries: RetrySummary,
 }
@@ -53,6 +56,7 @@ pub async fn status(store: &StateStore, retry_cap: i64) -> Result<StatusReport> 
     let pipeline = PipelineStatus {
         unmapped_photos: store.count_unmapped_photos().await?,
         resources_pending: store.count_pending_resources().await?,
+        spool_bytes: store.unevicted_bytes().await?,
         retries: store.retry_summary(retry_cap).await?,
     };
     Ok(StatusReport {

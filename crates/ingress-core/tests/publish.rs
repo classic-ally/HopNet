@@ -273,6 +273,7 @@ async fn rig() -> Rig {
                 max: Duration::ZERO,
             },
             reserve_floor_bytes: 0,
+            spool_soft_cap_bytes: 0,
             pressure_pause: Duration::from_millis(10),
             storage_poll: Duration::from_millis(10),
             default_size_estimate: 1024,
