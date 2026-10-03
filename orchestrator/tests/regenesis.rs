@@ -1894,6 +1894,237 @@ impl TestScenario for StragglerRejoin {
     }
 }
 
+/// The release gate (required before every tag — CLAUDE.md "Releases"):
+/// a mesh born on the PREVIOUS release crosses into THIS build, with a
+/// node that was offline through the seal rejoining afterwards on this
+/// build. The crossed pair builds epoch 2 from its own sealed file; the
+/// straggler can only build it from the artifact the previous release
+/// sealed — the staged-join path the macbook's 2026.10.5 join failed on
+/// (consensus-bugs.md 19). Load the old image first:
+/// `scripts/build-release-image.sh v<PREVIOUS_RELEASE>`, plus the usual
+/// `orchestrator load-image` for the current one.
+pub struct ReleaseCrossing;
+
+/// The release the gate crosses FROM. Bump with every release tag.
+pub(crate) const PREVIOUS_RELEASE: &str = "2026.10.6";
+
+/// The version the crossing targets: this build's, or — while the
+/// workspace still carries the previous release's number — a synthetic
+/// next version over the override seam (the boundary needs two codes).
+pub(crate) fn release_crossing_target() -> &'static str {
+    if env!("CARGO_PKG_VERSION") == PREVIOUS_RELEASE {
+        "2026.10.99"
+    } else {
+        env!("CARGO_PKG_VERSION")
+    }
+}
+
+impl TestScenario for ReleaseCrossing {
+    fn name(&self) -> &'static str {
+        "release-crossing"
+    }
+
+    fn description(&self) -> &'static str {
+        "Previous-release mesh crosses into this build; a node offline through the seal rejoins through the old artifact (release gate)"
+    }
+
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
+        let mut result = TestResult::new();
+        anyhow::ensure!(nodes.len() == 3, "release-crossing expects a 3-node mesh");
+        let docker = crate::sys::connect()?;
+        let target: &str = release_crossing_target();
+        let crossed_env: &[(&str, &str)] = &[("HOPNET_UPGRADE_VERSION_OVERRIDE", target)];
+        let new_image = format!("hopnet:{}", crate::naming::checkout_hash());
+        let expected: std::collections::BTreeMap<String, u64> = hopnet::db::chains::chains()
+            .iter()
+            .map(|c| (c.module.to_string(), u64::from(c.head())))
+            .collect();
+
+        println!("\nRunning release-crossing checks:");
+
+        // 0. Born on the previous release — a misloaded image would
+        //    self-cross and prove nothing.
+        let born_on = regenesis_status(&nodes[0]).await?["running_version"]
+            .as_str()
+            .unwrap_or("?")
+            .to_string();
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: format!("Mesh born on the previous release ({PREVIOUS_RELEASE})"),
+                passed: born_on == PREVIOUS_RELEASE,
+                detail: Some(born_on.clone()),
+            },
+        );
+        if born_on != PREVIOUS_RELEASE {
+            return Ok(result);
+        }
+
+        // 1. Epoch-1 data with everyone present, then the straggler goes
+        //    dark BEFORE the freeze: it never sees the seal.
+        upload_file(
+            &nodes[0],
+            "/",
+            "previous-release.txt",
+            b"written by the previous release".to_vec(),
+        )
+        .await?;
+        let straggler = nodes[2].clone();
+        crate::tests::persistence::stop_node(&docker, mesh_id, straggler.node_id).await?;
+
+        // 2. The pair freezes toward this build and seals (parked alive:
+        //    the old binary cannot run the target version).
+        let pair = [nodes[0].clone(), nodes[1].clone()];
+        if attest_and_freeze(&mut result, &pair, Some(target))
+            .await?
+            .is_none()
+        {
+            return Ok(result);
+        }
+        let seal_height = wait_sealed_everywhere(&pair).await?.unwrap_or(0);
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "The pair seals the previous release's epoch".to_string(),
+                passed: seal_height > 0,
+                detail: Some(format!("seal_height {seal_height}")),
+            },
+        );
+        if seal_height == 0 {
+            return Ok(result);
+        }
+
+        // 3. The pair crosses onto this build from its own sealed file.
+        let mut crossed = Vec::new();
+        let mut crossings = Vec::new();
+        for node in &pair {
+            recreate_node_with_env(
+                &docker,
+                mesh_id,
+                node.node_id,
+                Some(&new_image),
+                crossed_env,
+            )
+            .await?;
+            let fresh = reauth_node(&docker, mesh_id, node).await?;
+            let v = regenesis_status(&fresh).await?;
+            crossings.push((
+                node.node_id,
+                v["epoch"].as_str() == Some("2"),
+                v["running_version"].as_str() == Some(target),
+                ordinal_map(&v) == expected,
+            ));
+            crossed.push(fresh);
+        }
+        let pair_crossed = crossings.iter().all(|(_, e, r, o)| *e && *r && *o);
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "The pair crossed: epoch 2, this build, chains at head".to_string(),
+                passed: pair_crossed,
+                detail: Some(format!("{crossings:?}")),
+            },
+        );
+        if !pair_crossed {
+            return Ok(result);
+        }
+
+        // 4. Epoch 2 decides new work while the straggler is away.
+        upload_file(
+            &crossed[1],
+            "/",
+            "this-build.txt",
+            b"decided by this build".to_vec(),
+        )
+        .await?;
+        let mut progressed = false;
+        for _ in 0..60 {
+            if decided_height(&crossed[0]).await.unwrap_or(0) > seal_height {
+                progressed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Epoch 2 decides past the boundary".to_string(),
+                passed: progressed,
+                detail: Some(format!("H={seal_height}")),
+            },
+        );
+
+        // 5. The straggler comes back ON THIS BUILD, still holding the
+        //    previous release's unsealed epoch-1 database. It must notice
+        //    the boundary, fetch the artifact the previous release sealed,
+        //    stage it and ask for its restart...
+        recreate_node_with_env(
+            &docker,
+            mesh_id,
+            straggler.node_id,
+            Some(&new_image),
+            crossed_env,
+        )
+        .await?;
+        let code = wait_for_exit_code(
+            &docker,
+            mesh_id,
+            straggler.node_id,
+            Duration::from_secs(300),
+        )
+        .await?;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Straggler stages the previous release's seal and requests its restart"
+                    .to_string(),
+                passed: code == Some(75),
+                detail: Some(format!("exit code: {code:?}")),
+            },
+        );
+        if code != Some(75) {
+            return Ok(result);
+        }
+
+        // ...then its boot builds epoch 2 from that artifact.
+        start_node(&docker, mesh_id, straggler.node_id).await?;
+        let rejoined = reauth_node(&docker, mesh_id, &straggler).await?;
+        let on_epoch2 = wait_for_epoch(&rejoined, "2", Duration::from_secs(180)).await?;
+        let v = regenesis_status(&rejoined).await?;
+        let joined = on_epoch2 && v["boundary_error"].is_null() && ordinal_map(&v) == expected;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Straggler joins through the previous release's artifact: epoch 2, no boundary error, chains at head"
+                    .to_string(),
+                passed: joined,
+                detail: Some(format!(
+                    "epoch {:?}, boundary_error {:?}",
+                    v["epoch"], v["boundary_error"]
+                )),
+            },
+        );
+
+        // 6. One mesh again: converged and coherent.
+        let mut all_nodes = crossed.clone();
+        all_nodes.push(rejoined);
+        let tip = decided_height(&crossed[0]).await.unwrap_or(seal_height);
+        let (converged, heights) = wait_for_convergence(&all_nodes, tip, 180).await;
+        let snapshots = fetch_state_snapshots(&all_nodes).await?;
+        let (coherent, detail) = coherence(&snapshots);
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Rejoined mesh converges and is coherent".to_string(),
+                passed: converged && coherent,
+                detail: Some(format!("heights: {heights:?}, {detail}")),
+            },
+        );
+
+        Ok(result)
+    }
+}
+
 impl TestScenario for DivergedNodeRebuild {
     fn name(&self) -> &'static str {
         "diverged-node-rebuild"

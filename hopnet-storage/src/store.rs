@@ -93,12 +93,15 @@ pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionS
     // the covered set is unchanged, but the format_version is part of the
     // serialized bytes, so storage@3 artifacts import through the frozen
     // v3 spec below (re-serializing at 4 cannot reproduce their hash).
-    format_version: 4,
+    // v5 (rolling sweep): storage step 0005 adds the node-local sweep
+    // cursor; the covered set is unchanged, and storage@4 artifacts import
+    // through the frozen v4 spec below.
+    format_version: 5,
     tables: STORAGE_TABLES,
 };
 
-/// The covered tables shared by every spec since v3: the index-only v4
-/// bump changed no table or column.
+/// The covered tables shared by every spec since v3: the v4 (index) and
+/// v5 (node-local cursor) bumps changed no covered table or column.
 const STORAGE_TABLES: &[hopnet_common::TableSpec] = &[
     hopnet_common::TableSpec::exported("data_blocks"),
     hopnet_common::TableSpec::exported("storage_view_transitions"),
@@ -126,6 +129,17 @@ pub const PRE_SCAN_INDEX_SNAPSHOT_SECTION: hopnet_common::SectionSpec =
     hopnet_common::SectionSpec {
         name: "storage",
         format_version: 3,
+        tables: STORAGE_TABLES,
+    };
+
+/// The storage section as sealed by 2026.10.5 and 2026.10.6 (ordinal 4).
+/// FROZEN — the import mapping for storage@4 artifacts (the epoch-11 seal
+/// and the previous-release join fixture). Identical tables; only the
+/// hashed format_version differs.
+pub const PRE_ROLLING_SWEEP_SNAPSHOT_SECTION: hopnet_common::SectionSpec =
+    hopnet_common::SectionSpec {
+        name: "storage",
+        format_version: 4,
         tables: STORAGE_TABLES,
     };
 
@@ -187,7 +201,7 @@ pub const PRE_LIFECYCLE_SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_co
 };
 
 /// Node-local tables — outside the snapshot universe entirely.
-pub const NODE_LOCAL_TABLES: &[&str] = &["hopnet_storage_pins"];
+pub const NODE_LOCAL_TABLES: &[&str] = &["hopnet_storage_pins", "hopnet_storage_sweep_cursor"];
 
 /// This module's schema chain (RFC-020): replay is the only installer.
 /// Head ordinal == SNAPSHOT_SECTION.format_version, pinned by host
@@ -214,6 +228,11 @@ pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
             4,
             "scan_indexes",
             include_str!("../migrations/storage/0004_scan_indexes.sql"),
+        ),
+        hopnet_common::Step::sql(
+            5,
+            "sweep_cursor",
+            include_str!("../migrations/storage/0005_sweep_cursor.sql"),
         ),
     ],
 };
@@ -588,6 +607,100 @@ pub fn compute_inventory_differential(
         node_id,
         self_verified_height,
         previous_count,
+        fragments_added,
+        fragments_removed,
+    })
+}
+
+/// The rolling sweep's resume point, if this node has swept before.
+pub fn read_sweep_cursor(
+    conn: &rusqlite::Connection,
+) -> Result<Option<crate::sweep::SweepCursor>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT next_shard, rotation, rotation_started_unix, rotation_started_height
+         FROM hopnet_storage_sweep_cursor WHERE id = 1",
+        [],
+        |row| {
+            Ok(crate::sweep::SweepCursor {
+                next_shard: row.get::<_, u8>(0)?,
+                rotation: row.get::<_, i64>(1)? as u64,
+                started_unix: row.get::<_, i64>(2)? as u64,
+                started_height: row.get::<_, i64>(3)? as u64,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Persist the rolling sweep's resume point (one row, replaced).
+pub fn write_sweep_cursor(
+    conn: &rusqlite::Connection,
+    cursor: &crate::sweep::SweepCursor,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO hopnet_storage_sweep_cursor
+         (id, next_shard, rotation, rotation_started_unix, rotation_started_height)
+         VALUES (1, ?1, ?2, ?3, ?4)",
+        params![
+            cursor.next_shard,
+            cursor.rotation as i64,
+            cursor.started_unix as i64,
+            cursor.started_height as i64
+        ],
+    )
+    .map(|_| ())
+}
+
+/// SQL bounding `col` to one rolling-sweep shard, binding `?1` (and `?2`
+/// unless it is the last shard). Pair with `sweep::shard_bounds`.
+fn shard_clause(col: &str, last: bool) -> String {
+    if last {
+        format!("{col} >= ?1")
+    } else {
+        format!("{col} >= ?1 AND {col} < ?2")
+    }
+}
+
+/// `compute_inventory_differential` over one rolling-sweep shard: this
+/// node's belief rows against its stored-locally flags, restricted to the
+/// hashes whose first byte is `shard`. Both sides are range scans on
+/// indexes (`idx_fragment_hashes_local`, `idx_fragment_inventory_node`).
+/// `previous_count` is 0 (informational on the wire).
+pub fn compute_shard_inventory_differential(
+    tx: &rusqlite::Transaction<'_>,
+    node_id: i32,
+    shard: u8,
+    self_verified_height: u64,
+) -> Result<SelfCheckFragments, rusqlite::Error> {
+    let (lo, hi) = crate::sweep::shard_bounds(shard);
+    let last = hi.is_none();
+    let range = shard_clause("fragment_hash", last);
+    let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&lo];
+    if let Some(hi) = &hi {
+        bound.push(hi);
+    }
+    bound.push(&node_id);
+    let query = |sql: &str| -> Result<Vec<Blake3Hash>, rusqlite::Error> {
+        let mut stmt = tx.prepare(sql)?;
+        let rows = stmt.query_map(bound.as_slice(), |row| row.get(0))?;
+        rows.collect()
+    };
+    let node = if last { "?2" } else { "?3" };
+    let fragments_added = query(&format!(
+        "SELECT fragment_hash FROM fragment_hashes WHERE stored_locally = 1 AND {range}
+         EXCEPT
+         SELECT fragment_hash FROM fragment_inventory WHERE node_id = {node} AND {range}"
+    ))?;
+    let fragments_removed = query(&format!(
+        "SELECT fragment_hash FROM fragment_inventory WHERE node_id = {node} AND {range}
+         EXCEPT
+         SELECT fragment_hash FROM fragment_hashes WHERE stored_locally = 1 AND {range}"
+    ))?;
+    Ok(SelfCheckFragments {
+        node_id,
+        self_verified_height,
+        previous_count: 0,
         fragments_added,
         fragments_removed,
     })
@@ -1436,5 +1549,91 @@ mod tests {
         assert_eq!(report.previous_count, 0);
         assert!(report.fragments_removed.is_empty());
         assert_eq!(report.fragments_added, vec![h(2), h(1), h(5)]);
+    }
+
+    // Should: read nothing before the first write, then read back the one
+    // cursor row, replaced in place by each write.
+    #[test]
+    fn sweep_cursor_round_trips_as_one_row() {
+        let conn = test_conn();
+        conn.execute_batch(include_str!("../migrations/storage/0005_sweep_cursor.sql"))
+            .unwrap();
+        assert_eq!(read_sweep_cursor(&conn).unwrap(), None);
+        let first = crate::sweep::SweepCursor::fresh(1_000, 50);
+        write_sweep_cursor(&conn, &first).unwrap();
+        assert_eq!(read_sweep_cursor(&conn).unwrap(), Some(first));
+        let (next, _) = first.advance(1_010, 51);
+        write_sweep_cursor(&conn, &next).unwrap();
+        assert_eq!(read_sweep_cursor(&conn).unwrap(), Some(next));
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM hopnet_storage_sweep_cursor",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    // Impact: the rolling sweep pages belief per shard; a range that
+    // leaked into a neighbour, or missed the last shard, would assert or
+    // remove belief for fragments the shard's walk never looked at.
+    // Should: add this node's held hashes in the shard that lack its row,
+    // and remove its rows in the shard whose hash is not held.
+    // Should not: touch another shard's hashes, an un-held hash that has
+    // no row, or another node's rows.
+    #[test]
+    fn shard_differential_covers_exactly_the_shard() {
+        let mut conn = test_conn();
+        inventory_schema(&conn);
+        let blob = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap();
+        let h = |first: u8, rest: u8| {
+            let mut b = [rest; 32];
+            b[0] = first;
+            Blake3Hash::from_bytes(b)
+        };
+        // (hash, stored_locally)
+        for (i, (hash, local)) in [
+            (h(0xab, 0x00), true),  // held, no row → added
+            (h(0xab, 0xff), true),  // held, my row → nothing
+            (h(0xab, 0x11), false), // not held, my row → removed
+            (h(0xab, 0x22), false), // not held, no row → nothing
+            (h(0xaa, 0xff), true),  // previous shard → untouched
+            (h(0xac, 0x00), true),  // next shard → untouched
+            (h(0xff, 0x01), true),  // last shard, held, no row
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO fragment_hashes
+                 (data_block_id, chunk_number, local_index, fragment_hash, stored_locally)
+                 VALUES (?, 0, ?, ?, ?)",
+                params![blob, i as i64, hash, local],
+            )
+            .unwrap();
+        }
+        for (hash, node) in [
+            (h(0xab, 0xff), 1),
+            (h(0xab, 0x11), 1),
+            (h(0xab, 0x33), 2), // another node's row, not held here
+            (h(0xac, 0x11), 1), // next shard's stale row
+        ] {
+            conn.execute(
+                "INSERT INTO fragment_inventory (fragment_hash, node_id) VALUES (?, ?)",
+                params![hash, node],
+            )
+            .unwrap();
+        }
+
+        let tx = conn.transaction().unwrap();
+        let report = compute_shard_inventory_differential(&tx, 1, 0xab, 9).unwrap();
+        assert_eq!(report.self_verified_height, 9);
+        assert_eq!(report.fragments_added, vec![h(0xab, 0x00)]);
+        assert_eq!(report.fragments_removed, vec![h(0xab, 0x11)]);
+
+        let last = compute_shard_inventory_differential(&tx, 1, 0xff, 9).unwrap();
+        assert_eq!(last.fragments_added, vec![h(0xff, 0x01)]);
+        assert!(last.fragments_removed.is_empty());
     }
 }

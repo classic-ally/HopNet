@@ -197,94 +197,107 @@ fn is_temp_fragment_name(name: &str) -> bool {
 }
 
 /// `scan_fragments_detailed` plus the temp files and the unexpected-name
-/// count — the disk-truth sweep's walk.
+/// count — a full walk of the store.
 pub fn scan_fragments_with_temps(fragments_dir: &str) -> Result<FragmentListing, StorageError> {
-    use std::time::SystemTime;
-
     let fragments_path = std::path::Path::new(fragments_dir);
     if !fragments_path.exists() {
         tracing::warn!("Fragments directory does not exist: {}", fragments_dir);
         return Ok(FragmentListing::default());
     }
 
-    let mut disk_fragments = Vec::new();
-    let mut temps = Vec::new();
-    let mut unexpected = 0usize;
-
+    let mut listing = FragmentListing::default();
     // Iterate through first-level directories (00-ff)
     for first_level_entry in fs::read_dir(fragments_path)? {
         let first_level_entry = first_level_entry?;
         if !first_level_entry.file_type()?.is_dir() {
             continue;
         }
+        scan_first_level(&first_level_entry.path(), &mut listing)?;
+    }
+    if listing.unexpected > 0 {
+        tracing::warn!(
+            "fragment walk: {} files with names that are neither fragments nor temp files were left alone",
+            listing.unexpected
+        );
+    }
+    Ok(listing)
+}
 
-        // Iterate through second-level directories (00-ff)
-        for second_level_entry in fs::read_dir(first_level_entry.path())? {
-            let second_level_entry = second_level_entry?;
-            if !second_level_entry.file_type()?.is_dir() {
+/// One shard of the store: the first-level directory named by the hash's
+/// first byte (`get_fragment_dir`'s layout), the unit the rolling sweep
+/// lists per step. A missing directory scans as empty; unexpected names
+/// are counted, not logged, so the caller reports once per rotation.
+pub fn scan_shard(fragments_dir: &str, shard: u8) -> Result<FragmentListing, StorageError> {
+    let mut listing = FragmentListing::default();
+    let path = std::path::Path::new(fragments_dir).join(format!("{shard:02x}"));
+    if path.is_dir() {
+        scan_first_level(&path, &mut listing)?;
+    }
+    Ok(listing)
+}
+
+/// Walk one first-level directory (its second-level directories and
+/// their files) into `listing`.
+fn scan_first_level(
+    first_level: &std::path::Path,
+    listing: &mut FragmentListing,
+) -> Result<(), StorageError> {
+    use std::time::SystemTime;
+
+    // Iterate through second-level directories (00-ff)
+    for second_level_entry in fs::read_dir(first_level)? {
+        let second_level_entry = second_level_entry?;
+        if !second_level_entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        // Iterate through fragment files
+        for file_entry in fs::read_dir(second_level_entry.path())? {
+            let file_entry = file_entry?;
+            let metadata = file_entry.metadata()?;
+            if !metadata.is_file() {
                 continue;
             }
 
-            // Iterate through fragment files
-            for file_entry in fs::read_dir(second_level_entry.path())? {
-                let file_entry = file_entry?;
-                let metadata = file_entry.metadata()?;
-                if !metadata.is_file() {
-                    continue;
-                }
+            let mtime = metadata
+                .modified()?
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|_| StorageError::Io(io::Error::other("Invalid file modification time")))?
+                .as_secs();
 
-                let mtime = metadata
-                    .modified()?
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map_err(|_| {
-                        StorageError::Io(io::Error::other("Invalid file modification time"))
-                    })?
-                    .as_secs();
-
-                // Parse filename as Blake3 hash (64 hex characters)
-                let filename = file_entry.file_name();
-                let filename_str = filename.to_string_lossy();
-                if is_temp_fragment_name(&filename_str) {
-                    temps.push(TempFile {
-                        path: file_entry.path(),
+            // Parse filename as Blake3 hash (64 hex characters)
+            let filename = file_entry.file_name();
+            let filename_str = filename.to_string_lossy();
+            if is_temp_fragment_name(&filename_str) {
+                listing.temps.push(TempFile {
+                    path: file_entry.path(),
+                    mtime,
+                });
+                continue;
+            }
+            if filename_str.len() != 64 {
+                tracing::debug!("Unexpected fragment filename: {}", filename_str);
+                listing.unexpected += 1;
+                continue;
+            }
+            match hex::decode(&*filename_str) {
+                Ok(bytes) if bytes.len() == 32 => {
+                    let mut array = [0u8; 32];
+                    array.copy_from_slice(&bytes);
+                    listing.fragments.push(crate::sweep::DiskFragment {
+                        hash: Blake3Hash::from_bytes(array),
+                        size: metadata.len(),
                         mtime,
                     });
-                    continue;
                 }
-                if filename_str.len() != 64 {
-                    tracing::debug!("Unexpected fragment filename: {}", filename_str);
-                    unexpected += 1;
-                    continue;
-                }
-                match hex::decode(&*filename_str) {
-                    Ok(bytes) if bytes.len() == 32 => {
-                        let mut array = [0u8; 32];
-                        array.copy_from_slice(&bytes);
-                        disk_fragments.push(crate::sweep::DiskFragment {
-                            hash: Blake3Hash::from_bytes(array),
-                            size: metadata.len(),
-                            mtime,
-                        });
-                    }
-                    _ => {
-                        tracing::debug!("Invalid fragment hash filename: {}", filename_str);
-                        unexpected += 1;
-                    }
+                _ => {
+                    tracing::debug!("Invalid fragment hash filename: {}", filename_str);
+                    listing.unexpected += 1;
                 }
             }
         }
     }
-    if unexpected > 0 {
-        tracing::warn!(
-            "fragment walk: {unexpected} files with names that are neither fragments nor temp files were left alone"
-        );
-    }
-
-    Ok(FragmentListing {
-        fragments: disk_fragments,
-        temps,
-        unexpected,
-    })
+    Ok(())
 }
 
 /// Fetch and verify a fragment from local storage
@@ -439,6 +452,46 @@ mod tests {
         assert_eq!(listing.unexpected, 1);
         // The plain listing still sees only the fragment.
         assert_eq!(scan_fragments_detailed(&dir).unwrap().len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Should: list only the fragments and temp files under the shard's
+    // first-level directory, and scan a shard with no directory as empty.
+    #[test]
+    fn shard_scan_lists_only_its_prefix() {
+        let dir =
+            std::env::temp_dir().join(format!("hopnet-fragstore-shard-{}", std::process::id()));
+        let dir = dir.to_str().unwrap().to_string();
+        let _ = fs::remove_dir_all(&dir);
+        let mut hashes = Vec::new();
+        for i in 0u32..64 {
+            let data = i.to_le_bytes().to_vec();
+            let hash = Blake3Hash::new(blake3::hash(&data));
+            store_fragment(&dir, &hash, data).unwrap();
+            hashes.push(hash);
+        }
+        let shard = hashes[0].as_bytes()[0];
+        let leaf = create_fragment_path(&dir, &hashes[0]).unwrap();
+        fs::write(format!("{leaf}/{}.tmp.ab", hashes[0].to_hex()), b"x").unwrap();
+
+        let listing = scan_shard(&dir, shard).unwrap();
+        let mut expected: Vec<_> = hashes
+            .iter()
+            .filter(|h| h.as_bytes()[0] == shard)
+            .copied()
+            .collect();
+        let mut listed: Vec<_> = listing.fragments.iter().map(|d| d.hash).collect();
+        expected.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        listed.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(listed, expected);
+        assert_eq!(listing.temps.len(), 1);
+
+        let empty = (0..=u8::MAX)
+            .find(|b| hashes.iter().all(|h| h.as_bytes()[0] != *b))
+            .unwrap();
+        let none = scan_shard(&dir, empty).unwrap();
+        assert!(none.fragments.is_empty() && none.temps.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -832,3 +832,48 @@ async fn attestation_continues_past_a_failed_page() {
     assert_eq!((committed, failed), (3, 2));
     assert_eq!(submitter.calls.load(std::sync::atomic::Ordering::SeqCst), 5);
 }
+
+// Should: read the stored-locally flag of exactly the fragment rows whose
+// hash starts with the shard byte, the last shard included.
+// Should not: return rows of a neighbouring shard.
+#[test]
+fn shard_fragment_flags_read_only_the_shard() {
+    let pool = setup_test_db();
+    let conn = pool.get().unwrap();
+    let h = |first: u8, rest: u8| {
+        let mut b = [rest; 32];
+        b[0] = first;
+        Blake3Hash::from_bytes(b)
+    };
+    conn.execute(
+        "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes, file_size)
+         VALUES ('01890a5d-ac96-774b-b9aa-9f8b24f0c9a1', X'01', 4, 0, 1)",
+        [],
+    )
+    .unwrap();
+    for (i, (hash, local)) in [
+        (h(0x10, 0x00), true),
+        (h(0x10, 0xff), false),
+        (h(0x11, 0x00), true),
+        (h(0xff, 0x00), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        conn.execute(
+            "INSERT INTO fragment_hashes (data_block_id, chunk_number, local_index,
+             fragment_id, fragment_hash, chunk_type, stored_locally)
+             VALUES ('01890a5d-ac96-774b-b9aa-9f8b24f0c9a1', 0, ?, ?, ?, 0, ?)",
+            params![i as i64, format!("f{i}"), hash, local],
+        )
+        .unwrap();
+    }
+
+    let mut rows = crate::db::fragments::shard_fragment_flags(&conn, 0x10).unwrap();
+    rows.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    assert_eq!(rows, vec![(h(0x10, 0x00), true), (h(0x10, 0xff), false)]);
+    assert_eq!(
+        crate::db::fragments::shard_fragment_flags(&conn, 0xff).unwrap(),
+        vec![(h(0xff, 0x00), true)]
+    );
+}

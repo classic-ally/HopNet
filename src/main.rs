@@ -709,23 +709,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 takeout_worker.run().await;
             });
 
-            // Start fragment inventory self-check worker with randomized 20-30 minute schedule
-            let random_second = rand::rng().random_range(5..55);
-            let random_minute = rand::rng().random_range(0..30); // 0-29 minutes offset within each 30-minute window
-            let self_check_cron_expression =
-                format!("{} {}/30 * * * *", random_second, random_minute);
-            let self_check_schedule =
-                apalis_cron::Schedule::from_str(&self_check_cron_expression).unwrap();
-            let self_check_cron_stream = apalis_cron::CronStream::new(self_check_schedule);
-
-            let self_check_worker = WorkerBuilder::new("fragment-inventory-self-check")
-                .data(app_state.clone())
-                .backend(self_check_cron_stream)
-                .build_fn(storage_host::jobs::handle_fragment_inventory_self_check);
-
-            tokio::spawn(async move {
-                self_check_worker.run().await;
-            });
+            // The rolling disk-truth sweep: one shard at a time for the
+            // node's lifetime, a full rotation per hour, resuming from its
+            // saved cursor after a restart.
+            tokio::spawn(storage_host::jobs::run_rolling_sweep(app_state.clone()));
 
             // Storage policy tick (RFC-STORAGE-002 S6): view sync, repair
             // scan (urgent + one lazy re-encode), one migration pull,

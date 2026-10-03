@@ -179,6 +179,19 @@ pub fn resolve_import_plan(headers: &[(String, u32)]) -> Result<ImportPlan, Stri
                 plan.targets.insert("consensus", 2);
             }
             "storage"
+                if *fv
+                    == hopnet_storage::store::PRE_ROLLING_SWEEP_SNAPSHOT_SECTION.format_version =>
+            {
+                // Node-local bump (storage step 0005, the sweep cursor):
+                // same covered tables, hashed format_version, so storage@4
+                // verifies with the frozen v4 spec at ordinal 4, then
+                // fast-forwards through step 0005.
+                plan.specs
+                    .push(&hopnet_storage::store::PRE_ROLLING_SWEEP_SNAPSHOT_SECTION);
+                plan.expected.insert(name.clone(), *fv);
+                plan.targets.insert("storage", *fv);
+            }
+            "storage"
                 if *fv == hopnet_storage::store::PRE_SCAN_INDEX_SNAPSHOT_SECTION.format_version =>
             {
                 // Index-only bump (storage step 0004): same tables, but the
@@ -225,6 +238,19 @@ pub fn resolve_import_plan(headers: &[(String, u32)]) -> Result<ImportPlan, Stri
                 if !chain.contains(*fv) {
                     return Err(format!(
                         "artifact section {name}@{fv} names an ordinal outside the {name} chain"
+                    ));
+                }
+                // The format_version is serialized into the artifact and
+                // hashed, so the live spec can only verify its own
+                // ordinal. An older ordinal needs its frozen spec (an arm
+                // above); building it with the live one fails the
+                // roundtrip with an opaque hash mismatch (consensus-bugs
+                // 19). Refuse here, by name.
+                if *fv != spec.format_version {
+                    return Err(format!(
+                        "artifact section {name}@{fv} has no frozen import spec \
+                         (this binary's {name} spec is @{}) — refusing to import",
+                        spec.format_version
                     ));
                 }
                 plan.specs.push(spec);
@@ -505,7 +531,7 @@ pub(crate) mod tests {
         assert_eq!(report.manifest.top_hash.to_hex(), EMPTY_TOP_HASH);
     }
 
-    const EMPTY_TOP_HASH: &str = "c2992bfe87d1b69c62687129dbd110f8c199425fcfc35976aa5d8884931e5d7f";
+    const EMPTY_TOP_HASH: &str = "585ccef3573a3c624e50a095f1f50f3767359c4993dfa98c62bbce546f03d4ba";
     const EMPTY_SECTION_HASHES: &[(&str, &str)] = &[
         (
             "identity",
@@ -524,7 +550,7 @@ pub(crate) mod tests {
             // the covered set and data_blocks gained a column. v3 (S5):
             // fragment_inventory gained the disk-truth columns.
             "storage",
-            "efa15e42233987125239101d540df307f172da1ffb7611006ae0879d3307d69a",
+            "c44421424bb5b503fbf8f74479f729efb5e1a9bc2d1360e070b0b2e9dac62cb3",
         ),
         (
             "drive",
@@ -560,9 +586,9 @@ pub(crate) mod tests {
     }
 
     const SEEDED_TOP_HASH: &str =
-        "c5543c40744c9148c0fce43759e6d886642e54cd9b0a406bf9b5088f5097e382";
+        "482425c5cb68566a73fd7fda8b684c52f8de458941c6e12cc168ad13641f7418";
     const SEEDED_ARTIFACT_HASH: &str =
-        "98ce4e21dac2933b59d0f11856418ba36b50d9f057c81e1d4d66444ad16663c4";
+        "e25e4bff83b3c79a44585403ddcb0bdfc94a21098b70dd2a5326f561613e19e1";
     // 5159 pre-split + 25: the "host" section header (16 bytes) became
     // identity (20) + telemetry (21) headers. Row bytes unchanged — the
     // delta being exactly the header arithmetic is the cheap proof the

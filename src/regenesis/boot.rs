@@ -1486,6 +1486,74 @@ pub(crate) mod tests {
         assert_eq!(read_agreed_version(&fx.db_path), Some(TARGET));
     }
 
+    /// The previous release's straggler, frozen: its own database and the
+    /// staging it downloaded, all written by that release's binary.
+    /// Refresh at every release (see the README beside the files).
+    const PREVIOUS_RELEASE_JOIN_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/regenesis/fixtures/previous-release-join"
+    );
+
+    const PREVIOUS_RELEASE_JOIN_FILES: [&str; 4] =
+        ["database.db", "epoch-2.bin", "snapshot.bin", "manifest.bin"];
+
+    /// Regenerate the previous-release join fixture. Run from a worktree
+    /// checked out at the release tag, then copy the directory into the
+    /// branch: `cargo test --lib regenerate_previous_release_join_fixture
+    /// -- --ignored`.
+    #[test]
+    #[ignore = "writes the previous-release fixture; run at the release tag"]
+    fn regenerate_previous_release_join_fixture() {
+        let client = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let fx = join_fixture(client.path(), server.path());
+        fx.stage(None);
+        let out = Path::new(PREVIOUS_RELEASE_JOIN_FIXTURE);
+        std::fs::create_dir_all(out).unwrap();
+        std::fs::copy(&fx.db_path, out.join("database.db")).unwrap();
+        for name in ["epoch-2.bin", "snapshot.bin", "manifest.bin"] {
+            std::fs::copy(fx.staging.join(name), out.join(name)).unwrap();
+        }
+    }
+
+    // Impact: a straggler holding the previous release's seal must cross
+    // into this build. The 2026.10.5 join failed exactly here because a
+    // storage section bump had no frozen predecessor (consensus-bugs 19).
+    // Should: cross a database and staging written by the previous
+    // release into the target epoch, with every module stamped at this
+    // build's chain head.
+    #[test]
+    fn previous_release_straggler_crosses_into_this_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("database.db");
+        let staging = join::staging_path(&db_path.to_string_lossy());
+        std::fs::create_dir_all(&staging).unwrap();
+        let src = Path::new(PREVIOUS_RELEASE_JOIN_FIXTURE);
+        std::fs::copy(src.join("database.db"), &db_path).unwrap();
+        for name in &PREVIOUS_RELEASE_JOIN_FILES[1..] {
+            std::fs::copy(src.join(name), staging.join(name)).unwrap();
+        }
+        let manifest = join::read_manifest(&staging).expect("fixture manifest");
+        let db = db_path.to_string_lossy();
+
+        match boot_transition(&db, manifest.required_version_code) {
+            BootOutcome::Transitioned { epoch } => assert_eq!(epoch, manifest.target_epoch),
+            other => panic!("previous-release straggler did not cross: {other:?}"),
+        }
+
+        let conn = open(&db);
+        assert_eq!(genesis::current_epoch(&conn), manifest.target_epoch);
+        let stamps = crate::db::chains::read_stamps(&conn).unwrap();
+        for chain in crate::db::chains::chains() {
+            assert_eq!(
+                stamps.get(chain.module),
+                Some(&chain.head()),
+                "{} not at head after the join",
+                chain.module
+            );
+        }
+    }
+
     // Impact: an upgrade-boundary straggler running the old binary must
     // never build the new epoch's database — the node-local carry copies
     // rows blind, and only the exact-version gate makes that safe.
@@ -2423,14 +2491,16 @@ pub(crate) mod tests {
         // Simulate the pre-chain sealed shape by reverting every
         // post-baseline step: identity 0001 (schema_ordinals), storage
         // 0002 (RFC-STORAGE-003: the goal column, its indexes, the
-        // transition record), storage 0003 (the disk-truth columns) and
-        // storage 0004 (the held-fragment index).
+        // transition record), storage 0003 (the disk-truth columns),
+        // storage 0004 (the held-fragment index) and storage 0005 (the
+        // sweep cursor).
         // Fingerprints compare DDL text, so the reverts must restore the
         // baseline statements byte for byte.
         {
             let conn = open(&db_path);
             conn.execute_batch(
                 "DROP TABLE schema_ordinals;
+                 DROP TABLE hopnet_storage_sweep_cursor;
                  DROP INDEX idx_fragment_hashes_local;
                  DROP INDEX idx_fragment_inventory_verified;
                  ALTER TABLE fragment_inventory DROP COLUMN suspect;

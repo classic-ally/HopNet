@@ -42,6 +42,20 @@ pub fn compute_inventory_differential(
     }
 }
 
+/// One rolling-sweep shard's belief differential, under a consistent
+/// snapshot, stamped with `height` (the height the walker read before it
+/// listed the shard, never a later one).
+pub fn compute_shard_inventory_differential(
+    conn: &mut rusqlite::Connection,
+    node_id: i32,
+    shard: u8,
+    height: u64,
+) -> Result<SelfCheckFragments, DatabaseError> {
+    let tx = conn.transaction().map_err(|_| DatabaseError::LockError)?;
+    hopnet_storage::store::compute_shard_inventory_differential(&tx, node_id, shard, height)
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))
+}
+
 /// Blob-scoped belief for the prompt path after a pull: this node's held
 /// classes of `blob_id` with no inventory row yet (the pulled, rebuilt and
 /// origin classes). One indexed query under a consistent snapshot; the

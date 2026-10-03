@@ -591,8 +591,12 @@ apply functions inside consensus handlers.
       the sweep attests even when its self-check submit fails and logs a
       failed sweep (thor had attested nothing for a day), and
       attestation stamps are capped at the deciding height and only rise
-      (consensus-bugs.md 18). Still open for design: a free-space floor on
-      pulls, unseating a validator that stops voting, a paged sweep.
+      (consensus-bugs.md 18). The disk-truth sweep is rolling: one shard
+      per step, a 60-minute rotation, honest per-shard heights, a
+      node-local cursor (storage@5), and a required cross-release gate
+      before every tag (`release-crossing`, CLAUDE.md "Releases"). Still
+      open for design: a free-space floor on pulls, unseating a validator
+      that stops voting.
 - [x] Consensus↔storage quorum single-sourced + active-profile watermark
       (2026-07-21): quorum math extracted to `hopnet_common::quorum`
       (one source of truth for both the consensus engine and the storage

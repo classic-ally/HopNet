@@ -1034,7 +1034,8 @@ optimization and carries no proof obligation.
     scrub slice on the same listing, then submit the differential and
     the attestation. Cadence decision: every 30-minute self-check is
     disk-backed (the RFC's "daily" was a floor) — belief is dishonest
-    for at most one cycle. Confirmation evidence now requires a row
+    for at most one cycle (since the rolling sweep, one 60-minute
+    rotation; see the Cutover record). Confirmation evidence now requires a row
     verified within `ATTESTATION_RECENCY_HEIGHTS` (1024; 8192 from 2026.10.5) of the
     deciding height and not suspect; read routing ranks by
     `verified_height` and skips suspect rows; the obligation check and
@@ -1173,6 +1174,23 @@ optimization and carries no proof obligation.
     safety note above stands: no recency scheme closes the
     attest-then-die window, and a wider one only lengthens how long
     belief may lag a dead disk.
+  - Rolling sweep (2026-10-03, branch `feat-rolling-sweep`, decided
+    with Allison; replaces the 30-minute whole-store sweep). A walker
+    sweeps one shard (the hash's first byte = one first-level store
+    directory) per step for the node's lifetime, paced to a 60-minute
+    rotation (~2,700 heights at drain, inside the 8192 window; a WARN
+    fires past half the window). Each shard reads the height BEFORE
+    listing; belief (`compute_shard_inventory_differential`) and
+    present hashes go into page buffers stamped with the lowest height
+    any member was seen at, flushed at 8192 hashes or after 60 s, belief
+    before truth, failures tolerated as in 9edd3745. Scrub keeps its
+    budget (each shard on its day of seven); surplus release draws on a
+    per-rotation budget. The cursor lives in node-local
+    `hopnet_storage_sweep_cursor` (storage step 0005, storage@5, frozen
+    `PRE_ROLLING_SWEEP_SNAPSHOT_SECTION` for storage@4 artifacts), so a
+    restarting node resumes instead of rescanning from the top. The
+    operator routes run one unpaced rotation, exclusive with the walker
+    per shard. "Paging the sweep's walk" is closed by this.
   - Rehearsal (2026-09-27): `orchestrator test --test
     lifecycle-cutover-drain --flags blobs=N` — a mesh born on the
     deployed release image, populated, crosses into the build under
