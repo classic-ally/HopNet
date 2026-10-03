@@ -162,6 +162,9 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         enabled = pull_floor.enabled(),
         "pull floor: replica writes held back below max(bytes, share of the volume)"
     );
+    if let Ok(dir) = storage_host::functions::get_fragments_dir() {
+        hopnet_storage::admission::log_pull_floor_marks(&dir);
+    }
 
     // Pinned-HTTPS listener: the node's only network surface. Bound BEFORE
     // the plaintext listener so a kernel-assigned loopback port can never
