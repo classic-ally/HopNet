@@ -31,16 +31,17 @@
 //! runtime: the host passes a handle at spawn.
 
 pub mod evidence;
+pub mod fetch;
 pub mod policy;
 pub mod reencode;
 
 use crate::error::StorageError;
 use crate::fragstore;
-
 use crate::traits::{LocalStateSink, StateReader, Transport, TxSubmitter};
 use crate::types::BlobId;
+use fetch::{FetchMiss, FetchScheduler, PullLimits};
 use hopnet_common::Blake3Hash;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -69,6 +70,8 @@ impl<T, S, X, L> Clone for Seams<T, S, X, L> {
 pub struct EngineConfig {
     /// Local fragment store root.
     pub fragments_dir: String,
+    /// Pull concurrency (`fetch::PullLimits::from_env` in production).
+    pub limits: PullLimits,
 }
 
 #[derive(Debug)]
@@ -144,7 +147,8 @@ pub struct EngineHandle {
     reencode_lazy_tx: mpsc::UnboundedSender<ReencodeCmd>,
     /// Blobs waiting for (or in) a pull check: hints for a blob already
     /// queued are dropped, and the planner paces itself on the count.
-    queued: Arc<std::sync::Mutex<std::collections::HashSet<BlobId>>>,
+    queued: Arc<std::sync::Mutex<HashSet<BlobId>>>,
+    sched: Arc<FetchScheduler>,
 }
 
 impl EngineHandle {
@@ -176,7 +180,13 @@ impl EngineHandle {
         self.queued.lock().unwrap().len()
     }
 
-    /// Pull check for one blob, serialized on the worker; resolves when it
+    /// The fetch scheduler's live state: window, fetches in flight per
+    /// peer, parked peers and blobs.
+    pub fn scheduler_stats(&self) -> fetch::SchedulerStats {
+        self.sched.stats(std::time::Instant::now())
+    }
+
+    /// Pull check for one blob, run in the window; resolves when it
     /// completes. `None` = engine gone.
     pub async fn pull_blob(&self, blob_id: BlobId) -> Option<PullOutcome> {
         let (tx, rx) = oneshot::channel();
@@ -187,13 +197,25 @@ impl EngineHandle {
         rx.await.ok()
     }
 
-    /// Pull checks for a batch of blobs, aggregated. Engine-gone counts as
-    /// a failure — a later tick retries the blob.
+    /// Pull checks for a batch of blobs, aggregated. All are queued at once
+    /// (the window runs them in parallel), then awaited. Engine-gone counts
+    /// as a failure — a later pass retries the blob.
     pub async fn pull_blobs(&self, blob_ids: impl IntoIterator<Item = BlobId> + Send) -> PullStats {
         let mut stats = PullStats::default();
+        let mut waiting = Vec::new();
         for blob_id in blob_ids {
+            let (tx, rx) = oneshot::channel();
+            self.queued.lock().unwrap().insert(blob_id.clone());
+            if self.pull_tx.send((blob_id.clone(), Some(tx))).is_err() {
+                stats.checked += 1;
+                stats.failed += 1;
+                continue;
+            }
+            waiting.push((blob_id, rx));
+        }
+        for (blob_id, rx) in waiting {
             stats.checked += 1;
-            match self.pull_blob(blob_id.clone()).await {
+            match rx.await.ok() {
                 Some(o) => {
                     stats.owed += o.owed;
                     stats.pulled += o.pulled;
@@ -224,10 +246,13 @@ impl EngineHandle {
         }
     }
 
-    /// Spawn the engine: ONE serial worker on `data_rt` running the duty
-    /// ladder as queue order — urgent re-encode > pull checks > lazy
-    /// re-encode — so repair memory (~one chunk of shards in flight) and
-    /// bandwidth stay bounded per node.
+    /// Spawn the engine on `data_rt`: one dispatch loop running the duty
+    /// ladder as priority order — urgent re-encode > pull admission > lazy
+    /// re-encode. Pulls run in a bounded window of blobs whose fetches
+    /// share the scheduler's global and per-peer caps (`fetch`), so memory
+    /// and bandwidth stay bounded per node; re-encodes run on the loop
+    /// itself (one chunk of shards at a time) while admitted pulls proceed,
+    /// and an urgent one stops admission until it is done.
     pub fn spawn<T, S, X, L>(
         seams: Seams<T, S, X, L>,
         config: EngineConfig,
@@ -244,11 +269,14 @@ impl EngineHandle {
         let (reencode_lazy_tx, mut reencode_lazy_rx) = mpsc::unbounded_channel::<ReencodeCmd>();
 
         let fragments_dir = config.fragments_dir;
-        let queued: Arc<std::sync::Mutex<std::collections::HashSet<BlobId>>> = Default::default();
+        let queued: Arc<std::sync::Mutex<HashSet<BlobId>>> = Default::default();
         let worker_queued = queued.clone();
+        let sched = FetchScheduler::new(config.limits);
+        let worker_sched = sched.clone();
         let lane =
             evidence::EvidenceLane::spawn(seams.state.clone(), seams.submitter.clone(), &data_rt);
         data_rt.spawn(async move {
+            let mut running: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     biased;
@@ -256,19 +284,41 @@ impl EngineHandle {
                         let Some(cmd) = cmd else { break };
                         run_reencode_cmd(&seams, &fragments_dir, cmd).await;
                     }
-                    item = pull_rx.recv() => {
-                        let Some((blob_id, reply)) = item else { break };
-                        let outcome = match pull_owed(&seams, &fragments_dir, &blob_id, &lane).await {
-                            Ok(o) => o,
-                            Err(e) => {
-                                tracing::warn!("pull: blob {blob_id} failed: {e}");
-                                PullOutcome::default()
+                    Some(_) = running.join_next(), if !running.is_empty() => {}
+                    admitted = async {
+                        let permit = worker_sched.window.clone().acquire_owned().await;
+                        (permit, pull_rx.recv().await)
+                    } => {
+                        let (Ok(permit), Some((blob_id, reply))) = admitted else { break };
+                        if worker_sched.blob_parked(&blob_id, std::time::Instant::now()) {
+                            // Its sources are dark: let the window move on.
+                            worker_queued.lock().unwrap().remove(&blob_id);
+                            if let Some(reply) = reply {
+                                let _ = reply.send(PullOutcome::default());
                             }
-                        };
-                        worker_queued.lock().unwrap().remove(&blob_id);
-                        if let Some(reply) = reply {
-                            let _ = reply.send(outcome);
+                            continue;
                         }
+                        let (seams, dir, lane, sched, queued) = (
+                            seams.clone(),
+                            fragments_dir.clone(),
+                            lane.clone(),
+                            worker_sched.clone(),
+                            worker_queued.clone(),
+                        );
+                        running.spawn(async move {
+                            let outcome = match pull_owed(&seams, &dir, &blob_id, &lane, &sched).await {
+                                Ok(o) => o,
+                                Err(e) => {
+                                    tracing::warn!("pull: blob {blob_id} failed: {e}");
+                                    PullOutcome::default()
+                                }
+                            };
+                            drop(permit);
+                            queued.lock().unwrap().remove(&blob_id);
+                            if let Some(reply) = reply {
+                                let _ = reply.send(outcome);
+                            }
+                        });
                     }
                     cmd = reencode_lazy_rx.recv() => {
                         let Some(cmd) = cmd else { break };
@@ -283,6 +333,7 @@ impl EngineHandle {
             reencode_urgent_tx,
             reencode_lazy_tx,
             queued,
+            sched,
         }
     }
 }
@@ -328,12 +379,13 @@ async fn pull_owed<T, S, X, L>(
     fragments_dir: &str,
     blob_id: &BlobId,
     lane: &evidence::EvidenceLane,
+    sched: &Arc<FetchScheduler>,
 ) -> Result<PullOutcome, EngineError>
 where
     T: Transport + 'static,
     S: StateReader,
     X: TxSubmitter,
-    L: LocalStateSink,
+    L: LocalStateSink + 'static,
 {
     let mut outcome = PullOutcome::default();
     let Some(target) = seams.state.pull_target(blob_id)? else {
@@ -372,29 +424,99 @@ where
     if outcome.owed > 0 {
         let hashes: Vec<Blake3Hash> = owed.values().flatten().map(|(_, h)| *h).collect();
         let mut sources = seams.state.fragment_sources(&hashes)?;
-        let candidates = seams.state.all_peers()?;
+        let all_peers = seams.state.all_peers()?;
+        // Sources the host's liveness evidence calls dark are skipped like
+        // parked ones: the blob parks instead of holding window slots.
+        let dark: HashSet<i32> = all_peers
+            .iter()
+            .map(|p| p.node_id)
+            .filter(|n| !seams.state.peer_reachable(*n))
+            .collect();
+        let others: Arc<Vec<crate::traits::PeerRef>> = Arc::new(
+            all_peers
+                .into_iter()
+                .filter(|p| !dark.contains(&p.node_id))
+                .collect(),
+        );
+
+        // Every owed class at once, at most `per_blob` in flight, each under
+        // the scheduler's global and per-peer caps.
+        let per_blob = Arc::new(tokio::sync::Semaphore::new(sched.limits.per_blob()));
+        let mut fetches: tokio::task::JoinSet<(u32, u32, Result<(), FetchMiss>)> =
+            tokio::task::JoinSet::new();
         for (chunk, classes) in &owed {
-            let mut unserved: Vec<u32> = Vec::new();
             for (class, hash) in classes {
-                let hint = sources.remove(hash);
-                match crate::api::find_fragment_via(&seams.transport, hash, &candidates, hint).await
-                {
-                    Some(data) => match fragstore::store_fragment(fragments_dir, hash, data) {
-                        Ok(()) => {
-                            seams.local_state.mark_local(*hash).await;
-                            outcome.pulled += 1;
+                let known = sources.remove(hash).unwrap_or_default();
+                let attested: Vec<crate::traits::PeerRef> = known
+                    .iter()
+                    .copied()
+                    .filter(|p| !dark.contains(&p.node_id))
+                    .collect();
+                let all_dark = !known.is_empty() && attested.is_empty();
+                let (chunk, class, hash) = (*chunk, *class, *hash);
+                let (transport, local_state, sched, per_blob, others, dir) = (
+                    seams.transport.clone(),
+                    seams.local_state.clone(),
+                    sched.clone(),
+                    per_blob.clone(),
+                    others.clone(),
+                    fragments_dir.to_string(),
+                );
+                fetches.spawn(async move {
+                    let Ok(_slot) = per_blob.acquire_owned().await else {
+                        return (chunk, class, Err(FetchMiss::NotServed));
+                    };
+                    if all_dark {
+                        return (chunk, class, Err(FetchMiss::Unreachable));
+                    }
+                    let data =
+                        match fetch::fetch_class(&transport, &sched, &hash, &attested, &others)
+                            .await
+                        {
+                            Ok(data) => data,
+                            Err(miss) => return (chunk, class, Err(miss)),
+                        };
+                    let stored = tokio::task::spawn_blocking(move || {
+                        fragstore::store_fragment(&dir, &hash, data)
+                    })
+                    .await;
+                    match stored {
+                        Ok(Ok(())) => {
+                            local_state.mark_local(hash).await;
+                            (chunk, class, Ok(()))
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("pull: store fragment {} failed: {e}", hash.to_hex());
+                            (chunk, class, Err(FetchMiss::NotServed))
                         }
                         Err(e) => {
-                            tracing::warn!("pull: store fragment {} failed: {e}", hash.to_hex());
-                            unserved.push(*class);
+                            tracing::warn!("pull: store fragment {} join: {e}", hash.to_hex());
+                            (chunk, class, Err(FetchMiss::NotServed))
                         }
-                    },
-                    None => unserved.push(*class),
+                    }
+                });
+            }
+        }
+        let mut unserved_by_chunk: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut unreachable = false;
+        while let Some(joined) = fetches.join_next().await {
+            match joined {
+                Ok((_, _, Ok(()))) => outcome.pulled += 1,
+                Ok((chunk, class, Err(miss))) => {
+                    unreachable |= miss == FetchMiss::Unreachable;
+                    unserved_by_chunk.entry(chunk).or_default().push(class);
+                }
+                Err(e) => {
+                    tracing::warn!("pull: blob {blob_id}: fetch task failed: {e}");
+                    outcome.failed += 1;
                 }
             }
-            if unserved.is_empty() {
-                continue;
-            }
+        }
+
+        let mut rebuild_failed = false;
+        for (chunk, mut unserved) in unserved_by_chunk {
+            unserved.sort_unstable();
+            let chunk = &chunk;
             // Recovery is the fetch fallback: rebuild the classes nobody
             // served from any K live classes (local shards first).
             match reencode::reencode_chunk(
@@ -418,8 +540,20 @@ where
                         unserved.len()
                     );
                     outcome.failed += unserved.len();
+                    rebuild_failed = true;
                 }
             }
+        }
+
+        // A class whose known holders are all dark, and no rebuild: park the
+        // blob so the window admits blobs that can move. Progress (or a
+        // blob owing nothing more) clears the park.
+        let now = std::time::Instant::now();
+        if unreachable && rebuild_failed && outcome.pulled + outcome.rebuilt == 0 {
+            sched.park_blob(blob_id, now);
+            tracing::debug!("pull: blob {blob_id} parked: its sources are unreachable");
+        } else if outcome.failed == 0 {
+            sched.unpark_blob(blob_id);
         }
     }
 
@@ -690,10 +824,11 @@ mod tests {
         T: Transport + 'static,
         S: StateReader,
         X: TxSubmitter,
-        L: LocalStateSink,
+        L: LocalStateSink + 'static,
     {
         let (lane, mut rx) = evidence::EvidenceLane::channel();
-        let outcome = pull_owed(seams, dir, blob_id, &lane).await.unwrap();
+        let sched = FetchScheduler::new(PullLimits::default());
+        let outcome = pull_owed(seams, dir, blob_id, &lane, &sched).await.unwrap();
         let mut items = Vec::new();
         while let Ok(item) = rx.try_recv() {
             items.push(item);
@@ -801,6 +936,7 @@ mod tests {
             seams(idle_net()),
             EngineConfig {
                 fragments_dir: String::new(),
+                limits: PullLimits::default(),
             },
             tokio::runtime::Handle::current(),
         );
