@@ -383,10 +383,11 @@ fn backoff(base: Duration, cap: Duration, repeats: u32) -> Duration {
 /// Why a class was not fetched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchMiss {
-    /// Some reachable source answered but none served it (or no source is
-    /// known): the rebuild may still have shards.
+    /// A holder replied that it does not have it, or served bytes that
+    /// failed verification (or no holder is known): rebuild.
     NotServed,
-    /// Every known source is parked or unreachable.
+    /// A known holder is parked, unreachable, or too busy to serve it now:
+    /// retry later rather than rebuild.
     Unreachable,
 }
 
@@ -417,6 +418,9 @@ pub async fn fetch_class<T: Transport + 'static>(
         .collect();
     holders.sort_by_key(|p| std::cmp::Reverse(sched.peer_free(p.node_id)));
     let mut any_answer = false;
+    // A holder we could not get a slot with (busy, or a slow peer's gate)
+    // has not answered: the class is retried later, never rebuilt for it.
+    let mut busy = false;
     for peer in &holders {
         // The peer's slot first, so a global slot never idles behind a
         // busy peer.
@@ -424,8 +428,7 @@ pub async fn fetch_class<T: Transport + 'static>(
         let Ok(Ok(_slot)) =
             tokio::time::timeout(sched.limits.fetch_timeout, peer_sem.acquire()).await
         else {
-            // Busy, not dark: never a reason to park the blob.
-            any_answer = true;
+            busy = true;
             continue;
         };
         // A slow peer serves one fetch at a time.
@@ -434,7 +437,7 @@ pub async fn fetch_class<T: Transport + 'static>(
             match tokio::time::timeout(sched.limits.fetch_timeout, gate.acquire_owned()).await {
                 Ok(Ok(permit)) => Some(permit),
                 _ => {
-                    any_answer = true;
+                    busy = true;
                     continue;
                 }
             }
@@ -498,13 +501,19 @@ pub async fn fetch_class<T: Transport + 'static>(
             return Ok(Fetched { data, slot: global });
         }
     }
-    // Unreachable only when the class HAS known holders and none of them
-    // answered (all parked or failing at the transport): that is the
-    // offline-origin case the blob park exists for.
-    if attested.is_empty() || any_answer {
-        Err(FetchMiss::NotServed)
+    Err(miss_kind(!attested.is_empty(), any_answer, busy))
+}
+
+/// Why a class was not fetched, from what its holders did. NotServed
+/// (rebuild) only on a real "not here" reply or a content mismatch, and
+/// only when no holder was merely busy; a known holder that was busy,
+/// parked or failing at the transport is Unreachable (retry later): the
+/// bytes exist, the holder just has not answered.
+pub fn miss_kind(has_holders: bool, any_answer: bool, busy: bool) -> FetchMiss {
+    if busy || (has_holders && !any_answer) {
+        FetchMiss::Unreachable
     } else {
-        Err(FetchMiss::Unreachable)
+        FetchMiss::NotServed
     }
 }
 
@@ -844,6 +853,48 @@ mod tests {
         assert_eq!(sched.stats(Instant::now()).fetches_in_flight, 1);
         drop(fetched);
         assert_eq!(sched.stats(Instant::now()).fetches_in_flight, 0);
+    }
+
+    // Impact: review of #96 — a class held only by a slow peer (thor)
+    // whose one-at-a-time gate was taken came back NotServed and was
+    // rebuilt from shards instead of being fetched later.
+    // Should: report a class as Unreachable (retry later) when its holder
+    // could not be given a slot in time.
+    // Should: report NotServed only on a real "not here" reply or bad
+    // bytes, with no holder merely busy.
+    #[tokio::test]
+    async fn a_busy_or_gated_holder_is_retried_not_rebuilt() {
+        let net = Net::new(&[(2, Peer::Serves)], 1);
+        let sched = FetchScheduler::new(limits(4, 2, 50));
+        let t0 = Instant::now();
+        sched.record_peer_success(2, t0);
+        sched.record_peer_failure(2, PeerFailure::Timeout, t0);
+        assert!(sched.peer_slow(2, Instant::now()));
+        let _held = sched.slow_gate(2).acquire_owned().await.unwrap();
+        let hash = register(5000);
+        let got = fetch_class(&net, &sched, &hash, &[peer(2)], &[]).await;
+        assert_eq!(got.err(), Some(FetchMiss::Unreachable));
+
+        assert_eq!(
+            miss_kind(true, true, true),
+            FetchMiss::Unreachable,
+            "busy wins"
+        );
+        assert_eq!(
+            miss_kind(true, false, false),
+            FetchMiss::Unreachable,
+            "no answer"
+        );
+        assert_eq!(
+            miss_kind(true, true, false),
+            FetchMiss::NotServed,
+            "replied not here"
+        );
+        assert_eq!(
+            miss_kind(false, false, false),
+            FetchMiss::NotServed,
+            "no holder known"
+        );
     }
 
     // Should: give up on a fetch at its deadline and release its global
