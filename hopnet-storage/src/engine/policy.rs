@@ -60,7 +60,7 @@ pub const EVIDENCE_MAX_AGE_SECS: u64 = 60;
 /// The evidence lane flushes once nothing new has arrived for this long,
 /// so a lone upload confirms within seconds instead of waiting out the age
 /// bound; a draining node pushes faster than this and still batches.
-pub const EVIDENCE_QUIET_SECS: u64 = 2;
+pub const EVIDENCE_QUIET_MS: u64 = 2_000;
 
 /// Blobs per `ConfirmPlacement` the evidence lane proposes. Block-size
 /// hygiene like the declare page: an entry is a blob id and a height.

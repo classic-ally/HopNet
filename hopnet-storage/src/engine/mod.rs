@@ -1590,25 +1590,33 @@ mod tests {
 
     // Impact: the lane's first cut waited out the full minute for a lone
     // upload, and placement tests that allow ~30 s failed.
-    // Should: flush once the input has been quiet for a moment, flush a
+    // Should: flush once the input has been quiet for the full gap, flush a
     // steady stream once its oldest entry is a minute old, and flush at
     // once when a full page is waiting.
-    // Should not: flush while items keep arriving inside the quiet gap.
+    // Should not: flush while items keep arriving inside the quiet gap, or
+    // early because the push landed late in a whole second (review of #96:
+    // second-granular stamps could fire after ~1 s).
     #[test]
     fn lane_flushes_at_size_quiet_or_age() {
+        let t0 = 100_999; // late in second 100
         let mut buf = evidence::LaneBuffer::default();
-        assert!(!buf.due(100));
-        buf.push(item(1, 9, &[1]), 100);
-        assert!(!buf.due(100));
-        assert!(buf.due(100 + policy::EVIDENCE_QUIET_SECS), "quiet");
+        assert!(!buf.due(t0));
+        buf.push(item(1, 9, &[1]), t0);
+        assert!(!buf.due(t0));
+        assert!(
+            !buf.due(t0 + 1_001),
+            "one second boundary later is not quiet"
+        );
+        assert!(!buf.due(t0 + policy::EVIDENCE_QUIET_MS - 1));
+        assert!(buf.due(t0 + policy::EVIDENCE_QUIET_MS), "quiet");
 
         // A steady stream keeps it open until the age bound.
         let mut stream = evidence::LaneBuffer::default();
-        let mut t = 100;
-        while t < 100 + policy::EVIDENCE_MAX_AGE_SECS {
+        let mut t = t0;
+        while t < t0 + policy::EVIDENCE_MAX_AGE_SECS * 1000 {
             stream.push(item(2, 9, &[2]), t);
             assert!(!stream.due(t), "still streaming at {t}");
-            t += 1;
+            t += 500;
         }
         stream.push(item(2, 9, &[2]), t);
         assert!(stream.due(t), "age bound");
@@ -1619,8 +1627,8 @@ mod tests {
                 present: vec![Blake3Hash::from_bytes([7; 32]); policy::ATTEST_PAGE_SIZE],
                 ..item(2, 9, &[])
             },
-            100,
+            t0,
         );
-        assert!(full.due(100));
+        assert!(full.due(t0));
     }
 }

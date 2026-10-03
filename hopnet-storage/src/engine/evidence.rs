@@ -76,18 +76,18 @@ impl EvidenceLane {
                 let open = tokio::select! {
                     item = rx.recv() => match item {
                         Some(item) => {
-                            buf.push(item, unix_now());
+                            buf.push(item, unix_now_ms());
                             true
                         }
                         None => false,
                     },
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => true,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => true,
                 };
                 // Take everything already waiting before deciding to flush.
                 while let Ok(item) = rx.try_recv() {
-                    buf.push(item, unix_now());
+                    buf.push(item, unix_now_ms());
                 }
-                if !buf.is_empty() && (!open || buf.due(unix_now())) {
+                if !buf.is_empty() && (!open || buf.due(unix_now_ms())) {
                     let done = flush(state.as_ref(), submitter.as_ref(), &mut buf).await;
                     tracing::debug!(?done, "evidence lane: flushed");
                 }
@@ -100,11 +100,13 @@ impl EvidenceLane {
     }
 }
 
-fn unix_now() -> u64 {
+/// Unix time in milliseconds: the lane's quiet gap is shorter than the
+/// second-granular clocks would measure honestly.
+fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
+        .as_millis() as u64
 }
 
 /// The lane's buffered work: the blobs to report belief and confirmation
@@ -114,20 +116,21 @@ pub struct LaneBuffer {
     blobs: Vec<BlobId>,
     seen: HashSet<BlobId>,
     truth: PageBuffer,
-    /// When the oldest buffered blob arrived (unix seconds).
-    opened_at: Option<u64>,
-    /// When the newest one arrived.
-    last_push: Option<u64>,
+    /// When the oldest buffered blob arrived (unix milliseconds).
+    opened_at_ms: Option<u64>,
+    /// When the newest one arrived (unix milliseconds).
+    last_push_ms: Option<u64>,
 }
 
 impl LaneBuffer {
-    pub fn push(&mut self, item: EvidenceItem, now: u64) {
+    /// Buffer one blob's evidence; `now_ms` is unix milliseconds.
+    pub fn push(&mut self, item: EvidenceItem, now_ms: u64) {
         if self.seen.insert(item.blob_id.clone()) {
             self.blobs.push(item.blob_id);
         }
-        self.truth.push(item.height, now, item.present);
-        self.opened_at.get_or_insert(now);
-        self.last_push = Some(now);
+        self.truth.push(item.height, now_ms / 1000, item.present);
+        self.opened_at_ms.get_or_insert(now_ms);
+        self.last_push_ms = Some(now_ms);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -138,14 +141,14 @@ impl LaneBuffer {
     /// oldest entry has waited the sweep's buffer age. Quiet is what keeps
     /// a lone upload's confirmation prompt; under a drain, items arrive
     /// faster than the quiet gap and the age and size bounds batch them.
-    pub fn due(&self, now: u64) -> bool {
+    pub fn due(&self, now_ms: u64) -> bool {
         self.truth.len() >= policy::ATTEST_PAGE_SIZE
             || self
-                .last_push
-                .is_some_and(|t| now.saturating_sub(t) >= policy::EVIDENCE_QUIET_SECS)
+                .last_push_ms
+                .is_some_and(|t| now_ms.saturating_sub(t) >= policy::EVIDENCE_QUIET_MS)
             || self
-                .opened_at
-                .is_some_and(|t| now.saturating_sub(t) >= policy::EVIDENCE_MAX_AGE_SECS)
+                .opened_at_ms
+                .is_some_and(|t| now_ms.saturating_sub(t) >= policy::EVIDENCE_MAX_AGE_SECS * 1000)
     }
 }
 
@@ -172,8 +175,8 @@ where
     let page = policy::ATTEST_PAGE_SIZE;
     let blobs = std::mem::take(&mut buf.blobs);
     buf.seen.clear();
-    buf.opened_at = None;
-    buf.last_push = None;
+    buf.opened_at_ms = None;
+    buf.last_push_ms = None;
     let Some(me) = state.local_node_id() else {
         tracing::warn!("evidence lane: node id not set; dropping a flush");
         buf.truth = PageBuffer::default();
