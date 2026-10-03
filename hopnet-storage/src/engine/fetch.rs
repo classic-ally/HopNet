@@ -84,6 +84,13 @@ pub const REBUILD_WAIT_PARK: Duration = Duration::from_secs(30);
 pub const PARK_FORGET: Duration = Duration::from_secs(3600);
 /// How long the cached storage-view membership is reused.
 pub const MEMBERS_TTL: Duration = Duration::from_secs(60);
+/// After a failed membership refresh, retry no sooner than this; doubles
+/// per repeat, capped.
+pub const MEMBERS_RETRY_BASE: Duration = Duration::from_secs(30);
+pub const MEMBERS_RETRY_CAP: Duration = Duration::from_secs(300);
+/// A cached membership older than this is not trusted: with no fresh view,
+/// pulls fail open (attested holders are treated as members).
+pub const MEMBERS_STALE_MAX: Duration = Duration::from_secs(900);
 
 impl PullLimits {
     /// The defaults, overridden by `HOPNET_PULL_WINDOW`,
@@ -187,6 +194,8 @@ pub struct FetchScheduler {
     members: Mutex<Option<(Instant, Arc<std::collections::HashSet<i32>>)>>,
     /// One membership refresh at a time.
     members_refreshing: std::sync::atomic::AtomicBool,
+    /// Failed refreshes in a row, and when the next may run.
+    members_retry: Mutex<(u32, Option<Instant>)>,
     peers: Mutex<HashMap<i32, PeerPark>>,
     blobs: Mutex<HashMap<BlobId, BlobPark>>,
 }
@@ -202,6 +211,7 @@ impl FetchScheduler {
             slow_gates: Mutex::new(HashMap::new()),
             members: Mutex::new(None),
             members_refreshing: std::sync::atomic::AtomicBool::new(false),
+            members_retry: Mutex::new((0, None)),
             peers: Mutex::new(HashMap::new()),
             blobs: Mutex::new(HashMap::new()),
         })
@@ -368,6 +378,14 @@ impl FetchScheduler {
     }
 
     #[cfg(test)]
+    /// No membership refresh is running.
+    pub fn members_refresh_idle(&self) -> bool {
+        !self
+            .members_refreshing
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     /// How long the blob has been in the park book (since its first park,
     /// across repeats), if at all.
     pub fn blob_parked_for(&self, blob_id: &BlobId, now: Instant) -> Option<Duration> {
@@ -384,8 +402,10 @@ impl FetchScheduler {
     /// caller at a time refreshes it on the blocking pool, in the
     /// background while a stale value exists (everyone keeps using that
     /// value meanwhile), awaited only by the first caller when there is
-    /// none. `None` = no view yet or it cannot be read; nothing is
-    /// filtered then.
+    /// none. A failed refresh is retried with backoff (`MEMBERS_RETRY_*`),
+    /// not on the next call. `None` = no view yet, it cannot be read, or
+    /// the last one read is older than `MEMBERS_STALE_MAX`; nothing is
+    /// filtered then (fail open rather than trust an old list).
     pub async fn members<S: crate::traits::StateReader + 'static>(
         self: &Arc<Self>,
         state: &Arc<S>,
@@ -397,30 +417,54 @@ impl FetchScheduler {
                 return Some(ids.clone());
             }
         }
-        if self
-            .members_refreshing
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        // Stale: usable while a refresh runs, unless too old to trust.
+        let stale = cached
+            .filter(|(at, _)| now.saturating_duration_since(*at) < MEMBERS_STALE_MAX)
+            .map(|(_, ids)| ids);
+        let backing_off = self
+            .members_retry
+            .lock()
+            .unwrap()
+            .1
+            .is_some_and(|next| now < next);
+        if backing_off
+            || self
+                .members_refreshing
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
-            return cached.map(|(_, ids)| ids);
+            return stale;
         }
         let (this, state) = (self.clone(), state.clone());
         let refresh = async move {
-            let view = tokio::task::spawn_blocking(move || state.storage_view()).await;
+            let view = match tokio::task::spawn_blocking(move || state.storage_view()).await {
+                Ok(read) => read.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
             let ids = match view {
-                Ok(Ok(view)) => {
+                Ok(view) => {
                     let ids: Arc<std::collections::HashSet<i32>> =
                         Arc::new(view.members.iter().map(|p| p.node_id).collect());
-                    *this.members.lock().unwrap() = Some((Instant::now(), ids.clone()));
+                    *this.members.lock().unwrap() = Some((now.max(Instant::now()), ids.clone()));
+                    *this.members_retry.lock().unwrap() = (0, None);
                     Some(ids)
                 }
-                _ => None,
+                Err(e) => {
+                    let mut retry = this.members_retry.lock().unwrap();
+                    let wait = backoff(MEMBERS_RETRY_BASE, MEMBERS_RETRY_CAP, retry.0);
+                    *retry = (retry.0 + 1, Some(now.max(Instant::now()) + wait));
+                    tracing::warn!(
+                        retry_in_secs = wait.as_secs(),
+                        "pull: storage view refresh failed: {e}"
+                    );
+                    None
+                }
             };
             this.members_refreshing
                 .store(false, std::sync::atomic::Ordering::Release);
             ids
         };
-        match cached {
-            Some((_, stale)) => {
+        match stale {
+            Some(stale) => {
                 tokio::spawn(refresh);
                 Some(stale)
             }

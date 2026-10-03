@@ -1049,6 +1049,10 @@ mod tests {
         /// Fragments attested on node 3 instead, a reachable member (in
         /// the view whenever this is non-empty).
         held_on_three: HashSet<Blake3Hash>,
+        /// Deriving the storage view fails (a locked or broken database).
+        view_fails: std::sync::atomic::AtomicBool,
+        /// Storage-view derivations attempted.
+        view_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl StateReader for HeldOnTwo {
@@ -1057,6 +1061,11 @@ mod tests {
         }
         fn storage_view(&self) -> Result<crate::traits::StorageView, StorageError> {
             std::thread::sleep(self.view_delay);
+            self.view_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.view_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StorageError::Host("view unreadable".into()));
+            }
             let mut members = if self.two_member {
                 peers(&[1, 2])
             } else {
@@ -1155,6 +1164,8 @@ mod tests {
                     panic_manifest: false,
                     view_delay: std::time::Duration::ZERO,
                     held_on_three: HashSet::new(),
+                    view_fails: false.into(),
+                    view_calls: 0.into(),
                 }),
                 submitter: net.clone(),
                 local_state: net.clone(),
@@ -1203,6 +1214,8 @@ mod tests {
                 panic_manifest: false,
                 view_delay: std::time::Duration::ZERO,
                 held_on_three: HashSet::new(),
+                view_fails: false.into(),
+                view_calls: 0.into(),
             }),
             submitter: net.clone(),
             local_state: net.clone(),
@@ -1278,6 +1291,8 @@ mod tests {
                 panic_manifest: false,
                 view_delay: std::time::Duration::ZERO,
                 held_on_three,
+                view_fails: false.into(),
+                view_calls: 0.into(),
             }),
             submitter: net.clone(),
             local_state: net.clone(),
@@ -1324,6 +1339,8 @@ mod tests {
                 panic_manifest: false,
                 view_delay: std::time::Duration::ZERO,
                 held_on_three: outcome.fragments.iter().map(|f| f.fragment_hash).collect(),
+                view_fails: false.into(),
+                view_calls: 0.into(),
             }),
             submitter: net.clone(),
             local_state: net.clone(),
@@ -1381,6 +1398,8 @@ mod tests {
             panic_manifest: false,
             view_delay: delay,
             held_on_three: HashSet::new(),
+            view_fails: false.into(),
+            view_calls: 0.into(),
         });
         let sched = FetchScheduler::new(PullLimits::default());
         let t0 = std::time::Instant::now();
@@ -1398,6 +1417,71 @@ mod tests {
             "callers waited {:?}",
             started.elapsed()
         );
+    }
+
+    // Impact: final review of #96 — a failed membership refresh was retried
+    // on the very next call (a storage-view derivation per pull while the
+    // database is unhappy), and the last good list stayed in force forever,
+    // filtering holders by a membership that may be hours old.
+    // Should: back off refresh retries after a failure, doubling.
+    // Should: fail open (no membership filter) once the last good list is
+    // older than the stale bound.
+    // Should: use a fresh list again as soon as a refresh succeeds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_membership_refresh_backs_off_and_fails_open() {
+        use std::sync::atomic::Ordering;
+        let state = Arc::new(HeldOnTwo {
+            net: idle_net(),
+            two_reachable: true,
+            two_member: true,
+            panic_manifest: false,
+            view_delay: std::time::Duration::ZERO,
+            held_on_three: HashSet::new(),
+            view_fails: false.into(),
+            view_calls: 0.into(),
+        });
+        let sched = FetchScheduler::new(PullLimits::default());
+        let calls = || state.view_calls.load(Ordering::SeqCst);
+        let settle = || async {
+            while !sched.members_refresh_idle() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        let secs = std::time::Duration::from_secs;
+        let t0 = std::time::Instant::now();
+        assert!(sched.members(&state, t0).await.is_some());
+        assert_eq!(calls(), 1);
+
+        // Stale and failing: the old list is used, the refresh fails...
+        state.view_fails.store(true, Ordering::SeqCst);
+        let t1 = t0 + fetch::MEMBERS_TTL + secs(1);
+        assert!(sched.members(&state, t1).await.is_some());
+        settle().await;
+        assert_eq!(calls(), 2);
+        // ...and is not retried until its backoff passes.
+        assert!(sched.members(&state, t1 + secs(10)).await.is_some());
+        settle().await;
+        assert_eq!(calls(), 2, "retried inside the backoff");
+        let t2 = t1 + fetch::MEMBERS_RETRY_BASE + secs(1);
+        assert!(sched.members(&state, t2).await.is_some());
+        settle().await;
+        assert_eq!(calls(), 3);
+        // The second failure doubles the wait.
+        sched
+            .members(&state, t2 + fetch::MEMBERS_RETRY_BASE + secs(1))
+            .await;
+        settle().await;
+        assert_eq!(calls(), 3, "the backoff doubles");
+
+        // Too old to trust: no filter, rather than an old list.
+        let t3 = t0 + fetch::MEMBERS_STALE_MAX + secs(1);
+        assert!(sched.members(&state, t3).await.is_none());
+
+        // Readable again: a fresh list once the backoff passes.
+        state.view_fails.store(false, Ordering::SeqCst);
+        let t4 = t3 + fetch::MEMBERS_RETRY_CAP + secs(1);
+        let fresh = sched.members(&state, t4).await.unwrap();
+        assert_eq!(*fresh, [1, 2].into_iter().collect::<HashSet<i32>>());
     }
 
     // Impact: re-review of #96 — window tasks waited for a rebuild slot
@@ -1616,6 +1700,8 @@ mod tests {
                 panic_manifest: true,
                 view_delay: std::time::Duration::ZERO,
                 held_on_three: HashSet::new(),
+                view_fails: false.into(),
+                view_calls: 0.into(),
             }),
             submitter: net.clone(),
             local_state: net.clone(),
