@@ -1193,6 +1193,30 @@ mod tests {
         );
     }
 
+    // Impact: the artifact half of the previous-release straggler test
+    // in regenesis/boot.rs, isolated: a seal the previous release wrote
+    // must build and verify at its own shape in this build.
+    // Should: resolve the previous release's artifact and build it
+    // against its own hash.
+    #[test]
+    fn previous_release_artifact_builds_against_its_own_hash() {
+        let artifact = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/regenesis/fixtures/previous-release-join/snapshot.bin"
+        ))
+        .unwrap();
+        let headers = hopnet_common::snapshot::read_section_headers(&artifact).unwrap();
+        let plan = crate::db::snapshot::resolve_import_plan(&headers).unwrap();
+        let scratch = rusqlite::Connection::open_in_memory().unwrap();
+        build_artifact_db(
+            &scratch,
+            &plan,
+            &artifact,
+            blake3::hash(&artifact).as_bytes(),
+        )
+        .unwrap();
+    }
+
     /// The oldest ordinal a released binary has sealed for each module:
     /// every ordinal from here to head must stay importable. Identity's
     /// 0 never reached an artifact (steps 0 and 1 both first shipped in
