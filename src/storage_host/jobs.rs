@@ -1246,6 +1246,70 @@ static LAST_VIEW_SUMMARY: std::sync::Mutex<Option<String>> = std::sync::Mutex::n
 /// same confirmations twice and double the consensus traffic for nothing.
 static TICK_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How long, after this node boots or after a member's contact resumes, a
+/// member in liveness contact stays up for repair although the
+/// availability grid calls it offline (`evidence::repair_grace_peers`). A
+/// rebooted node is grid-offline until its own next metrics sample — up
+/// to ten minutes after boot — so the grace must outlast that; after an
+/// epoch crossing
+/// every node reboots at once, and without it two members "down" put
+/// every chunk below the watermark (2026.10.8: hours of urgent re-encodes
+/// of copies that were only rebooting).
+pub const REPAIR_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// `REPAIR_GRACE`, overridden by `HOPNET_REPAIR_GRACE_SECS` (0 turns the
+/// grace off).
+fn repair_grace() -> std::time::Duration {
+    static GRACE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *GRACE.get_or_init(|| {
+        std::env::var("HOPNET_REPAIR_GRACE_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(REPAIR_GRACE)
+    })
+}
+
+/// The members the repair grace may cover: grid-offline, and offline on
+/// the grid for no longer than the grace plus one grid bucket (the grid's
+/// own lag in seeing a node come back). The cap bounds the total grace per
+/// grid-offline episode: a member whose contact keeps dropping and
+/// resuming would otherwise restart its grace forever while the grid
+/// calls it offline for good (a stuck metrics sampler, a full disk).
+fn grace_candidates(
+    members: &std::collections::HashSet<i32>,
+    view: &hopnet_storage::traits::StorageView,
+    grace: std::time::Duration,
+) -> Vec<i32> {
+    let cap = grace.as_secs() as i64 + view.grid_step_secs;
+    members
+        .iter()
+        .copied()
+        .filter(|m| !view.online.contains(m))
+        .filter(|m| view.absence.get(m).copied().unwrap_or(0) <= cap)
+        .collect()
+}
+
+/// Who repair counts as up: the grid's online set, this node, and the
+/// members in liveness contact within the grace (`in_grace`). Grace only adds
+/// members back — it never removes a grid-online node, and never revives
+/// a node that has left the storage view.
+fn repair_online(
+    grid_online: &[i32],
+    members: &std::collections::HashSet<i32>,
+    me: i32,
+    in_grace: &std::collections::HashSet<i32>,
+) -> std::collections::HashSet<i32> {
+    let mut up: std::collections::HashSet<i32> = grid_online.iter().copied().collect();
+    up.extend(
+        members
+            .iter()
+            .copied()
+            .filter(|m| *m == me || in_grace.contains(m)),
+    );
+    up
+}
+
 pub async fn handle_storage_policy_tick(_job: TaskId, ctx: Data<AppState>) -> Result<(), Error> {
     run_storage_policy_tick(&ctx).await.map(|_| ())
 }
@@ -1258,15 +1322,22 @@ pub struct PolicyTickReport {
     /// Unix seconds when the tick ran.
     pub at: i64,
     pub members: Vec<i32>,
+    /// Members the availability grid calls online.
     pub online: usize,
+    /// Members (and this node) repair counted as up although the grid
+    /// calls them offline: in liveness contact within the repair grace.
+    pub repair_grace_online: usize,
     pub watermark: usize,
     /// Chunks below the watermark with a class this node owes a rebuild
-    /// of (all enqueued, urgently).
+    /// of (all enqueued, urgently, unless already queued).
     pub urgent_chunks_owed: usize,
     /// Chunks at or above the watermark with a class this node owes a
     /// rebuild of — one is picked per tick.
     pub lazy_chunks_owed: usize,
+    /// Urgent chunks newly queued by this tick (not already waiting).
     pub urgent_reencodes: usize,
+    /// Urgent re-encodes queued or running on the engine after this tick.
+    pub urgent_reencodes_pending: usize,
     pub lazy_reencodes: usize,
     /// Blobs the pull planner has handed the reconciler since its current
     /// pass started (a wake-up, not a result — the worker pulls on its
@@ -1367,13 +1438,33 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
         .map_err(|e| Error::Failed(Arc::new(format!("settings join: {e}").into())))?
         .map_err(|e| Error::Failed(Arc::new(e.into())))?
     };
+    let mut urgent_owed = 0usize;
     let mut urgent_enqueued = 0usize;
     let mut lazy_enqueued = 0usize;
     let mut lazy_owed = 0usize;
     let mut scan_ms = 0u64;
+    let mut repair_grace_online = 0usize;
     if settings.reencode_enabled {
-        let online: std::collections::HashSet<i32> = view.online.iter().copied().collect();
         let members: std::collections::HashSet<i32> = member_ids.iter().copied().collect();
+        // Repair's "up": the grid plus members in liveness contact within the
+        // grace, so a reboot (every node's, at a crossing) is not taken
+        // for a departure.
+        let in_grace = crate::consensus::evidence::repair_grace_peers(
+            &app_state.evidence.snapshot(),
+            app_state.evidence.origin(),
+            std::time::Instant::now(),
+            repair_grace(),
+            grace_candidates(&members, &view, repair_grace()),
+        );
+        let online = repair_online(&view.online, &members, my_node_id, &in_grace);
+        repair_grace_online = online.iter().filter(|n| !view.online.contains(n)).count();
+        if repair_grace_online > 0 {
+            tracing::debug!(
+                grid_online = view.online.len(),
+                repair_online = online.len(),
+                "policy tick: members within the repair grace count as up"
+            );
+        }
         let (candidates, goals, elapsed) = {
             let pool = app_state.db_pool.clone();
             let (online, members) = (online.clone(), members.clone());
@@ -1413,6 +1504,7 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
         if let Some(engine) = app_state.storage.get() {
             let up: std::collections::BTreeSet<i32> = online.iter().copied().collect();
             let mut lazy_pick: Option<ReencodeCmd> = None;
+            let mut urgent_cmds: Vec<ReencodeCmd> = Vec::new();
             for cand in candidates {
                 // No goal on record: nothing is owed until the record
                 // reaches it (the staleness pass will re-goal it).
@@ -1462,8 +1554,7 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
                     missing_classes: owed,
                 };
                 if urgent {
-                    engine.enqueue_reencode(cmd, true);
-                    urgent_enqueued += 1;
+                    urgent_cmds.push(cmd);
                 } else {
                     lazy_owed += 1;
                     if lazy_pick.is_none() {
@@ -1471,11 +1562,37 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
                     }
                 }
             }
+            // Publish this tick's urgent set before queueing it: the
+            // engine drops a queued urgent chunk this tick no longer owes
+            // (its holders came back), so a wrong tick costs at most one
+            // tick's work.
+            urgent_owed = urgent_cmds.len();
+            engine.set_urgent_reencodes(
+                urgent_cmds
+                    .iter()
+                    .map(|c| {
+                        (
+                            (c.blob_id.clone(), c.chunk_number),
+                            c.missing_classes.clone(),
+                        )
+                    })
+                    .collect(),
+            );
+            for cmd in urgent_cmds {
+                // A chunk still queued from an earlier tick is not
+                // queued twice.
+                if engine.enqueue_reencode(cmd, true) {
+                    urgent_enqueued += 1;
+                }
+            }
             if let Some(cmd) = lazy_pick {
                 engine.enqueue_reencode(cmd, false);
                 lazy_enqueued = 1;
             }
         }
+    } else if let Some(engine) = app_state.storage.get() {
+        // Re-encode turned off: nothing queued is owed any more.
+        engine.set_urgent_reencodes(Default::default());
     }
 
     // (2b) The staleness pass's grace rung (S4): if no proposer has run
@@ -1522,10 +1639,15 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
         at: chrono::Utc::now().timestamp(),
         members: member_ids,
         online: view.online.len(),
+        repair_grace_online,
         watermark: view.watermark,
-        urgent_chunks_owed: urgent_enqueued,
+        urgent_chunks_owed: urgent_owed,
         lazy_chunks_owed: lazy_owed,
         urgent_reencodes: urgent_enqueued,
+        urgent_reencodes_pending: app_state
+            .storage
+            .get()
+            .map_or(0, |engine| engine.urgent_reencodes_pending()),
         lazy_reencodes: lazy_enqueued,
         pull_kicks,
         confirms_proposed,
@@ -1542,6 +1664,80 @@ async fn policy_tick_rungs(app_state: &AppState) -> Result<PolicyTickReport, Err
 mod tests {
     use super::*;
     use hopnet_storage::types::Blake3Hash;
+    use std::collections::HashSet;
+
+    // Impact: at a crossing every node reboots; repair taking the grid's
+    // word for "offline" re-encoded every chunk (2026.10.8).
+    // Should: count a grid-offline member seen within the grace, and this
+    // node itself, as up for repair.
+    // Should not: count a node that has left the storage view, however
+    // recently it was seen.
+    #[test]
+    fn repair_counts_members_within_the_grace_and_itself_as_up() {
+        let members = HashSet::from([0, 1, 2, 3]);
+        let in_grace = HashSet::from([1, 9]);
+        let up = repair_online(&[2], &members, 3, &in_grace);
+        assert_eq!(up, HashSet::from([1, 2, 3]));
+    }
+
+    fn grid_view(online: Vec<i32>, absence: &[(i32, i64)]) -> hopnet_storage::traits::StorageView {
+        hopnet_storage::traits::StorageView {
+            height: 1,
+            members: vec![],
+            tiers: Default::default(),
+            weights: Default::default(),
+            watermark: 18,
+            online,
+            absence: absence.iter().copied().collect(),
+            grid_step_secs: 600,
+        }
+    }
+
+    // Impact: review of #99 — every silence over ~2 min restarts the
+    // contact span, so a member the grid calls offline for good (a stuck
+    // sampler, a full disk) whose link also drops every few minutes (a
+    // flaky link, a sleeping laptop) would restart its grace forever and
+    // never be rebuilt around.
+    // Should not: keep a flapping member live for repair once the grid has
+    // called it offline for longer than the grace plus one grid bucket.
+    // Should: keep the same member live while its grid absence is within
+    // that bound (a reboot whose metrics have not landed yet).
+    #[test]
+    fn a_flapping_member_offline_in_the_grid_for_longer_than_the_grace_is_not_kept_live() {
+        let evidence = crate::consensus::evidence::EvidenceMap::new();
+        let origin = evidence.origin();
+        let grace = std::time::Duration::from_secs(900);
+        // Long after boot; contact resumed 2 minutes ago after a 5-minute
+        // drop-out: a fresh contact span.
+        evidence.record_at(2, None, origin + std::time::Duration::from_secs(3000));
+        evidence.record_at(2, None, origin + std::time::Duration::from_secs(3300));
+        let now = origin + std::time::Duration::from_secs(3420);
+        let members = HashSet::from([1, 2]);
+        let in_grace = |view: &hopnet_storage::traits::StorageView| {
+            crate::consensus::evidence::repair_grace_peers(
+                &evidence.snapshot(),
+                origin,
+                now,
+                grace,
+                grace_candidates(&members, view, grace),
+            )
+        };
+
+        let hours_offline = grid_view(vec![1], &[(1, 0), (2, 3 * 3600)]);
+        assert!(in_grace(&hours_offline).is_empty());
+
+        let just_rebooted = grid_view(vec![1], &[(1, 0), (2, 600)]);
+        assert_eq!(in_grace(&just_rebooted), HashSet::from([2]));
+    }
+
+    // Should not: drop a node the grid calls online because it is outside
+    // the grace — grace only ever adds holders back.
+    #[test]
+    fn grace_never_removes_a_grid_online_holder() {
+        let members = HashSet::from([0, 1, 2]);
+        let up = repair_online(&[0, 1, 2], &members, 0, &HashSet::new());
+        assert_eq!(up, HashSet::from([0, 1, 2]));
+    }
 
     /// Records every submit as (function, payload); fails the listed
     /// 1-based call numbers.

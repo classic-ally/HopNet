@@ -818,6 +818,8 @@ mod tests {
                 .collect(),
             watermark: 1,
             online: vec![],
+            absence: Default::default(),
+            grid_step_secs: 0,
         }
     }
 
@@ -887,6 +889,8 @@ mod tests {
             weights: [(1, 4), (2, 8), (3, 16), (9, 2)].into_iter().collect(),
             watermark: 1,
             online: vec![1],
+            absence: Default::default(),
+            grid_step_secs: 0,
         };
         let a = ViewSnapshot::from(&mk(&[3, 1, 2]));
         let b = ViewSnapshot::from(&mk(&[1, 2, 3]));

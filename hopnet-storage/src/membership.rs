@@ -347,6 +347,8 @@ pub fn derive_view(
         weights,
         watermark,
         online,
+        absence,
+        grid_step_secs,
     }
 }
 
