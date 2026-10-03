@@ -141,21 +141,47 @@ pub struct EngineHandle {
     pull_tx: mpsc::UnboundedSender<PullRequest>,
     reencode_urgent_tx: mpsc::UnboundedSender<ReencodeCmd>,
     reencode_lazy_tx: mpsc::UnboundedSender<ReencodeCmd>,
+    /// Blobs waiting for (or in) a pull check: hints for a blob already
+    /// queued are dropped, and the planner paces itself on the count.
+    queued: Arc<std::sync::Mutex<std::collections::HashSet<BlobId>>>,
 }
 
 impl EngineHandle {
     /// Latency hint for a decided blob (or a moved goal): check this node's
     /// pull duties for it soon. NON-BLOCKING (unbounded send) — safe from
     /// the host's consensus apply path. Carries no correctness weight: the
-    /// tick's level-triggered re-kick discovers anything a hint missed.
+    /// pull planner's pass over the in-flight set discovers anything a
+    /// hint missed. A blob already queued is not queued twice.
     pub fn notify_blob_committed(&self, blob_id: BlobId) {
-        let _ = self.pull_tx.send((blob_id, None));
+        self.offer(blob_id);
+    }
+
+    /// Queue a pull check for `blob_id` unless one is already queued.
+    /// Returns whether it was queued.
+    pub fn offer(&self, blob_id: BlobId) -> bool {
+        if !self.queued.lock().unwrap().insert(blob_id.clone()) {
+            return false;
+        }
+        if self.pull_tx.send((blob_id.clone(), None)).is_err() {
+            self.queued.lock().unwrap().remove(&blob_id);
+            return false;
+        }
+        true
+    }
+
+    /// Pull checks queued or running — the planner keeps this near its
+    /// target instead of flooding the channel.
+    pub fn queued_len(&self) -> usize {
+        self.queued.lock().unwrap().len()
     }
 
     /// Pull check for one blob, serialized on the worker; resolves when it
     /// completes. `None` = engine gone.
     pub async fn pull_blob(&self, blob_id: BlobId) -> Option<PullOutcome> {
         let (tx, rx) = oneshot::channel();
+        // Always queued (the caller waits on this exact check); counted so
+        // the planner's pacing sees operator work too.
+        self.queued.lock().unwrap().insert(blob_id.clone());
         self.pull_tx.send((blob_id, Some(tx))).ok()?;
         rx.await.ok()
     }
@@ -217,6 +243,8 @@ impl EngineHandle {
         let (reencode_lazy_tx, mut reencode_lazy_rx) = mpsc::unbounded_channel::<ReencodeCmd>();
 
         let fragments_dir = config.fragments_dir;
+        let queued: Arc<std::sync::Mutex<std::collections::HashSet<BlobId>>> = Default::default();
+        let worker_queued = queued.clone();
         data_rt.spawn(async move {
             loop {
                 tokio::select! {
@@ -234,6 +262,7 @@ impl EngineHandle {
                                 PullOutcome::default()
                             }
                         };
+                        worker_queued.lock().unwrap().remove(&blob_id);
                         if let Some(reply) = reply {
                             let _ = reply.send(outcome);
                         }
@@ -250,6 +279,7 @@ impl EngineHandle {
             pull_tx,
             reencode_urgent_tx,
             reencode_lazy_tx,
+            queued,
         }
     }
 }
@@ -750,6 +780,51 @@ mod tests {
             chunks,
         };
         (blob_id, outcome, manifest)
+    }
+
+    fn idle_net() -> Arc<PullNet> {
+        Arc::new(PullNet {
+            served: Mutex::new(HashMap::new()),
+            manifest: Mutex::new(None),
+            target: None,
+            ready: None,
+            marked_local: Mutex::new(Vec::new()),
+            submitted: Mutex::new(Vec::new()),
+            inventoried: Mutex::new(Default::default()),
+            payloads: Mutex::new(Vec::new()),
+        })
+    }
+
+    // Impact: the planner paces itself on the queue depth, and consensus
+    // apply hints the same blobs again; without coalescing the queue grows
+    // with duplicates of work already waiting.
+    // Should: queue a blob once however often it is offered, count it until
+    // its check finishes, and accept it again after.
+    #[tokio::test]
+    async fn duplicate_kicks_are_coalesced() {
+        let engine = EngineHandle::spawn(
+            seams(idle_net()),
+            EngineConfig {
+                fragments_dir: String::new(),
+            },
+            tokio::runtime::Handle::current(),
+        );
+        let a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        let b = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c902").unwrap();
+
+        // The current-thread runtime runs no worker step until we await.
+        assert!(engine.offer(a.clone()));
+        assert!(!engine.offer(a.clone()), "already queued");
+        engine.notify_blob_committed(a.clone());
+        assert!(engine.offer(b.clone()));
+        assert_eq!(engine.queued_len(), 2);
+
+        // A reply-carrying check queues behind them; once it resolves the
+        // worker has drained everything ahead of it.
+        let c = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c903").unwrap();
+        engine.pull_blob(c).await.unwrap();
+        assert_eq!(engine.queued_len(), 0);
+        assert!(engine.offer(a), "re-offered after its check finished");
     }
 
     // Should: pull every class this node owes under the goal from a

@@ -6,12 +6,6 @@
 //! pacing now lives on the pull side — one serial worker per node, so
 //! concurrency tracks the mesh, not the upload count.
 
-/// In-flight blobs the policy tick re-kicks per run, oldest goal first.
-/// Bounded so a ballooning in-flight set (a catch-up drain after a view
-/// transition) is paced, never refused — the set records need, the tick
-/// works it down.
-pub const PULL_KICKS_PER_TICK: usize = 64;
-
 /// The fulfillment pass's base sample (S4): in-flight blobs checked for
 /// complete confirmation evidence in the tick's first round. Rounds
 /// continue, doubling, while the sample stays dense (`next_fulfillment_sample`).
