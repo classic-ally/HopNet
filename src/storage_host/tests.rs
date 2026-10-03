@@ -940,15 +940,22 @@ fn planner_pass_plans_owed_blobs_on_the_host_schema() {
 
 // Impact: review of #96 — passes ran back to back whenever any work
 // existed, re-reading every manifest continuously while most owed blobs
-// sat parked.
+// sat parked; and on thor a pass slower than the interval left no rest
+// at all, so passes re-read the set while the feeder lagged.
 // Should: start passes no closer than the minimum interval, and rest the
 // idle interval after a pass that walked to the end and found nothing.
-// Should not: rest at all once a slow pass has already used the interval.
+// Should: rest at least the minimum rest after any pass, however slow.
+// Should not: start a pass while the book holds a backlog for the feeder.
 #[test]
 fn planner_passes_are_paced() {
-    use crate::storage_host::pull_planner::{PLANNER_IDLE_SECS, PLANNER_MIN_PASS_SECS, pass_rest};
+    use crate::storage_host::pull_planner::{
+        BOOK_BACKLOG, PLANNER_IDLE_SECS, PLANNER_MIN_PASS_SECS, PLANNER_MIN_REST_SECS,
+        feeder_caught_up, pass_rest,
+    };
     use std::time::Duration;
     let secs = Duration::from_secs;
+    assert!(feeder_caught_up(BOOK_BACKLOG - 1));
+    assert!(!feeder_caught_up(BOOK_BACKLOG));
     assert_eq!(
         pass_rest(true, false, secs(2)),
         secs(PLANNER_MIN_PASS_SECS - 2)
@@ -960,5 +967,9 @@ fn planner_passes_are_paced() {
         "mid-walk"
     );
     assert_eq!(pass_rest(false, true, secs(5)), secs(PLANNER_IDLE_SECS - 5));
-    assert_eq!(pass_rest(true, false, secs(600)), Duration::ZERO);
+    assert_eq!(
+        pass_rest(true, false, secs(600)),
+        secs(PLANNER_MIN_REST_SECS),
+        "a slow pass still rests"
+    );
 }

@@ -2,13 +2,16 @@
 //!
 //! Replaces the policy tick's 64-blob kick, which re-sent the same lowest
 //! ids every tick once one transition gave every in-flight blob the same
-//! goal (production, 2026-10-03: ~68.8k blobs never pulled). A pass walks
-//! the whole in-flight set page by page on the blocking pool, keeps the
-//! blobs this node owes a class of, and orders them at-risk first by the
-//! resilience pane's rule (`hopnet_storage::planner`). The plan feeds the
-//! engine as its queue drains, not on a cron, and a new pass starts as
-//! soon as the last one is used up. State is in memory only: a restart
-//! replans from scratch, which costs one pass (seconds on a fast node).
+//! goal (production, 2026-10-03: ~68.8k blobs never pulled). Each pass
+//! reads one bounded slice of the in-flight set (resuming where the last
+//! stopped) page by page on the blocking pool, keeps the blobs this node
+//! owes a class of (skipping parked ones), scores them by the resilience
+//! pane's rule (`hopnet_storage::planner`) and absorbs them into one
+//! global at-risk-first priority book. A separate feeder offers from the
+//! book's head whenever the engine's queue has room. Passes are paced: at
+//! most one per interval, at least a short rest after any pass, and none
+//! while the book still holds several queues' worth of work. State is in
+//! memory only: a restart replans from scratch.
 
 use crate::AppState;
 use hopnet_storage::planner::{self, PlanItem};
@@ -33,6 +36,13 @@ pub const PLANNER_MIN_PASS_SECS: u64 = 30;
 /// the next pass resumes where it stopped. At 68.8k in-flight blobs a full
 /// walk takes ~5 passes, ~2.5 min at the minimum interval.
 pub const PLAN_BLOBS_PER_PASS: usize = 16_384;
+
+/// The least a planner rests after any pass, however long the pass took.
+pub const PLANNER_MIN_REST_SECS: u64 = 10;
+
+/// Owed blobs waiting in the book beyond which no new pass starts until
+/// the feeder catches up.
+pub const BOOK_BACKLOG: usize = 4 * PULL_QUEUE_TARGET;
 
 /// How often the feeder looks at the engine's queue.
 const FEED_POLL: Duration = Duration::from_millis(500);
@@ -210,19 +220,34 @@ async fn run(app_state: AppState) {
             }
         }
         tokio::time::sleep(pass_rest(found_work, resume.is_none(), started.elapsed())).await;
+        // Then hold the next pass while the feeder is behind.
+        while !feeder_caught_up(book.lock().unwrap().len()) {
+            tokio::time::sleep(Duration::from_secs(PLANNER_MIN_REST_SECS)).await;
+        }
     }
 }
 
 /// How long to rest before the next pass, which may start no sooner than
 /// the minimum interval after this one started: one that reached the end
 /// of the set with nothing owed rests for the idle interval instead.
+/// Never less than `PLANNER_MIN_REST_SECS`, so a pass slower than the
+/// interval (a cold cache on thor's HDD) cannot run back to back.
 pub fn pass_rest(found_work: bool, reached_end: bool, elapsed: Duration) -> Duration {
     let interval = if !found_work && reached_end {
         PLANNER_IDLE_SECS
     } else {
         PLANNER_MIN_PASS_SECS
     };
-    Duration::from_secs(interval).saturating_sub(elapsed)
+    Duration::from_secs(interval)
+        .saturating_sub(elapsed)
+        .max(Duration::from_secs(PLANNER_MIN_REST_SECS))
+}
+
+/// Whether the next pass may start: not while the feeder is behind (the
+/// book already holds several queues' worth of owed blobs) — re-reading
+/// more of the set then only re-scores work that is already waiting.
+pub fn feeder_caught_up(book_len: usize) -> bool {
+    book_len < BOOK_BACKLOG
 }
 
 /// One full, unbounded planning pass over the in-flight set (the operator
