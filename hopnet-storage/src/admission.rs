@@ -396,12 +396,20 @@ struct SpaceState {
     observed: Option<(u64, u64)>,
     /// Last free-space probe failure WARN (rate-limited).
     last_probe_warn: Option<Instant>,
-    /// The latest probe failure, kept for the report.
+    /// The latest probe failure, kept for the report; cleared by the next
+    /// good probe.
     last_probe_error: Option<String>,
+    /// Urgent repairs refused for space since start, and the last reason.
+    urgent_refused: u64,
+    last_urgent_refused: Option<PauseReason>,
+    /// Last refused-urgent-repair WARN (rate-limited).
+    last_urgent_warn: Option<Instant>,
 }
 
 /// Probe-failure WARNs at most this often.
 pub const PROBE_WARN_EVERY: Duration = Duration::from_secs(300);
+/// Refused-urgent-repair WARNs at most this often.
+pub const URGENT_REFUSED_WARN_EVERY: Duration = Duration::from_secs(300);
 
 /// The state of the guard, for the planner report.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -418,8 +426,13 @@ pub struct SpaceReport {
     pub paused_since: Option<i64>,
     /// Why it is paused (`low_space` | `probe_error`); `None` when open.
     pub pause_reason: Option<PauseReason>,
-    /// The latest free-space probe failure, if any.
+    /// The latest free-space probe failure, until a probe reads again.
     pub last_probe_error: Option<String>,
+    /// Urgent repairs (a chunk below the watermark) refused for space since
+    /// start: each is retried every tick while the chunk stays at risk.
+    pub urgent_refused: u64,
+    /// Why the last one was refused (`low_space` | `probe_error`).
+    pub last_urgent_refused: Option<PauseReason>,
 }
 
 /// A read-only admission answer ([`SpaceGuard::would_admit`]).
@@ -513,16 +526,18 @@ impl SpaceGuard {
                 counter: self.counter,
             });
         }
-        let (free, total) = self.probe_or_hold(dir)?;
+        let (free, total) = self.probe_or_hold(dir, class)?;
         let ingest = self.ingest_floor();
         let (pull, resume) = floor.marks(total, ingest);
         let reserved = self.counter.load(Ordering::Acquire);
         let mut state = self.state.lock().unwrap();
         state.observed = Some((free, total));
+        state.last_probe_error = None;
         match class {
             WriteClass::Repair => try_reserve(self.counter, free, bytes, ingest),
             WriteClass::Pull => {
-                if let Some(paused) = state.paused {
+                if let Some(paused) = Self::settle(&mut state, free.saturating_sub(reserved), pull)
+                {
                     let available = free.saturating_sub(reserved);
                     if !Self::clears(paused.reason, available, pull, resume) {
                         Self::remind(&mut state, free, pull, resume);
@@ -551,17 +566,37 @@ impl SpaceGuard {
         }
     }
 
-    /// Probe free space. A probe failure fails safe: the guard pauses
-    /// (`ProbeError`; an unreadable volume is not one to keep writing
-    /// replicas to), a rate-limited WARN says why, and the error is
-    /// returned so the write is refused.
-    fn probe_or_hold(&self, dir: &str) -> Result<(u64, u64), StorageError> {
+    /// A good probe read `available` bytes: the current pause after it, if
+    /// any. A probe-error pause that now reads at or below the pull floor
+    /// was hiding a full disk — it is relabelled `LowSpace`, which then
+    /// waits for the resume mark (hysteresis) and shows as low space.
+    fn settle(state: &mut SpaceState, available: u64, pull: u64) -> Option<Paused> {
+        state.last_probe_error = None;
+        let hiding_a_full_disk = state
+            .paused
+            .is_some_and(|p| p.reason == PauseReason::ProbeError && available <= pull);
+        if let Some(paused) = state.paused.as_mut().filter(|_| hiding_a_full_disk) {
+            paused.reason = PauseReason::LowSpace;
+            tracing::warn!(
+                available_bytes = available,
+                pull_floor_bytes = pull,
+                "storage: free space readable again but below the pull floor; holding back for space"
+            );
+        }
+        state.paused
+    }
+
+    /// Probe free space. A probe failure fails safe: that write is refused
+    /// and a rate-limited WARN says why. A pull-class probe failure also
+    /// pauses the guard (`ProbeError`; an unreadable volume is not one to
+    /// keep writing replicas to); a repair-class one never pauses anything.
+    fn probe_or_hold(&self, dir: &str, class: WriteClass) -> Result<(u64, u64), StorageError> {
         match (self.probe)(Path::new(dir)) {
             Ok(probed) => Ok(probed),
             Err(e) => {
                 let mut state = self.state.lock().unwrap();
                 Self::note_probe_failure(&mut state, dir, &e);
-                if state.paused.is_none() {
+                if class == WriteClass::Pull && state.paused.is_none() {
                     let (free, total) = state.observed.unwrap_or((0, 0));
                     let (pull, resume) = self.pull_floor().marks(total, self.ingest_floor());
                     Self::pause(&mut state, PauseReason::ProbeError, free, pull, resume);
@@ -587,9 +622,9 @@ impl SpaceGuard {
         );
     }
 
-    /// Would a replica write of `bytes` be admitted right now? Strictly
-    /// read-only: reserves nothing and never changes the guard's state, a
-    /// probe error included (that write is refused, fail safe). A
+    /// Would a replica write of `bytes` be admitted right now? It reserves
+    /// nothing and never pauses, a probe error included (that write is
+    /// refused, fail safe); it only keeps `last_probe_error` current. A
     /// re-encode asks before gathering K shards, so a refusal costs no
     /// download; the caller decides whether to hold the guard back
     /// ([`SpaceGuard::hold_back`]).
@@ -601,8 +636,16 @@ impl SpaceGuard {
         if class == WriteClass::Pull && self.paused() {
             return Admission::BelowFloor;
         }
-        let Ok((free, total)) = (self.probe)(Path::new(dir)) else {
-            return Admission::ProbeError;
+        let (free, total) = match (self.probe)(Path::new(dir)) {
+            Ok(probed) => {
+                self.state.lock().unwrap().last_probe_error = None;
+                probed
+            }
+            Err(e) => {
+                let mut state = self.state.lock().unwrap();
+                Self::note_probe_failure(&mut state, dir, &e);
+                return Admission::ProbeError;
+            }
         };
         let ingest = self.ingest_floor();
         let limit = match class {
@@ -631,6 +674,30 @@ impl SpaceGuard {
         Self::pause(&mut state, reason, free, pull, resume);
     }
 
+    /// An urgent repair of `what` (a chunk below the watermark) was refused
+    /// for `reason`. It is retried every tick while the chunk stays at
+    /// risk, so it is counted for the report and WARNed (rate-limited)
+    /// rather than vanishing into a debug line; it never pauses anything.
+    pub fn note_urgent_refused(&self, what: &str, reason: PauseReason) {
+        let mut state = self.state.lock().unwrap();
+        state.urgent_refused += 1;
+        state.last_urgent_refused = Some(reason);
+        let now = Instant::now();
+        if state
+            .last_urgent_warn
+            .is_some_and(|t| now.saturating_duration_since(t) < URGENT_REFUSED_WARN_EVERY)
+        {
+            return;
+        }
+        state.last_urgent_warn = Some(now);
+        let refused = state.urgent_refused;
+        tracing::warn!(
+            reason = ?reason,
+            refused_total = refused,
+            "storage: urgent repair of {what} refused for space; a chunk below the watermark stays at risk"
+        );
+    }
+
     /// A write failed with the disk full (another writer took the space
     /// under us): pause as if the floor had refused it.
     pub fn note_disk_full(&self) {
@@ -647,9 +714,9 @@ impl SpaceGuard {
         }
         let probed = (self.probe)(Path::new(dir));
         let mut state = self.state.lock().unwrap();
-        let Some(paused) = state.paused else {
+        if state.paused.is_none() {
             return true;
-        };
+        }
         let (free, total) = match probed {
             Ok(probed) => probed,
             // Stay paused (fail safe), and say why.
@@ -661,6 +728,9 @@ impl SpaceGuard {
         state.observed = Some((free, total));
         let (pull, resume) = floor.marks(total, self.ingest_floor());
         let available = free.saturating_sub(self.counter.load(Ordering::Acquire));
+        let Some(paused) = Self::settle(&mut state, available, pull) else {
+            return true;
+        };
         if Self::clears(paused.reason, available, pull, resume) {
             Self::resume(&mut state, free);
             true
@@ -689,6 +759,8 @@ impl SpaceGuard {
             paused_since: state.paused.map(|p| p.unix),
             pause_reason: state.paused.map(|p| p.reason),
             last_probe_error: state.last_probe_error.clone(),
+            urgent_refused: state.urgent_refused,
+            last_urgent_refused: state.last_urgent_refused,
         }
     }
 
