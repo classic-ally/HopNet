@@ -418,8 +418,11 @@ pub fn pull_target(
 }
 
 /// In-flight blobs — goal not yet confirmed — oldest goal first, bounded.
-/// The level-triggered obligation check's work-list: a blob leaves it at
-/// confirm, so no cursor is needed.
+/// The FIRST page only: one transition gives every in-flight blob the
+/// same goal height, so repeated calls return the same lowest ids for as
+/// long as those blobs wait on confirmation. Anything that must reach the
+/// whole set walks it with [`in_flight_page_after`] (the pull planner);
+/// this stays for the operator route's compatibility paths and the pane.
 pub fn in_flight_blobs(
     conn: &rusqlite::Connection,
     limit: usize,
@@ -438,6 +441,44 @@ pub fn in_flight_blobs(
         .collect::<Result<Vec<BlobId>, _>>()
         .map_err(db_err("read in-flight row"))?;
     Ok(ids)
+}
+
+/// One page of the in-flight set in `(desired_placement_height, id)` order,
+/// strictly after `after` (a keyset cursor; `None` starts from the
+/// beginning). Returns each blob with its goal height so the caller can
+/// resume from the last row. An empty page means the walk reached the end.
+/// Each call is its own short read, so a walk over the whole set never
+/// holds one long reader (which would pin the WAL).
+pub fn in_flight_page_after(
+    conn: &rusqlite::Connection,
+    after: Option<(u64, &BlobId)>,
+    limit: usize,
+) -> Result<Vec<(u64, BlobId)>, StorageError> {
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<(u64, BlobId)> {
+        Ok((height_from_db(row.get(0)?), row.get(1)?))
+    };
+    // Without a cursor, start below every real key: heights are >= 0 and
+    // ids are non-empty text, so (-1, '') sorts first.
+    let start: (i64, &dyn rusqlite::ToSql) = match after {
+        Some((h, id)) => (height_to_db(h), id),
+        None => (-1, &""),
+    };
+    let (height, id) = start;
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT desired_placement_height, id FROM data_blocks
+             WHERE (placement_height IS NULL OR placement_height != desired_placement_height)
+               AND (desired_placement_height, id) > (?, ?)
+             ORDER BY desired_placement_height ASC, id ASC
+             LIMIT ?",
+        )
+        .map_err(db_err("prepare in-flight page"))?;
+    let rows = stmt
+        .query_map(params![height, id, limit as i64], map_row)
+        .map_err(db_err("read in-flight page"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err("read in-flight page row"))?;
+    Ok(rows)
 }
 
 /// The staleness pass's page (S4): blobs whose goal predates the latest
@@ -1204,6 +1245,39 @@ mod tests {
             "confirmed: quiescent"
         );
         assert_eq!(in_flight_blobs(&tx, 10).unwrap(), vec![c.clone()]);
+    }
+
+    // Impact: production 2026-10-03 — every in-flight blob shared one goal
+    // height, so the tick's LIMIT-64 kick returned the same lowest ids
+    // forever and the other ~68.8k blobs were never pulled.
+    // Should: return disjoint pages that together cover every in-flight
+    // blob exactly once, in (goal, id) order, across a shared goal height.
+    // Should not: return a quiescent blob, or anything after the last page.
+    #[test]
+    fn in_flight_page_after_walks_every_blob_once() {
+        let mut conn = test_conn();
+        let tx = conn.transaction().unwrap();
+        for n in 1..=7u8 {
+            insert_blob(&tx, &blob(n), 9, None);
+        }
+        insert_blob(&tx, &blob(8), 4, Some(2)); // older goal, in flight
+        insert_blob(&tx, &blob(9), 9, Some(9)); // quiescent
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<(u64, BlobId)> = None;
+        loop {
+            let page =
+                in_flight_page_after(&tx, cursor.as_ref().map(|(h, id)| (*h, id)), 3).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().cloned();
+            seen.extend(page);
+        }
+
+        let mut expected = vec![(4, blob(8))];
+        expected.extend((1..=7u8).map(|n| (9, blob(n))));
+        assert_eq!(seen, expected);
     }
 
     // Should: page the blobs whose goal predates T, oldest goal first, as
