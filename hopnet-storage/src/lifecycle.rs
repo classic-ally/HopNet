@@ -1279,6 +1279,7 @@ mod tests {
                 &tx,
                 assignment[i as usize],
                 8,
+                10,
                 &[Blake3Hash::from_bytes([i as u8; 32])],
                 &[],
             )
@@ -1288,7 +1289,7 @@ mod tests {
         assert_eq!(confirm_ready(&tx, &b, 10).unwrap(), Some(6));
         // Unknown hash: nothing stamped, nothing created.
         assert_eq!(
-            crate::store::apply_attestation(&tx, 1, 8, &[Blake3Hash::from_bytes([9; 32])], &[])
+            crate::store::apply_attestation(&tx, 1, 8, 10, &[Blake3Hash::from_bytes([9; 32])], &[])
                 .unwrap(),
             0
         );
@@ -1304,9 +1305,9 @@ mod tests {
         // Suspect on one class: evidence gone; a fresh present attestation
         // clears it.
         let victim = Blake3Hash::from_bytes([0; 32]);
-        crate::store::apply_attestation(&tx, assignment[0], 9, &[], &[victim]).unwrap();
+        crate::store::apply_attestation(&tx, assignment[0], 9, 10, &[], &[victim]).unwrap();
         assert_eq!(confirm_ready(&tx, &b, 10).unwrap(), None);
-        crate::store::apply_attestation(&tx, assignment[0], 9, &[victim], &[]).unwrap();
+        crate::store::apply_attestation(&tx, assignment[0], 9, 10, &[victim], &[]).unwrap();
         assert_eq!(confirm_ready(&tx, &b, 10).unwrap(), Some(6));
         let (verified, provenance, suspect): (i64, i64, i64) = tx
             .query_row(

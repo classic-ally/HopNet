@@ -32,7 +32,7 @@ impl TransactionHandler for AttestFragmentsHandler {
         &self,
         tx: &TxMeta<'_>,
         _execute: bool,
-        _ctx: &HandlerCtx<'_>,
+        ctx: &HandlerCtx<'_>,
         db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (report, _) =
@@ -53,6 +53,7 @@ impl TransactionHandler for AttestFragmentsHandler {
             db_tx,
             report.node_id,
             report.height,
+            ctx.height,
             &report.present,
             &report.suspect,
         )

@@ -423,20 +423,28 @@ pub fn apply_self_check(
 /// self-scan, suspect cleared) and flag the rows it marks suspect. Only
 /// rows that exist are touched — attestation never creates belief, the
 /// self-check does; unknown hashes are ignored. Idempotent.
+///
+/// The stamp is the report's height capped at `deciding_height`, and it
+/// only ever rises: the payload's height is the submitter's word, so an
+/// uncapped one could keep a row inside the recency window indefinitely,
+/// and a page that commits late with an older height must not age out a
+/// newer stamp.
 pub fn apply_attestation(
     db_tx: &rusqlite::Transaction,
     node_id: i32,
     height: u64,
+    deciding_height: u64,
     present: &[Blake3Hash],
     suspect: &[Blake3Hash],
 ) -> Result<usize, StorageError> {
     let mut stamped = 0usize;
-    let height_db = height_to_db(height);
+    let height_db = height_to_db(height.min(deciding_height));
     for chunk in present.chunks(500) {
         let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let query = format!(
             "UPDATE fragment_inventory
-             SET verified_height = ?, provenance = 0, suspect = 0
+             SET verified_height = MAX(COALESCE(verified_height, 0), ?),
+                 provenance = 0, suspect = 0
              WHERE node_id = ? AND fragment_hash IN ({placeholders})"
         );
         let mut stmt = db_tx
@@ -1316,6 +1324,53 @@ mod tests {
             Some((None, Some(8), 0)),
             "disk-verified after the report: the removal is stale"
         );
+    }
+
+    // Impact: the sweep's pages commit over minutes and a prompt pull
+    // attestation can land between them; an overwrite let an older page
+    // age a newer stamp back out of the recency window.
+    // Should: keep the newer stamp when an older attestation lands later.
+    // Should: still clear the suspect flag on the older attestation.
+    #[test]
+    fn attestation_never_lowers_a_stamp() {
+        let mut conn = test_conn();
+        inventory_schema(&conn);
+        let hash = Blake3Hash::from_bytes([4u8; 32]);
+        conn.execute(
+            "INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height, suspect)
+             VALUES (?, 1, 50, 1)",
+            params![hash],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let stamped = apply_attestation(&tx, 1, 40, 60, &[hash], &[]).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(stamped, 1);
+        assert_eq!(inventory_row(&conn, 1, &hash), Some((None, Some(50), 0)));
+    }
+
+    // Impact: the attestation's height is the submitter's word and the
+    // confirmation window trusts it; a far-future height would keep a row
+    // fresh indefinitely.
+    // Should: stamp no later than the height the attestation is applied at.
+    #[test]
+    fn attestation_height_is_clamped_to_the_deciding_height() {
+        let mut conn = test_conn();
+        inventory_schema(&conn);
+        let hash = Blake3Hash::from_bytes([5u8; 32]);
+        conn.execute(
+            "INSERT INTO fragment_inventory (fragment_hash, node_id) VALUES (?, 1)",
+            params![hash],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        apply_attestation(&tx, 1, 1_000_000, 70, &[hash], &[]).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(inventory_row(&conn, 1, &hash), Some((None, Some(70), 0)));
     }
 
     // Impact: the whole-node differential ran once per pull (~5×/min over
