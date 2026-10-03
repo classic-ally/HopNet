@@ -37,7 +37,7 @@ bytes = { version = "1.10.1", optional = true }
 engine = ["dep:tokio", "dep:tokio-stream", "dep:async-stream", "dep:bytes"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread", "test-util"] }
 tokio-stream = "0.1.17"
 tempfile = "3"
 # ITF trace reader for the model-conformance test (spec/traces).

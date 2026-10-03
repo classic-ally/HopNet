@@ -331,15 +331,23 @@ impl FetchScheduler {
     /// Hold a blob out briefly because every rebuild slot is busy: a flat
     /// `REBUILD_WAIT_PARK` that leaves the unreachable backoff alone, so a
     /// rebuild-needing (often at-risk) blob is back as soon as a slot may
-    /// have freed. Never shortens a longer park already in force.
-    pub fn park_blob_for_rebuild(&self, blob_id: &BlobId, now: Instant) {
+    /// have freed. Never shortens a longer park already in force. Returns
+    /// how long until the blob should be offered again, when this short
+    /// wait is the park in force (the planner's skip would otherwise keep
+    /// it out until the cursor revisits its slice).
+    pub fn park_blob_for_rebuild(&self, blob_id: &BlobId, now: Instant) -> Option<Duration> {
         let mut blobs = self.blobs.lock().unwrap();
         let entry = blobs.entry(blob_id.clone()).or_insert(BlobPark {
             attempts: 0,
             until: now,
             since: now,
         });
-        entry.until = entry.until.max(now + REBUILD_WAIT_PARK);
+        let wait_ends = now + REBUILD_WAIT_PARK;
+        if entry.until > wait_ends {
+            return None;
+        }
+        entry.until = wait_ends;
+        Some(REBUILD_WAIT_PARK)
     }
 
     /// A blob that made progress (or turned out to owe nothing) leaves

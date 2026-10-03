@@ -127,7 +127,8 @@ async fn feed(app_state: AppState, book: Book) {
             continue;
         };
         // Parked since it was planned: its next slice read brings it back
-        // once the park ends.
+        // once the park ends (a short wait for a rebuild slot is offered
+        // again by the engine itself).
         if engine.blob_parked(&blob_id) {
             continue;
         }

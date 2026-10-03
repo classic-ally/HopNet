@@ -113,6 +113,8 @@ pub struct PullOutcome {
     /// This blob's belief, disk truth and confirmation check went to the
     /// evidence lane (births and moved bytes only).
     pub evidence_queued: bool,
+    /// Waiting for a rebuild slot: offer the blob again after this long.
+    pub retry_after: Option<std::time::Duration>,
 }
 
 /// Aggregate of many pull checks (the tick's re-kick, the operator drain).
@@ -170,6 +172,26 @@ impl Drop for QueuedEntry {
     }
 }
 
+/// Queue a pull check unless one is already queued; see
+/// `EngineHandle::enqueue`.
+fn enqueue_on(
+    queue: &PullQueue,
+    pull_tx: &mpsc::UnboundedSender<PullRequest>,
+    blob_id: BlobId,
+    waiter: Option<oneshot::Sender<PullOutcome>>,
+) -> bool {
+    let mut queued = queue.lock().unwrap();
+    if let Some(waiters) = queued.get_mut(&blob_id) {
+        waiters.extend(waiter);
+        return false;
+    }
+    if pull_tx.send(blob_id.clone()).is_err() {
+        return false;
+    }
+    queued.insert(blob_id, waiter.into_iter().collect());
+    true
+}
+
 /// Held by the dispatch loop: however it ends, every queued blob is
 /// dropped and every waiter sees the engine as gone (`None`) instead of
 /// hanging, and the closed channel refuses later requests.
@@ -219,16 +241,7 @@ impl EngineHandle {
     /// The one way into the queue: a blob already queued gains a waiter
     /// (if any) and is not sent again. Returns whether it was newly queued.
     fn enqueue(&self, blob_id: BlobId, waiter: Option<oneshot::Sender<PullOutcome>>) -> bool {
-        let mut queued = self.queued.lock().unwrap();
-        if let Some(waiters) = queued.get_mut(&blob_id) {
-            waiters.extend(waiter);
-            return false;
-        }
-        if self.pull_tx.send(blob_id.clone()).is_err() {
-            return false;
-        }
-        queued.insert(blob_id, waiter.into_iter().collect());
-        true
+        enqueue_on(&self.queued, &self.pull_tx, blob_id, waiter)
     }
 
     /// Pull checks queued or running — the planner keeps this near its
@@ -335,6 +348,8 @@ impl EngineHandle {
         let worker_queued = queued.clone();
         let sched = FetchScheduler::new(config.limits);
         let worker_sched = sched.clone();
+        // Weak, so the loop still ends when every handle is dropped.
+        let retry_tx = pull_tx.downgrade();
         let lane =
             evidence::EvidenceLane::spawn(seams.state.clone(), seams.submitter.clone(), &data_rt);
         data_rt.spawn(async move {
@@ -362,11 +377,13 @@ impl EngineHandle {
                             entry.finish(PullOutcome::default());
                             continue;
                         }
-                        let (seams, dir, lane, sched) = (
+                        let (seams, dir, lane, sched, queue, retry_tx) = (
                             seams.clone(),
                             fragments_dir.clone(),
                             lane.clone(),
                             worker_sched.clone(),
+                            worker_queued.clone(),
+                            retry_tx.clone(),
                         );
                         running.spawn(async move {
                             // Dropped on panic too: the blob leaves the queue.
@@ -380,6 +397,17 @@ impl EngineHandle {
                             };
                             drop(permit);
                             entry.finish(outcome);
+                            // Waiting for a rebuild slot: back as soon as the
+                            // short park ends, not when the planner's cursor
+                            // next reaches this blob's slice.
+                            if let Some(after) = outcome.retry_after {
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(after).await;
+                                    if let Some(tx) = retry_tx.upgrade() {
+                                        enqueue_on(&queue, &tx, blob_id, None);
+                                    }
+                                });
+                            }
                         });
                     }
                     cmd = reencode_lazy_rx.recv() => {
@@ -706,7 +734,7 @@ where
             sched.park_blob(blob_id, now);
             tracing::debug!("pull: blob {blob_id} parked: its sources are unreachable");
         } else if wait_for_rebuild_slot {
-            sched.park_blob_for_rebuild(blob_id, now);
+            outcome.retry_after = sched.park_blob_for_rebuild(blob_id, now);
             tracing::debug!("pull: blob {blob_id} waits for a rebuild slot");
         } else if outcome.failed == 0 {
             sched.unpark_blob(blob_id);
@@ -1261,6 +1289,77 @@ mod tests {
         assert!(fragstore::read_fragment(&dir_dst, &lost).is_ok());
         assert!(fragstore::read_fragment(&dir_dst, &on_dark).is_err());
         assert!(sched.blob_parked(&blob_id, std::time::Instant::now()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: final review of #96 — the 30 s rebuild-slot park did not
+    // bring the blob back after 30 s: the planner skips parked blobs and
+    // the feeder drops them, so it waited for the cursor to revisit its
+    // slice (a full walk of the in-flight set).
+    // Should: offer a blob that waited for a rebuild slot again once the
+    // short park ends, and rebuild it then.
+    #[tokio::test(start_paused = true)]
+    async fn a_blob_waiting_for_a_rebuild_slot_comes_back_by_itself() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-retry-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, outcome, manifest) = encoded_blob(&dir_src).await;
+        let lost = outcome.fragments[0].fragment_hash;
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        for f in &outcome.fragments[1..] {
+            let bytes = fragstore::read_fragment(&dir_src, &f.fragment_hash).unwrap();
+            net.served.lock().unwrap().insert(f.fragment_hash, bytes);
+        }
+        let seams = Seams {
+            transport: net.clone(),
+            state: Arc::new(HeldOnTwo {
+                net: net.clone(),
+                two_reachable: true,
+                two_member: false,
+                panic_manifest: false,
+                view_delay: std::time::Duration::ZERO,
+                held_on_three: outcome.fragments.iter().map(|f| f.fragment_hash).collect(),
+            }),
+            submitter: net.clone(),
+            local_state: net.clone(),
+        };
+        let engine = EngineHandle::spawn(
+            seams,
+            EngineConfig {
+                fragments_dir: dir_dst.clone(),
+                limits: PullLimits {
+                    rebuilds: 1,
+                    ..PullLimits::default()
+                },
+            },
+            tokio::runtime::Handle::current(),
+        );
+
+        // Every rebuild slot busy: the lost class waits.
+        let busy = engine.sched.rebuild.clone().try_acquire_owned().unwrap();
+        let first = engine.pull_blob(blob_id.clone()).await.unwrap();
+        assert_eq!((first.rebuilt, first.failed), (0, 1));
+        assert_eq!(first.retry_after, Some(fetch::REBUILD_WAIT_PARK));
+        drop(busy);
+        // The park book runs on the wall clock, which the paused test clock
+        // does not move: end the short park by hand.
+        assert!(engine.blob_parked(&blob_id));
+        engine.sched.unpark_blob(&blob_id);
+
+        // Nobody offers it again; it is back and rebuilt within the wait.
+        let started = tokio::time::Instant::now();
+        while fragstore::read_fragment(&dir_dst, &lost).is_err() {
+            assert!(
+                started.elapsed() < fetch::REBUILD_WAIT_PARK * 2,
+                "not offered again after its rebuild wait"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
