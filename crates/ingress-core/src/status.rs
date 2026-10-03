@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::ids::PhotoId;
 use crate::model::{LibraryConfig, PhotoRecord, ResourceRecord};
 use crate::paths::SpoolPaths;
-use crate::store::{LibraryStats, LogEvent, RetrySummary, StateStore};
+use crate::store::{LibraryStats, LogEvent, RetrySummary, SpoolStuck, StateStore};
 
 /// How many log events the per-photo view tails by default.
 pub const PHOTO_LOG_TAIL: i64 = 20;
@@ -37,6 +37,15 @@ pub struct PipelineStatus {
     pub unmapped_photos: i64,
     /// Unwritten resources that never failed a fetch.
     pub resources_pending: i64,
+    /// Materialized spool bytes (unevicted blobs). Every one of them counts
+    /// against the soft cap (`HOPNET_INGRESS_SPOOL_SOFT_CAP_BYTES`): new
+    /// photos stop when they reach it.
+    pub spool_bytes: u64,
+    /// Advisory: the part of `spool_bytes` that will not evict on its own,
+    /// by cause. It counts against the cap like the rest; the scan resets
+    /// the retry ledgers behind it, hard delete reaps the tombstones, and
+    /// an unbound library waits on an operator.
+    pub spool_stuck: SpoolStuck,
     #[serde(flatten)]
     pub retries: RetrySummary,
 }
@@ -50,9 +59,17 @@ pub async fn status(store: &StateStore, retry_cap: i64) -> Result<StatusReport> 
         .zip(stats)
         .map(|(config, stats)| LibraryStatus { config, stats })
         .collect();
+    let spool_bytes = store.unevicted_bytes().await?;
     let pipeline = PipelineStatus {
         unmapped_photos: store.count_unmapped_photos().await?,
         resources_pending: store.count_pending_resources().await?,
+        spool_bytes,
+        spool_stuck: store
+            .stuck_spool(
+                retry_cap,
+                crate::publish::PublishConfig::default().retry_cap,
+            )
+            .await?,
         retries: store.retry_summary(retry_cap).await?,
     };
     Ok(StatusReport {

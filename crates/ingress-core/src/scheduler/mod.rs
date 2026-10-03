@@ -30,12 +30,32 @@ pub use admission::{FreeSpaceProbe, StatvfsProbe};
 pub use backoff::BackoffConfig;
 pub use fetcher::{CancelToken, FetchFailure, FetchRequest, ResourceFetcher, StreamSink};
 
+/// Default soft cap on the spool (`SchedulerConfig::spool_soft_cap_bytes`).
+pub const DEFAULT_SPOOL_SOFT_CAP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// The soft cap override: a byte count, 0 disables.
+pub const SPOOL_SOFT_CAP_ENV: &str = "HOPNET_INGRESS_SPOOL_SOFT_CAP_BYTES";
+
+/// The soft cap in force: [`SPOOL_SOFT_CAP_ENV`] when it parses, else the
+/// default.
+pub fn spool_soft_cap_from(get: impl Fn(&str) -> Option<String>) -> u64 {
+    get(SPOOL_SOFT_CAP_ENV)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SPOOL_SOFT_CAP_BYTES)
+}
+
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
     pub fetch_concurrency: usize,
     pub retry_cap: i64,
     pub backoff: BackoffConfig,
     pub reserve_floor_bytes: u64,
+    /// Soft cap on materialized spool bytes (unevicted blobs plus fetches
+    /// in flight): no new fetch starts at or above it, but the check covers
+    /// what is already on disk, never the next item's size, so a single
+    /// item larger than the cap still lands when the spool is under it.
+    /// Eviction (publish decided) brings it back down. 0 disables.
+    pub spool_soft_cap_bytes: u64,
     pub pressure_pause: Duration,
     pub storage_poll: Duration,
     /// Fallback pessimistic size when neither descriptor nor blob history
@@ -57,6 +77,7 @@ impl Default for SchedulerConfig {
             retry_cap: 5,
             backoff: BackoffConfig::default(),
             reserve_floor_bytes: 10 * 1024 * 1024 * 1024,
+            spool_soft_cap_bytes: DEFAULT_SPOOL_SOFT_CAP_BYTES,
             pressure_pause: Duration::from_secs(60),
             storage_poll: Duration::from_secs(15),
             default_size_estimate: 64 * 1024 * 1024,
@@ -110,6 +131,14 @@ struct Shared {
     locks: locks::KeyedLocks,
     counters: Mutex<Counters>,
     pause: Mutex<PauseState>,
+    /// At or above the spool soft cap at the last check. Not a pause: the
+    /// daemon loop keeps publishing (which evicts) and routing events; only
+    /// new fetches wait.
+    spool_full: Mutex<bool>,
+    /// A publisher is attached: the only thing that evicts, so the spool
+    /// cap applies only then, and only then is an unbound shared library
+    /// (which it could never evict) left unfetched.
+    publishes: std::sync::atomic::AtomicBool,
     /// Photos with a live `photo_task`. Hoisted here (not loop-local) so the
     /// daemon's event classification can defer changes to inflight photos.
     inflight: Mutex<HashSet<PhotoId>>,
@@ -145,6 +174,8 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 locks: locks::KeyedLocks::new(),
                 counters: Mutex::new(Counters::default()),
                 pause: Mutex::new(PauseState::default()),
+                spool_full: Mutex::new(false),
+                publishes: std::sync::atomic::AtomicBool::new(false),
                 inflight: Mutex::new(HashSet::new()),
             }),
             publisher: None,
@@ -155,6 +186,9 @@ impl<F: ResourceFetcher> Scheduler<F> {
     /// (`config.publish`). Drain runs never publish.
     pub fn with_publisher(mut self, publisher: Arc<dyn crate::publish::Publisher>) -> Self {
         self.publisher = Some(publisher);
+        self.shared
+            .publishes
+            .store(true, std::sync::atomic::Ordering::Release);
         self
     }
 
@@ -181,7 +215,9 @@ impl<F: ResourceFetcher> Scheduler<F> {
             let claimable = self.claim_batch(&no_skip).await?;
             if claimable.is_empty() {
                 if tasks.is_empty() {
-                    break; // queue drained (or only future retries remain)
+                    // Queue drained (or only future retries remain). The
+                    // production drain has no publisher, so no spool cap.
+                    break;
                 }
                 let _ = tasks.join_next().await; // wait for capacity/progress
                 continue;
@@ -216,11 +252,28 @@ impl<F: ResourceFetcher> Scheduler<F> {
     /// caller's skip set (the daemon's deferred photos — a photo with a
     /// queued hard move must not start fetching into the old root).
     async fn claim_batch(&self, skip: &HashSet<PhotoId>) -> Result<Vec<PhotoRecord>> {
+        // The spool soft cap gates only photos holding no spool bytes yet.
+        // A photo with bytes is always claimable whatever the spool size:
+        // it can only release them by completing, publishing and evicting,
+        // so holding it back (a transient fetch failure, a pause, a
+        // cancellation, a Live Photo's video on retry, a resource revived
+        // by `reset_gave_up`, a published photo's edit refetch) would wedge
+        // the cap. With a publisher attached, an unbound shared library is
+        // not fetched at all: nothing could ever evict its bytes.
+        let publishes = self
+            .shared
+            .publishes
+            .load(std::sync::atomic::Ordering::Acquire);
+        let filter = photos::PendingFilter {
+            holding_bytes_only: !spool_has_room(&self.shared).await?,
+            bound_only: publishes,
+        };
         let batch = photos::pending_photos(
             self.shared.store.pool(),
             self.shared.config.retry_cap,
             Utc::now(),
             (self.shared.config.fetch_concurrency * 2) as i64,
+            filter,
         )
         .await?;
         let inflight = self.shared.inflight.lock().expect("inflight mutex");
@@ -347,6 +400,45 @@ impl<F: ResourceFetcher> Scheduler<F> {
     }
 }
 
+/// The spool soft cap: may a photo holding no spool bytes be claimed?
+/// Counts EVERY unevicted byte plus inflight writes. Nothing is excluded
+/// as "stuck": a photo in a mesh outage looks exactly like one stranded
+/// at a retry cap, and the cap exists for the outage. Stuck bytes are
+/// reported instead (`status`, and the breakdown on the `spool_full`
+/// line), and the scan resets the ledgers that strand them. Off without a
+/// publisher (nothing would ever evict). Logs `spool_full` once on
+/// reaching the cap and `spool_below_cap` once on coming back under; the
+/// per-claim path runs one indexed SUM and nothing else.
+async fn spool_has_room(shared: &Shared) -> Result<bool> {
+    let cap = shared.config.spool_soft_cap_bytes;
+    if cap == 0 || !shared.publishes.load(std::sync::atomic::Ordering::Acquire) {
+        *shared.spool_full.lock().expect("spool mutex") = false;
+        return Ok(true);
+    }
+    let unevicted = shared.store.unevicted_bytes().await?;
+    let materialized = unevicted.saturating_add(shared.inflight_bytes.total());
+    let room = admission::spool_admits(materialized, cap);
+    let was_full = std::mem::replace(&mut *shared.spool_full.lock().expect("spool mutex"), !room);
+    if was_full == room {
+        let mut detail = serde_json::json!({ "spool_bytes": materialized, "soft_cap": cap });
+        let event = if room {
+            "spool_below_cap"
+        } else {
+            shared.counters.lock().expect("counters mutex").pauses += 1;
+            // Advisory, computed on the crossing only: what an operator
+            // would want to know when the cap bites.
+            let stuck = shared
+                .store
+                .stuck_spool(shared.config.retry_cap, shared.config.publish.retry_cap)
+                .await?;
+            detail["stuck"] = serde_json::to_value(stuck)?;
+            "spool_full"
+        };
+        let _ = shared.store.append_log(event, None, Some(detail)).await;
+    }
+    Ok(room)
+}
+
 /// Enter a pause state (idempotent) and log `storage_low` once per entry.
 async fn enter_pause(shared: &Shared, local_disk: bool, detail: serde_json::Value) {
     let newly = {
@@ -441,6 +533,11 @@ async fn photo_task<F: ResourceFetcher>(
             let _ = n;
             continue;
         };
+
+        // No spool cap check here: the cap gates claiming a photo, never a
+        // photo already admitted. Only complete photos publish and only
+        // published photos evict, so a photo held between resources would
+        // hold its own bytes forever and wedge the cap.
 
         // Storage-aware admission.
         let expected = match res_desc.expected_size {

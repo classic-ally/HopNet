@@ -10,6 +10,59 @@ use crate::model::BlobRecord;
 
 use super::StateStore;
 
+/// Does blob `b` have a referent resource `r` (photo `p`, library `l`)
+/// that BLOCKS its eviction — the exact predicate of
+/// [`StateStore::evictable_blobs`] — and is in the terminal state
+/// `$terminal`? Per resource, like eviction itself: a reopened row that
+/// kept its old hash as the superseded pointer is not blocking (the old
+/// bytes are the mesh's), so its blob is evictable however the refetch
+/// goes. Binds: `?1` = the fetch retry cap, `?2` = the publish/edit retry
+/// cap.
+macro_rules! blocked_by {
+    ($terminal:expr) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM photo_resources r \
+               JOIN photos p ON p.photo_id = r.photo_id \
+               JOIN libraries l ON l.library_id = p.library_id \
+               WHERE p.library_id = b.library_id \
+                 AND r.content_hash = b.content_hash \
+                 AND (p.published_at IS NULL \
+                   OR r.published_content_hash IS NOT r.content_hash) \
+                 AND (",
+            $terminal,
+            "))"
+        )
+    };
+}
+
+/// Unevicted spool bytes that will not evict on their own, by cause —
+/// ADVISORY, for `status` and the `spool_full` log line. Every one of
+/// these bytes counts against the spool soft cap all the same: a photo in
+/// an outage looks exactly like a stuck one (the publish ledger fills in
+/// both), and the cap exists for the outage. One spool file (one content
+/// hash, shared across libraries) is stuck while ANY unevicted row for it
+/// has a blocking referent in a terminal state; `bytes` counts each file
+/// once, the causes may overlap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SpoolStuck {
+    /// Every stuck file, counted once.
+    pub bytes: u64,
+    /// A deleted photo: unpublished (waits on hard delete, never publish)
+    /// or published with an edit owed (edits never propagate for a
+    /// tombstone). Hard delete at retention reaps these.
+    pub deleted: u64,
+    /// A scope-bound library with no `mesh_library_id`: nothing claims it
+    /// until an operator binds it.
+    pub unbound_library: u64,
+    /// Unpublished at the publish retry cap. The scan resets the ledger.
+    pub publish_capped: u64,
+    /// Published, at the edit retry cap. The scan resets the ledger.
+    pub edit_capped: u64,
+    /// A resource given up at the fetch retry cap, so the photo never
+    /// completes. The scan resets the ledger.
+    pub fetch_gave_up: u64,
+}
+
 impl StateStore {
     /// Largest blob seen in a library — the pessimistic size estimate for
     /// admission when a descriptor reports no expected size.
@@ -20,6 +73,85 @@ impl StateStore {
                 .fetch_one(self.pool())
                 .await?,
         )
+    }
+
+    /// Bytes the spool holds materialized: one file per content hash with
+    /// an unevicted row in any library (the spool is shared across
+    /// libraries). Read fresh each time (eviction, hard deletes and fsck
+    /// repairs all move it), so it stays right across crashes and other
+    /// processes.
+    pub async fn unevicted_bytes(&self) -> Result<u64> {
+        let sum: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(size_bytes) FROM ( \
+               SELECT MAX(size_bytes) AS size_bytes FROM blobs \
+               WHERE evicted_at IS NULL GROUP BY content_hash)",
+        )
+        .fetch_one(self.pool())
+        .await?;
+        Ok(sum.unwrap_or(0).max(0) as u64)
+    }
+
+    /// The stuck breakdown ([`SpoolStuck`]) — one file per content hash,
+    /// each cause tested per referent resource. Five correlated EXISTS per
+    /// blob row: run it for `status` and on a cap crossing, never per
+    /// claim.
+    pub async fn stuck_spool(
+        &self,
+        fetch_retry_cap: i64,
+        publish_retry_cap: i64,
+    ) -> Result<SpoolStuck> {
+        let (bytes, deleted, unbound_library, publish_capped, edit_capped, fetch_gave_up): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(concat!(
+            "SELECT COALESCE(SUM(size_bytes), 0), \
+                    COALESCE(SUM(CASE WHEN deleted THEN size_bytes ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN unbound THEN size_bytes ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN publish_capped THEN size_bytes ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN edit_capped THEN size_bytes ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN fetch_gave_up THEN size_bytes ELSE 0 END), 0) \
+             FROM ( \
+               SELECT MAX(b.size_bytes) AS size_bytes, \
+                      MAX(",
+            blocked_by!("p.deleted_at IS NOT NULL"),
+            ") AS deleted, \
+                      MAX(",
+            blocked_by!("l.scope_binding IS NOT NULL AND l.mesh_library_id IS NULL"),
+            ") AS unbound, \
+                      MAX(",
+            blocked_by!("p.published_at IS NULL AND p.publish_attempts >= ?2"),
+            ") AS publish_capped, \
+                      MAX(",
+            blocked_by!("p.published_at IS NOT NULL AND p.edit_publish_attempts >= ?2"),
+            ") AS edit_capped, \
+                      MAX(",
+            blocked_by!(
+                "EXISTS (SELECT 1 FROM photo_resources g \
+                         WHERE g.photo_id = p.photo_id AND g.written_at IS NULL \
+                           AND g.retry_count >= ?1)"
+            ),
+            ") AS fetch_gave_up \
+               FROM blobs b WHERE b.evicted_at IS NULL \
+               GROUP BY b.content_hash) \
+             WHERE deleted OR unbound OR publish_capped OR edit_capped OR fetch_gave_up"
+        ))
+        .bind(fetch_retry_cap)
+        .bind(publish_retry_cap)
+        .fetch_one(self.pool())
+        .await?;
+        let u = |n: i64| n.max(0) as u64;
+        Ok(SpoolStuck {
+            bytes: u(bytes),
+            deleted: u(deleted),
+            unbound_library: u(unbound_library),
+            publish_capped: u(publish_capped),
+            edit_capped: u(edit_capped),
+            fetch_gave_up: u(fetch_gave_up),
+        })
     }
 
     pub async fn blob(

@@ -86,6 +86,26 @@ pub fn print_status(report: &StatusReport) {
     let p = &report.pipeline;
     println!("\nPIPELINE");
     println!("  pending resources: {}", p.resources_pending);
+    let bytes = |n: u64| human_bytes(i64::try_from(n).unwrap_or(i64::MAX));
+    println!(
+        "  spool:             {} (counts against the cap; new photos stop when they reach it)",
+        bytes(p.spool_bytes)
+    );
+    let stuck = &p.spool_stuck;
+    if stuck.bytes > 0 {
+        println!(
+            "  WARNING: {} of spool will not evict on its own and counts against the cap: \
+             {} deleted photos awaiting hard delete, {} shared library with no mesh \
+             binding, {} at the publish retry cap, {} at the edit retry cap, {} fetch \
+             given up at the retry cap (the retry caps reset at the next scan)",
+            bytes(stuck.bytes),
+            bytes(stuck.deleted),
+            bytes(stuck.unbound_library),
+            bytes(stuck.publish_capped),
+            bytes(stuck.edit_capped),
+            bytes(stuck.fetch_gave_up),
+        );
+    }
     println!(
         "  awaiting retry:    {} (earliest {})",
         p.retries.awaiting_retry,

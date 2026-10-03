@@ -174,32 +174,57 @@ pub(crate) async fn delete_photo(exec: &mut sqlx::SqliteConnection, id: &PhotoId
     Ok(())
 }
 
+/// Narrowing of [`pending_photos`] for the spool soft cap.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PendingFilter {
+    /// Only photos that already hold spool bytes: some resource row with
+    /// a `content_hash`, written or reopened for a refetch (the reopened
+    /// row keeps its old hash as the superseded pointer). The cap never
+    /// holds those back — their bytes leave only by completing,
+    /// publishing and evicting, so a held photo would wedge the cap.
+    pub holding_bytes_only: bool,
+    /// Only photos of a library with a publish target (the personal
+    /// partition, or a scope-bound library with `mesh_library_id` set).
+    /// With a publisher attached an unbound library's bytes could never
+    /// evict, so they are not fetched; a publisher-less drain still
+    /// fetches them.
+    pub bound_only: bool,
+}
+
 /// The drain work queue (spec §Discovery: state.db IS the work queue):
 /// FIFO by discovery time, photos with at least one fetchable resource.
+/// The library join stands in for `p.library_id IS NOT NULL`.
 pub(crate) async fn pending_photos<'e, E>(
     exec: E,
     retry_cap: i64,
     now: DateTime<Utc>,
     limit: i64,
+    filter: PendingFilter,
 ) -> Result<Vec<PhotoRecord>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
     Ok(sqlx::query_as(
         "SELECT p.* FROM photos p \
-         WHERE p.library_id IS NOT NULL \
-           AND p.materialized_at IS NULL \
+         JOIN libraries l ON l.library_id = p.library_id \
+         WHERE p.materialized_at IS NULL \
            AND p.deleted_at IS NULL \
            AND EXISTS (SELECT 1 FROM photo_resources r \
                        WHERE r.photo_id = p.photo_id \
                          AND r.written_at IS NULL \
                          AND r.retry_count < ? \
                          AND (r.next_retry_at IS NULL OR r.next_retry_at <= ?)) \
+           AND (? = 0 OR EXISTS (SELECT 1 FROM photo_resources w \
+                                 WHERE w.photo_id = p.photo_id \
+                                   AND w.content_hash IS NOT NULL)) \
+           AND (? = 0 OR l.scope_binding IS NULL OR l.mesh_library_id IS NOT NULL) \
          ORDER BY p.discovered_at, p.photo_id \
          LIMIT ?",
     )
     .bind(retry_cap)
     .bind(now)
+    .bind(filter.holding_bytes_only)
+    .bind(filter.bound_only)
     .bind(limit)
     .fetch_all(exec)
     .await?)
@@ -420,6 +445,45 @@ where
     .execute(exec)
     .await?;
     Ok(())
+}
+
+/// Re-enqueue photos whose publish, edit or tombstone ledger sits at the
+/// cap — the mesh-side counterpart of [`super::resources::reset_gave_up`],
+/// run at the same point (scan finish). An outage burns attempts
+/// (`Transient` failures count; only `NodeUnreachable` parks), and a
+/// photo stranded at the cap holds its spool bytes forever: it never
+/// publishes, never propagates its edit, and a published tombstone is
+/// never hard-deleted. Touches only ledgers at or over the cap; healthy
+/// retry state and the last-error text are left alone.
+pub(crate) async fn reset_gave_up_publishes<'e, E>(exec: E, retry_cap: i64) -> Result<u64>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query(
+        "UPDATE photos SET \
+           publish_attempts = \
+             CASE WHEN publish_attempts >= ?1 THEN 0 ELSE publish_attempts END, \
+           publish_next_retry_at = \
+             CASE WHEN publish_attempts >= ?1 THEN NULL ELSE publish_next_retry_at END, \
+           edit_publish_attempts = \
+             CASE WHEN edit_publish_attempts >= ?1 THEN 0 ELSE edit_publish_attempts END, \
+           edit_publish_next_retry_at = \
+             CASE WHEN edit_publish_attempts >= ?1 THEN NULL \
+                  ELSE edit_publish_next_retry_at END, \
+           tombstone_publish_attempts = \
+             CASE WHEN tombstone_publish_attempts >= ?1 THEN 0 \
+                  ELSE tombstone_publish_attempts END, \
+           tombstone_publish_next_retry_at = \
+             CASE WHEN tombstone_publish_attempts >= ?1 THEN NULL \
+                  ELSE tombstone_publish_next_retry_at END \
+         WHERE publish_attempts >= ?1 \
+            OR edit_publish_attempts >= ?1 \
+            OR tombstone_publish_attempts >= ?1",
+    )
+    .bind(retry_cap)
+    .execute(exec)
+    .await?
+    .rows_affected())
 }
 
 /// Photos whose local tombstone state disagrees with what the mesh was

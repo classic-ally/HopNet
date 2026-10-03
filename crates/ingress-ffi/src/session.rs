@@ -294,6 +294,9 @@ impl IngressSession {
                 max: std::time::Duration::from_secs(options.retry_max_secs),
             },
             reserve_floor_bytes: options.reserve_floor_gib * 1024 * 1024 * 1024,
+            spool_soft_cap_bytes: ingress_core::scheduler::spool_soft_cap_from(|k| {
+                std::env::var(k).ok()
+            }),
             pressure_pause: std::time::Duration::from_secs(options.pressure_pause_secs),
             storage_poll: std::time::Duration::from_secs(options.storage_poll_secs),
             ..SchedulerConfig::default()
@@ -409,8 +412,13 @@ impl IngressSession {
     }
 
     /// Close the active scan: offline-deletion synthesis (guarded against
-    /// zero-enumeration), gave-up retry reset, `scan_completed` log. Wakes
-    /// the daemon loop so revived work is picked up promptly.
+    /// zero-enumeration), gave-up retry reset for fetches and publishes,
+    /// `scan_completed` log. Wakes the daemon loop so revived work is
+    /// picked up promptly.
+    ///
+    /// The publish retry cap is the default: `run_daemon` builds its
+    /// `PublishConfig` with `..PublishConfig::default()`, and this is the
+    /// one place that cap is read outside the scheduler.
     pub fn finish_scan(&self, enumerated: u64, retry_cap: i64) -> Result<FfiScanSummary, FfiError> {
         let scan = self
             .inner
@@ -427,6 +435,7 @@ impl IngressSession {
             &scan,
             enumerated,
             retry_cap,
+            ingress_core::publish::PublishConfig::default().retry_cap,
         ))?;
         self.inner.daemon.wake();
         Ok(FfiScanSummary {
@@ -483,6 +492,9 @@ impl IngressSession {
                 max: std::time::Duration::from_secs(options.retry_max_secs),
             },
             reserve_floor_bytes: options.reserve_floor_gib * 1024 * 1024 * 1024,
+            spool_soft_cap_bytes: ingress_core::scheduler::spool_soft_cap_from(|k| {
+                std::env::var(k).ok()
+            }),
             pressure_pause: std::time::Duration::from_secs(options.pressure_pause_secs),
             storage_poll: std::time::Duration::from_secs(options.storage_poll_secs),
             cleanup_interval: std::time::Duration::from_secs(options.cleanup_interval_secs.max(1)),
