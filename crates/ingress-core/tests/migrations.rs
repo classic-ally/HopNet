@@ -38,6 +38,7 @@ async fn fresh_migrate_creates_schema() {
     assert_eq!(
         names,
         vec![
+            "idx_blobs_unevicted",
             "idx_ingest_log_photo",
             "idx_photo_resources_edit_pending",
             "idx_photo_resources_hash",
@@ -182,7 +183,7 @@ async fn migrate_is_idempotent() {
         .fetch_one(second.raw_pool())
         .await
         .unwrap();
-    assert_eq!(n, 10);
+    assert_eq!(n, 11);
 
     std::fs::remove_dir_all(&dir).ok();
 }
