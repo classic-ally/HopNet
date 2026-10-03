@@ -51,6 +51,7 @@ pub fn spawn_storage_engine(app_state: &AppState) {
         EngineConfig {
             fragments_dir: app_state.fragments_dir.clone(),
             limits: hopnet_storage::engine::fetch::PullLimits::from_env(),
+            space: None,
         },
         tokio::runtime::Handle::current(),
     );

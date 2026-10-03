@@ -109,6 +109,9 @@ pub async fn serve<L: LocalStateSink + ?Sized>(
             StoreOutcome::Io(e) => FragmentResponse::Error {
                 message: format!("failed to store fragment: {:?}", e),
             },
+            StoreOutcome::NoSpace => FragmentResponse::Error {
+                message: "no space: below the pull floor".to_string(),
+            },
         },
     }
 }

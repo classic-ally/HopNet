@@ -154,6 +154,14 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         min_free_bytes = ingest_floor,
         "ingest admission: new blobs refused below this free space"
     );
+    let pull_floor = hopnet_storage::admission::PullFloor::from_env();
+    hopnet_storage::admission::configure_pull_floor(pull_floor);
+    tracing::info!(
+        min_free_bytes = pull_floor.min_free_bytes,
+        min_free_basis_points = pull_floor.min_free_basis_points,
+        enabled = pull_floor.enabled(),
+        "pull floor: replica writes held back below max(bytes, share of the volume)"
+    );
 
     // Pinned-HTTPS listener: the node's only network surface. Bound BEFORE
     // the plaintext listener so a kernel-assigned loopback port can never

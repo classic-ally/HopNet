@@ -35,6 +35,7 @@ pub mod fetch;
 pub mod policy;
 pub mod reencode;
 
+use crate::admission::{self, SpaceGuard, WriteClass};
 use crate::error::StorageError;
 use crate::fragstore;
 use crate::traits::{LocalStateSink, StateReader, Transport, TxSubmitter};
@@ -72,7 +73,13 @@ pub struct EngineConfig {
     pub fragments_dir: String,
     /// Pull concurrency (`fetch::PullLimits::from_env` in production).
     pub limits: PullLimits,
+    /// The replica-write floor; `None` = the process guard
+    /// (`admission::SpaceGuard::global`, configured at boot).
+    pub space: Option<Arc<crate::admission::SpaceGuard>>,
 }
+
+/// While held back for space, re-probe free space this often.
+pub const SPACE_REPROBE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum EngineError {
@@ -80,6 +87,9 @@ pub enum EngineError {
     State(StorageError),
     /// A fragment could not be sourced or stored.
     Transfer(String),
+    /// Below the free-space floor for this write (`admission::SpaceGuard`):
+    /// held, not failed.
+    NoSpace,
 }
 
 impl std::fmt::Display for EngineError {
@@ -87,6 +97,7 @@ impl std::fmt::Display for EngineError {
         match self {
             EngineError::State(e) => write!(f, "state error: {}", e),
             EngineError::Transfer(m) => write!(f, "fragment transfer error: {}", m),
+            EngineError::NoSpace => write!(f, "held for space (below the pull floor)"),
         }
     }
 }
@@ -110,6 +121,9 @@ pub struct PullOutcome {
     pub rebuilt: usize,
     /// Owed classes still missing after both — retried on the next kick.
     pub failed: usize,
+    /// Owed classes not attempted (or not written) because this node is
+    /// below its pull floor: held, not failed — no rebuild, no park.
+    pub held_for_space: usize,
     /// This blob's belief, disk truth and confirmation check went to the
     /// evidence lane (births and moved bytes only).
     pub evidence_queued: bool,
@@ -125,6 +139,8 @@ pub struct PullStats {
     pub pulled: usize,
     pub rebuilt: usize,
     pub failed: usize,
+    /// Classes held back by the pull floor.
+    pub held_for_space: usize,
     /// Blobs whose evidence went to the evidence lane.
     pub evidence_queued: usize,
 }
@@ -308,6 +324,7 @@ impl EngineHandle {
                     stats.pulled += o.pulled;
                     stats.rebuilt += o.rebuilt;
                     stats.failed += o.failed;
+                    stats.held_for_space += o.held_for_space;
                     stats.evidence_queued += o.evidence_queued as usize;
                 }
                 None => {
@@ -389,7 +406,10 @@ impl EngineHandle {
         let worker_urgent = urgent_pending.clone();
         let urgent_latest: UrgentLatest = Default::default();
         let worker_latest = urgent_latest.clone();
-        let sched = FetchScheduler::new(config.limits);
+        let sched = match config.space {
+            Some(space) => FetchScheduler::with_space(config.limits, space),
+            None => FetchScheduler::new(config.limits),
+        };
         let worker_sched = sched.clone();
         // Weak, so the loop still ends when every handle is dropped.
         let retry_tx = pull_tx.downgrade();
@@ -398,14 +418,21 @@ impl EngineHandle {
         data_rt.spawn(async move {
             let _drain = DrainOnExit(worker_queued.clone());
             let mut running: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+            let mut reprobe = tokio::time::interval(SPACE_REPROBE);
+            reprobe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
+                // Below the pull floor nothing is taken off the pull queue
+                // and lazy re-encode waits: owed blobs stay queued in the
+                // planner's order (no failing, no parking) until free
+                // space is back at the resume mark. Serving never stops.
+                let held_back = worker_sched.space.paused();
                 tokio::select! {
                     biased;
                     cmd = reencode_urgent_rx.recv() => {
                         let Some(cmd) = cmd else { break };
                         let key = (cmd.blob_id.clone(), cmd.chunk_number);
                         if let Some(cmd) = still_owed(&worker_latest, cmd) {
-                            run_reencode_guarded(&seams, &fragments_dir, cmd).await;
+                            run_reencode_guarded(&seams, &fragments_dir, cmd, WriteClass::Repair, &worker_sched.space).await;
                         } else {
                             tracing::debug!(
                                 "re-encode: blob {} chunk {} no longer owed — dropped",
@@ -416,10 +443,13 @@ impl EngineHandle {
                         worker_urgent.lock().unwrap().remove(&key);
                     }
                     Some(_) = running.join_next(), if !running.is_empty() => {}
+                    _ = reprobe.tick(), if held_back => {
+                        worker_sched.space.reprobe(&fragments_dir);
+                    }
                     admitted = async {
                         let permit = worker_sched.window.clone().acquire_owned().await;
                         (permit, pull_rx.recv().await)
-                    } => {
+                    }, if !held_back => {
                         let (Ok(permit), Some(blob_id)) = admitted else { break };
                         let entry = QueuedEntry {
                             queue: worker_queued.clone(),
@@ -463,9 +493,9 @@ impl EngineHandle {
                             }
                         });
                     }
-                    cmd = reencode_lazy_rx.recv() => {
+                    cmd = reencode_lazy_rx.recv(), if !held_back => {
                         let Some(cmd) = cmd else { break };
-                        run_reencode_guarded(&seams, &fragments_dir, cmd).await;
+                        run_reencode_guarded(&seams, &fragments_dir, cmd, WriteClass::Pull, &worker_sched.space).await;
                     }
                 }
             }
@@ -507,32 +537,39 @@ async fn run_reencode_guarded<T, S, X, L>(
     seams: &Seams<T, S, X, L>,
     fragments_dir: &str,
     cmd: ReencodeCmd,
+    class: WriteClass,
+    space: &Arc<SpaceGuard>,
 ) where
     T: Transport + 'static,
     S: StateReader + 'static,
     X: TxSubmitter + 'static,
     L: LocalStateSink + 'static,
 {
-    let (seams, dir) = (seams.clone(), fragments_dir.to_string());
+    let (seams, dir, space) = (seams.clone(), fragments_dir.to_string(), space.clone());
     let (blob_id, chunk) = (cmd.blob_id.clone(), cmd.chunk_number);
-    if let Err(e) = tokio::spawn(async move { run_reencode_cmd(&seams, &dir, cmd).await }).await {
+    if let Err(e) =
+        tokio::spawn(async move { run_reencode_cmd(&seams, &dir, cmd, class, &space).await }).await
+    {
         tracing::error!("re-encode: blob {blob_id} chunk {chunk} task failed: {e}");
     }
 }
 
 /// Run one re-encode command (errors logged, not propagated — the next
-/// tick's scan re-elects and retries).
+/// tick's scan re-elects and retries). Urgent repair writes under
+/// `WriteClass::Repair` (down to the ingest floor), lazy under `Pull`.
 async fn run_reencode_cmd<T, S, X, L>(
     seams: &Seams<T, S, X, L>,
     fragments_dir: &str,
     cmd: ReencodeCmd,
+    class: WriteClass,
+    space: &SpaceGuard,
 ) where
     T: Transport + 'static,
     S: StateReader,
     X: TxSubmitter,
     L: LocalStateSink,
 {
-    if let Err(e) = reencode::reencode_chunk(
+    match reencode::reencode_chunk(
         &seams.transport,
         seams.state.as_ref(),
         seams.local_state.as_ref(),
@@ -540,14 +577,21 @@ async fn run_reencode_cmd<T, S, X, L>(
         &cmd.blob_id,
         cmd.chunk_number,
         &cmd.missing_classes,
+        (space, class),
     )
     .await
     {
-        tracing::warn!(
+        Ok(_) => {}
+        Err(EngineError::NoSpace) => tracing::debug!(
+            "re-encode: blob {} chunk {} held for space",
+            cmd.blob_id,
+            cmd.chunk_number
+        ),
+        Err(e) => tracing::warn!(
             "re-encode: blob {} chunk {} failed: {e}",
             cmd.blob_id,
             cmd.chunk_number
-        );
+        ),
     }
 }
 
@@ -673,6 +717,11 @@ where
                     if all_dark {
                         return (chunk, class, Err(FetchMiss::Unreachable));
                     }
+                    // Below the pull floor: don't download what can't be
+                    // written.
+                    if sched.space.paused() {
+                        return (chunk, class, Err(FetchMiss::NoSpace));
+                    }
                     let fetch::Fetched { data, slot } =
                         match fetch::fetch_class(&transport, &sched, &hash, &attested, &others)
                             .await
@@ -680,16 +729,34 @@ where
                             Ok(fetched) => fetched,
                             Err(miss) => return (chunk, class, Err(miss)),
                         };
-                    // The global slot is held until the bytes are on disk.
+                    // The bytes are reserved against the pull floor before
+                    // they land (a refusal pauses the guard), and the
+                    // reservation and the global slot are held until they
+                    // are on disk.
+                    let Ok(reserved) = sched.space.reserve(
+                        &dir,
+                        admission::fragment_file_bytes(data.len()),
+                        WriteClass::Pull,
+                    ) else {
+                        return (chunk, class, Err(FetchMiss::NoSpace));
+                    };
                     let stored = tokio::task::spawn_blocking(move || {
                         fragstore::store_fragment(&dir, &hash, data)
                     })
                     .await;
-                    drop(slot);
+                    drop((slot, reserved));
                     match stored {
                         Ok(Ok(())) => {
                             local_state.mark_local(hash).await;
                             (chunk, class, Ok(()))
+                        }
+                        // The disk filled under us (another writer): held
+                        // for space, never read as the holder not serving
+                        // it, which would rebuild — fetch K shards to
+                        // write more.
+                        Ok(Err(e)) if admission::is_disk_full(&e) => {
+                            sched.space.note_disk_full();
+                            (chunk, class, Err(FetchMiss::NoSpace))
                         }
                         Ok(Err(e)) => {
                             tracing::warn!("pull: store fragment {} failed: {e}", hash.to_hex());
@@ -708,6 +775,7 @@ where
         while let Some(joined) = fetches.join_next().await {
             match joined {
                 Ok((_, _, Ok(()))) => outcome.pulled += 1,
+                Ok((_, _, Err(FetchMiss::NoSpace))) => outcome.held_for_space += 1,
                 Ok((chunk, class, Err(miss))) => {
                     let entry = unserved_by_chunk.entry(chunk).or_default();
                     if miss == FetchMiss::Unreachable {
@@ -751,6 +819,11 @@ where
                 continue;
             }
             unserved.sort_unstable();
+            // Held for space: a rebuild fetches K shards to write more.
+            if sched.space.paused() {
+                outcome.held_for_space += unserved.len();
+                continue;
+            }
             // Genuinely unserved: rebuild from any K live classes (local
             // shards first), a bounded number at once, with every shard
             // fetch under the scheduler's caps and deadline and dark or
@@ -769,6 +842,7 @@ where
                 blob_id,
                 chunk,
                 &unserved,
+                (&sched.space, WriteClass::Pull),
                 |hash, hint, view_members| async move {
                     let usable = |p: &crate::traits::PeerRef| {
                         !dark.contains(&p.node_id)
@@ -788,6 +862,7 @@ where
                     outcome.rebuilt += r.regenerated;
                     outcome.failed += unserved.len().saturating_sub(r.regenerated);
                 }
+                Err(EngineError::NoSpace) => outcome.held_for_space += unserved.len(),
                 Err(e) => {
                     tracing::warn!(
                         "pull: blob {blob_id} chunk {chunk}: {} classes unsourceable and rebuild failed: {e}",
@@ -859,12 +934,17 @@ where
 
     if outcome.owed > 0 {
         tracing::info!(
-            "pull: blob {} owed {} classes — pulled {}, rebuilt {}, failed {}{}",
+            "pull: blob {} owed {} classes — pulled {}, rebuilt {}, failed {}{}{}",
             blob_id,
             outcome.owed,
             outcome.pulled,
             outcome.rebuilt,
             outcome.failed,
+            if outcome.held_for_space > 0 {
+                format!(", held for space {}", outcome.held_for_space)
+            } else {
+                String::new()
+            },
             if outcome.evidence_queued {
                 " (evidence queued)"
             } else {
@@ -1422,6 +1502,7 @@ mod tests {
         let engine = EngineHandle::spawn(
             seams,
             EngineConfig {
+                space: None,
                 fragments_dir: dir_dst.clone(),
                 limits: PullLimits {
                     rebuilds: 1,
@@ -1697,6 +1778,7 @@ mod tests {
         let engine = EngineHandle::spawn(
             seams(idle_net()),
             EngineConfig {
+                space: None,
                 fragments_dir: String::new(),
                 limits: PullLimits::default(),
             },
@@ -1783,6 +1865,7 @@ mod tests {
         let engine = EngineHandle::spawn(
             seams,
             EngineConfig {
+                space: None,
                 fragments_dir: String::new(),
                 limits: PullLimits::default(),
             },
@@ -1900,6 +1983,7 @@ mod tests {
         let engine = EngineHandle::spawn(
             seams,
             EngineConfig {
+                space: None,
                 fragments_dir: dir_dst,
                 limits: PullLimits::default(),
             },
@@ -2423,5 +2507,187 @@ mod tests {
             t0,
         );
         assert!(full.due(t0));
+    }
+
+    /// Bytes of every file under `dir` (a fake volume's used space).
+    fn dir_bytes(dir: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|e| match e.metadata() {
+                Ok(m) if m.is_dir() => dir_bytes(&e.path()),
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            })
+            .sum()
+    }
+
+    /// A pull floor of `floor` bytes (no share) with `gap` to resume, over
+    /// a fake volume: `budget` bytes free minus what is written under the
+    /// probed directory, plus whatever `extra` holds.
+    fn space_over(
+        budget: u64,
+        floor: u64,
+        gap: u64,
+        extra: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Arc<crate::admission::SpaceGuard> {
+        crate::admission::SpaceGuard::new(
+            crate::admission::PullFloor {
+                min_free_bytes: floor,
+                min_free_basis_points: 0,
+                resume_gap_bytes: Some(gap),
+            },
+            Some(1),
+            Box::new(move |dir| {
+                let free = (budget + extra.load(std::sync::atomic::Ordering::Acquire))
+                    .saturating_sub(dir_bytes(dir));
+                Ok((free, 1 << 40))
+            }),
+            Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0))),
+        )
+    }
+
+    // Impact: the 2026-10-03 macbook incident — pulls at ~30 fetches/s took
+    // its volume from 2 GB free to 116 MB in a minute; and a store that
+    // failed for space was read as the holder not serving the class, which
+    // rebuilt it (fetching K shards to write more).
+    // Should: pull only what fits above the floor and hold the rest for
+    // space, pausing the guard.
+    // Should not: rebuild, fail, park the blob or strike the peer for the
+    // classes held for space.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_never_fills_its_disk_by_pulling() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-floor-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, outcome, manifest) = encoded_blob(&dir_src).await;
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        let mut one_file = 0;
+        for f in &outcome.fragments {
+            let bytes = fragstore::read_fragment(&dir_src, &f.fragment_hash).unwrap();
+            one_file = admission::fragment_file_bytes(bytes.len());
+            net.served.lock().unwrap().insert(f.fragment_hash, bytes);
+        }
+        // Room for about eight of the thirty classes above the floor.
+        let floor = 1 << 20;
+        let space = space_over(floor + 8 * one_file, floor, 1 << 20, Arc::default());
+        let sched = FetchScheduler::with_space(PullLimits::default(), space.clone());
+        let (result, _) = pull_with_sched(&seams(net), &dir_dst, &blob_id, &sched).await;
+
+        assert_eq!(result.owed, 30);
+        assert!(result.pulled > 0 && result.pulled < 30, "{result:?}");
+        assert_eq!(result.held_for_space, 30 - result.pulled);
+        assert_eq!((result.rebuilt, result.failed), (0, 0));
+        assert!(space.paused());
+        let now = std::time::Instant::now();
+        assert!(!sched.blob_parked(&blob_id, now));
+        assert!(!sched.peer_parked(2, now));
+        // Reservations count against the floor, so nothing overshot it.
+        let written = dir_bytes(std::path::Path::new(&dir_dst));
+        assert!(written <= 8 * one_file, "{written} written");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: a node below the floor that kept dequeuing would fail every
+    // owed blob, churn parks and reorder the at-risk-first queue.
+    // Should: take nothing off the pull queue while held back for space.
+    // Should: take it again once a re-probe sees the resume mark.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_engine_takes_no_pulls_and_resumes_at_the_mark() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-pause-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let extra = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let space = space_over(10, 100, 50, extra.clone());
+        assert!(space
+            .reserve(base.to_str().unwrap(), 1, WriteClass::Pull)
+            .is_err());
+        assert!(space.paused());
+        let engine = EngineHandle::spawn(
+            seams(idle_net()),
+            EngineConfig {
+                space: Some(space.clone()),
+                fragments_dir: base.to_str().unwrap().to_string(),
+                limits: PullLimits::default(),
+            },
+            tokio::runtime::Handle::current(),
+        );
+        let a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        assert!(engine.offer(a));
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        assert_eq!(engine.queued_len(), 1, "held while paused");
+
+        extra.store(1000, std::sync::atomic::Ordering::Release);
+        tokio::time::sleep(SPACE_REPROBE + std::time::Duration::from_secs(1)).await;
+        assert!(!space.paused());
+        assert_eq!(engine.queued_len(), 0, "taken after the resume");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Should: hold a lazy re-encode for space without fetching a shard.
+    // Should: let an urgent re-encode write into the repair reserve while
+    // the guard is paused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lazy_reencode_waits_urgent_reencode_runs_while_paused() {
+        let base = std::env::temp_dir().join(format!("hopnet-reenc-floor-{}", std::process::id()));
+        let dir = base.to_str().unwrap().to_string();
+        let (blob_id, outcome, mut manifest) = encoded_blob(&dir).await;
+        // Two classes lost here; the other 28 on disk.
+        let lost: Vec<u32> = vec![3, 17];
+        let chunk = manifest.chunks.get_mut(&0).unwrap();
+        for map in [&mut chunk.0, &mut chunk.1] {
+            for (idx, entry) in map.iter_mut() {
+                entry.2 = !lost.contains(&(*idx as u32));
+            }
+        }
+        for f in &outcome.fragments {
+            if lost.contains(&f.local_index) {
+                fragstore::delete_fragment(&dir, &f.fragment_hash).unwrap();
+            }
+        }
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        // Free space sits between the repair floor (1 byte) and the pull
+        // floor, and the guard is paused.
+        let space = space_over(1 << 30, 1 << 40, 0, Arc::default());
+        assert!(space.reserve(&dir, 1, WriteClass::Pull).is_err());
+
+        // Every shard the rebuild needs is local: nothing is fetched.
+        let fetch = |_, _, _| std::future::ready(None);
+        let lazy = reencode::reencode_chunk_via(
+            net.as_ref(),
+            net.as_ref(),
+            &dir,
+            &blob_id,
+            0,
+            &lost,
+            (&space, WriteClass::Pull),
+            fetch,
+        )
+        .await;
+        assert!(matches!(lazy, Err(EngineError::NoSpace)), "{lazy:?}");
+
+        let urgent = reencode::reencode_chunk_via(
+            net.as_ref(),
+            net.as_ref(),
+            &dir,
+            &blob_id,
+            0,
+            &lost,
+            (&space, WriteClass::Repair),
+            fetch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(urgent.regenerated, 2);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
