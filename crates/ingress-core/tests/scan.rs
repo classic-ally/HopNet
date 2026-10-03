@@ -44,7 +44,7 @@ async fn probe_done_for_unchanged_marks_seen() {
         ScanVerdict::Done
     );
 
-    let summary = finish(&store, &scan, 1, 5).await.unwrap();
+    let summary = finish(&store, &scan, 1, 5, 5).await.unwrap();
     assert_eq!(summary.deletions_synthesized, 0);
     assert!(
         store
@@ -158,7 +158,7 @@ async fn finish_synthesizes_deletions_for_unseen_only() {
         .build();
     let midscan_id = seed_one(&store, &midscan_desc).await;
 
-    let summary = finish(&store, &scan, 2, 5).await.unwrap();
+    let summary = finish(&store, &scan, 2, 5, 5).await.unwrap();
     assert_eq!(summary.deletions_synthesized, 1);
     assert!(
         store
@@ -207,7 +207,7 @@ async fn finish_with_zero_enumeration_skips_synthesis() {
     let id = seed_one(&store, &desc).await;
 
     let scan = begin(&store).await.unwrap();
-    let summary = finish(&store, &scan, 0, 5).await.unwrap();
+    let summary = finish(&store, &scan, 0, 5, 5).await.unwrap();
     assert!(summary.synthesis_skipped);
     assert_eq!(summary.deletions_synthesized, 0);
     assert!(
@@ -244,7 +244,7 @@ async fn finish_resets_gave_up_and_logs_counts() {
 
     let scan = begin(&store).await.unwrap();
     probe(&store, &scan, &probe_of(&desc)).await.unwrap();
-    let summary = finish(&store, &scan, 1, cap).await.unwrap();
+    let summary = finish(&store, &scan, 1, cap, 5).await.unwrap();
     assert_eq!(summary.gave_up_reset, 1);
 
     let row = store
@@ -262,4 +262,101 @@ async fn finish_resets_gave_up_and_logs_counts() {
         serde_json::from_str(events[0].detail.as_ref().unwrap()).unwrap();
     assert_eq!(detail["gave_up_reset"], 1);
     assert_eq!(detail["probed"], 1);
+}
+
+// Impact: an outage burns publish attempts (`Transient` failures count;
+// only `NodeUnreachable` parks), and the publish, edit and tombstone
+// ledgers were never reset, so the photos it stranded held their spool
+// bytes against the soft cap for good, and a published tombstone at the
+// cap could never be hard-deleted (#102). The scan is the sanctioned
+// re-enqueue point, as it is for fetches.
+// Should: zero each of the three ledgers at or over the publish retry cap
+// and clear its retry deadline.
+// Should not: touch a ledger below the cap.
+// Should: report the count in the summary and the scan_completed event.
+#[tokio::test]
+async fn a_scan_resets_the_publish_edit_and_tombstone_ledgers_at_the_cap() {
+    let (store, _) = store_with_personal().await;
+    let _tmp = tempfile::tempdir().unwrap();
+    let cap = 3i64;
+    let mut descs = Vec::new();
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let desc = AssetDescriptorBuilder::simple_image()
+            .modified_at(Utc::now())
+            .build();
+        ids.push(seed_one(&store, &desc).await);
+        descs.push(desc);
+    }
+    let [publish, edit, tombstone, healthy] = ids.as_slice() else {
+        unreachable!()
+    };
+    let ledgers = [
+        (
+            publish,
+            "UPDATE photos SET publish_attempts = ?, publish_next_retry_at = ? WHERE photo_id = ?",
+            cap,
+        ),
+        (
+            edit,
+            "UPDATE photos SET edit_publish_attempts = ?, edit_publish_next_retry_at = ? \
+             WHERE photo_id = ?",
+            cap + 1,
+        ),
+        (
+            tombstone,
+            "UPDATE photos SET tombstone_publish_attempts = ?, \
+             tombstone_publish_next_retry_at = ? WHERE photo_id = ?",
+            cap,
+        ),
+        (
+            healthy,
+            "UPDATE photos SET publish_attempts = ?, publish_next_retry_at = ? WHERE photo_id = ?",
+            cap - 1,
+        ),
+    ];
+    for (id, sql, count) in ledgers {
+        sqlx::query(sql)
+            .bind(count)
+            .bind(Utc::now())
+            .bind(id)
+            .execute(store.raw_pool())
+            .await
+            .unwrap();
+    }
+
+    let scan = begin(&store).await.unwrap();
+    for desc in &descs {
+        probe(&store, &scan, &probe_of(desc)).await.unwrap();
+    }
+    let summary = finish(&store, &scan, 4, 5, cap).await.unwrap();
+    assert_eq!(summary.publish_gave_up_reset, 3);
+    assert_eq!(summary.deletions_synthesized, 0);
+
+    let p = store.photo(publish).await.unwrap().unwrap();
+    assert_eq!((p.publish_attempts, p.publish_next_retry_at), (0, None));
+    let e = store.photo(edit).await.unwrap().unwrap();
+    assert_eq!(
+        (e.edit_publish_attempts, e.edit_publish_next_retry_at),
+        (0, None)
+    );
+    let t = store.photo(tombstone).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            t.tombstone_publish_attempts,
+            t.tombstone_publish_next_retry_at
+        ),
+        (0, None)
+    );
+    let h = store.photo(healthy).await.unwrap().unwrap();
+    assert_eq!(h.publish_attempts, cap - 1);
+    assert!(
+        h.publish_next_retry_at.is_some(),
+        "below the cap: untouched"
+    );
+
+    let events = store.log_events("scan_completed").await.unwrap();
+    let detail: serde_json::Value =
+        serde_json::from_str(events[0].detail.as_ref().unwrap()).unwrap();
+    assert_eq!(detail["publish_gave_up_reset"], 3);
 }

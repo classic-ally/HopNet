@@ -432,6 +432,45 @@ where
     Ok(())
 }
 
+/// Re-enqueue photos whose publish, edit or tombstone ledger sits at the
+/// cap — the mesh-side counterpart of [`super::resources::reset_gave_up`],
+/// run at the same point (scan finish). An outage burns attempts
+/// (`Transient` failures count; only `NodeUnreachable` parks), and a
+/// photo stranded at the cap holds its spool bytes forever: it never
+/// publishes, never propagates its edit, and a published tombstone is
+/// never hard-deleted. Touches only ledgers at or over the cap; healthy
+/// retry state and the last-error text are left alone.
+pub(crate) async fn reset_gave_up_publishes<'e, E>(exec: E, retry_cap: i64) -> Result<u64>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query(
+        "UPDATE photos SET \
+           publish_attempts = \
+             CASE WHEN publish_attempts >= ?1 THEN 0 ELSE publish_attempts END, \
+           publish_next_retry_at = \
+             CASE WHEN publish_attempts >= ?1 THEN NULL ELSE publish_next_retry_at END, \
+           edit_publish_attempts = \
+             CASE WHEN edit_publish_attempts >= ?1 THEN 0 ELSE edit_publish_attempts END, \
+           edit_publish_next_retry_at = \
+             CASE WHEN edit_publish_attempts >= ?1 THEN NULL \
+                  ELSE edit_publish_next_retry_at END, \
+           tombstone_publish_attempts = \
+             CASE WHEN tombstone_publish_attempts >= ?1 THEN 0 \
+                  ELSE tombstone_publish_attempts END, \
+           tombstone_publish_next_retry_at = \
+             CASE WHEN tombstone_publish_attempts >= ?1 THEN NULL \
+                  ELSE tombstone_publish_next_retry_at END \
+         WHERE publish_attempts >= ?1 \
+            OR edit_publish_attempts >= ?1 \
+            OR tombstone_publish_attempts >= ?1",
+    )
+    .bind(retry_cap)
+    .execute(exec)
+    .await?
+    .rows_affected())
+}
+
 /// Photos whose local tombstone state disagrees with what the mesh was
 /// told (spec §Propagation to the mesh). Covers BOTH directions in one
 /// query — a pending delete (`deleted_at` set, marker NULL) and a pending

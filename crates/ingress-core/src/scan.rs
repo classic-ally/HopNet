@@ -60,7 +60,10 @@ pub struct ScanSummary {
     pub probed: u64,
     pub needed_full: u64,
     pub deletions_synthesized: u64,
+    /// Resources re-enqueued from the fetch retry cap.
     pub gave_up_reset: u64,
+    /// Photos re-enqueued from the publish, edit or tombstone retry cap.
+    pub publish_gave_up_reset: u64,
     /// The health guard fired: zero assets enumerated against a non-empty
     /// store (lost authorization, empty fetch) — synthesis skipped.
     pub synthesis_skipped: bool,
@@ -158,17 +161,23 @@ pub async fn probe(store: &StateStore, scan: &ScanState, p: &ScanProbe) -> Resul
 }
 
 /// Close a scan: synthesize deletions for unseen photos, re-enqueue gave-up
-/// resources (spec §Failure Handling), log `scan_completed`.
+/// resources (spec §Failure Handling) and gave-up publishes, log
+/// `scan_completed`.
 ///
 /// `enumerated` is the platform-side fetch count — the health guard (spec:
 /// "absence of evidence from PhotoKit is only evidence of deletion when the
 /// API is healthy"): zero enumerated against a non-empty store skips
-/// synthesis AND the gave-up reset (no evidence either way).
+/// synthesis AND the fetch gave-up reset (no evidence either way). The
+/// publish ledgers (`publish_retry_cap`: the publish, edit and tombstone
+/// attempt counters) are about the mesh, not PhotoKit, so their reset runs
+/// on every scan: an outage burns attempts, and a photo left at a cap
+/// would otherwise hold its spool bytes against the soft cap for good.
 pub async fn finish(
     store: &StateStore,
     scan: &ScanState,
     enumerated: u64,
     retry_cap: i64,
+    publish_retry_cap: i64,
 ) -> Result<ScanSummary> {
     let probed = scan.probes.load(Ordering::Relaxed);
     let needed_full = scan.needed_full.load(Ordering::Relaxed);
@@ -192,6 +201,8 @@ pub async fn finish(
         }
         gave_up_reset = crate::store::resources::reset_gave_up(store.pool(), retry_cap).await?;
     }
+    let publish_gave_up_reset =
+        crate::store::photos::reset_gave_up_publishes(store.pool(), publish_retry_cap).await?;
 
     store
         .append_log(
@@ -203,6 +214,7 @@ pub async fn finish(
                 "needed_full": needed_full,
                 "deletions_synthesized": deletions_synthesized,
                 "gave_up_reset": gave_up_reset,
+                "publish_gave_up_reset": publish_gave_up_reset,
                 "synthesis_skipped": synthesis_skipped,
             })),
         )
@@ -213,6 +225,7 @@ pub async fn finish(
         needed_full,
         deletions_synthesized,
         gave_up_reset,
+        publish_gave_up_reset,
         synthesis_skipped,
     })
 }

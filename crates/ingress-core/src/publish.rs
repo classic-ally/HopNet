@@ -1044,10 +1044,10 @@ const EVICT_BATCH: i64 = 500;
 enum AssembleSkip {
     MissingDescriptor,
     /// Nothing left to say — not a failure, and must not be recorded as
-    /// one. The edit ledger is never reset (`reset_gave_up` touches only
-    /// the resource FETCH counters), so an attempt burned on a no-op is
-    /// permanent progress toward a cap that silences the photo's real
-    /// edits.
+    /// one. The edit ledger is reset only at scan finish
+    /// (`reset_gave_up_publishes`), so an attempt burned on a no-op is
+    /// progress toward a cap that silences the photo's real edits until
+    /// the next scan.
     NothingToDo,
     Transient(String),
 }
