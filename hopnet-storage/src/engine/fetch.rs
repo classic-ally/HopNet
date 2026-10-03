@@ -22,6 +22,7 @@
 //! unreachable (and that cannot be rebuilt) is parked itself and leaves
 //! the window, which admits the next blob.
 
+use crate::admission::{SpaceGuard, SpaceReport};
 use crate::traits::{PeerRef, Transport, TransportError};
 use crate::types::BlobId;
 use hopnet_common::Blake3Hash;
@@ -171,6 +172,8 @@ pub struct SchedulerStats {
     pub parked_peers: Vec<ParkedPeer>,
     pub parked_blobs: usize,
     pub parked_longest_secs: u64,
+    /// The replica-write floor: free space, marks, paused since.
+    pub space: SpaceReport,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -198,12 +201,20 @@ pub struct FetchScheduler {
     members_retry: Mutex<(u32, Option<Instant>)>,
     peers: Mutex<HashMap<i32, PeerPark>>,
     blobs: Mutex<HashMap<BlobId, BlobPark>>,
+    /// The replica-write floor (`admission::SpaceGuard`): pulls, rebuilds
+    /// and re-encodes reserve their bytes here before writing.
+    pub space: Arc<SpaceGuard>,
 }
 
 impl FetchScheduler {
     pub fn new(limits: PullLimits) -> Arc<Self> {
+        Self::with_space(limits, SpaceGuard::global().clone())
+    }
+
+    pub fn with_space(limits: PullLimits, space: Arc<SpaceGuard>) -> Arc<Self> {
         Arc::new(FetchScheduler {
             limits,
+            space,
             window: Arc::new(Semaphore::new(limits.window.max(1))),
             global: Arc::new(Semaphore::new(limits.pull_permits())),
             rebuild: Arc::new(Semaphore::new(limits.rebuilds.max(1))),
@@ -522,6 +533,7 @@ impl FetchScheduler {
             parked_peers,
             parked_blobs,
             parked_longest_secs,
+            space: self.space.report(),
         }
     }
 }
@@ -539,6 +551,10 @@ pub enum FetchMiss {
     /// A known holder is parked, unreachable, or too busy to serve it now:
     /// retry later rather than rebuild.
     Unreachable,
+    /// This node is below its pull floor, or the write hit a full disk:
+    /// held for space. Not the holder's fault — no rebuild, no park, no
+    /// peer strike; the planner offers the blob again after the resume.
+    NoSpace,
 }
 
 /// Verified fragment bytes, still holding their global fetch slot: the

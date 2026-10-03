@@ -20,6 +20,17 @@
         severity?: 'warn' | 'stale';
     }[] = [];
 
+    // Members holding back replica writes — below their pull floor, or
+    // (this node only) unable to read their own free space: serving, but
+    // taking on no copies.
+    export let holdingBack: {
+        nodeId: number;
+        displayName: string;
+        freeGb: number;
+        pullFloorGb: number;
+        reason: string;
+    }[] = [];
+
     // The minimum supported redundancy. Below 2 tolerable failures the mesh is
     // still writing, but it is producing fragments that buy no node redundancy
     // — an unsupported configuration, not extra capacity.
@@ -65,6 +76,20 @@
     {/snippet}
 
     <StorageSummary {consumedGb} {capacityGb} {unrecoverableGb} {unplacedBuckets} />
+
+    {#each holdingBack as node (node.nodeId)}
+        <p class="mt-2 text-xs font-mono">
+            <span class="text-yellow">{node.displayName} holding back:</span>
+            <span class="text-subtitle">
+                {#if node.reason === 'probe_error'}
+                    cannot read its free space
+                {:else}
+                    {node.freeGb.toFixed(1)} GB free, below its {node.pullFloorGb.toFixed(0)} GB pull floor
+                {/if}
+                (still serving, taking on no copies)
+            </span>
+        </p>
+    {/each}
 
     <div class="my-4 border-t border-overlay0"></div>
 

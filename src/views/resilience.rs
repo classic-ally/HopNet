@@ -15,9 +15,9 @@ use r2d2_sqlite::SqliteConnectionManager;
 
 use hopnet_common::db::{FaultToleranceCurvePoint, NodeStorageBaseline};
 use hopnet_common::views::{
-    AgeBucketView, AgeSeverity, ConsensusPanelView, EtaTierView, EtaView, LifecycleView,
-    NodeVerificationView, PercentilesView, ResilienceLevelBytes, StoragePanelView, TransferView,
-    UnplacedBucket, UnplacedSeverity, VerificationView,
+    AgeBucketView, AgeSeverity, ConsensusPanelView, EtaTierView, EtaView, HoldingBackNode,
+    LifecycleView, NodeVerificationView, PercentilesView, ResilienceLevelBytes, StoragePanelView,
+    TransferView, UnplacedBucket, UnplacedSeverity, VerificationView,
 };
 use hopnet_storage::observe;
 
@@ -72,6 +72,96 @@ pub struct StorageParts {
     /// and whether the bounded scan was cut short. Behind the TTL with the
     /// other scans because it walks the in-flight set.
     pub owed_pull: (u64, bool),
+    /// Each node's last reported disk (replicated metrics), for the
+    /// "holding back for space" flag.
+    pub disks: Vec<NodeDisk>,
+}
+
+/// A node's latest reported volume, in GiB.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeDisk {
+    pub node_id: i32,
+    pub display_name: String,
+    pub total_gb: f64,
+    pub used_gb: f64,
+}
+
+/// Latest `metrics` disk report per node.
+fn node_disks(conn: &rusqlite::Connection) -> Result<Vec<NodeDisk>, DatabaseError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT n.node_id, COALESCE(n.name, 'Node ' || n.node_id), m.storage_total_gb, m.storage_used_gb
+             FROM nodes n
+             JOIN (SELECT to_node, storage_total_gb, storage_used_gb,
+                          ROW_NUMBER() OVER (PARTITION BY to_node ORDER BY height DESC, start_time DESC) AS rn
+                   FROM metrics WHERE storage_total_gb > 0) m
+               ON m.to_node = n.node_id AND m.rn = 1",
+        )
+        .map_err(|_| DatabaseError::ProcessingError)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(NodeDisk {
+                node_id: r.get(0)?,
+                display_name: r.get(1)?,
+                total_gb: r.get(2)?,
+                used_gb: r.get(3)?,
+            })
+        })
+        .map_err(|_| DatabaseError::ProcessingError)?;
+    rows.collect::<Result<_, _>>()
+        .map_err(|_| DatabaseError::ProcessingError)
+}
+
+/// Members whose last reported free space is below the default pull floor
+/// for their volume (`admission::PullFloor::default()` over the default
+/// ingest floor): approximate, since a node may override its knobs. A
+/// probe failure is not in the replicated metrics, so this node adds
+/// itself from its own guard (`local`: its id and report) when that is
+/// holding back for `probe_error`.
+fn holding_back(
+    disks: &[NodeDisk],
+    member_ids: &[i32],
+    local: Option<(i32, &hopnet_storage::admission::SpaceReport)>,
+) -> Vec<HoldingBackNode> {
+    use hopnet_storage::admission::PauseReason;
+    let floor = hopnet_storage::admission::PullFloor::default();
+    let ingest = hopnet_storage::admission::DEFAULT_MIN_FREE_BYTES;
+    let mut flagged: Vec<HoldingBackNode> = disks
+        .iter()
+        .filter(|d| member_ids.contains(&d.node_id))
+        .filter_map(|d| {
+            let total = (d.total_gb * BYTES_PER_GB) as u64;
+            let free = ((d.total_gb - d.used_gb).max(0.0) * BYTES_PER_GB) as u64;
+            let (pull_floor, _) = floor.marks(total, ingest);
+            (free <= pull_floor).then(|| HoldingBackNode {
+                node_id: d.node_id,
+                display_name: d.display_name.clone(),
+                free_gb: free as f64 / BYTES_PER_GB,
+                pull_floor_gb: pull_floor as f64 / BYTES_PER_GB,
+                reason: "low_space".to_string(),
+            })
+        })
+        .collect();
+    // A low-space entry from the metrics is the more specific truth: the
+    // probe-error entry only fills in for a node the metrics call healthy.
+    if let Some((me, report)) = local
+        && report.pause_reason == Some(PauseReason::ProbeError)
+        && !flagged.iter().any(|n| n.node_id == me)
+    {
+        let gb = |b: Option<u64>| b.unwrap_or(0) as f64 / BYTES_PER_GB;
+        let display_name = disks
+            .iter()
+            .find(|d| d.node_id == me)
+            .map_or_else(|| format!("Node {me}"), |d| d.display_name.clone());
+        flagged.push(HoldingBackNode {
+            node_id: me,
+            display_name,
+            free_gb: gb(report.free_bytes),
+            pull_floor_gb: gb(report.pull_floor_bytes),
+            reason: "probe_error".to_string(),
+        });
+    }
+    flagged
 }
 
 struct Cached {
@@ -245,6 +335,7 @@ pub fn storage_parts(
             .map_err(|_| DatabaseError::ProcessingError)?,
         None => (0, false),
     };
+    let disks = node_disks(conn)?;
 
     Ok(StorageParts {
         member_ids,
@@ -253,6 +344,7 @@ pub fn storage_parts(
         curve,
         unplaced,
         owed_pull,
+        disks,
     })
 }
 
@@ -420,6 +512,9 @@ pub fn storage_view(
     let verification = verification_view(conn, tip);
     let transfers = observe::transfers();
     let eta = eta_view(app_state, parts, &transfers);
+    // This node's own replica-write guard: a probe-failure pause shows
+    // nowhere else (it is not in the replicated metrics).
+    let local_space = hopnet_storage::admission::SpaceGuard::global().report();
 
     StoragePanelView {
         curve: parts.curve.clone(),
@@ -428,6 +523,11 @@ pub fn storage_view(
         unknown_gb,
         unreachable_members,
         unplaced_buckets,
+        holding_back: holding_back(
+            &parts.disks,
+            &parts.member_ids,
+            app_state.get_node_id().ok().map(|me| (me, &local_space)),
+        ),
         lifecycle,
         verification,
         transfers: TransferView {
@@ -677,12 +777,93 @@ mod tests {
         );
     }
 
+    // Should: flag a member whose reported free space is at or below the
+    // default pull floor for its volume (max(20 GiB, 2%)).
+    // Should not: flag a member above it, or a node outside the storage view.
+    #[test]
+    fn holding_back_flags_members_below_the_pull_floor() {
+        let disk = |node_id, total_gb: f64, used_gb: f64| NodeDisk {
+            node_id,
+            display_name: format!("n{node_id}"),
+            total_gb,
+            used_gb,
+        };
+        let disks = vec![
+            disk(1, 927.0, 926.0),
+            disk(2, 2000.0, 1000.0),
+            disk(3, 12000.0, 11800.0),
+            disk(4, 927.0, 926.0),
+        ];
+        let flagged = holding_back(&disks, &[1, 2, 3], None);
+        let ids: Vec<i32> = flagged.iter().map(|n| n.node_id).collect();
+        assert_eq!(ids, vec![1, 3]);
+        assert_eq!(flagged[0].pull_floor_gb, 20.0);
+        assert!((flagged[1].pull_floor_gb - 240.0).abs() < 0.01);
+        assert!(flagged.iter().all(|n| n.reason == "low_space"));
+    }
+
+    // Impact: second review of #100 — a probe-failure pause was invisible
+    // outside the node's log: its replicated disk numbers look healthy, so
+    // the pane showed a node holding back as fine.
+    // Should: flag this node as holding back for probe_error when its own
+    // guard says so, even with plenty of reported free space.
+    // Should not: flag it for a low-space pause the metrics do not show.
+    #[test]
+    fn a_probe_error_pause_shows_as_holding_back() {
+        use hopnet_storage::admission::{PauseReason, SpaceReport};
+        let disks = vec![NodeDisk {
+            node_id: 2,
+            display_name: "desktop".into(),
+            total_gb: 2000.0,
+            used_gb: 500.0,
+        }];
+        let mut report = SpaceReport {
+            pause_reason: Some(PauseReason::ProbeError),
+            last_probe_error: Some("Input/output error".into()),
+            ..SpaceReport::default()
+        };
+        let flagged = holding_back(&disks, &[2], Some((2, &report)));
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(
+            (flagged[0].node_id, flagged[0].reason.as_str()),
+            (2, "probe_error")
+        );
+        assert_eq!(flagged[0].display_name, "desktop");
+
+        report.pause_reason = Some(PauseReason::LowSpace);
+        assert!(holding_back(&disks, &[2], Some((2, &report))).is_empty());
+    }
+
+    // Impact: review of #100 at bbf1cf58 — a local probe-error pause
+    // replaced the metrics' low-space entry for the same node, so a full
+    // disk read as "cannot read its free space".
+    // Should: keep the low-space entry when the metrics already flag this
+    // node, whatever its own guard says.
+    #[test]
+    fn a_low_space_entry_wins_over_a_local_probe_error() {
+        use hopnet_storage::admission::{PauseReason, SpaceReport};
+        let disks = vec![NodeDisk {
+            node_id: 3,
+            display_name: "macbook".into(),
+            total_gb: 927.0,
+            used_gb: 926.0,
+        }];
+        let report = SpaceReport {
+            pause_reason: Some(PauseReason::ProbeError),
+            ..SpaceReport::default()
+        };
+        let flagged = holding_back(&disks, &[3], Some((3, &report)));
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].reason, "low_space");
+    }
+
     fn parts_reporting(user_data_gb: f64) -> StorageParts {
         StorageParts {
             member_ids: vec![1, 2, 3],
             levels: vec![(2, 4096.0)],
             baselines: vec![],
             owed_pull: (0, false),
+            disks: vec![],
             curve: vec![FaultToleranceCurvePoint {
                 user_data_gb,
                 active_nodes: 3,

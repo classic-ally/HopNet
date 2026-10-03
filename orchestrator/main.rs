@@ -1219,6 +1219,11 @@ pub(crate) async fn create_hopnet_container(
             if std::env::var("HOPNET_STORAGE_MIN_FREE_BYTES").is_err() {
                 e.push("HOPNET_STORAGE_MIN_FREE_BYTES=0".to_string());
             }
+            // The pull floor likewise (max(20 GiB, 2%) of the shared host
+            // disk would hold back every pull on a fullish dev host).
+            if std::env::var("HOPNET_PULL_MIN_FREE_BYTES").is_err() {
+                e.push("HOPNET_PULL_MIN_FREE_BYTES=0".to_string());
+            }
             // Default consensus-policy seed (RFC-CONSENSUS-002 S5): mesh
             // FORMATION under mesh-initiated seating needs a small s_full
             // (the v=1 formation batch is exposed) and p_prove (stacked

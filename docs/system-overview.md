@@ -602,8 +602,14 @@ apply functions inside consensus handlers.
       through an evidence lane instead of three awaited consensus rounds
       per blob; and a fetch scheduler runs a 64-blob window under global
       and per-peer caps with peer and blob parking, so an offline origin
-      cannot stall it (`HOPNET_PULL_*` knobs, thor narrower). Still open
-      for design: a free-space floor on pulls, unseating a validator
+      cannot stall it (`HOPNET_PULL_*` knobs, thor narrower). The pull
+      floor (2026.10.9): replica writes (pulls, rebuilds, re-encodes,
+      the inbound store) stop at max(20 GiB, 2%) free and resume
+      max(10 GiB, 1%) higher, while the node keeps serving; urgent
+      repair may use the reserve down to the ingest floor; an ENOSPC
+      store is held, never rebuilt around; the resilience pane flags
+      members holding back. Still open for design: "closed: keep what
+      you hold" placement for a genuinely full mesh, unseating a validator
       that stops voting, and (known 10.8 limitation) availability that
       reflects serving: a member that answers probes but cannot serve
       fragments stays in the storage view and is never rebuilt around.
