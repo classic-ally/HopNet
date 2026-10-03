@@ -78,10 +78,6 @@ pub const PEER_PARK_CAP: Duration = Duration::from_secs(600);
 /// First blob park; doubles per repeat, capped.
 pub const BLOB_PARK_BASE: Duration = Duration::from_secs(60);
 pub const BLOB_PARK_CAP: Duration = Duration::from_secs(1800);
-/// A blob parked this long on unreachable holders is rebuilt anyway
-/// (subject to the rebuild slots and K sourceable shards): a holder dark
-/// for hours is as good as gone.
-pub const UNREACHABLE_ESCALATE: Duration = Duration::from_secs(2 * 3600);
 /// A park entry whose park ended this long ago is forgotten.
 pub const PARK_FORGET: Duration = Duration::from_secs(3600);
 /// How long the cached storage-view membership is reused.
@@ -336,7 +332,7 @@ impl FetchScheduler {
     /// Forget park entries whose park ended over `PARK_FORGET` ago: nothing
     /// re-parked them since, so the blob was confirmed, deleted, or went
     /// quiet. A blob still stuck is re-parked on every retry and keeps its
-    /// entry (and its escalation age). Returns how many were dropped.
+    /// entry. Returns how many were dropped.
     pub fn prune_parks(&self, now: Instant) -> usize {
         let mut blobs = self.blobs.lock().unwrap();
         let before = blobs.len();
@@ -344,6 +340,7 @@ impl FetchScheduler {
         before - blobs.len()
     }
 
+    #[cfg(test)]
     /// How long the blob has been in the park book (since its first park,
     /// across repeats), if at all.
     pub fn blob_parked_for(&self, blob_id: &BlobId, now: Instant) -> Option<Duration> {
@@ -877,7 +874,7 @@ mod tests {
     // quiescent or were deleted while parked were never removed.
     // Should: drop an entry whose park ended more than an hour ago.
     // Should not: drop one still parked, or recently ended (a stuck blob
-    // re-parked on retry keeps its escalation age).
+    // re-parked on retry keeps its entry).
     #[test]
     fn stale_park_entries_are_pruned() {
         use std::str::FromStr;

@@ -621,16 +621,16 @@ where
         }
 
         let mut park = false;
-        // Parked on dark holders for hours: stop waiting and rebuild.
-        let escalated = sched
-            .blob_parked_for(blob_id, std::time::Instant::now())
-            .is_some_and(|age| age >= fetch::UNREACHABLE_ESCALATE);
+        // The rebuild rule: a class is rebuilt only when every holder has
+        // left the storage view (filtered out above, so it arrives here as
+        // unserved) or every reachable holder says it does not have it.
+        // A member that is dark, parked, slow or busy is never rebuilt
+        // around: the blob parks with backoff. A member dark for long
+        // enough is voted out, and then its classes become rebuildable
+        // through the membership filter.
         for (chunk, (mut unserved, unreachable)) in unserved_by_chunk {
             unserved.sort_unstable();
-            if unreachable && !escalated {
-                // Its holders are dark, parked or busy, not its bytes gone:
-                // a rebuild would hold a chunk of shards for nothing the
-                // holders will not serve once back. Park and retry.
+            if unreachable {
                 outcome.failed += unserved.len();
                 park = true;
                 continue;
@@ -1108,16 +1108,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // Impact: re-review of #96 — a blob whose holder was dark parked
-    // forever, and inventory rows of departed nodes counted as holders to
-    // wait for, so their classes were never rebuilt.
+    // Impact: inventory rows of departed nodes counted as holders to wait
+    // for, so their classes were never rebuilt; and rebuilding around a
+    // member that is merely dark spends memory and makes copies its holder
+    // will serve again once back (decided with Allison: a member dark for
+    // long enough is voted out, and only then rebuilt around).
     // Should: rebuild (not park) a class whose only holder has left the
     // storage view, even while that node is dark.
-    // Should: rebuild a class whose member holder has been dark for longer
-    // than the escalation threshold.
-    // Should not: escalate a blob parked only briefly.
+    // Should not: rebuild around a member holder, however long it has been
+    // dark: the blob stays parked.
     #[tokio::test(flavor = "multi_thread")]
-    async fn departed_or_long_dark_holders_escalate_to_a_rebuild() {
+    async fn departed_holders_rebuild_and_dark_members_do_not() {
         let base = std::env::temp_dir().join(format!("hopnet-pull-escal-{}", std::process::id()));
         let dir_src = base.join("src").to_str().unwrap().to_string();
         let dir_dst = base.join("dst").to_str().unwrap().to_string();
@@ -1146,20 +1147,16 @@ mod tests {
         pull_with_sched(&seams_for(false), &dir_dst, &blob_id, &sched).await;
         assert!(!sched.blob_parked(&blob_id, std::time::Instant::now()));
 
-        // A member dark for a minute: parked, no rebuild.
+        // A member dark for a long time (its park entry hours old): still
+        // parked, never rebuilt around.
         let now = std::time::Instant::now();
         let sched = FetchScheduler::new(PullLimits::default());
-        sched.park_blob(&blob_id, now - std::time::Duration::from_secs(60));
-        pull_with_sched(&seams_for(true), &dir_dst, &blob_id, &sched).await;
-        assert!(sched.blob_parked(&blob_id, std::time::Instant::now()));
-
-        // Dark beyond the threshold: escalated to a rebuild, not re-parked.
-        if let Some(long_ago) = now.checked_sub(fetch::UNREACHABLE_ESCALATE * 2) {
-            let sched = FetchScheduler::new(PullLimits::default());
+        if let Some(long_ago) = now.checked_sub(std::time::Duration::from_secs(4 * 3600)) {
             sched.park_blob(&blob_id, long_ago);
-            pull_with_sched(&seams_for(true), &dir_dst, &blob_id, &sched).await;
-            assert!(!sched.blob_parked(&blob_id, std::time::Instant::now()));
         }
+        let (result, _) = pull_with_sched(&seams_for(true), &dir_dst, &blob_id, &sched).await;
+        assert_eq!(result.rebuilt, 0);
+        assert!(sched.blob_parked(&blob_id, std::time::Instant::now()));
         let _ = std::fs::remove_dir_all(&base);
     }
 

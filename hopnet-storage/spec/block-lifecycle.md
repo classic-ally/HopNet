@@ -1223,13 +1223,21 @@ optimization and carries no proof obligation.
       re-encode), a per-peer cap (8) and a per-blob share (6), each
       with a 30 s deadline. A source failing at the transport three
       times running parks (30 s doubling to 10 min); one the host's
-      liveness evidence calls dark is skipped; a blob whose known
-      holders are all dark and cannot be rebuilt parks (1 min doubling
-      to 30 min) and leaves the window, so an offline origin cannot
-      stall it. Knobs `HOPNET_PULL_WINDOW`, `_FETCH_GLOBAL`,
-      `_FETCH_PER_PEER`, `_URGENT_RESERVE`; thor runs 16/6/3/2 from
-      nix-config. Re-encode's own shard fetches stay serial (one chunk
-      at a time on the dispatch loop), outside the caps.
+      liveness evidence calls dark is skipped; a blob a class of which
+      is held by a dark, parked, slow or busy member parks (1 min
+      doubling to 30 min) and leaves the window, so an offline origin
+      cannot stall it. Knobs `HOPNET_PULL_WINDOW`, `_FETCH_GLOBAL`,
+      `_FETCH_PER_PEER`, `_URGENT_RESERVE`, `_REBUILDS`; thor runs
+      16/6/3/2/1 from nix-config.
+    - The rebuild rule (decided with Allison after review): a class is
+      rebuilt only when every holder has left the storage view (sources
+      are filtered to current members; departed nodes' inventory rows
+      are not holders) or every reachable holder reports it does not
+      have it or serves bytes that fail verification. A member that is
+      dark, parked, slow or busy is never rebuilt around; a member dark
+      long enough is voted out, which makes its classes rebuildable.
+      Pull-path rebuilds take one of `HOPNET_PULL_REBUILDS` slots without
+      waiting and fetch shards through the scheduler.
   - Rehearsal (2026-09-27): `orchestrator test --test
     lifecycle-cutover-drain --flags blobs=N` — a mesh born on the
     deployed release image, populated, crosses into the build under
