@@ -6,12 +6,6 @@
 //! pacing now lives on the pull side — one serial worker per node, so
 //! concurrency tracks the mesh, not the upload count.
 
-/// In-flight blobs the policy tick re-kicks per run, oldest goal first.
-/// Bounded so a ballooning in-flight set (a catch-up drain after a view
-/// transition) is paced, never refused — the set records need, the tick
-/// works it down.
-pub const PULL_KICKS_PER_TICK: usize = 64;
-
 /// The fulfillment pass's base sample (S4): in-flight blobs checked for
 /// complete confirmation evidence in the tick's first round. Rounds
 /// continue, doubling, while the sample stays dense (`next_fulfillment_sample`).
@@ -57,6 +51,20 @@ pub const DECLARE_PAGE_SIZE: usize = 500;
 /// wire; the live mesh's 196k-fragment node attests in 24 pages where one
 /// 6.5 MB transaction timed out in the queue (2026-10-01).
 pub const ATTEST_PAGE_SIZE: usize = 8192;
+
+/// The longest a pull's evidence waits in the evidence lane before a
+/// partial page is flushed — the rolling sweep's buffer age, so pull and
+/// sweep evidence age out of their buffers on the same clock.
+pub const EVIDENCE_MAX_AGE_SECS: u64 = 60;
+
+/// The evidence lane flushes once nothing new has arrived for this long,
+/// so a lone upload confirms within seconds instead of waiting out the age
+/// bound; a draining node pushes faster than this and still batches.
+pub const EVIDENCE_QUIET_MS: u64 = 2_000;
+
+/// Blobs per `ConfirmPlacement` the evidence lane proposes. Block-size
+/// hygiene like the declare page: an entry is a blob id and a height.
+pub const CONFIRM_PAGE_SIZE: usize = 500;
 
 /// The staleness pass's grace rung: a node that has not observed the
 /// `desired < T` check (a proposal of its own, or anyone's declare page

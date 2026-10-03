@@ -50,11 +50,15 @@ pub fn spawn_storage_engine(app_state: &AppState) {
         },
         EngineConfig {
             fragments_dir: app_state.fragments_dir.clone(),
+            limits: hopnet_storage::engine::fetch::PullLimits::from_env(),
         },
         tokio::runtime::Handle::current(),
     );
     // Lost race = another spawner won; their engine is equivalent.
     let _ = app_state.storage.set(handle);
+    // The planner is what wakes the worker for the in-flight set; the
+    // policy tick restarts it if it ever stops.
+    crate::storage_host::pull_planner::ensure_running(app_state);
 }
 
 /// Seam bundle for the crate's get path (api::get) — one shared adapter
@@ -256,6 +260,21 @@ impl StateReader for SubstrateHost {
 
     fn local_node_id(&self) -> Option<i32> {
         self.app_state.node_id.get().copied()
+    }
+
+    /// Dark by this node's own liveness evidence: probed at least the
+    /// vote-out attestation floor of times since its last contact. A peer
+    /// with no evidence yet counts as reachable (first-deadline grace).
+    fn peer_reachable(&self, node_id: i32) -> bool {
+        !self
+            .app_state
+            .evidence
+            .snapshot()
+            .iter()
+            .find(|(id, _)| *id == node_id)
+            .is_some_and(|(_, view)| {
+                view.probes_since_contact >= hopnet_consensus::membership::ATTESTATION_PROBE_FLOOR
+            })
     }
 }
 

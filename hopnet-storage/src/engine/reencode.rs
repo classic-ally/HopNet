@@ -149,6 +149,39 @@ where
     S: StateReader,
     L: LocalStateSink,
 {
+    reencode_chunk_via(
+        state,
+        local_state,
+        fragments_dir,
+        blob_id,
+        chunk_number,
+        missing_classes,
+        |hash, hint, members| async move {
+            crate::api::find_fragment_via(transport, &hash, &members, Some(hint)).await
+        },
+    )
+    .await
+}
+
+/// `reencode_chunk` with the shard fetch supplied by the caller: the pull
+/// path routes it through the fetch scheduler (caps, deadline, parked and
+/// dark peers skipped); the repair path uses plain discovery. `fetch`
+/// gets a shard's hash, its attested holders and the view's members.
+pub async fn reencode_chunk_via<S, L, F, Fut>(
+    state: &S,
+    local_state: &L,
+    fragments_dir: &str,
+    blob_id: &BlobId,
+    chunk_number: u32,
+    missing_classes: &[u32],
+    mut fetch: F,
+) -> Result<ReencodeOutcome, EngineError>
+where
+    S: StateReader,
+    L: LocalStateSink,
+    F: FnMut(Blake3Hash, Vec<crate::traits::PeerRef>, Vec<crate::traits::PeerRef>) -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<u8>>>,
+{
     let Some(manifest) = state.blob_manifest(blob_id)? else {
         return Ok(ReencodeOutcome {
             regenerated: 0,
@@ -206,10 +239,8 @@ where
             if shards.len() >= ORIGINAL_FRAGMENTS_PER_CHUNK {
                 break;
             }
-            let hint = sources.remove(&hash);
-            if let Some(data) =
-                crate::api::find_fragment_via(transport, &hash, &view.members, hint).await
-            {
+            let hint = sources.remove(&hash).unwrap_or_default();
+            if let Some(data) = fetch(hash, hint, view.members.clone()).await {
                 shards.insert(class, data);
                 fetched += 1;
             }

@@ -30,16 +30,18 @@
 //! threshold, the blind placement batcher) is gone. The engine owns NO
 //! runtime: the host passes a handle at spawn.
 
+pub mod evidence;
+pub mod fetch;
 pub mod policy;
 pub mod reencode;
 
 use crate::error::StorageError;
 use crate::fragstore;
-use crate::lifecycle::{ConfirmPlacement, PlacementConfirmation, CONFIRM_TX_FN};
-use crate::traits::{LocalStateSink, StateReader, SubmitError, Transport, TxSubmitter};
+use crate::traits::{LocalStateSink, StateReader, Transport, TxSubmitter};
 use crate::types::BlobId;
+use fetch::{FetchMiss, FetchScheduler, PullLimits};
 use hopnet_common::Blake3Hash;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -68,6 +70,8 @@ impl<T, S, X, L> Clone for Seams<T, S, X, L> {
 pub struct EngineConfig {
     /// Local fragment store root.
     pub fragments_dir: String,
+    /// Pull concurrency (`fetch::PullLimits::from_env` in production).
+    pub limits: PullLimits,
 }
 
 #[derive(Debug)]
@@ -106,10 +110,11 @@ pub struct PullOutcome {
     pub rebuilt: usize,
     /// Owed classes still missing after both — retried on the next kick.
     pub failed: usize,
-    /// A prompt attestation was submitted for this node's new copies.
-    pub attested: bool,
-    /// A ConfirmPlacement was proposed (the goal's evidence was complete).
-    pub confirm_proposed: bool,
+    /// This blob's belief, disk truth and confirmation check went to the
+    /// evidence lane (births and moved bytes only).
+    pub evidence_queued: bool,
+    /// Waiting for a rebuild slot: offer the blob again after this long.
+    pub retry_after: Option<std::time::Duration>,
 }
 
 /// Aggregate of many pull checks (the tick's re-kick, the operator drain).
@@ -120,7 +125,8 @@ pub struct PullStats {
     pub pulled: usize,
     pub rebuilt: usize,
     pub failed: usize,
-    pub confirms_proposed: usize,
+    /// Blobs whose evidence went to the evidence lane.
+    pub evidence_queued: usize,
 }
 
 /// One re-encode work item for the serial worker (RFC-STORAGE-001 Repair:
@@ -132,7 +138,76 @@ pub struct ReencodeCmd {
     pub missing_classes: Vec<u32>,
 }
 
-type PullRequest = (BlobId, Option<oneshot::Sender<PullOutcome>>);
+type PullRequest = BlobId;
+
+/// Blobs queued for (or in) a pull check, each with the callers waiting
+/// on its outcome. One entry per blob: a second request for a queued blob
+/// waits on the same check instead of queueing a duplicate.
+type PullQueue = Arc<std::sync::Mutex<HashMap<BlobId, Vec<oneshot::Sender<PullOutcome>>>>>;
+
+/// Takes a blob out of the queue when its check ends — normally by
+/// `finish`, which answers the waiters; if the check panics, on drop, so
+/// the blob can be queued again (its waiters see the engine as gone).
+struct QueuedEntry {
+    queue: PullQueue,
+    blob_id: Option<BlobId>,
+}
+
+impl QueuedEntry {
+    fn finish(mut self, outcome: PullOutcome) {
+        if let Some(blob_id) = self.blob_id.take() {
+            let waiters = self.queue.lock().unwrap().remove(&blob_id);
+            for waiter in waiters.into_iter().flatten() {
+                let _ = waiter.send(outcome);
+            }
+        }
+    }
+}
+
+impl Drop for QueuedEntry {
+    fn drop(&mut self) {
+        if let Some(blob_id) = self.blob_id.take() {
+            self.queue.lock().unwrap().remove(&blob_id);
+        }
+    }
+}
+
+/// Queue a pull check unless one is already queued; see
+/// `EngineHandle::enqueue`.
+fn enqueue_on(
+    queue: &PullQueue,
+    pull_tx: &mpsc::UnboundedSender<PullRequest>,
+    blob_id: BlobId,
+    waiter: Option<oneshot::Sender<PullOutcome>>,
+) -> bool {
+    let mut queued = queue.lock().unwrap();
+    if let Some(waiters) = queued.get_mut(&blob_id) {
+        waiters.extend(waiter);
+        return false;
+    }
+    if pull_tx.send(blob_id.clone()).is_err() {
+        return false;
+    }
+    queued.insert(blob_id, waiter.into_iter().collect());
+    true
+}
+
+/// Held by the dispatch loop: however it ends, every queued blob is
+/// dropped and every waiter sees the engine as gone (`None`) instead of
+/// hanging, and the closed channel refuses later requests.
+struct DrainOnExit(PullQueue);
+
+impl Drop for DrainOnExit {
+    fn drop(&mut self) {
+        let drained = std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
+        if !drained.is_empty() {
+            tracing::error!(
+                queued = drained.len(),
+                "pull: dispatch loop ended; queued checks dropped"
+            );
+        }
+    }
+}
 
 /// Handle to the running engine. Cheap to clone; the host stores one in its
 /// app state (mirrors the consensus EngineHandle pattern).
@@ -141,38 +216,87 @@ pub struct EngineHandle {
     pull_tx: mpsc::UnboundedSender<PullRequest>,
     reencode_urgent_tx: mpsc::UnboundedSender<ReencodeCmd>,
     reencode_lazy_tx: mpsc::UnboundedSender<ReencodeCmd>,
+    /// Blobs waiting for (or in) a pull check: hints for a blob already
+    /// queued are dropped, and the planner paces itself on the count.
+    queued: PullQueue,
+    sched: Arc<FetchScheduler>,
 }
 
 impl EngineHandle {
     /// Latency hint for a decided blob (or a moved goal): check this node's
     /// pull duties for it soon. NON-BLOCKING (unbounded send) — safe from
     /// the host's consensus apply path. Carries no correctness weight: the
-    /// tick's level-triggered re-kick discovers anything a hint missed.
+    /// pull planner's pass over the in-flight set discovers anything a
+    /// hint missed. A blob already queued is not queued twice.
     pub fn notify_blob_committed(&self, blob_id: BlobId) {
-        let _ = self.pull_tx.send((blob_id, None));
+        self.offer(blob_id);
     }
 
-    /// Pull check for one blob, serialized on the worker; resolves when it
+    /// Queue a pull check for `blob_id` unless one is already queued.
+    /// Returns whether it was queued.
+    pub fn offer(&self, blob_id: BlobId) -> bool {
+        self.enqueue(blob_id, None)
+    }
+
+    /// The one way into the queue: a blob already queued gains a waiter
+    /// (if any) and is not sent again. Returns whether it was newly queued.
+    fn enqueue(&self, blob_id: BlobId, waiter: Option<oneshot::Sender<PullOutcome>>) -> bool {
+        enqueue_on(&self.queued, &self.pull_tx, blob_id, waiter)
+    }
+
+    /// Pull checks queued or running — the planner keeps this near its
+    /// target instead of flooding the channel.
+    pub fn queued_len(&self) -> usize {
+        self.queued.lock().unwrap().len()
+    }
+
+    /// The fetch scheduler's live state: window, fetches in flight per
+    /// peer, parked peers and blobs.
+    pub fn scheduler_stats(&self) -> fetch::SchedulerStats {
+        self.sched.stats(std::time::Instant::now())
+    }
+
+    /// Parked on unreachable sources: the planner skips it until its
+    /// backoff passes.
+    pub fn blob_parked(&self, blob_id: &BlobId) -> bool {
+        self.sched.blob_parked(blob_id, std::time::Instant::now())
+    }
+
+    /// Drop park entries nobody has re-parked for an hour (blobs that went
+    /// quiescent or were deleted while parked). Returns how many.
+    pub fn prune_parks(&self) -> usize {
+        self.sched.prune_parks(std::time::Instant::now())
+    }
+
+    /// Pull check for one blob, run in the window; resolves when it
     /// completes. `None` = engine gone.
     pub async fn pull_blob(&self, blob_id: BlobId) -> Option<PullOutcome> {
         let (tx, rx) = oneshot::channel();
-        self.pull_tx.send((blob_id, Some(tx))).ok()?;
+        // A blob already queued is waited on, not queued twice.
+        self.enqueue(blob_id, Some(tx));
         rx.await.ok()
     }
 
-    /// Pull checks for a batch of blobs, aggregated. Engine-gone counts as
-    /// a failure — a later tick retries the blob.
+    /// Pull checks for a batch of blobs, aggregated. All are queued at once
+    /// (the window runs them in parallel), then awaited. Engine-gone counts
+    /// as a failure — a later pass retries the blob.
     pub async fn pull_blobs(&self, blob_ids: impl IntoIterator<Item = BlobId> + Send) -> PullStats {
         let mut stats = PullStats::default();
+        let mut waiting = Vec::new();
         for blob_id in blob_ids {
+            let (tx, rx) = oneshot::channel();
+            self.enqueue(blob_id.clone(), Some(tx));
+            waiting.push((blob_id, rx));
+        }
+        for (blob_id, rx) in waiting {
             stats.checked += 1;
-            match self.pull_blob(blob_id.clone()).await {
+            match rx.await.ok() {
                 Some(o) => {
                     stats.owed += o.owed;
                     stats.pulled += o.pulled;
                     stats.rebuilt += o.rebuilt;
                     stats.failed += o.failed;
-                    stats.confirms_proposed += o.confirm_proposed as usize;
+                    stats.evidence_queued += o.evidence_queued as usize;
                 }
                 None => {
                     stats.failed += 1;
@@ -197,10 +321,13 @@ impl EngineHandle {
         }
     }
 
-    /// Spawn the engine: ONE serial worker on `data_rt` running the duty
-    /// ladder as queue order — urgent re-encode > pull checks > lazy
-    /// re-encode — so repair memory (~one chunk of shards in flight) and
-    /// bandwidth stay bounded per node.
+    /// Spawn the engine on `data_rt`: one dispatch loop running the duty
+    /// ladder as priority order — urgent re-encode > pull admission > lazy
+    /// re-encode. Pulls run in a bounded window of blobs whose fetches
+    /// share the scheduler's global and per-peer caps (`fetch`), so memory
+    /// and bandwidth stay bounded per node; re-encodes run on the loop
+    /// itself (one chunk of shards at a time) while admitted pulls proceed,
+    /// and an urgent one stops admission until it is done.
     pub fn spawn<T, S, X, L>(
         seams: Seams<T, S, X, L>,
         config: EngineConfig,
@@ -217,30 +344,75 @@ impl EngineHandle {
         let (reencode_lazy_tx, mut reencode_lazy_rx) = mpsc::unbounded_channel::<ReencodeCmd>();
 
         let fragments_dir = config.fragments_dir;
+        let queued: PullQueue = Default::default();
+        let worker_queued = queued.clone();
+        let sched = FetchScheduler::new(config.limits);
+        let worker_sched = sched.clone();
+        // Weak, so the loop still ends when every handle is dropped.
+        let retry_tx = pull_tx.downgrade();
+        let lane =
+            evidence::EvidenceLane::spawn(seams.state.clone(), seams.submitter.clone(), &data_rt);
         data_rt.spawn(async move {
+            let _drain = DrainOnExit(worker_queued.clone());
+            let mut running: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     biased;
                     cmd = reencode_urgent_rx.recv() => {
                         let Some(cmd) = cmd else { break };
-                        run_reencode_cmd(&seams, &fragments_dir, cmd).await;
+                        run_reencode_guarded(&seams, &fragments_dir, cmd).await;
                     }
-                    item = pull_rx.recv() => {
-                        let Some((blob_id, reply)) = item else { break };
-                        let outcome = match pull_owed(&seams, &fragments_dir, &blob_id).await {
-                            Ok(o) => o,
-                            Err(e) => {
-                                tracing::warn!("pull: blob {blob_id} failed: {e}");
-                                PullOutcome::default()
-                            }
+                    Some(_) = running.join_next(), if !running.is_empty() => {}
+                    admitted = async {
+                        let permit = worker_sched.window.clone().acquire_owned().await;
+                        (permit, pull_rx.recv().await)
+                    } => {
+                        let (Ok(permit), Some(blob_id)) = admitted else { break };
+                        let entry = QueuedEntry {
+                            queue: worker_queued.clone(),
+                            blob_id: Some(blob_id.clone()),
                         };
-                        if let Some(reply) = reply {
-                            let _ = reply.send(outcome);
+                        if worker_sched.blob_parked(&blob_id, std::time::Instant::now()) {
+                            // Its sources are dark: let the window move on.
+                            entry.finish(PullOutcome::default());
+                            continue;
                         }
+                        let (seams, dir, lane, sched, queue, retry_tx) = (
+                            seams.clone(),
+                            fragments_dir.clone(),
+                            lane.clone(),
+                            worker_sched.clone(),
+                            worker_queued.clone(),
+                            retry_tx.clone(),
+                        );
+                        running.spawn(async move {
+                            // Dropped on panic too: the blob leaves the queue.
+                            let entry = entry;
+                            let outcome = match pull_owed(&seams, &dir, &blob_id, &lane, &sched).await {
+                                Ok(o) => o,
+                                Err(e) => {
+                                    tracing::warn!("pull: blob {blob_id} failed: {e}");
+                                    PullOutcome::default()
+                                }
+                            };
+                            drop(permit);
+                            entry.finish(outcome);
+                            // Waiting for a rebuild slot: back as soon as the
+                            // short park ends, not when the planner's cursor
+                            // next reaches this blob's slice.
+                            if let Some(after) = outcome.retry_after {
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(after).await;
+                                    if let Some(tx) = retry_tx.upgrade() {
+                                        enqueue_on(&queue, &tx, blob_id, None);
+                                    }
+                                });
+                            }
+                        });
                     }
                     cmd = reencode_lazy_rx.recv() => {
                         let Some(cmd) = cmd else { break };
-                        run_reencode_cmd(&seams, &fragments_dir, cmd).await;
+                        run_reencode_guarded(&seams, &fragments_dir, cmd).await;
                     }
                 }
             }
@@ -250,12 +422,34 @@ impl EngineHandle {
             pull_tx,
             reencode_urgent_tx,
             reencode_lazy_tx,
+            queued,
+            sched,
         }
     }
 }
 
-/// Run one re-encode command on the serial worker (errors logged, not
-/// propagated — the next tick's scan re-elects and retries).
+/// Run one re-encode command as its own task and wait for it: still one
+/// at a time on the dispatch loop, but a panic in it ends that task, not
+/// the loop that every pull depends on.
+async fn run_reencode_guarded<T, S, X, L>(
+    seams: &Seams<T, S, X, L>,
+    fragments_dir: &str,
+    cmd: ReencodeCmd,
+) where
+    T: Transport + 'static,
+    S: StateReader + 'static,
+    X: TxSubmitter + 'static,
+    L: LocalStateSink + 'static,
+{
+    let (seams, dir) = (seams.clone(), fragments_dir.to_string());
+    let (blob_id, chunk) = (cmd.blob_id.clone(), cmd.chunk_number);
+    if let Err(e) = tokio::spawn(async move { run_reencode_cmd(&seams, &dir, cmd).await }).await {
+        tracing::error!("re-encode: blob {blob_id} chunk {chunk} task failed: {e}");
+    }
+}
+
+/// Run one re-encode command (errors logged, not propagated — the next
+/// tick's scan re-elects and retries).
 async fn run_reencode_cmd<T, S, X, L>(
     seams: &Seams<T, S, X, L>,
     fragments_dir: &str,
@@ -286,26 +480,32 @@ async fn run_reencode_cmd<T, S, X, L>(
 }
 
 /// The pull check for one blob on this node: derive the owed classes from
-/// the goal, fetch each with recovery, then attest and (if the goal's
-/// evidence is complete) propose confirmation.
+/// the goal, fetch each with recovery, then content-verify the blob's
+/// fragments and hand the evidence to the lane — which reports belief and
+/// disk truth and proposes confirmation in pages. The worker never waits
+/// on consensus.
 async fn pull_owed<T, S, X, L>(
     seams: &Seams<T, S, X, L>,
     fragments_dir: &str,
     blob_id: &BlobId,
+    lane: &evidence::EvidenceLane,
+    sched: &Arc<FetchScheduler>,
 ) -> Result<PullOutcome, EngineError>
 where
     T: Transport + 'static,
-    S: StateReader,
+    S: StateReader + 'static,
     X: TxSubmitter,
-    L: LocalStateSink,
+    L: LocalStateSink + 'static,
 {
     let mut outcome = PullOutcome::default();
     let Some(target) = seams.state.pull_target(blob_id)? else {
         // Unknown blob (raced a delete), or the record does not reach the
         // goal yet: nothing is owed until it does.
+        sched.unpark_blob(blob_id);
         return Ok(outcome);
     };
     let Some(manifest) = seams.state.blob_manifest(blob_id)? else {
+        sched.unpark_blob(blob_id);
         return Ok(outcome);
     };
     let me = seams
@@ -332,46 +532,186 @@ where
         }
     }
     outcome.owed = owed.values().map(Vec::len).sum();
+    if outcome.owed == 0 {
+        // Owing nothing (pulled since, or re-goaled away): it has no
+        // business in the park book.
+        sched.unpark_blob(blob_id);
+    }
 
     if outcome.owed > 0 {
         let hashes: Vec<Blake3Hash> = owed.values().flatten().map(|(_, h)| *h).collect();
         let mut sources = seams.state.fragment_sources(&hashes)?;
-        let candidates = seams.state.all_peers()?;
+        let all_peers = seams.state.all_peers()?;
+        // Sources the host's liveness evidence calls dark are skipped like
+        // parked ones: the blob parks instead of holding window slots.
+        let dark: HashSet<i32> = all_peers
+            .iter()
+            .map(|p| p.node_id)
+            .filter(|n| !seams.state.peer_reachable(*n))
+            .collect();
+        let others: Arc<Vec<crate::traits::PeerRef>> = Arc::new(
+            all_peers
+                .into_iter()
+                .filter(|p| !dark.contains(&p.node_id))
+                .collect(),
+        );
+        // Inventory rows of nodes that have left the storage view (decayed
+        // out on availability) outlive them: they are not holders to wait for. A
+        // class held only by non-members is unserved, so it rebuilds; a
+        // live non-member is still reached through discovery.
+        let members = sched.members(&seams.state, std::time::Instant::now()).await;
+        let is_member = |node: i32| {
+            members
+                .as_ref()
+                .is_none_or(|m: &Arc<HashSet<i32>>| m.contains(&node))
+        };
+
+        // Every owed class at once, at most `per_blob` in flight, each under
+        // the scheduler's global and per-peer caps.
+        let per_blob = Arc::new(tokio::sync::Semaphore::new(sched.limits.per_blob()));
+        let mut fetches: tokio::task::JoinSet<(u32, u32, Result<(), FetchMiss>)> =
+            tokio::task::JoinSet::new();
         for (chunk, classes) in &owed {
-            let mut unserved: Vec<u32> = Vec::new();
             for (class, hash) in classes {
-                let hint = sources.remove(hash);
-                match crate::api::find_fragment_via(&seams.transport, hash, &candidates, hint).await
-                {
-                    Some(data) => match fragstore::store_fragment(fragments_dir, hash, data) {
-                        Ok(()) => {
-                            seams.local_state.mark_local(*hash).await;
-                            outcome.pulled += 1;
+                let known: Vec<crate::traits::PeerRef> = sources
+                    .remove(hash)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|p| is_member(p.node_id))
+                    .collect();
+                let attested: Vec<crate::traits::PeerRef> = known
+                    .iter()
+                    .copied()
+                    .filter(|p| !dark.contains(&p.node_id))
+                    .collect();
+                let all_dark = !known.is_empty() && attested.is_empty();
+                let (chunk, class, hash) = (*chunk, *class, *hash);
+                let (transport, local_state, sched, per_blob, others, dir) = (
+                    seams.transport.clone(),
+                    seams.local_state.clone(),
+                    sched.clone(),
+                    per_blob.clone(),
+                    others.clone(),
+                    fragments_dir.to_string(),
+                );
+                fetches.spawn(async move {
+                    let Ok(_slot) = per_blob.acquire_owned().await else {
+                        return (chunk, class, Err(FetchMiss::NotServed));
+                    };
+                    if all_dark {
+                        return (chunk, class, Err(FetchMiss::Unreachable));
+                    }
+                    let fetch::Fetched { data, slot } =
+                        match fetch::fetch_class(&transport, &sched, &hash, &attested, &others)
+                            .await
+                        {
+                            Ok(fetched) => fetched,
+                            Err(miss) => return (chunk, class, Err(miss)),
+                        };
+                    // The global slot is held until the bytes are on disk.
+                    let stored = tokio::task::spawn_blocking(move || {
+                        fragstore::store_fragment(&dir, &hash, data)
+                    })
+                    .await;
+                    drop(slot);
+                    match stored {
+                        Ok(Ok(())) => {
+                            local_state.mark_local(hash).await;
+                            (chunk, class, Ok(()))
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("pull: store fragment {} failed: {e}", hash.to_hex());
+                            (chunk, class, Err(FetchMiss::NotServed))
                         }
                         Err(e) => {
-                            tracing::warn!("pull: store fragment {} failed: {e}", hash.to_hex());
-                            unserved.push(*class);
+                            tracing::warn!("pull: store fragment {} join: {e}", hash.to_hex());
+                            (chunk, class, Err(FetchMiss::NotServed))
                         }
-                    },
-                    None => unserved.push(*class),
+                    }
+                });
+            }
+        }
+        // chunk -> (classes to rebuild, classes waiting on a member holder)
+        let mut unserved_by_chunk: BTreeMap<u32, (Vec<u32>, Vec<u32>)> = BTreeMap::new();
+        while let Some(joined) = fetches.join_next().await {
+            match joined {
+                Ok((_, _, Ok(()))) => outcome.pulled += 1,
+                Ok((chunk, class, Err(miss))) => {
+                    let entry = unserved_by_chunk.entry(chunk).or_default();
+                    if miss == FetchMiss::Unreachable {
+                        entry.1.push(class);
+                    } else {
+                        entry.0.push(class);
+                    }
                 }
+                Err(e) => {
+                    tracing::warn!("pull: blob {blob_id}: fetch task failed: {e}");
+                    outcome.failed += 1;
+                }
+            }
+        }
+
+        let mut park = false;
+        let mut wait_for_rebuild_slot = false;
+        // The rebuild rule: a class is rebuilt only when every holder has
+        // left the storage view (filtered out above, so it arrives here as
+        // unserved) or every reachable holder says it does not have it.
+        // A member that is dark, parked, slow or busy is never rebuilt
+        // around: the blob parks with backoff. Its classes become
+        // rebuildable only once it leaves the storage view, and storage
+        // membership is derived from replicated availability
+        // (`membership::derive_view` over the availability history, the
+        // MAX of `available` across observers), not from consensus
+        // vote-out. KNOWN LIMITATION (2026.10.8): a node that still
+        // answers availability probes but cannot serve fragments (wedged
+        // store, full disk) stays a member, so its classes are never
+        // rebuilt around and its blobs stay parked. The next release makes
+        // availability reflect serving.
+        // The rule is per class: a class waiting on a member holder parks
+        // the blob, but does not hold back a sibling class in the same
+        // chunk whose reachable holders all said they do not have it.
+        for (chunk, (mut unserved, waiting)) in unserved_by_chunk {
+            if !waiting.is_empty() {
+                outcome.failed += waiting.len();
+                park = true;
             }
             if unserved.is_empty() {
                 continue;
             }
-            // Recovery is the fetch fallback: rebuild the classes nobody
-            // served from any K live classes (local shards first).
-            match reencode::reencode_chunk(
-                &seams.transport,
+            unserved.sort_unstable();
+            // Genuinely unserved: rebuild from any K live classes (local
+            // shards first), a bounded number at once, with every shard
+            // fetch under the scheduler's caps and deadline and dark or
+            // parked peers skipped. No rebuild slot free: park and retry
+            // rather than hold a window slot while queued for one.
+            let Ok(_rebuild) = sched.rebuild.clone().try_acquire_owned() else {
+                outcome.failed += unserved.len();
+                wait_for_rebuild_slot = true;
+                continue;
+            };
+            let (transport, dark, view) = (&seams.transport, &dark, &members);
+            let rebuilt = reencode::reencode_chunk_via(
                 seams.state.as_ref(),
                 seams.local_state.as_ref(),
                 fragments_dir,
                 blob_id,
-                *chunk,
+                chunk,
                 &unserved,
+                |hash, hint, view_members| async move {
+                    let usable = |p: &crate::traits::PeerRef| {
+                        !dark.contains(&p.node_id)
+                            && view.as_ref().is_none_or(|m| m.contains(&p.node_id))
+                    };
+                    let attested: Vec<_> = hint.into_iter().filter(usable).collect();
+                    let others: Vec<_> = view_members.into_iter().filter(usable).collect();
+                    fetch::fetch_class(transport, sched, &hash, &attested, &others)
+                        .await
+                        .ok()
+                        .map(|fetched| fetched.data)
+                },
             )
-            .await
-            {
+            .await;
+            match rebuilt {
                 Ok(r) => {
                     outcome.rebuilt += r.regenerated;
                     outcome.failed += unserved.len().saturating_sub(r.regenerated);
@@ -384,6 +724,20 @@ where
                     outcome.failed += unserved.len();
                 }
             }
+        }
+
+        // A class whose known holders are all dark parks the blob so the
+        // window admits blobs that can move. A blob with nothing left
+        // failing leaves the park book.
+        let now = std::time::Instant::now();
+        if park {
+            sched.park_blob(blob_id, now);
+            tracing::debug!("pull: blob {blob_id} parked: its sources are unreachable");
+        } else if wait_for_rebuild_slot {
+            outcome.retry_after = sched.park_blob_for_rebuild(blob_id, now);
+            tracing::debug!("pull: blob {blob_id} waits for a rebuild slot");
+        } else if outcome.failed == 0 {
+            sched.unpark_blob(blob_id);
         }
     }
 
@@ -399,33 +753,11 @@ where
     let moved_bytes = outcome.pulled + outcome.rebuilt > 0;
     let birth_holder = target.placement_height.is_none() && holds_any;
     if in_flight && (moved_bytes || birth_holder) {
-        // Belief first (rows for what we hold of THIS blob — the classes
-        // this pull landed or rebuilt and, at birth, the origin's), then
-        // disk truth (S5): every fragment of this blob on our disk is
-        // content-verified right now and attested with the current height,
-        // so the confirmation's recency check has fresh evidence. The
-        // report is blob-scoped and already filtered against the inventory
-        // (one indexed query, not the whole-node differential that used to
-        // run here ~5×/min and bound pull throughput), and the apply is
-        // idempotent, so no round is bought for rows that exist.
-        let report = seams.state.blob_self_check_report(blob_id)?;
-        if !report.is_empty() {
-            let encoded = bincode::serde::encode_to_vec(&report, bincode::config::standard())
-                .map_err(|e| EngineError::Transfer(format!("self-check encode: {e}")))?;
-            match seams.submitter.submit(policy::SELF_CHECK_FN, encoded).await {
-                Ok(()) => outcome.attested = true,
-                // Belief is the sweep's to repair; disk truth and the
-                // proposal below still go out.
-                Err(SubmitError::Rejected(r)) => {
-                    tracing::warn!("prompt self-check rejected: {r}")
-                }
-                Err(SubmitError::Transient(e)) => {
-                    tracing::debug!("prompt self-check deferred to the sweep: {e}")
-                }
-            }
-        }
-        // Content-verifying every fragment of the blob reads and hashes each
-        // file: blocking work, off the serial worker's async thread.
+        // The height is read BEFORE the rehash, so the attestation never
+        // claims a fragment was seen later than it was (the rolling
+        // sweep's rule). Content-verifying every fragment of the blob reads
+        // and hashes each file: blocking work, off the async worker.
+        let height = seams.state.current_height()?;
         let candidates: Vec<Blake3Hash> = manifest
             .chunks
             .values()
@@ -441,41 +773,15 @@ where
         })
         .await
         .map_err(|e| EngineError::Transfer(format!("attestation rehash join: {e}")))?;
+        // Belief (computed at flush, after the marks landed), truth and the
+        // confirmation check ride the lane's pages: no consensus round is
+        // awaited here.
         if !present.is_empty() {
-            let attestation = crate::types::FragmentAttestation {
-                node_id: me,
-                height: seams.state.current_height()?,
+            outcome.evidence_queued = lane.push(evidence::EvidenceItem {
+                blob_id: blob_id.clone(),
+                height,
                 present,
-                suspect: Vec::new(),
-            };
-            let encoded = bincode::serde::encode_to_vec(&attestation, bincode::config::standard())
-                .map_err(|e| EngineError::Transfer(format!("attestation encode: {e}")))?;
-            match seams.submitter.submit(policy::ATTEST_FN, encoded).await {
-                Ok(()) => outcome.attested = true,
-                Err(SubmitError::Rejected(r)) => {
-                    tracing::warn!("disk-truth attestation rejected: {r}")
-                }
-                Err(SubmitError::Transient(e)) => {
-                    tracing::debug!("disk-truth attestation deferred to the sweep: {e}")
-                }
-            }
-        }
-        if let Some(height) = seams.state.confirm_ready(blob_id)? {
-            let payload = ConfirmPlacement {
-                confirmations: vec![PlacementConfirmation {
-                    blob_id: blob_id.clone(),
-                    height,
-                }],
-            };
-            let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
-                .map_err(|e| EngineError::Transfer(format!("confirm encode: {e}")))?;
-            match seams.submitter.submit(CONFIRM_TX_FN, encoded).await {
-                Ok(()) => outcome.confirm_proposed = true,
-                Err(SubmitError::Rejected(r)) => tracing::warn!("confirm proposal rejected: {r}"),
-                Err(SubmitError::Transient(e)) => {
-                    tracing::debug!("confirm proposal deferred to the tick: {e}")
-                }
-            }
+            });
         }
     }
 
@@ -487,8 +793,8 @@ where
             outcome.pulled,
             outcome.rebuilt,
             outcome.failed,
-            if outcome.confirm_proposed {
-                " (confirm proposed)"
+            if outcome.evidence_queued {
+                " (evidence queued)"
             } else {
                 ""
             }
@@ -500,7 +806,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::{PeerRef, PlacementInputs, PullTarget, StoreResult, TransportError};
+    use crate::lifecycle::{ConfirmPlacement, CONFIRM_TX_FN};
+    use crate::traits::{
+        PeerRef, PlacementInputs, PullTarget, StoreResult, SubmitError, TransportError,
+    };
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Mutex;
@@ -689,6 +998,545 @@ mod tests {
             .collect()
     }
 
+    /// One pull with a test lane: the outcome and the evidence it queued.
+    async fn pull_with_lane<T, S, X, L>(
+        seams: &Seams<T, S, X, L>,
+        dir: &str,
+        blob_id: &BlobId,
+    ) -> (PullOutcome, Vec<evidence::EvidenceItem>)
+    where
+        T: Transport + 'static,
+        S: StateReader + 'static,
+        X: TxSubmitter,
+        L: LocalStateSink + 'static,
+    {
+        let sched = FetchScheduler::new(PullLimits::default());
+        pull_with_sched(seams, dir, blob_id, &sched).await
+    }
+
+    async fn pull_with_sched<T, S, X, L>(
+        seams: &Seams<T, S, X, L>,
+        dir: &str,
+        blob_id: &BlobId,
+        sched: &Arc<FetchScheduler>,
+    ) -> (PullOutcome, Vec<evidence::EvidenceItem>)
+    where
+        T: Transport + 'static,
+        S: StateReader + 'static,
+        X: TxSubmitter,
+        L: LocalStateSink + 'static,
+    {
+        let (lane, mut rx) = evidence::EvidenceLane::channel();
+        let outcome = pull_owed(seams, dir, blob_id, &lane, sched).await.unwrap();
+        let mut items = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            items.push(item);
+        }
+        (outcome, items)
+    }
+
+    /// PullNet's state, except that every fragment is attested on node 2,
+    /// which the host's liveness evidence calls reachable or not.
+    struct HeldOnTwo {
+        net: Arc<PullNet>,
+        two_reachable: bool,
+        /// Node 2 is in the storage view (else it departed, rows remain).
+        two_member: bool,
+        /// Reading any manifest panics (a re-encode that blows up).
+        panic_manifest: bool,
+        /// Deriving the storage view takes this long (a cold, slow node).
+        view_delay: std::time::Duration,
+        /// Fragments attested on node 3 instead, a reachable member (in
+        /// the view whenever this is non-empty).
+        held_on_three: HashSet<Blake3Hash>,
+        /// Deriving the storage view fails (a locked or broken database).
+        view_fails: std::sync::atomic::AtomicBool,
+        /// Storage-view derivations attempted.
+        view_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StateReader for HeldOnTwo {
+        fn placement_inputs(&self) -> Result<PlacementInputs, StorageError> {
+            self.net.placement_inputs()
+        }
+        fn storage_view(&self) -> Result<crate::traits::StorageView, StorageError> {
+            std::thread::sleep(self.view_delay);
+            self.view_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.view_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StorageError::Host("view unreadable".into()));
+            }
+            let mut members = if self.two_member {
+                peers(&[1, 2])
+            } else {
+                peers(&[1])
+            };
+            if !self.held_on_three.is_empty() {
+                members.extend(peers(&[3]));
+            }
+            Ok(crate::traits::StorageView {
+                height: 9,
+                watermark: 1,
+                tiers: HashMap::new(),
+                weights: HashMap::new(),
+                online: members.iter().map(|p| p.node_id).collect(),
+                members,
+            })
+        }
+        fn placement_inputs_at(&self, height: u64) -> Result<PlacementInputs, StorageError> {
+            self.net.placement_inputs_at(height)
+        }
+        fn fragment_sources(
+            &self,
+            fragment_hashes: &[Blake3Hash],
+        ) -> Result<HashMap<Blake3Hash, Vec<PeerRef>>, StorageError> {
+            Ok(fragment_hashes
+                .iter()
+                .map(|h| {
+                    let holder = if self.held_on_three.contains(h) { 3 } else { 2 };
+                    (*h, peers(&[holder]))
+                })
+                .collect())
+        }
+        fn all_peers(&self) -> Result<Vec<PeerRef>, StorageError> {
+            self.net.all_peers()
+        }
+        fn pull_target(&self, blob_id: &BlobId) -> Result<Option<PullTarget>, StorageError> {
+            self.net.pull_target(blob_id)
+        }
+        fn self_check_report(&self) -> Result<crate::types::SelfCheckFragments, StorageError> {
+            self.net.self_check_report()
+        }
+        fn blob_self_check_report(
+            &self,
+            blob_id: &BlobId,
+        ) -> Result<crate::types::SelfCheckFragments, StorageError> {
+            self.net.blob_self_check_report(blob_id)
+        }
+        fn confirm_ready(&self, blob_id: &BlobId) -> Result<Option<u64>, StorageError> {
+            self.net.confirm_ready(blob_id)
+        }
+        fn current_height(&self) -> Result<u64, StorageError> {
+            self.net.current_height()
+        }
+        fn blob_manifest(
+            &self,
+            blob_id: &BlobId,
+        ) -> Result<Option<crate::store::BlobManifest>, StorageError> {
+            assert!(!self.panic_manifest, "manifest read panics");
+            self.net.blob_manifest(blob_id)
+        }
+        fn local_node_id(&self) -> Option<i32> {
+            self.net.local_node_id()
+        }
+        fn peer_reachable(&self, node_id: i32) -> bool {
+            node_id != 2 || self.two_reachable
+        }
+    }
+
+    // Impact: review of #96 — each of the 64 window tasks rebuilt chunks
+    // when a holder was merely dark, holding ~40-120 MB of shards apiece
+    // outside every cap, for classes the holder would serve once back.
+    // Should: park a blob whose unserved classes are held only by dark
+    // peers, without rebuilding.
+    // Should: still try a rebuild (and not park) when the holders answer
+    // but do not serve the class.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dark_holders_park_the_blob_instead_of_rebuilding() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-dark-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, _outcome, manifest) = encoded_blob(&dir_src).await;
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+
+        for (two_reachable, parks) in [(false, true), (true, false)] {
+            let seams = Seams {
+                transport: net.clone(),
+                state: Arc::new(HeldOnTwo {
+                    net: net.clone(),
+                    two_reachable,
+                    two_member: true,
+                    panic_manifest: false,
+                    view_delay: std::time::Duration::ZERO,
+                    held_on_three: HashSet::new(),
+                    view_fails: false.into(),
+                    view_calls: 0.into(),
+                }),
+                submitter: net.clone(),
+                local_state: net.clone(),
+            };
+            let sched = FetchScheduler::new(PullLimits::default());
+            let (result, _) = pull_with_sched(&seams, &dir_dst, &blob_id, &sched).await;
+            assert_eq!(result.failed, 30);
+            assert_eq!(result.rebuilt, 0);
+            assert_eq!(
+                sched.blob_parked(&blob_id, std::time::Instant::now()),
+                parks,
+                "node 2 reachable: {two_reachable}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: inventory rows of departed nodes counted as holders to wait
+    // for, so their classes were never rebuilt; and rebuilding around a
+    // member that is merely dark spends memory and makes copies its holder
+    // will serve again once back (decided with Allison: a member is rebuilt
+    // around only once it decays out of the availability-derived storage
+    // view; a wedged-but-available member is a known 10.8 limitation).
+    // Should: rebuild (not park) a class whose only holder has left the
+    // storage view, even while that node is dark.
+    // Should not: rebuild around a member holder, however long it has been
+    // dark: the blob stays parked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn departed_holders_rebuild_and_dark_members_do_not() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-escal-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, _outcome, manifest) = encoded_blob(&dir_src).await;
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        let seams_for = |two_member: bool| Seams {
+            transport: net.clone(),
+            state: Arc::new(HeldOnTwo {
+                net: net.clone(),
+                two_reachable: false,
+                two_member,
+                panic_manifest: false,
+                view_delay: std::time::Duration::ZERO,
+                held_on_three: HashSet::new(),
+                view_fails: false.into(),
+                view_calls: 0.into(),
+            }),
+            submitter: net.clone(),
+            local_state: net.clone(),
+        };
+
+        // Departed: its rows are not holders; the rebuild runs (and, with
+        // no shards anywhere, fails), and the blob is not parked.
+        let sched = FetchScheduler::new(PullLimits::default());
+        pull_with_sched(&seams_for(false), &dir_dst, &blob_id, &sched).await;
+        assert!(!sched.blob_parked(&blob_id, std::time::Instant::now()));
+
+        // A member dark for a long time (its park entry hours old): still
+        // parked, never rebuilt around.
+        let now = std::time::Instant::now();
+        let sched = FetchScheduler::new(PullLimits::default());
+        if let Some(long_ago) = now.checked_sub(std::time::Duration::from_secs(4 * 3600)) {
+            sched.park_blob(&blob_id, long_ago);
+        }
+        let (result, _) = pull_with_sched(&seams_for(true), &dir_dst, &blob_id, &sched).await;
+        assert_eq!(result.rebuilt, 0);
+        assert!(sched.blob_parked(&blob_id, std::time::Instant::now()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: final review of #96 — the wait-for-a-member flag was per
+    // chunk, so one class on a dark member held back the rebuild of every
+    // sibling class in that chunk, even ones whose reachable holders had
+    // all said they do not have it.
+    // Should: rebuild a class whose reachable member holders do not serve
+    // it, while another class of the same chunk waits on a dark member.
+    // Should: still park the blob for the class on the dark member.
+    // Should not: rebuild the class held by the dark member.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_class_on_a_dark_member_does_not_hold_back_its_siblings() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-split-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, outcome, manifest) = encoded_blob(&dir_src).await;
+        let mut chunk0: Vec<_> = outcome
+            .fragments
+            .iter()
+            .filter(|f| f.chunk_number == 0)
+            .map(|f| f.fragment_hash)
+            .collect();
+        chunk0.sort_unstable_by_key(|h| h.to_hex());
+        // Class `on_dark` stays on dark member 2; `lost` is attested on
+        // node 3, which answers but no longer has it; node 3 serves the rest.
+        let (on_dark, lost) = (chunk0[0], chunk0[1]);
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        for f in &outcome.fragments {
+            if f.fragment_hash != on_dark && f.fragment_hash != lost {
+                let bytes = fragstore::read_fragment(&dir_src, &f.fragment_hash).unwrap();
+                net.served.lock().unwrap().insert(f.fragment_hash, bytes);
+            }
+        }
+        let held_on_three = outcome
+            .fragments
+            .iter()
+            .map(|f| f.fragment_hash)
+            .filter(|h| *h != on_dark)
+            .collect();
+        let seams = Seams {
+            transport: net.clone(),
+            state: Arc::new(HeldOnTwo {
+                net: net.clone(),
+                two_reachable: false,
+                two_member: true,
+                panic_manifest: false,
+                view_delay: std::time::Duration::ZERO,
+                held_on_three,
+                view_fails: false.into(),
+                view_calls: 0.into(),
+            }),
+            submitter: net.clone(),
+            local_state: net.clone(),
+        };
+        let sched = FetchScheduler::new(PullLimits::default());
+        let (result, _) = pull_with_sched(&seams, &dir_dst, &blob_id, &sched).await;
+        assert_eq!(result.rebuilt, 1, "the lost class is rebuilt");
+        assert_eq!(result.failed, 1, "the dark member's class waits");
+        assert!(fragstore::read_fragment(&dir_dst, &lost).is_ok());
+        assert!(fragstore::read_fragment(&dir_dst, &on_dark).is_err());
+        assert!(sched.blob_parked(&blob_id, std::time::Instant::now()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: final review of #96 — the 30 s rebuild-slot park did not
+    // bring the blob back after 30 s: the planner skips parked blobs and
+    // the feeder drops them, so it waited for the cursor to revisit its
+    // slice (a full walk of the in-flight set).
+    // Should: offer a blob that waited for a rebuild slot again once the
+    // short park ends, and rebuild it then.
+    #[tokio::test(start_paused = true)]
+    async fn a_blob_waiting_for_a_rebuild_slot_comes_back_by_itself() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-retry-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, outcome, manifest) = encoded_blob(&dir_src).await;
+        let lost = outcome.fragments[0].fragment_hash;
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        for f in &outcome.fragments[1..] {
+            let bytes = fragstore::read_fragment(&dir_src, &f.fragment_hash).unwrap();
+            net.served.lock().unwrap().insert(f.fragment_hash, bytes);
+        }
+        let seams = Seams {
+            transport: net.clone(),
+            state: Arc::new(HeldOnTwo {
+                net: net.clone(),
+                two_reachable: true,
+                two_member: false,
+                panic_manifest: false,
+                view_delay: std::time::Duration::ZERO,
+                held_on_three: outcome.fragments.iter().map(|f| f.fragment_hash).collect(),
+                view_fails: false.into(),
+                view_calls: 0.into(),
+            }),
+            submitter: net.clone(),
+            local_state: net.clone(),
+        };
+        let engine = EngineHandle::spawn(
+            seams,
+            EngineConfig {
+                fragments_dir: dir_dst.clone(),
+                limits: PullLimits {
+                    rebuilds: 1,
+                    ..PullLimits::default()
+                },
+            },
+            tokio::runtime::Handle::current(),
+        );
+
+        // Every rebuild slot busy: the lost class waits.
+        let busy = engine.sched.rebuild.clone().try_acquire_owned().unwrap();
+        let first = engine.pull_blob(blob_id.clone()).await.unwrap();
+        assert_eq!((first.rebuilt, first.failed), (0, 1));
+        assert_eq!(first.retry_after, Some(fetch::REBUILD_WAIT_PARK));
+        drop(busy);
+        // The park book runs on the wall clock, which the paused test clock
+        // does not move: end the short park by hand.
+        assert!(engine.blob_parked(&blob_id));
+        engine.sched.unpark_blob(&blob_id);
+
+        // Nobody offers it again; it is back and rebuilt within the wait.
+        let started = tokio::time::Instant::now();
+        while fragstore::read_fragment(&dir_dst, &lost).is_err() {
+            assert!(
+                started.elapsed() < fetch::REBUILD_WAIT_PARK * 2,
+                "not offered again after its rebuild wait"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: third review of #96 — the membership cache derived the
+    // storage view (pool checkout plus 30 days of availability history)
+    // under its lock inside the async pull, so on every expiry each window
+    // task blocked behind one slow derivation.
+    // Should: refresh a stale membership in the background, once, and let
+    // every caller use the stale value meanwhile.
+    // Should not: make a caller wait for the derivation once any value
+    // exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_membership_is_refreshed_without_blocking_callers() {
+        let delay = std::time::Duration::from_millis(800);
+        let state = Arc::new(HeldOnTwo {
+            net: idle_net(),
+            two_reachable: true,
+            two_member: true,
+            panic_manifest: false,
+            view_delay: delay,
+            held_on_three: HashSet::new(),
+            view_fails: false.into(),
+            view_calls: 0.into(),
+        });
+        let sched = FetchScheduler::new(PullLimits::default());
+        let t0 = std::time::Instant::now();
+        let first = sched.members(&state, t0).await.unwrap();
+        assert_eq!(*first, [1, 2].into_iter().collect::<HashSet<i32>>());
+
+        // Stale: every caller returns at once with the stale value.
+        let stale_at = std::time::Instant::now() + fetch::MEMBERS_TTL;
+        let started = std::time::Instant::now();
+        for _ in 0..8 {
+            assert!(sched.members(&state, stale_at).await.is_some());
+        }
+        assert!(
+            started.elapsed() < delay / 2,
+            "callers waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    // Impact: final review of #96 — a failed membership refresh was retried
+    // on the very next call (a storage-view derivation per pull while the
+    // database is unhappy), and the last good list stayed in force forever,
+    // filtering holders by a membership that may be hours old.
+    // Should: back off refresh retries after a failure, doubling.
+    // Should: fail open (no membership filter) once the last good list is
+    // older than the stale bound.
+    // Should: use a fresh list again as soon as a refresh succeeds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_membership_refresh_backs_off_and_fails_open() {
+        use std::sync::atomic::Ordering;
+        let state = Arc::new(HeldOnTwo {
+            net: idle_net(),
+            two_reachable: true,
+            two_member: true,
+            panic_manifest: false,
+            view_delay: std::time::Duration::ZERO,
+            held_on_three: HashSet::new(),
+            view_fails: false.into(),
+            view_calls: 0.into(),
+        });
+        let sched = FetchScheduler::new(PullLimits::default());
+        let calls = || state.view_calls.load(Ordering::SeqCst);
+        let settle = || async {
+            while !sched.members_refresh_idle() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        let secs = std::time::Duration::from_secs;
+        let t0 = std::time::Instant::now();
+        assert!(sched.members(&state, t0).await.is_some());
+        assert_eq!(calls(), 1);
+
+        // Stale and failing: the old list is used, the refresh fails...
+        state.view_fails.store(true, Ordering::SeqCst);
+        let t1 = t0 + fetch::MEMBERS_TTL + secs(1);
+        assert!(sched.members(&state, t1).await.is_some());
+        settle().await;
+        assert_eq!(calls(), 2);
+        // ...and is not retried until its backoff passes.
+        assert!(sched.members(&state, t1 + secs(10)).await.is_some());
+        settle().await;
+        assert_eq!(calls(), 2, "retried inside the backoff");
+        let t2 = t1 + fetch::MEMBERS_RETRY_BASE + secs(1);
+        assert!(sched.members(&state, t2).await.is_some());
+        settle().await;
+        assert_eq!(calls(), 3);
+        // The second failure doubles the wait.
+        sched
+            .members(&state, t2 + fetch::MEMBERS_RETRY_BASE + secs(1))
+            .await;
+        settle().await;
+        assert_eq!(calls(), 3, "the backoff doubles");
+
+        // Too old to trust: no filter, rather than an old list.
+        let t3 = t0 + fetch::MEMBERS_STALE_MAX + secs(1);
+        assert!(sched.members(&state, t3).await.is_none());
+
+        // Readable again: a fresh list once the backoff passes.
+        state.view_fails.store(false, Ordering::SeqCst);
+        let t4 = t3 + fetch::MEMBERS_RETRY_CAP + secs(1);
+        let fresh = sched.members(&state, t4).await.unwrap();
+        assert_eq!(*fresh, [1, 2].into_iter().collect::<HashSet<i32>>());
+    }
+
+    // Impact: re-review of #96 — window tasks waited for a rebuild slot
+    // with no timeout while holding their window slot, so a few long
+    // rebuilds could stall every blob in the window behind them.
+    // Should: park the blob when no rebuild slot is free.
+    // Should not: wait for one (the pull returns at once).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_free_rebuild_slot_parks_instead_of_waiting() {
+        let base = std::env::temp_dir().join(format!("hopnet-pull-noslot-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, _outcome, manifest) = encoded_blob(&dir_src).await;
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        let sched = FetchScheduler::new(PullLimits::default());
+        let _all = sched
+            .rebuild
+            .clone()
+            .acquire_many_owned(PullLimits::default().rebuilds as u32)
+            .await
+            .unwrap();
+        let pulled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pull_with_sched(&seams(net.clone()), &dir_dst, &blob_id, &sched),
+        )
+        .await
+        .expect("the pull must not wait for a rebuild slot");
+        assert_eq!(pulled.0.rebuilt, 0);
+        let now = std::time::Instant::now();
+        assert!(sched.blob_parked(&blob_id, now));
+        assert!(
+            !sched.blob_parked(&blob_id, now + fetch::REBUILD_WAIT_PARK),
+            "a short flat wait, not the unreachable backoff"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Flush queued evidence the way the lane task does.
+    async fn flush_items<X: TxSubmitter>(
+        state: &PullNet,
+        submitter: &X,
+        items: Vec<evidence::EvidenceItem>,
+    ) -> evidence::LaneFlush {
+        let mut buf = evidence::LaneBuffer::default();
+        for item in items {
+            buf.push(item, 0);
+        }
+        evidence::flush(state, submitter, &mut buf).await
+    }
+
     impl LocalStateSink for PullNet {
         async fn mark_local(&self, fragment_hash: Blake3Hash) {
             self.marked_local.lock().unwrap().push(fragment_hash);
@@ -752,15 +1600,178 @@ mod tests {
         (blob_id, outcome, manifest)
     }
 
+    fn idle_net() -> Arc<PullNet> {
+        Arc::new(PullNet {
+            served: Mutex::new(HashMap::new()),
+            manifest: Mutex::new(None),
+            target: None,
+            ready: None,
+            marked_local: Mutex::new(Vec::new()),
+            submitted: Mutex::new(Vec::new()),
+            inventoried: Mutex::new(Default::default()),
+            payloads: Mutex::new(Vec::new()),
+        })
+    }
+
+    // Impact: the planner paces itself on the queue depth, and consensus
+    // apply hints the same blobs again; without coalescing the queue grows
+    // with duplicates of work already waiting.
+    // Should: queue a blob once however often it is offered, count it until
+    // its check finishes, and accept it again after.
+    #[tokio::test]
+    async fn duplicate_kicks_are_coalesced() {
+        let engine = EngineHandle::spawn(
+            seams(idle_net()),
+            EngineConfig {
+                fragments_dir: String::new(),
+                limits: PullLimits::default(),
+            },
+            tokio::runtime::Handle::current(),
+        );
+        let a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        let b = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c902").unwrap();
+
+        // The current-thread runtime runs no worker step until we await.
+        assert!(engine.offer(a.clone()));
+        assert!(!engine.offer(a.clone()), "already queued");
+        engine.notify_blob_committed(a.clone());
+        assert!(engine.offer(b.clone()));
+        assert_eq!(engine.queued_len(), 2);
+
+        // A caller waiting on a queued blob waits on that same check.
+        let (tx, rx) = oneshot::channel();
+        assert!(!engine.enqueue(a.clone(), Some(tx)), "waits, not re-queued");
+        assert_eq!(engine.queued_len(), 2);
+        rx.await.unwrap();
+        engine.pull_blob(b).await.unwrap();
+        assert_eq!(engine.queued_len(), 0);
+        assert!(engine.offer(a), "re-offered after its check finished");
+    }
+
+    // Impact: review of #96 — a panicking pull task left its blob in the
+    // queue forever, so it could never be offered again and the planner's
+    // queue depth only grew.
+    // Should: take the blob out of the queue when its check panics.
+    #[tokio::test]
+    async fn a_panicking_check_leaves_the_queue() {
+        let queue: PullQueue = Default::default();
+        let a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        queue.lock().unwrap().insert(a.clone(), Vec::new());
+        let entry = QueuedEntry {
+            queue: queue.clone(),
+            blob_id: Some(a.clone()),
+        };
+        let task = tokio::spawn(async move {
+            let _entry = entry;
+            panic!("pull check panicked");
+        });
+        assert!(task.await.is_err());
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    // Impact: re-review of #96 — waiters live in the shared queue map; if
+    // the dispatch loop died, pull_blob callers hung and new requests
+    // joined dead entries.
+    // Should: drop every queued blob and wake every waiter with "engine
+    // gone" when the dispatch loop ends.
+    #[tokio::test]
+    async fn a_dead_dispatch_loop_releases_its_waiters() {
+        let queue: PullQueue = Default::default();
+        let a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        let (tx, rx) = oneshot::channel();
+        queue.lock().unwrap().insert(a, vec![tx]);
+        drop(DrainOnExit(queue.clone()));
+        assert!(rx.await.is_err(), "the waiter is woken, not left hanging");
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    // Impact: re-review of #96 — a panic in a re-encode ran on the
+    // dispatch loop itself and would have ended it, stranding every pull.
+    // Should: keep serving pulls after a re-encode panics.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_reencode_does_not_stop_the_engine() {
+        let net = idle_net();
+        let seams = Seams {
+            transport: net.clone(),
+            state: Arc::new(HeldOnTwo {
+                net: net.clone(),
+                two_reachable: true,
+                two_member: true,
+                panic_manifest: true,
+                view_delay: std::time::Duration::ZERO,
+                held_on_three: HashSet::new(),
+                view_fails: false.into(),
+                view_calls: 0.into(),
+            }),
+            submitter: net.clone(),
+            local_state: net.clone(),
+        };
+        let engine = EngineHandle::spawn(
+            seams,
+            EngineConfig {
+                fragments_dir: String::new(),
+                limits: PullLimits::default(),
+            },
+            tokio::runtime::Handle::current(),
+        );
+        let a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c901").unwrap();
+        engine.enqueue_reencode(
+            ReencodeCmd {
+                blob_id: a.clone(),
+                chunk_number: 0,
+                missing_classes: vec![1],
+            },
+            true,
+        );
+        // No goal on record (target None): the pull returns before any
+        // manifest read, so only the re-encode panics.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), engine.pull_blob(a))
+            .await
+            .expect("the engine still answers");
+        assert_eq!(outcome, Some(PullOutcome::default()));
+    }
+
+    // Impact: review of #96 — park entries for blobs that stopped being
+    // owed were never removed, so the park book grew without bound.
+    // Should: drop a blob's park entry once a check finds it owes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_owing_nothing_leaves_the_park_book() {
+        let base = std::env::temp_dir().join(format!("hopnet-unpark-{}", std::process::id()));
+        let dir = base.join("held").to_str().unwrap().to_string();
+        let (blob_id, _outcome, mut manifest) = encoded_blob(&dir).await;
+        for (originals, recovery) in manifest.chunks.values_mut() {
+            for entry in originals.values_mut().chain(recovery.values_mut()) {
+                entry.2 = true;
+            }
+        }
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(PullTarget {
+                placement_height: Some(5),
+                desired: 9,
+                assignment: vec![1; crate::rs::TOTAL_FRAGMENTS_PER_CHUNK],
+            }),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        let sched = FetchScheduler::new(PullLimits::default());
+        sched.park_blob(&blob_id, std::time::Instant::now());
+        let (result, _) = pull_with_sched(&seams(net), &dir, &blob_id, &sched).await;
+        assert_eq!(result.owed, 0);
+        assert_eq!(sched.stats(std::time::Instant::now()).parked_blobs, 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // Should: pull every class this node owes under the goal from a
-    // serving holder, settle each through the (awaited) sink, attest
-    // promptly, and propose confirmation once the goal's evidence is
-    // complete.
-    // Should not: propose confirmation when the evidence is incomplete, nor
-    // pull anything for a blob whose goal assigns this node nothing.
+    // serving holder, settle each through the (awaited) sink, and queue the
+    // blob's evidence for the lane, which then reports belief, attests and
+    // proposes confirmation once the goal's evidence is complete.
+    // Should not: submit anything to consensus from the pull itself;
+    // propose confirmation when the evidence is incomplete; pull anything
+    // for a blob whose goal assigns this node nothing.
     // Impact: this is the whole distribution path now — a missed duty
     // strands a class on the origin; a premature confirm lapses obligations
-    // against holders that do not exist.
+    // against holders that do not exist; a consensus wait on the worker
+    // capped production at ~6 blobs a minute.
     #[tokio::test(flavor = "multi_thread")]
     async fn pulls_owed_classes_attests_and_confirms() {
         let base = std::env::temp_dir().join(format!("hopnet-pull-test-{}", std::process::id()));
@@ -784,20 +1795,27 @@ mod tests {
             net.served.lock().unwrap().insert(f.fragment_hash, data);
         }
 
-        let result = pull_owed(&seams(net.clone()), &dir_dst, &blob_id)
-            .await
-            .unwrap();
+        let (result, items) = pull_with_lane(&seams(net.clone()), &dir_dst, &blob_id).await;
         assert_eq!(result.owed, 30);
         assert_eq!(result.pulled, 30);
         assert_eq!(result.rebuilt, 0);
         assert_eq!(result.failed, 0);
-        assert!(result.attested);
-        assert!(result.confirm_proposed);
+        assert!(result.evidence_queued);
         assert_eq!(net.marked_local.lock().unwrap().len(), 30);
+        assert!(
+            net.submitted.lock().unwrap().is_empty(),
+            "the pull awaits no consensus round"
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].height, 9, "read before the rehash");
+        assert_eq!(items[0].present.len(), 30);
+
+        let flushed = flush_items(&net, net.as_ref(), items).await;
+        assert_eq!(flushed.confirmed, 1);
         assert_eq!(
             *net.submitted.lock().unwrap(),
             vec![policy::SELF_CHECK_FN, policy::ATTEST_FN, CONFIRM_TX_FN],
-            "attestation lands before the confirm proposal"
+            "belief, then truth, then the confirm proposal"
         );
         let believed = self_check_hashes(&net.payloads.lock().unwrap());
         let landed: std::collections::HashSet<Blake3Hash> =
@@ -826,11 +1844,10 @@ mod tests {
             inventoried: Mutex::new(Default::default()),
             payloads: Mutex::new(Vec::new()),
         });
-        let result = pull_owed(&seams(net2.clone()), &dir_dst2, &blob_id)
-            .await
-            .unwrap();
+        let (result, items) = pull_with_lane(&seams(net2.clone()), &dir_dst2, &blob_id).await;
         assert_eq!(result.pulled, 30);
-        assert!(!result.confirm_proposed);
+        let flushed = flush_items(&net2, net2.as_ref(), items).await;
+        assert_eq!(flushed.confirmed, 0);
         assert_eq!(
             *net2.submitted.lock().unwrap(),
             vec![policy::SELF_CHECK_FN, policy::ATTEST_FN]
@@ -851,8 +1868,9 @@ mod tests {
             inventoried: Mutex::new(Default::default()),
             payloads: Mutex::new(Vec::new()),
         });
-        let result = pull_owed(&seams(net3), &dir_dst2, &blob_id).await.unwrap();
+        let (result, items) = pull_with_lane(&seams(net3), &dir_dst2, &blob_id).await;
         assert_eq!(result, PullOutcome::default());
+        assert!(items.is_empty());
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -895,13 +1913,11 @@ mod tests {
             inventoried: Mutex::new(Default::default()),
             payloads: Mutex::new(Vec::new()),
         });
-        let result = pull_owed(&seams(regoal.clone()), &dir, &blob_id)
-            .await
-            .unwrap();
+        let (result, items) = pull_with_lane(&seams(regoal.clone()), &dir, &blob_id).await;
         assert_eq!(result, PullOutcome::default(), "nothing owed, nothing done");
         assert!(
-            regoal.submitted.lock().unwrap().is_empty(),
-            "a rubber stamp buys no consensus round on the worker"
+            items.is_empty() && regoal.submitted.lock().unwrap().is_empty(),
+            "a rubber stamp queues no evidence"
         );
 
         // Birth: never confirmed, held here, no belief rows yet — the
@@ -922,12 +1938,11 @@ mod tests {
             inventoried: Mutex::new(Default::default()),
             payloads: Mutex::new(Vec::new()),
         });
-        let result = pull_owed(&seams(birth.clone()), &dir, &blob_id)
-            .await
-            .unwrap();
+        let (result, items) = pull_with_lane(&seams(birth.clone()), &dir, &blob_id).await;
         assert_eq!(result.owed, 0);
-        assert!(result.attested);
-        assert!(result.confirm_proposed);
+        assert!(result.evidence_queued);
+        let flushed = flush_items(&birth, birth.as_ref(), items).await;
+        assert_eq!(flushed.confirmed, 1);
         assert_eq!(
             *birth.submitted.lock().unwrap(),
             vec![policy::SELF_CHECK_FN, policy::ATTEST_FN, CONFIRM_TX_FN]
@@ -950,10 +1965,9 @@ mod tests {
             inventoried: Mutex::new(all_hashes),
             payloads: Mutex::new(Vec::new()),
         });
-        let result = pull_owed(&seams(believed.clone()), &dir, &blob_id)
-            .await
-            .unwrap();
-        assert!(result.attested);
+        let (result, items) = pull_with_lane(&seams(believed.clone()), &dir, &blob_id).await;
+        assert!(result.evidence_queued);
+        flush_items(&believed, believed.as_ref(), items).await;
         assert_eq!(
             *believed.submitted.lock().unwrap(),
             vec![policy::ATTEST_FN, CONFIRM_TX_FN]
@@ -991,9 +2005,7 @@ mod tests {
             let data = fragstore::read_fragment(&dir_src, &f.fragment_hash).unwrap();
             net.served.lock().unwrap().insert(f.fragment_hash, data);
         }
-        let result = pull_owed(&seams(net.clone()), &dir_dst, &blob_id)
-            .await
-            .unwrap();
+        let (result, _) = pull_with_lane(&seams(net.clone()), &dir_dst, &blob_id).await;
         assert_eq!(result.owed, 30);
         assert_eq!(result.pulled, 10);
         assert_eq!(result.rebuilt, 20);
@@ -1018,20 +2030,15 @@ mod tests {
             inventoried: Mutex::new(Default::default()),
             payloads: Mutex::new(Vec::new()),
         });
-        let result = pull_owed(&seams(dead.clone()), &dir_dst2, &blob_id)
-            .await
-            .unwrap();
+        let (result, items) = pull_with_lane(&seams(dead.clone()), &dir_dst2, &blob_id).await;
         assert_eq!(result.failed, 30);
-        assert!(
-            dead.submitted.lock().unwrap().is_empty(),
-            "nothing to attest"
-        );
+        assert!(items.is_empty(), "nothing to attest");
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
     // Should: still attest disk truth and propose confirmation when the
-    // prompt self-check is refused — belief is the sweep's to repair, the
+    // lane's belief page is refused — belief is the sweep's to repair, the
     // evidence the confirmation needs must not wait on it.
     // Should not: fail the pull or skip the attestation on that refusal.
     #[tokio::test(flavor = "multi_thread")]
@@ -1063,9 +2070,17 @@ mod tests {
             local_state: net.clone(),
         };
 
-        let result = pull_owed(&seams, &dir_dst, &blob_id).await.unwrap();
+        let (result, items) = pull_with_lane(&seams, &dir_dst, &blob_id).await;
         assert_eq!(result.pulled, 30);
-        assert!(result.confirm_proposed);
+        let flushed = flush_items(&net, seams.submitter.as_ref(), items).await;
+        assert_eq!(
+            (
+                flushed.belief_failed,
+                flushed.truth_pages,
+                flushed.confirmed
+            ),
+            (1, 1, 1)
+        );
         assert_eq!(
             *net.submitted.lock().unwrap(),
             vec![policy::ATTEST_FN, CONFIRM_TX_FN],
@@ -1073,5 +2088,115 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn item(n: u8, height: u64, hashes: &[u8]) -> evidence::EvidenceItem {
+        evidence::EvidenceItem {
+            blob_id: BlobId::from_str(&format!("01890a5d-ac96-774b-b9aa-9f8b24f0c9{n:02x}"))
+                .unwrap(),
+            height,
+            present: hashes
+                .iter()
+                .map(|b| Blake3Hash::from_bytes([*b; 32]))
+                .collect(),
+        }
+    }
+
+    // Impact: a page stamped with a later height than one of its hashes was
+    // seen at overstates freshness for the confirmation's recency check.
+    // Should: stamp an attestation page with the lowest height among the
+    // pulls whose hashes it carries.
+    #[tokio::test]
+    async fn page_height_is_the_lowest_observation() {
+        let net = idle_net();
+        let flushed = flush_items(
+            &net,
+            net.as_ref(),
+            vec![item(1, 12, &[1]), item(2, 7, &[2])],
+        )
+        .await;
+        assert_eq!(flushed.truth_pages, 1);
+        let payloads = net.payloads.lock().unwrap();
+        let (_, bytes) = payloads
+            .iter()
+            .find(|(f, _)| *f == policy::ATTEST_FN)
+            .unwrap();
+        let (attestation, _): (crate::types::FragmentAttestation, _) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard()).unwrap();
+        assert_eq!(attestation.height, 7);
+        assert_eq!(attestation.present.len(), 2);
+    }
+
+    // Impact: one consensus round per confirmed blob was the old worker's
+    // ceiling; the lane batches every ready blob it attested.
+    // Should: propose one ConfirmPlacement carrying every buffered blob
+    // whose evidence is complete.
+    // Should not: queue the same blob twice when two pulls report it.
+    #[tokio::test]
+    async fn confirm_proposed_for_every_ready_buffered_blob_in_one_tx() {
+        let net = Arc::new(PullNet {
+            ready: Some(9),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        let flushed = flush_items(
+            &net,
+            net.as_ref(),
+            vec![item(1, 9, &[1]), item(2, 9, &[2]), item(1, 9, &[3])],
+        )
+        .await;
+        assert_eq!(flushed.confirmed, 2);
+        let payloads = net.payloads.lock().unwrap();
+        let confirms: Vec<_> = payloads
+            .iter()
+            .filter(|(f, _)| *f == CONFIRM_TX_FN)
+            .collect();
+        assert_eq!(confirms.len(), 1, "one transaction");
+        let (payload, _): (ConfirmPlacement, _) =
+            bincode::serde::decode_from_slice(&confirms[0].1, bincode::config::standard()).unwrap();
+        assert_eq!(payload.confirmations.len(), 2);
+    }
+
+    // Impact: the lane's first cut waited out the full minute for a lone
+    // upload, and placement tests that allow ~30 s failed.
+    // Should: flush once the input has been quiet for the full gap, flush a
+    // steady stream once its oldest entry is a minute old, and flush at
+    // once when a full page is waiting.
+    // Should not: flush while items keep arriving inside the quiet gap, or
+    // early because the push landed late in a whole second (review of #96:
+    // second-granular stamps could fire after ~1 s).
+    #[test]
+    fn lane_flushes_at_size_quiet_or_age() {
+        let t0 = 100_999; // late in second 100
+        let mut buf = evidence::LaneBuffer::default();
+        assert!(!buf.due(t0));
+        buf.push(item(1, 9, &[1]), t0);
+        assert!(!buf.due(t0));
+        assert!(
+            !buf.due(t0 + 1_001),
+            "one second boundary later is not quiet"
+        );
+        assert!(!buf.due(t0 + policy::EVIDENCE_QUIET_MS - 1));
+        assert!(buf.due(t0 + policy::EVIDENCE_QUIET_MS), "quiet");
+
+        // A steady stream keeps it open until the age bound.
+        let mut stream = evidence::LaneBuffer::default();
+        let mut t = t0;
+        while t < t0 + policy::EVIDENCE_MAX_AGE_SECS * 1000 {
+            stream.push(item(2, 9, &[2]), t);
+            assert!(!stream.due(t), "still streaming at {t}");
+            t += 500;
+        }
+        stream.push(item(2, 9, &[2]), t);
+        assert!(stream.due(t), "age bound");
+
+        let mut full = evidence::LaneBuffer::default();
+        full.push(
+            evidence::EvidenceItem {
+                present: vec![Blake3Hash::from_bytes([7; 32]); policy::ATTEST_PAGE_SIZE],
+                ..item(2, 9, &[])
+            },
+            t0,
+        );
+        assert!(full.due(t0));
     }
 }

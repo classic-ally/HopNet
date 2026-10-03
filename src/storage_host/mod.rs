@@ -15,6 +15,7 @@ pub mod functions;
 pub mod handlers;
 pub mod jobs;
 pub mod placement;
+pub mod pull_planner;
 pub mod routes;
 pub mod staleness;
 pub mod substrate_host;

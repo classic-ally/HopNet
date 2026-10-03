@@ -877,3 +877,153 @@ fn shard_fragment_flags_read_only_the_shard() {
         vec![(h(0xff, 0x00), true)]
     );
 }
+
+// Impact: the planner replaced the tick's stuck 64-blob kick; its pass is
+// raw SQL over the host schema, so this pins it to the real tables.
+// Should: plan an in-flight blob whose goal assigns this node an unheld
+// class, with the owed count from the manifest.
+// Should not: plan a confirmed blob, or one whose assigned classes are
+// already on this node's disk.
+#[test]
+fn planner_pass_plans_owed_blobs_on_the_host_schema() {
+    use hopnet_storage::lifecycle::{ViewSnapshot, record_transition};
+
+    let app_state = crate::consensus::tests::create_test_app_state();
+    let _ = app_state.node_id.set(1);
+    let view = ViewSnapshot {
+        members: vec![1],
+        weights: [(1, 1)].into(),
+    };
+    let blob = |n: u8| {
+        CustomUUID::from_str(&format!("01890a5d-ac96-774b-b9aa-9f8b24f0c9{n:02x}")).unwrap()
+    };
+    let mut conn = app_state.db_pool.get().unwrap();
+    {
+        let tx = conn.transaction().unwrap();
+        record_transition(&tx, 5, &view).unwrap();
+        tx.commit().unwrap();
+    }
+    // Blob 1 in flight, nothing held; blob 2 in flight, everything held;
+    // blob 3 confirmed at its goal.
+    for (n, placed, local) in [(1u8, None, false), (2, None, true), (3, Some(9i64), false)] {
+        conn.execute(
+            "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes,
+             placement_height, file_size, desired_placement_height)
+             VALUES (?, X'01', 3, 0, ?, 10, 9)",
+            params![blob(n), placed],
+        )
+        .unwrap();
+        for i in 0..3i64 {
+            conn.execute(
+                "INSERT INTO fragment_hashes (data_block_id, chunk_number, local_index,
+                 fragment_id, fragment_hash, chunk_type, stored_locally)
+                 VALUES (?, 0, ?, ?, ?, ?, ?)",
+                params![
+                    blob(n),
+                    i,
+                    format!("f{n}-{i}"),
+                    Blake3Hash::new(blake3::hash(format!("{n}-{i}").as_bytes())),
+                    if i < 2 { 0 } else { 1 },
+                    local
+                ],
+            )
+            .unwrap();
+        }
+    }
+    drop(conn);
+
+    let (plan, scanned) = crate::storage_host::pull_planner::plan(&app_state).unwrap();
+    assert_eq!(scanned, 2, "the confirmed blob is not in flight");
+    let owed: Vec<(CustomUUID, usize)> = plan.into_iter().map(|i| (i.blob_id, i.owed)).collect();
+    assert_eq!(owed, vec![(blob(1), 3)]);
+}
+
+// Impact: review of #96 — passes ran back to back whenever any work
+// existed, re-reading every manifest continuously while most owed blobs
+// sat parked; and on thor a pass slower than the interval left no rest
+// at all, so passes re-read the set while the feeder lagged.
+// Should: start passes no closer than the minimum interval, and rest the
+// idle interval after a pass that walked to the end and found nothing.
+// Should: rest at least the minimum rest after any pass, however slow.
+// Should not: start a pass while the book holds a backlog for the feeder.
+#[test]
+fn planner_passes_are_paced() {
+    use crate::storage_host::pull_planner::{
+        BOOK_BACKLOG, PLANNER_IDLE_SECS, PLANNER_MIN_PASS_SECS, PLANNER_MIN_REST_SECS,
+        feeder_caught_up, pass_rest,
+    };
+    use std::time::Duration;
+    let secs = Duration::from_secs;
+    assert!(feeder_caught_up(BOOK_BACKLOG - 1));
+    assert!(!feeder_caught_up(BOOK_BACKLOG));
+    assert_eq!(
+        pass_rest(true, false, secs(2)),
+        secs(PLANNER_MIN_PASS_SECS - 2)
+    );
+    assert_eq!(pass_rest(true, true, secs(0)), secs(PLANNER_MIN_PASS_SECS));
+    assert_eq!(
+        pass_rest(false, false, secs(0)),
+        secs(PLANNER_MIN_PASS_SECS),
+        "mid-walk"
+    );
+    assert_eq!(pass_rest(false, true, secs(5)), secs(PLANNER_IDLE_SECS - 5));
+    assert_eq!(
+        pass_rest(true, false, secs(600)),
+        secs(PLANNER_MIN_REST_SECS),
+        "a slow pass still rests"
+    );
+}
+
+// Impact: third review of #96 — a feeder that died (a panic) went
+// unnoticed: the planner kept filling the book and nothing was offered.
+// Should: respawn a feeder that has stopped.
+// Should not: respawn one that is still running.
+#[tokio::test]
+async fn a_dead_feeder_is_respawned() {
+    use crate::storage_host::pull_planner::{AbortOnDrop, respawn_if_finished};
+    let mut task = AbortOnDrop(tokio::spawn(async { panic!("feeder panicked") }));
+    while !task.0.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let respawned = respawn_if_finished(&mut task, || tokio::spawn(std::future::pending::<()>()));
+    assert!(respawned);
+    assert!(!task.0.is_finished());
+    assert!(!respawn_if_finished(&mut task, || unreachable!(
+        "a running feeder is left alone"
+    )));
+}
+
+// Impact: final review of #96 — the planner held off while the book was
+// long without checking the feeder, so a feeder that died with 512+ blobs
+// in the book wedged pulls for good.
+// Should: respawn a dead feeder while holding off, and stop holding once
+// the book is no longer behind.
+#[tokio::test]
+async fn holding_off_respawns_a_dead_feeder() {
+    use crate::storage_host::pull_planner::{AbortOnDrop, BOOK_BACKLOG, hold_while_behind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut feeder = AbortOnDrop(tokio::spawn(async {}));
+    while !feeder.0.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let respawns = AtomicUsize::new(0);
+    let len = AtomicUsize::new(BOOK_BACKLOG);
+    hold_while_behind(
+        || {
+            // The respawned feeder drains the book.
+            if respawns.load(Ordering::SeqCst) > 0 {
+                len.store(0, Ordering::SeqCst);
+            }
+            len.load(Ordering::SeqCst)
+        },
+        &mut feeder,
+        || {
+            respawns.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(std::future::pending::<()>())
+        },
+        std::time::Duration::from_millis(1),
+    )
+    .await;
+    assert_eq!(respawns.load(Ordering::SeqCst), 1);
+    assert!(!feeder.0.is_finished());
+}
