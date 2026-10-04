@@ -467,7 +467,8 @@ pub(crate) struct Rotation {
     /// The current shard step's timings, filled step by step so a failed
     /// shard still reports the steps it got through.
     shard: hopnet_storage::sweep::ShardTimings,
-    /// Shards since the last progress line, and when it was logged.
+    /// Shards since the last progress line, and when the last INFO one was
+    /// logged.
     progress_shards: usize,
     progress_at: std::time::Instant,
 }
@@ -546,20 +547,20 @@ pub async fn run_rolling_sweep(app_state: AppState) {
         let height = current_height(&app_state).unwrap_or(cursor.started_height);
         let (next, completed) = cursor.advance(unix_now(), height);
         rotation.progress_shards += 1;
-        if !completed
-            && hopnet_storage::sweep::progress_due(
-                rotation.progress_shards,
-                rotation.progress_at.elapsed().as_secs(),
-            )
-        {
-            tracing::info!(
-                "sweep: rotation {} progress at shard {:02x}: {}",
-                cursor.rotation,
-                cursor.next_shard,
-                rotation.report.timing_summary()
-            );
+        let due = hopnet_storage::sweep::progress_due(
+            rotation.progress_shards,
+            rotation.progress_at.elapsed().as_secs(),
+        );
+        if let (false, Some(level)) = (completed, due) {
+            let (rot, shard) = (cursor.rotation, cursor.next_shard);
+            let summary = rotation.report.timing_summary();
+            if level == hopnet_storage::sweep::ProgressLine::Info {
+                tracing::info!("sweep: rotation {rot} progress at shard {shard:02x}: {summary}");
+                rotation.progress_at = std::time::Instant::now();
+            } else {
+                tracing::debug!("sweep: rotation {rot} progress at shard {shard:02x}: {summary}");
+            }
             rotation.progress_shards = 0;
-            rotation.progress_at = std::time::Instant::now();
         }
         if completed {
             flush_buffers(&host, rotation, true).await;

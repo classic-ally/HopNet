@@ -481,7 +481,7 @@ async fn report_with_held(
 
 /// The `in_progress` section: the rolling walker's current rotation — its
 /// cursor and running report with the step timings so far — or null
-/// before its first shard.
+/// before its first shard. Totals count from the walker's (re)start.
 fn in_progress_section(app_state: &AppState) -> serde_json::Value {
     let progress = app_state.sweep_progress.lock().unwrap().clone();
     serde_json::to_value(progress).unwrap_or_default()

@@ -240,8 +240,9 @@ pub struct SweepReport {
     pub flush_pages: usize,
     #[serde(default)]
     pub flush_slowest_ms: u64,
-    /// The rolling walker's per-shard work (step plus flush) and its pacing
-    /// sleep between shards.
+    /// The rolling walker's per-shard work (step plus flush, including any
+    /// wait for `SWEEP_LOCK` behind an operator sweep) and its pacing sleep
+    /// between shards.
     #[serde(default)]
     pub ms_work: u64,
     #[serde(default)]
@@ -283,17 +284,35 @@ pub struct FlushTimings {
     pub slowest_ms: u64,
 }
 
-/// The rolling sweep logs its rotation's progress after this many shards
-/// since the last progress line...
+/// The rolling sweep logs its rotation's progress at DEBUG after this many
+/// shards since the last progress line...
 pub const PROGRESS_EVERY_SHARDS: usize = 16;
-/// ...or this many seconds, whichever comes first.
+/// ...and at INFO at most this often (a healthy walker passes 16 shards
+/// every few minutes; INFO stays sparse).
 pub const PROGRESS_EVERY_SECS: u64 = 900;
 
-/// Whether the rolling sweep's progress line is due, `shards` shards and
-/// `secs` seconds after the last one (or the rotation's start). Never
-/// without a new shard to report.
-pub fn progress_due(shards: usize, secs: u64) -> bool {
-    shards > 0 && (shards >= PROGRESS_EVERY_SHARDS || secs >= PROGRESS_EVERY_SECS)
+/// The level a progress line is due at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressLine {
+    Debug,
+    Info,
+}
+
+/// Which progress line is due, `shards` shards after the last line of
+/// either level and `secs_since_info` seconds after the last INFO one (or
+/// the rotation's start): INFO once the INFO interval has passed, else
+/// DEBUG every `PROGRESS_EVERY_SHARDS` shards. Never without a new shard
+/// to report.
+pub fn progress_due(shards: usize, secs_since_info: u64) -> Option<ProgressLine> {
+    if shards == 0 {
+        None
+    } else if secs_since_info >= PROGRESS_EVERY_SECS {
+        Some(ProgressLine::Info)
+    } else if shards >= PROGRESS_EVERY_SHARDS {
+        Some(ProgressLine::Debug)
+    } else {
+        None
+    }
 }
 
 impl SweepReport {
@@ -367,7 +386,8 @@ impl SweepReport {
 }
 
 /// The rolling walker's rotation in progress, for the operator: where it
-/// is, and its running report with the step timings so far.
+/// is, and its running report with the step timings so far. The report is
+/// in memory: it counts from the walker's (re)start, not the rotation's.
 #[derive(Debug, Clone, Serialize)]
 pub struct SweepProgress {
     pub rotation: u64,
@@ -611,17 +631,20 @@ mod tests {
 
     // Impact: thor's walker never finishes a rotation, so this line is the
     // only log of where its rotation time goes.
-    // Should: report progress once 16 shards have passed since the last line.
-    // Should: report progress once 15 minutes have passed, however few shards.
-    // Should not: report progress before a single new shard was swept.
+    // Should: log progress at INFO once 15 minutes have passed since the
+    // last INFO line, however few shards.
+    // Should: log progress at DEBUG every 16 shards in between.
+    // Should not: log progress at INFO more often than every 15 minutes.
+    // Should not: log progress before a single new shard was swept.
     #[test]
-    fn progress_line_is_due_every_16_shards_or_15_minutes() {
-        assert!(!progress_due(0, 0));
-        assert!(!progress_due(0, 10_000));
-        assert!(!progress_due(15, 899));
-        assert!(progress_due(16, 0));
-        assert!(progress_due(1, 900));
-        assert!(progress_due(40, 3_600));
+    fn progress_line_is_info_every_15_minutes_and_debug_every_16_shards() {
+        assert_eq!(progress_due(0, 0), None);
+        assert_eq!(progress_due(0, 10_000), None);
+        assert_eq!(progress_due(15, 899), None);
+        assert_eq!(progress_due(16, 0), Some(ProgressLine::Debug));
+        assert_eq!(progress_due(64, 899), Some(ProgressLine::Debug));
+        assert_eq!(progress_due(1, 900), Some(ProgressLine::Info));
+        assert_eq!(progress_due(40, 3_600), Some(ProgressLine::Info));
     }
 
     // Should: sum each step's milliseconds and the scrub's reads over every
