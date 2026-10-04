@@ -1029,7 +1029,7 @@ mod tests {
     }
 
     const STEP_FIXTURE_STORAGE_0006_HASH: &str =
-        "d92fe74b2f6aa5f455510fc37690cb087d97bc648f39599b9ce384fd6d128c15";
+        "7c904d25b2c5506c897af60d637afeaa700645d7eb03e1102c393540bc9ce0db";
 
     // Should: land the documented backfill values, not just a stable hash.
     #[test]

@@ -789,13 +789,15 @@ optimization and carries no proof obligation.
     every put-before-row site records its hashes in the node-local
     `hopnet_storage_local_uploads` (storage step 0006, storage@6,
     frozen `PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION` for storage@5
-    artifacts), the sweep holds a ledgered rowless file at any age
-    (reported as `orphans_held`), and retires the entry once the row
-    lands (consensus-bugs 20). The two-call scan/delete API and its
-    process-memory scan cache die; the manual route becomes a report
-    of the sweep's last findings plus the held uploads by blob, and
-    `POST /maintenance/orphaned-fragments/purge-held` is the
-    operator's explicit way to give one up.
+    artifacts) before each fragment file is written, the sweep holds a
+    ledgered rowless file for up to 14 days (reported as
+    `orphans_held`; `LOCAL_UPLOAD_RETENTION_SECS`), retires the entry
+    once the row lands, and expires it past the retention, after which
+    the file is an ordinary orphan (consensus-bugs 20). The two-call
+    scan/delete API and its process-memory scan cache die; the manual
+    route becomes a report of the sweep's last findings plus the held
+    uploads by blob, and `POST /maintenance/orphaned-fragments/purge-held`
+    is the owner's explicit way to give one up early.
   - Orphaned data-block cleanup stays a slow cron — deletion
     policy, not convergence — but actually registered on a
     schedule, keeping the manual route and the takeout gate. The
@@ -1208,12 +1210,19 @@ optimization and carries no proof obligation.
   - Own-upload ledger (2026-10-04, PR #108, consensus-bugs 20). The
     sweep's orphan case deletes a rowless file past the grace unless
     `hopnet_storage_local_uploads` names it: the node's own uploads,
-    recorded at every `api::put` site before the transaction is signed,
-    held at any age and retired when the row lands. Stuck uploads are
-    visible under `held` on the orphan route and purged only by the
-    operator (`purge-held`, by blob id). Storage step 0006 moves the
-    hashed format_version to 6; storage@5 artifacts import through the
-    frozen `PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION`.
+    recorded per blob by a hook inside `put` before each batch of
+    fragment files is written (so a multi-hour upload is covered from
+    its first chunk), held for up to 14 days
+    (`LOCAL_UPLOAD_RETENTION_SECS`, env
+    `HOPNET_STORAGE_LOCAL_UPLOAD_RETENTION_SECS`), retired by SQL once
+    the row lands whatever became of the file, and expired past the
+    retention into ordinary orphans. Stuck uploads are visible under
+    `held` on the orphan route; the node's owner can purge them early
+    (`purge-held`, by blob id), which deletes a file only when it has
+    no row and no other upload holds it, in the same transaction.
+    Storage step 0006 moves the hashed format_version to 6; storage@5
+    artifacts import through the frozen
+    `PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION`.
   - Pull pipeline (2026-10-03, branch `pull-pipeline` on
     `feat-rolling-sweep`, decided with Allison; ships as 2026.10.8).
     Production after the 10.6 crossing: 68,878 in-flight blobs, pulls

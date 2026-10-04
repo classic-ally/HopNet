@@ -171,14 +171,28 @@ impl HostCapabilities {
     }
 }
 
-/// Ledger an ingest as this node's own upload, between `api::put` and the
-/// transaction that carries its `fragment_hashes` rows. Every site that
-/// writes fragments before their rows exist calls this (the drive's
-/// `process_uploaded_file`, the photos `Submitter`); the sweep then holds
-/// the rowless files instead of deleting them as orphans, until the rows
-/// land (consensus-bugs 20). One transaction, committed here so the
-/// caller can fail the upload if the ledger write fails — the client
-/// retries rather than proceeding with files nothing protects.
+/// The `api::put_with` hook for a host ingest: ledgers each batch of
+/// fragments as this node's own upload before their files are written.
+/// Every site that writes fragments before their `fragment_hashes` rows
+/// exist uses it (the drive's `process_uploaded_file`, the photos
+/// `Submitter`); the sweep then holds the rowless files instead of
+/// deleting them as orphans, until the rows land (consensus-bugs 20). A
+/// ledger failure aborts the put, so the client retries rather than
+/// proceeding with files nothing protects.
+pub fn upload_ledger_hook(
+    pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    blob_id: hopnet_storage::BlobId,
+) -> impl FnMut(&[hopnet_storage::Blake3Hash]) -> Result<(), hopnet_storage::StorageError> + Send + 'static
+{
+    move |hashes| {
+        record_own_upload(&pool, &blob_id, hashes)
+            .map(|_| ())
+            .map_err(hopnet_storage::StorageError::Host)
+    }
+}
+
+/// One ledger write for a batch of an ingest's fragments, in one
+/// transaction committed here (`commit_timed`).
 pub fn record_own_upload<'a>(
     pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     blob_id: &hopnet_storage::BlobId,

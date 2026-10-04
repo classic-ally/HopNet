@@ -54,24 +54,20 @@ impl PhotoDispatch for Submitter {
         file_size: usize,
         per_blob_key: chacha20poly1305::Key,
     ) -> Result<UploadedDataBlock, PhotosCoreError> {
-        let outcome = hopnet_storage::api::put(
+        // The fragments are on disk long before the photo transaction is
+        // signed; each batch is ledgered before its files are written, so
+        // the sweep holds them until their rows land (consensus-bugs 20). A
+        // ledger failure fails the upload, so the client retries instead of
+        // proceeding with unprotected files.
+        let outcome = hopnet_storage::api::put_with(
             source,
             file_size,
             blob_id.clone(),
             &per_blob_key,
             &self.app_state.fragments_dir,
+            hopnet_projection::host::upload_ledger_hook(self.app_state.db_pool.clone(), blob_id),
         )
         .await?;
-        // The fragments are on disk before the photo transaction is signed;
-        // ledgered, the sweep holds them until their rows land
-        // (consensus-bugs 20). A ledger failure fails the upload, so the
-        // client retries instead of proceeding with unprotected files.
-        hopnet_projection::host::record_own_upload(
-            &self.app_state.db_pool,
-            &blob_id,
-            outcome.fragments.iter().map(|f| &f.fragment_hash),
-        )
-        .map_err(PhotosCoreError::Dispatch)?;
 
         Ok(UploadedDataBlock {
             integrity_hash: outcome.integrity_hash,

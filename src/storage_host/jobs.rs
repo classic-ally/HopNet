@@ -389,6 +389,26 @@ pub struct UnplacedDrainResult {
 /// not an orphan.
 pub const SWEEP_ORPHAN_GRACE_SECS: u64 = 3600;
 
+/// How long the sweep holds this node's own upload whose `fragment_hashes`
+/// row has not landed (`hopnet_storage_local_uploads`). Past it the upload
+/// is given up on and its files are ordinary orphans. Long enough for any
+/// transaction that is going to land — a straggler's rows arrive with its
+/// join, within hours — and bounded so retried uploads under fresh blob
+/// ids cannot grow the ledger forever. 14 days.
+pub const LOCAL_UPLOAD_RETENTION_SECS: u64 = 14 * 86_400;
+
+/// `LOCAL_UPLOAD_RETENTION_SECS`, overridden by
+/// `HOPNET_STORAGE_LOCAL_UPLOAD_RETENTION_SECS`, read once.
+fn local_upload_retention() -> u64 {
+    static RETENTION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RETENTION.get_or_init(|| {
+        std::env::var("HOPNET_STORAGE_LOCAL_UPLOAD_RETENTION_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(LOCAL_UPLOAD_RETENTION_SECS)
+    })
+}
+
 /// One rotation of the rolling sweep visits every shard in about this
 /// long, paced per shard; a slow disk stretches the rotation, it never
 /// bursts. At drain traffic (~45 heights a minute) an hour is ~2,700
@@ -586,7 +606,7 @@ fn finish_rotation(
         .map(|tip| tip.saturating_sub(started_height))
         .unwrap_or(0);
     tracing::info!(
-        "sweep: rotation of {} shards in {}s ({} heights): {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} orphans held (own uploads), {} corrupt deleted, {} surplus released, {} temp files deleted, {} belief pages ({} failed), {} attestation pages ({} failed), {} shards failed",
+        "sweep: rotation of {} shards in {}s ({} heights): {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} orphans held (own uploads), {} held uploads expired, {} corrupt deleted, {} surplus released, {} temp files deleted, {} belief pages ({} failed), {} attestation pages ({} failed), {} shards failed",
         report.shards,
         report.rotation_secs,
         report.rotation_heights,
@@ -596,6 +616,7 @@ fn finish_rotation(
         report.unflagged,
         report.orphans_deleted,
         report.orphans_held,
+        report.uploads_expired,
         report.corrupt_deleted,
         report.surplus_released,
         report.temps_deleted,
@@ -690,8 +711,15 @@ pub(crate) async fn sweep_shard(
             .db_pool
             .get()
             .map_err(|e| fail("pool", e.to_string()))?;
-        reap_orphans(&mut conn, &fragments_dir, shard, &diff, report)
-            .map_err(|e| fail("orphans", e))?
+        reap_orphans(
+            &mut conn,
+            &fragments_dir,
+            shard,
+            &diff,
+            local_upload_retention(),
+            report,
+        )
+        .map_err(|e| fail("orphans", e))?
     };
 
     // (4) Only a content hash mismatch is corruption; a file that vanished
@@ -790,23 +818,36 @@ pub(crate) async fn sweep_shard(
 }
 
 /// Step 3's orphan half, the only place the sweep deletes a rowless file.
-/// `diff.orphans` (rowless, past the grace) are split by this node's
-/// upload ledger: a hash the ledger names is this node's own upload whose
-/// `fragment_hashes` row has not reached it — the transaction may still be
-/// in flight, or a staged join may have imported an inventory without it
-/// (consensus-bugs 20) — so the file is held and counted, never deleted;
-/// the rest are deleted. Ledger entries whose hash is now `present` (the
-/// upload landed) are retired. Returns the hashes deleted, which the scrub
-/// skips.
+/// First the shard's ledger is settled in one transaction: entries whose
+/// hash has a `fragment_hashes` row are retired (the upload landed,
+/// whatever became of the file), and entries older than the retention are
+/// expired (the upload is given up on; its files are orphans from here).
+/// Then `diff.orphans` (rowless, past the grace) are split by what remains:
+/// a hash the ledger names is this node's own upload whose row has not
+/// reached it — the transaction may still be in flight, or a staged join
+/// may have imported an inventory without it (consensus-bugs 20) — so the
+/// file is held and counted, never deleted; the rest are deleted. Returns
+/// the hashes deleted, which the scrub skips.
 pub(crate) fn reap_orphans(
     conn: &mut rusqlite::Connection,
     fragments_dir: &str,
     shard: u8,
     diff: &hopnet_storage::sweep::SweepDiff,
+    retention_secs: u64,
     report: &mut hopnet_storage::sweep::SweepReport,
 ) -> Result<Vec<hopnet_storage::Blake3Hash>, String> {
-    let ledger = hopnet_storage::store::local_uploads_in(conn, shard)
-        .map_err(|e| format!("upload ledger: {e}"))?;
+    let ledger = {
+        let tx = conn.transaction().map_err(|e| format!("tx: {e}"))?;
+        hopnet_storage::store::retire_local_uploads(&tx, shard)
+            .map_err(|e| format!("retire ledger: {e}"))?;
+        let cutoff = unix_now().saturating_sub(retention_secs);
+        report.uploads_expired += hopnet_storage::store::expire_local_uploads(&tx, shard, cutoff)
+            .map_err(|e| format!("expire ledger: {e}"))?;
+        let ledger = hopnet_storage::store::local_uploads_in(&tx, shard)
+            .map_err(|e| format!("upload ledger: {e}"))?;
+        crate::db::shared::commit_timed(tx).map_err(|e| format!("ledger commit: {e}"))?;
+        ledger
+    };
     let (delete, held) = hopnet_storage::sweep::split_orphans(&diff.orphans, &ledger);
     let mut deleted = Vec::with_capacity(delete.len());
     for (hash, size) in &delete {
@@ -822,18 +863,6 @@ pub(crate) fn reap_orphans(
     for (_, size) in &held {
         report.orphans_held += 1;
         report.orphan_bytes_held = report.orphan_bytes_held.saturating_add(*size);
-    }
-    let landed: Vec<_> = diff
-        .present
-        .iter()
-        .filter(|hash| ledger.contains(hash))
-        .copied()
-        .collect();
-    if !landed.is_empty() {
-        let tx = conn.transaction().map_err(|e| format!("tx: {e}"))?;
-        hopnet_storage::store::retire_local_uploads(&tx, &landed)
-            .map_err(|e| format!("retire ledger: {e}"))?;
-        crate::db::shared::commit_timed(tx).map_err(|e| format!("retire commit: {e}"))?;
     }
     Ok(deleted)
 }
@@ -903,38 +932,31 @@ pub fn held_uploads(app_state: &AppState) -> Result<HeldUploads, String> {
     Ok(report)
 }
 
-/// Give up on held uploads: drop the ledger entries of `blob_ids` and
-/// delete the files among them that still have no row. Explicit and
-/// operator-driven by design — a stuck upload is indistinguishable from a
-/// slow one by anything but the operator, and the blob ids are also the
-/// handle for re-uploading. The ledger commits first: a crash between
-/// leaves unledgered rowless files, which the sweep reaps after its grace.
+/// Give up on held uploads early: drop the ledger entries of `blob_ids`
+/// and delete the files only they held and that still have no row.
+/// Explicit and operator-driven by design — a stuck upload is
+/// indistinguishable from a slow one by anything but the operator (the
+/// retention reclaims it eventually), and the blob ids are also the handle
+/// for re-uploading. One IMMEDIATE transaction: the row check and the
+/// unlink happen in the same critical section, so a fragment that has
+/// gained a row is never deleted.
 pub fn purge_held_uploads(
     app_state: &AppState,
     blob_ids: &[CustomUUID],
 ) -> Result<PurgedUploads, String> {
-    let hashes = {
-        let mut conn = app_state.db_pool.get().map_err(|e| format!("pool: {e}"))?;
-        let tx = conn.transaction().map_err(|e| format!("tx: {e}"))?;
-        let hashes = hopnet_storage::store::purge_local_uploads(&tx, blob_ids)
+    let mut conn = app_state.db_pool.get().map_err(|e| format!("pool: {e}"))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("tx: {e}"))?;
+    let outcome =
+        hopnet_storage::store::purge_local_uploads(&tx, &app_state.fragments_dir, blob_ids)
             .map_err(|e| format!("ledger: {e}"))?;
-        crate::db::shared::commit_timed(tx).map_err(|e| format!("ledger commit: {e}"))?;
-        hashes
-    };
-    let mut report = PurgedUploads {
+    crate::db::shared::commit_timed(tx).map_err(|e| format!("ledger commit: {e}"))?;
+    let report = PurgedUploads {
         blobs: blob_ids.len(),
-        ..Default::default()
+        fragments_deleted: outcome.fragments_deleted,
+        bytes_freed: outcome.bytes_freed,
     };
-    for hash in &hashes {
-        let bytes = fragment_file_size(&app_state.fragments_dir, hash);
-        match hopnet_storage::fragstore::delete_fragment(&app_state.fragments_dir, hash) {
-            Ok(()) => {
-                report.fragments_deleted += 1;
-                report.bytes_freed = report.bytes_freed.saturating_add(bytes);
-            }
-            Err(e) => tracing::warn!("purge-held: delete {} failed: {e}", hash.to_hex()),
-        }
-    }
     tracing::info!(
         blobs = report.blobs,
         fragments_deleted = report.fragments_deleted,
@@ -1894,8 +1916,31 @@ mod tests {
             unix_now().saturating_sub(SWEEP_ORPHAN_GRACE_SECS),
         );
         let mut report = hopnet_storage::sweep::SweepReport::default();
-        let deleted = reap_orphans(conn, frags, shard, &diff, &mut report).unwrap();
+        let deleted = reap_orphans(
+            conn,
+            frags,
+            shard,
+            &diff,
+            LOCAL_UPLOAD_RETENTION_SECS,
+            &mut report,
+        )
+        .unwrap();
         (deleted, diff, report)
+    }
+
+    /// The upload's transaction lands: `data_blocks` and `fragment_hashes`
+    /// rows for `hash` under `blob`.
+    fn land_row(conn: &rusqlite::Connection, blob: &CustomUUID, hash: &Blake3Hash, size: usize) {
+        conn.execute_batch(&format!(
+            "INSERT OR IGNORE INTO data_blocks (id, file_hash, fragment_count, added_bytes, file_size)
+             VALUES ('{blob}', X'00', 1, 0, {size});
+             INSERT INTO fragment_hashes
+             (data_block_id, chunk_number, local_index, fragment_id, fragment_hash, chunk_type, stored_locally)
+             VALUES ('{blob}', 0, 0, '{}', X'{}', 0, 0);",
+            hash.to_hex(),
+            hash.to_hex()
+        ))
+        .unwrap();
     }
 
     // Impact: regression guard for the 2026-10-01 loss of two uploaded
@@ -1928,17 +1973,7 @@ mod tests {
             ));
         }
 
-        // The upload's transaction lands.
-        conn.execute_batch(&format!(
-            "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes, file_size)
-             VALUES ('{blob}', X'00', 1, 0, {});
-             INSERT INTO fragment_hashes
-             (data_block_id, chunk_number, local_index, fragment_id, fragment_hash, chunk_type, stored_locally)
-             VALUES ('{blob}', 0, 0, 'upload-0', X'{}', 0, 0);",
-            bytes.len(),
-            hash.to_hex()
-        ))
-        .unwrap();
+        land_row(&conn, &blob, &hash, bytes.len());
         let (deleted, diff, report) = reap_shard(&mut conn, &frags, shard);
         assert!(deleted.is_empty());
         assert_eq!(diff.present, vec![hash]);
@@ -1974,6 +2009,81 @@ mod tests {
         assert_eq!(report.orphans_held, 0);
         assert!(!hopnet_storage::fragstore::fragment_exists_and_valid(
             &frags, &hash
+        ));
+    }
+
+    // Impact: a ledger entry retired only when the sweep sees its file as
+    // present would outlive a file that left disk first (a blob deleted
+    // soon after landing, an eviction), a phantom hold forever.
+    // Should: retire an entry whose row has landed when its file is gone.
+    #[test]
+    fn a_landed_entry_whose_file_is_gone_is_still_retired() {
+        let (_dir, frags, mut conn) = orphan_fixture();
+        let bytes = b"landed, then evicted";
+        let hash = Blake3Hash::from_bytes(*blake3::hash(bytes).as_bytes());
+        let shard = hopnet_storage::sweep::shard_of(&hash);
+        let blob = CustomUUID::new(None);
+        hopnet_storage::store::record_local_uploads(&conn, &blob, [&hash], unix_now()).unwrap();
+        land_row(&conn, &blob, &hash, bytes.len());
+
+        let (deleted, diff, report) = reap_shard(&mut conn, &frags, shard);
+        assert!(deleted.is_empty());
+        assert!(diff.present.is_empty(), "nothing on disk");
+        assert_eq!(report.orphans_held, 0);
+        assert!(
+            hopnet_storage::store::local_uploads_in(&conn, shard)
+                .unwrap()
+                .is_empty(),
+            "the row exists, so the hold is retired, file or no file"
+        );
+    }
+
+    // Impact: an upload whose transaction never lands (rejected, given up,
+    // retried under a fresh blob id) must not hold its files forever and
+    // grow the ledger without bound; the retention is the durable bound a
+    // restart cannot reset.
+    // Should: expire a held upload written longer ago than the retention,
+    // report it, and delete its file as an ordinary orphan on the same
+    // visit.
+    // Should not: expire an entry within the retention, nor one stamped in
+    // the future by a clock step.
+    #[test]
+    fn a_held_upload_past_the_retention_becomes_an_ordinary_orphan() {
+        let (_dir, frags, mut conn) = orphan_fixture();
+        let now = unix_now();
+        let stale = store_aged(&frags, b"given up on two weeks ago", 3 * 3600);
+        let fresh = store_aged(&frags, b"uploaded yesterday", 3 * 3600);
+        let future = store_aged(&frags, b"stamped after a clock step", 3 * 3600);
+        let blob = CustomUUID::new(None);
+        hopnet_storage::store::record_local_uploads(
+            &conn,
+            &blob,
+            [&stale],
+            now - LOCAL_UPLOAD_RETENTION_SECS - 1,
+        )
+        .unwrap();
+        hopnet_storage::store::record_local_uploads(&conn, &blob, [&fresh], now - 86_400).unwrap();
+        hopnet_storage::store::record_local_uploads(&conn, &blob, [&future], now + 86_400).unwrap();
+
+        let mut total = hopnet_storage::sweep::SweepReport::default();
+        for hash in [&stale, &fresh, &future] {
+            let (_, _, report) =
+                reap_shard(&mut conn, &frags, hopnet_storage::sweep::shard_of(hash));
+            total.uploads_expired += report.uploads_expired;
+            total.orphans_deleted += report.orphans_deleted;
+            total.orphans_held += report.orphans_held;
+        }
+        assert_eq!(total.uploads_expired, 1);
+        assert_eq!(total.orphans_deleted, 1);
+        assert_eq!(total.orphans_held, 2);
+        assert!(!hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags, &stale
+        ));
+        assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags, &fresh
+        ));
+        assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags, &future
         ));
     }
 

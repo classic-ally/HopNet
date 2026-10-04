@@ -41,6 +41,7 @@ When making changes to the codebase:
 - Pragma tuning is via `HOPNET_DB_*` env vars (see `src/db/shared.rs::env_pragma_overrides`); orchestrator forwards them to containers automatically.
 - Pull concurrency is via `HOPNET_PULL_WINDOW` / `HOPNET_PULL_FETCH_GLOBAL` / `HOPNET_PULL_FETCH_PER_PEER` / `HOPNET_PULL_URGENT_RESERVE` / `HOPNET_PULL_REBUILDS` (defaults 64/24/8/4/2, see `hopnet-storage/src/engine/fetch.rs::PullLimits`); orchestrator forwards `HOPNET_PULL_*` too.
 - Urgent repair's startup grace is `HOPNET_REPAIR_GRACE_SECS` (default 900, 0 = off; see `src/storage_host/jobs.rs::REPAIR_GRACE`); orchestrator forwards `HOPNET_REPAIR_*`.
+- The sweep holds this node's own unconfirmed uploads for `HOPNET_STORAGE_LOCAL_UPLOAD_RETENTION_SECS` (default 1209600 = 14 days; see `src/storage_host/jobs.rs::LOCAL_UPLOAD_RETENTION_SECS`) before reclaiming them as orphans; orchestrator forwards `HOPNET_STORAGE_*`.
 - Free-space floors (`hopnet-storage/src/admission.rs`): uploads stop at `HOPNET_STORAGE_MIN_FREE_BYTES` (10 GiB); replica writes (pulls, rebuilds, re-encodes) stop at `HOPNET_PULL_MIN_FREE_BYTES` / `HOPNET_PULL_MIN_FREE_PCT` (max(20 GiB, 2%); `0` bytes disables) and resume `HOPNET_PULL_RESUME_FREE_BYTES` higher (default max(10 GiB, 1%)).
 
 # Debugging

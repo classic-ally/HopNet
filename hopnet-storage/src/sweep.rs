@@ -152,6 +152,10 @@ pub struct SweepReport {
     pub orphans_held: usize,
     #[serde(default)]
     pub orphan_bytes_held: u64,
+    /// Ledger entries given up on this walk: no row landed within the
+    /// retention, so their files are ordinary orphans from here on.
+    #[serde(default)]
+    pub uploads_expired: usize,
     pub young_orphans: usize,
     pub corrupt_deleted: usize,
     /// Scrub-slice files the read failed on for a reason other than

@@ -304,9 +304,10 @@ CREATE TABLE hopnet_storage_sweep_cursor (
 );
 
 CREATE TABLE hopnet_storage_local_uploads (
-    fragment_hash   BLOB PRIMARY KEY,
+    fragment_hash   BLOB NOT NULL,
     blob_id         TEXT NOT NULL,
-    written_unix    INTEGER NOT NULL
+    written_unix    INTEGER NOT NULL,
+    PRIMARY KEY (fragment_hash, blob_id)
 );
 
 CREATE INDEX idx_local_uploads_blob ON hopnet_storage_local_uploads (blob_id);

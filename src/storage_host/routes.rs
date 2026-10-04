@@ -542,16 +542,39 @@ pub struct PurgeHeldRequest {
     blob_ids: Vec<CustomUUID>,
 }
 
+/// Owner-only gate for a destructive node-local action: the caller must be
+/// the user this node is registered to (`AppState::get_user_id`), the same
+/// rule the photo-ingress provisioning routes apply. A node with no owner
+/// yet has nobody who may do this.
+fn owner_only(owner: Result<i32, StatusCode>, uid: i32) -> Result<(), StatusCode> {
+    match owner {
+        Ok(owner) if owner == uid => Ok(()),
+        _ => Err(StatusCode::FORBIDDEN),
+    }
+}
+
 /// POST /maintenance/orphaned-fragments/purge-held
-/// Give up on held uploads: drop the ledger entries of `blob_ids` and
-/// delete the files among them that still have no row. Explicit by design
-/// — a held file is this node's own upload, and only the operator can tell
-/// a stuck one from a slow one.
+/// Give up on held uploads early: drop the ledger entries of `blob_ids`
+/// and delete the files only they held and that still have no row. Owner-
+/// only and explicit by design — a held file is this node's own upload,
+/// only the operator can tell a stuck one from a slow one, and the
+/// retention reclaims it anyway in time.
 pub async fn post_purge_held_uploads(
     State(app_state): State<AppState>,
     Extension(uid): Extension<i32>,
     Json(request): Json<PurgeHeldRequest>,
 ) -> impl IntoResponse {
+    if let Err(status) = owner_only(app_state.get_user_id(), uid) {
+        tracing::warn!("Purge of held uploads refused: user {uid} is not this node's owner");
+        return (
+            status,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": "purging held uploads is owner-only"
+            })),
+        )
+            .into_response();
+    }
     if request.blob_ids.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -620,5 +643,26 @@ pub async fn get_file_fragment_distribution(
             tracing::error!("Failed to get file fragment distribution: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Impact: purge-held unlinks this node's own uploads by hand; the other
+    // /maintenance routes are open to any authenticated user, and a guest
+    // of the node must not be able to throw away its owner's in-flight
+    // photos.
+    // Should: admit exactly the node's registered owner.
+    // Should not: admit another user, or anyone on a node with no owner yet.
+    #[test]
+    fn purge_held_is_owner_only() {
+        assert_eq!(owner_only(Ok(7), 7), Ok(()));
+        assert_eq!(owner_only(Ok(7), 8), Err(StatusCode::FORBIDDEN));
+        assert_eq!(
+            owner_only(Err(StatusCode::PRECONDITION_REQUIRED), 7),
+            Err(StatusCode::FORBIDDEN)
+        );
     }
 }
