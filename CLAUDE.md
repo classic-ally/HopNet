@@ -46,6 +46,13 @@ When making changes to the codebase:
 # Debugging
 - macOS debugging with the `log` command requires the use of sudo
 - tail the last ~10 lines with cargo check to ensure you can see the final result; only if a build fails do you need to get more output.
+- Heap profiling (Linux node only; jemalloc via `src/main.rs`, handlers in `src/debug/heap.rs`). Owner JWT required, others get 403:
+  1. `curl -k -X POST -H "Authorization: Bearer $JWT" -H 'Content-Type: application/json' -d '{"active":true}' https://<node>:34632/api/debug/heap/profiling`
+  2. Wait while the suspect workload runs (sampling only sees allocations made while active).
+  3. `curl -k -H "Authorization: Bearer $JWT" https://<node>:34632/api/debug/heap/profile > heap.pb.gz` (409 while inactive; 503 on either profiling route if profiling was not enabled at startup, e.g. `MALLOC_CONF=prof:false`, which needs a restart).
+  4. `nix shell nixpkgs#pprof --command pprof -top <path-to-hopnet-binary> heap.pb.gz` (or `go tool pprof`).
+  5. POST `{"active":false}` to stop sampling (this also resets the collected samples).
+  `GET /api/debug/heap/stats` reports jemalloc `allocated`/`active`/`resident`/`mapped`/`retained`/`metadata`, dirty and muzzy page bytes across all arenas, whether background purge threads are on (`background_thread`, `background_threads`) and profiler state. Built-in config is `prof:true,prof_active:false,lg_prof_sample:19,background_thread:true` (exported `malloc_conf`); override with the standard `MALLOC_CONF` env var (e.g. `MALLOC_CONF=prof_active:true` to sample from boot). macOS (and HopNet.app) keeps the system allocator; the routes return 501 there.
 
 # Git Commits
 - Never include your attribution in commits

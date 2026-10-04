@@ -282,6 +282,17 @@ pub fn encode_jwt_with_duration(
     })
 }
 
+/// Refuse anyone but the node's owner (the user this node was set up for).
+/// For routes behind `auth_middleware` that expose node-wide internals, where
+/// "any authenticated user" is too broad. A node with no owner yet refuses
+/// everyone.
+pub fn require_owner(app_state: &AppState, uid: i32) -> Result<(), StatusCode> {
+    match app_state.get_user_id() {
+        Ok(owner_id) if owner_id == uid => Ok(()),
+        _ => Err(StatusCode::FORBIDDEN),
+    }
+}
+
 /// Logout endpoint. Removes session from store.
 /// In GUI mode, the owner's keychain-loaded session is preserved for auto-login.
 pub async fn sign_out(
@@ -640,5 +651,20 @@ mod tests {
 
         let result = unwrap_user_key_from_device(&secret, &wrapped);
         assert!(result.is_err());
+    }
+
+    // Impact: the heap debug routes sit behind auth_middleware, which admits
+    // any user on the node; this check is what keeps them owner-only.
+    // Should: refuse every user with 403 while the node has no owner.
+    // Should: refuse a signed-in user who is not the owner with 403.
+    // Should: admit the owner.
+    #[test]
+    fn require_owner_refuses_a_non_owner_and_an_unset_owner() {
+        let app_state = crate::consensus::tests::create_test_app_state();
+        assert_eq!(require_owner(&app_state, 7), Err(StatusCode::FORBIDDEN));
+
+        app_state.user_id.set(7).unwrap();
+        assert_eq!(require_owner(&app_state, 8), Err(StatusCode::FORBIDDEN));
+        assert_eq!(require_owner(&app_state, 7), Ok(()));
     }
 }

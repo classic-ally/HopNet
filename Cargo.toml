@@ -133,6 +133,20 @@ objc2-service-management = "0.3.2"
 # Security framework for keychain access
 security-framework = "3.3.0"
 
+# jemalloc for the Linux node (src/main.rs #[global_allocator]). Unprefixed so
+# bundled C code (SQLite, ring) allocates through it too; profiling compiled
+# in for the owner-only /api/debug/heap/* routes (src/debug/heap.rs).
+[target.'cfg(target_os = "linux")'.dependencies]
+jemalloc_pprof = "0.9"
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats", "profiling"] }
+tikv-jemallocator = { version = "0.7", features = ["profiling", "unprefixed_malloc_on_supported_platforms", "background_threads"] }
+
+# jemalloc's configure builds with -Werror, and Nix's gcc wrapper adds
+# -D_FORTIFY_SOURCE, which warns at -O0: an unoptimised dev build of
+# tikv-jemalloc-sys fails configure. Optimise just that crate in dev builds.
+[profile.dev.package.tikv-jemalloc-sys]
+opt-level = 1
+
 [dev-dependencies]
 # oneshot router tests (RFC-023 client_compat registry test)
 tower = { version = "0.5.2", features = ["util"] }
