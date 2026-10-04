@@ -261,15 +261,26 @@ const MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 /// Generous enough for relay/holepunch but prevents indefinite hangs.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Receiver-side dedup entries live this long after first sight, delivered
-/// or not: a successful `finish()` only means the reply reached the local
-/// send buffer, so a lost reply looks identical to a delivered one here.
-/// The window only has to cover the sender's one retry (`rpc_with_id_on`),
-/// which follows its RPC timeout plus a redial — seconds, not minutes. It
-/// was 300 s, and with the storage scope cached (it now opts out) it held
-/// every served fragment for that long — gigabytes of heap on a busy node
-/// (consensus-bugs.md entry 21).
-const DEDUP_TTL: Duration = Duration::from_secs(30);
+/// Receiver-side dedup entries live this long after the reply is written
+/// (or its write fails, or the stream task is dropped), delivered or not:
+/// a successful `finish()` only means the reply reached the local send
+/// buffer, so a lost reply looks identical to a delivered one here.
+///
+/// The window covers the sender's one retry (`rpc_with_id_on`), which
+/// comes at most one rpc timeout after its first send plus a redial
+/// (`CONNECTION_TIMEOUT`, 10 s). The longest timeout of a scope that keeps
+/// dedup is 30 s (setup's JoinDeliver), so the retry lands at most ~40 s
+/// after the first send, which is no earlier than our reply; 60 s leaves
+/// 20 s of margin. It was 300 s from first sight, and with the storage
+/// scope cached (it now opts out) that held every served fragment for
+/// five minutes — gigabytes of heap on a busy node (consensus-bugs.md
+/// entry 21).
+const DEDUP_TTL: Duration = Duration::from_secs(60);
+
+/// Ceiling on the response bytes the dedup cache holds at once. A reply
+/// that would cross it is still sent, just not cached (its retry, if any,
+/// runs the handler again).
+const DEDUP_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// Dedicated runtime for iroh networking: the endpoint's internal actors
 /// (magicsock, relay client, keepalives), every outbound dial's connection
@@ -465,36 +476,108 @@ impl EndpointHooks for HookAdapter {
 // ============================================================================
 
 type DedupCell = Arc<tokio::sync::OnceCell<Vec<u8>>>;
-type DedupMap = std::sync::Mutex<HashMap<u64, DedupCell>>;
+type DedupMap = std::sync::Mutex<DedupCache>;
 
-/// Join (or open) the dedup entry for `request_id` and schedule its
-/// removal after [`DEDUP_TTL`]. One timer per request is fine: only the
-/// low-volume scopes that keep dedup get here. The timer holds a `Weak`,
-/// so an entry evicted early frees its bytes once its requests finish.
-fn join_dedup(map: &Arc<DedupMap>, request_id: u64) -> DedupCell {
-    let cell = map
-        .lock()
-        .unwrap()
-        .entry(request_id)
-        .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
-        .clone();
-    let timer_map = map.clone();
-    let timer_cell = Arc::downgrade(&cell);
-    tokio::spawn(async move {
-        tokio::time::sleep(DEDUP_TTL).await;
-        if let Some(cell) = timer_cell.upgrade() {
-            evict_if_owned(&timer_map, request_id, &cell);
-        }
-    });
-    cell
+/// Receiver-side request dedup: request_id → the response cell and the
+/// bytes it is charged against [`DEDUP_BUDGET_BYTES`] (None until the
+/// reply is computed and admitted). `bytes` is the sum of the charges;
+/// every change happens under the one mutex.
+#[derive(Default)]
+struct DedupCache {
+    entries: HashMap<u64, (DedupCell, Option<usize>)>,
+    bytes: usize,
 }
 
-/// Remove `request_id`'s entry only if it is still `cell`: a newer entry
-/// for the same id is never removed by an older request's cleanup.
-fn evict_if_owned(map: &DedupMap, request_id: u64, cell: &DedupCell) {
-    let mut map = map.lock().unwrap();
-    if map.get(&request_id).is_some_and(|c| Arc::ptr_eq(c, cell)) {
-        map.remove(&request_id);
+impl DedupCache {
+    fn join(&mut self, request_id: u64) -> DedupCell {
+        self.entries
+            .entry(request_id)
+            .or_insert_with(|| (Arc::new(tokio::sync::OnceCell::new()), None))
+            .0
+            .clone()
+    }
+
+    /// Admit `cell`'s computed reply of `len` bytes. False when it is not
+    /// cached: over the frame cap (no reader accepts it, so no retry can
+    /// use it), over the byte budget (dropped from the map), or no longer
+    /// the entry for `request_id`.
+    fn charge(&mut self, request_id: u64, cell: &DedupCell, len: usize) -> bool {
+        let Some((current, charged)) = self.entries.get_mut(&request_id) else {
+            return false;
+        };
+        if !Arc::ptr_eq(current, cell) {
+            return false;
+        }
+        if charged.is_some() {
+            return true;
+        }
+        if len > MAX_MESSAGE_SIZE || self.bytes + len > DEDUP_BUDGET_BYTES {
+            self.entries.remove(&request_id);
+            return false;
+        }
+        *charged = Some(len);
+        self.bytes += len;
+        true
+    }
+
+    /// Remove `request_id`'s entry only if it is still `cell`: a newer
+    /// entry for the same id is never removed by an older request's
+    /// cleanup.
+    fn evict_if_owned(&mut self, request_id: u64, cell: &DedupCell) {
+        let owned = self
+            .entries
+            .get(&request_id)
+            .is_some_and(|(c, _)| Arc::ptr_eq(c, cell));
+        if owned {
+            if let Some((_, Some(len))) = self.entries.remove(&request_id) {
+                self.bytes -= len;
+            }
+        }
+    }
+}
+
+/// One request's hold on its dedup entry. Dropping it — once the reply is
+/// written, the write fails, or the stream task is dropped — starts the
+/// entry's [`DEDUP_TTL`], so the window is measured from the reply, not
+/// from first sight. One timer per request is fine: only the low-volume
+/// scopes that keep dedup get here. The timer holds a `Weak`, so an entry
+/// evicted early frees its bytes once its requests finish.
+struct DedupHold {
+    map: Arc<DedupMap>,
+    request_id: u64,
+    cell: DedupCell,
+}
+
+impl DedupHold {
+    fn join(map: &Arc<DedupMap>, request_id: u64) -> Self {
+        let cell = map.lock().unwrap().join(request_id);
+        Self {
+            map: map.clone(),
+            request_id,
+            cell,
+        }
+    }
+}
+
+impl Drop for DedupHold {
+    fn drop(&mut self) {
+        let map = self.map.clone();
+        let request_id = self.request_id;
+        let cell = Arc::downgrade(&self.cell);
+        let expire = move || {
+            if let Some(cell) = cell.upgrade() {
+                map.lock().unwrap().evict_if_owned(request_id, &cell);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    tokio::time::sleep(DEDUP_TTL).await;
+                    expire();
+                });
+            }
+            Err(_) => expire(),
+        }
     }
 }
 
@@ -631,7 +714,7 @@ impl IrohComms {
             endpoint,
             connections: Arc::new(RwLock::new(HashMap::new())),
             addr_hints: Arc::new(RwLock::new(HashMap::new())),
-            dedup: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            dedup: Arc::default(),
             directory,
             custom_relay,
             identity,
@@ -1271,24 +1354,30 @@ impl IrohComms {
 
                     // Opted out: every request is safe to re-execute, so
                     // nothing is cached and a retry simply runs again.
-                    let response_cell;
+                    // Dropped after the write below, starting the TTL.
+                    let hold;
                     let owned_response;
                     let response = if handler.dedup() {
                         // Receiver-side dedup: first caller computes;
-                        // retried requests (same id) within DEDUP_TTL wait
-                        // for and reuse the same bytes.
+                        // retried requests (same id) within DEDUP_TTL of
+                        // the reply wait for and reuse the same bytes.
                         let request_id = envelope.request_id;
-                        response_cell = join_dedup(&self.dedup, request_id);
+                        hold = DedupHold::join(&self.dedup, request_id);
                         let handler = handler.clone();
                         let payload = envelope.payload;
-                        let response = response_cell
+                        let response = hold
+                            .cell
                             .get_or_init(|| async move { handler.handle(peer, payload).await })
                             .await;
-                        // A reply over the frame cap is refused by every
-                        // reader, so a retry cannot use it either: never
-                        // hold one. Cached entries are thereby bounded.
-                        if response.len() > MAX_MESSAGE_SIZE {
-                            evict_if_owned(&self.dedup, request_id, &response_cell);
+                        if !self.dedup.lock().unwrap().charge(
+                            request_id,
+                            &hold.cell,
+                            response.len(),
+                        ) {
+                            tracing::debug!(
+                                bytes = response.len(),
+                                "rpc reply not cached for dedup (frame cap or byte budget)"
+                            );
                         }
                         response
                     } else {
@@ -1564,7 +1653,15 @@ mod tests {
         let second = tokio::spawn(call(a.clone()));
         // Both requests hold the one cell (plus the map's own reference).
         assert!(
-            eventually(|| b.dedup.lock().unwrap().get(&id).map(Arc::strong_count) == Some(3)).await
+            eventually(|| b
+                .dedup
+                .lock()
+                .unwrap()
+                .entries
+                .get(&id)
+                .map(|(c, _)| Arc::strong_count(c))
+                == Some(3))
+            .await
         );
         release.add_permits(1);
 
@@ -1633,26 +1730,13 @@ mod tests {
             .rpc_with_id(&peer_b, "echo", b"x".to_vec(), Duration::from_secs(5), id)
             .await
             .unwrap();
-        assert!(b.dedup.lock().unwrap().contains_key(&id));
+        assert!(b.dedup.lock().unwrap().entries.contains_key(&id));
         let (retried, _) = a
             .rpc_with_id(&peer_b, "echo", b"x".to_vec(), Duration::from_secs(5), id)
             .await
             .unwrap();
         assert_eq!(first, retried);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    // Should: remove a dedup entry once DEDUP_TTL has passed, and not
-    // before.
-    #[tokio::test(start_paused = true)]
-    async fn dedup_entry_expires_after_ttl() {
-        let map: Arc<DedupMap> = Arc::default();
-        let _cell = join_dedup(&map, 7);
-
-        tokio::time::sleep(DEDUP_TTL - Duration::from_secs(1)).await;
-        assert!(map.lock().unwrap().contains_key(&7));
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert!(map.lock().unwrap().is_empty());
     }
 
     // Impact: the storage scope served ~19 MB/s of fragments through the
@@ -1687,10 +1771,10 @@ mod tests {
             }
         });
         assert!(eventually(|| calls.load(Ordering::SeqCst) == 1).await);
-        assert!(b.dedup.lock().unwrap().is_empty());
+        assert!(b.dedup.lock().unwrap().entries.is_empty());
         release.add_permits(1);
         assert_eq!(first.await.unwrap().unwrap().len(), 1 << 20);
-        assert!(b.dedup.lock().unwrap().is_empty());
+        assert!(b.dedup.lock().unwrap().entries.is_empty());
 
         release.add_permits(1);
         let (again, _) = a
@@ -1699,7 +1783,7 @@ mod tests {
             .unwrap();
         assert_eq!(again.len(), 1 << 20);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert!(b.dedup.lock().unwrap().is_empty());
+        assert!(b.dedup.lock().unwrap().entries.is_empty());
     }
 
     // Should not: keep a cached reply larger than the frame cap, which no
@@ -1725,7 +1809,7 @@ mod tests {
             result.is_err(),
             "the sender must refuse the oversized reply"
         );
-        assert!(eventually(|| b.dedup.lock().unwrap().is_empty()).await);
+        assert!(eventually(|| b.dedup.lock().unwrap().entries.is_empty()).await);
     }
 
     // Impact: request ids are sender-chosen; an older request's timer
@@ -1736,13 +1820,111 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ttl_cleanup_spares_newer_entry_for_same_id() {
         let map: Arc<DedupMap> = Arc::default();
-        let _older = join_dedup(&map, 7);
+        drop(DedupHold::join(&map, 7));
         let newer: DedupCell = Arc::new(tokio::sync::OnceCell::new());
-        map.lock().unwrap().insert(7, newer.clone());
+        map.lock().unwrap().entries.insert(7, (newer.clone(), None));
 
         tokio::time::sleep(DEDUP_TTL + Duration::from_secs(1)).await;
         let map = map.lock().unwrap();
-        assert!(Arc::ptr_eq(map.get(&7).unwrap(), &newer));
+        assert!(Arc::ptr_eq(&map.entries.get(&7).unwrap().0, &newer));
+    }
+
+    // Impact: setup's JoinDeliver and regenesis chunk fetches wait 30 s
+    // before retrying; the old 30 s TTL counted from first sight, so a
+    // lost JoinAck re-ran the join and the coordinator gave up on a node
+    // that had joined.
+    // Should: still answer a retry that arrives more than 30 s after the
+    // first request (40 s of handler time, then 30 s more) from the cache.
+    // Should: expire the entry DEDUP_TTL after the reply, not after first
+    // sight.
+    #[tokio::test(start_paused = true)]
+    async fn dedup_window_runs_from_the_reply() {
+        let map: Arc<DedupMap> = Arc::default();
+        let first = DedupHold::join(&map, 7);
+        tokio::time::sleep(Duration::from_secs(40)).await; // handler time
+        first.cell.set(b"joined".to_vec()).unwrap();
+        assert!(map.lock().unwrap().charge(7, &first.cell, 6));
+        drop(first); // reply written at t = 40 s
+
+        tokio::time::sleep(Duration::from_secs(30)).await; // retry at t = 70 s
+        let retry = DedupHold::join(&map, 7);
+        assert_eq!(retry.cell.get().map(Vec::as_slice), Some(&b"joined"[..]));
+        drop(retry);
+
+        tokio::time::sleep(Duration::from_secs(29)).await; // t = 99 s
+        assert!(map.lock().unwrap().entries.contains_key(&7));
+        tokio::time::sleep(Duration::from_secs(2)).await; // t = 101 s
+        let map = map.lock().unwrap();
+        assert!(map.entries.is_empty());
+        assert_eq!(map.bytes, 0);
+    }
+
+    // Impact: regenesis and consensus catch-up replies run to several MiB
+    // back to back; without a ceiling the cache grows by gigabytes per
+    // joiner within one TTL.
+    // Should: keep the bytes charged to the cache at or under the budget
+    // while replies totalling more than the budget are admitted.
+    // Should not: cache a reply that would cross the budget.
+    // Should: give the budget back when an entry is evicted.
+    #[test]
+    fn dedup_cache_never_exceeds_the_byte_budget() {
+        let mut cache = DedupCache::default();
+        let reply = 4 * 1024 * 1024;
+        let mut cached = 0;
+        for id in 0..20u64 {
+            let cell = cache.join(id);
+            if cache.charge(id, &cell, reply) {
+                cached += 1;
+            } else {
+                assert!(!cache.entries.contains_key(&id));
+            }
+            assert!(cache.bytes <= DEDUP_BUDGET_BYTES);
+        }
+        assert_eq!(cached, DEDUP_BUDGET_BYTES / reply);
+        assert_eq!(cache.bytes, cached * reply);
+
+        let cell = cache.entries.get(&0).unwrap().0.clone();
+        cache.evict_if_owned(0, &cell);
+        assert_eq!(cache.bytes, (cached - 1) * reply);
+    }
+
+    // Should: deliver a reply that does not fit the remaining budget.
+    // Should not: cache it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn over_budget_reply_is_delivered_but_not_cached() {
+        let mut scopes = ScopeRegistry::new();
+        scopes.rpc(
+            "echo",
+            Arc::new(Echo {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let (a, b, peer_b) = pair(Arc::new(AllowAll), scopes).await;
+        // Fill the budget to within 10 bytes with stand-in 4 MiB entries.
+        {
+            let mut cache = b.dedup.lock().unwrap();
+            let chunk = 4 * 1024 * 1024;
+            let fillers = (DEDUP_BUDGET_BYTES / chunk) as u64;
+            for filler in 0..fillers {
+                let len = if filler + 1 == fillers {
+                    chunk - 10
+                } else {
+                    chunk
+                };
+                let cell = cache.join(filler);
+                assert!(cache.charge(filler, &cell, len));
+            }
+        }
+
+        let id: u64 = rand::random::<u64>() | (1 << 63);
+        let (reply, _) = a
+            .rpc_with_id(&peer_b, "echo", vec![7; 1024], Duration::from_secs(5), id)
+            .await
+            .unwrap();
+        assert_eq!(reply, vec![7; 1024]);
+        let cache = b.dedup.lock().unwrap();
+        assert!(!cache.entries.contains_key(&id));
+        assert_eq!(cache.bytes, DEDUP_BUDGET_BYTES - 10);
     }
 
     #[tokio::test(flavor = "multi_thread")]

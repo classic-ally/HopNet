@@ -578,6 +578,48 @@ mod tests {
         );
     }
 
+    // Impact: storage fetches and regenesis snapshot chunks are the large,
+    // high-volume replies; cached, they pinned gigabytes (thor's OOM kills,
+    // consensus-bugs.md entry 21). Every other rpc scope relies on the
+    // cache to make a same-id retry harmless.
+    // Should: opt exactly the storage and regenesis scopes out of the
+    // transport's dedup cache.
+    #[test]
+    fn only_storage_and_regenesis_skip_rpc_dedup() {
+        let app_state = crate::consensus::tests::create_test_app_state();
+        let app_state = || app_state.clone();
+        assert!(
+            !StorageScope {
+                app_state: app_state()
+            }
+            .dedup()
+        );
+        assert!(
+            !crate::regenesis::rpc::RegenesisScope {
+                app_state: app_state()
+            }
+            .dedup()
+        );
+        assert!(
+            ConsensusScope {
+                app_state: app_state()
+            }
+            .dedup()
+        );
+        assert!(
+            MetricsScope {
+                app_state: app_state()
+            }
+            .dedup()
+        );
+        assert!(
+            SetupScope {
+                app_state: app_state()
+            }
+            .dedup()
+        );
+    }
+
     #[test]
     fn registry_matches_the_scope_class_table() {
         use hopnet_comms::ScopeClass::{Compat, Locked};
