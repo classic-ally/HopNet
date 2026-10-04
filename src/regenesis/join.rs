@@ -853,7 +853,7 @@ pub async fn epoch_join_bootstrap_with(
     // A re-registered node may already hold fragments from a previous
     // life; the imported inventory does not know that yet.
     if let Ok(conn) = app_state.db_pool.get()
-        && let Err(e) = reconcile_fragment_store(&conn, &app_state.fragments_dir, now_unix())
+        && let Err(e) = reconcile_fragment_store(&conn, &app_state.fragments_dir)
     {
         tracing::warn!("fragment reconcile after join failed (harmless): {e}");
     }
@@ -866,13 +866,19 @@ pub async fn epoch_join_bootstrap_with(
 }
 
 /// Reconcile the fragment store against a freshly imported inventory
-/// (RFC-019 S7), in both directions:
+/// (RFC-019 S7). A fragment the new epoch's inventory backs but that
+/// imported with `stored_locally = 0` is re-marked if the bytes are on
+/// disk and hash correctly (a joiner has no old database to carry the
+/// flag from).
 ///
-/// - a fragment the new epoch's inventory backs but that imported with
-///   `stored_locally = 0` is re-marked if the bytes are on disk and hash
-///   correctly (a joiner has no old database to carry the flag from);
-/// - a fragment on disk that the new inventory does not back at all is
-///   an orphan and is deleted.
+/// A file the new inventory does not back at all is counted and left on
+/// disk. Deleting it is the existence sweep's job (`hopnet_storage::sweep`),
+/// whose grace window runs once the node is back at the tip. A join is
+/// not a quiet moment: this node's own upload writes its fragments before
+/// its transaction commits, and a straggler can join before it sees that
+/// commit. Deleting rowless files here lost two uploaded videos in
+/// production (consensus-bugs 20). Under-collecting is harmless,
+/// over-collecting is not.
 ///
 /// Direct SQL, deliberately NOT the attestation path: a self-check rides a
 /// consensus round, and at boot there is no engine yet to carry a
@@ -880,16 +886,10 @@ pub async fn epoch_join_bootstrap_with(
 /// NULL — the existing self-check cron re-attests over time, at its own
 /// pace.
 ///
-/// Runs at boot before the engine starts, so the zero grace period on
-/// the orphan scan is safe: there are no in-flight stores to race. The
-/// scan still only considers fragments strictly older than `now_unix`,
-/// so anything written in the current second survives to the next pass —
-/// under-collecting orphans is harmless, over-collecting is not.
-/// Returns `(remarked, orphans_deleted)`.
+/// Returns `(remarked, unbacked)`.
 pub fn reconcile_fragment_store(
     conn: &rusqlite::Connection,
     fragments_dir: &str,
-    now_unix: u64,
 ) -> Result<(usize, usize), String> {
     let unmarked: Vec<(String, i64, i64, Vec<u8>)> = {
         let mut stmt = conn
@@ -925,28 +925,15 @@ pub fn reconcile_fragment_store(
         remarked += 1;
     }
 
-    // Orphans (files with no row in the freshly imported table): the
-    // sweep's diff with no grace — nothing is in flight during a join.
+    // Files with no row in the freshly imported table: counted for the
+    // log, left for the sweep.
     let listing = hopnet_storage::fragstore::scan_fragments_detailed(fragments_dir)
-        .map_err(|e| format!("orphan walk: {e:?}"))?;
+        .map_err(|e| format!("unbacked walk: {e:?}"))?;
     let rows = crate::db::fragments::all_fragment_flags(conn)
         .map_err(|e| format!("fragment flags: {e:?}"))?;
-    let diff = hopnet_storage::sweep::diff(&listing, &rows, now_unix);
-    let mut deleted = 0usize;
-    for (hash, _) in &diff.orphans {
-        if hopnet_storage::fragstore::delete_fragment(fragments_dir, hash).is_ok() {
-            deleted += 1;
-        }
-    }
-    Ok((remarked, deleted))
-}
-
-/// Seconds since the epoch, for the reconcile clock.
-pub fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    let backed: std::collections::HashSet<_> = rows.iter().map(|(hash, _)| hash).collect();
+    let unbacked = listing.iter().filter(|d| !backed.contains(&d.hash)).count();
+    Ok((remarked, unbacked))
 }
 
 /// Spawn an epoch join unless one is already inflight. The trigger seam
@@ -1104,12 +1091,13 @@ mod tests {
     // Impact: a rejoining node's fragment store survives the boundary
     // but the inventory it is measured against is replaced wholesale —
     // without this pass a joiner reports holding nothing it actually
-    // holds, and keeps bytes the new epoch no longer knows about.
-    // Should: re-mark on-disk fragments the new inventory backs, and
-    // delete on-disk fragments it does not.
+    // holds.
+    // Should: re-mark on-disk fragments the new inventory backs.
+    // Should: count on-disk fragments it does not back.
     // Should not: re-mark a row whose bytes are absent or corrupt.
+    // Should not: delete a fragment the new inventory does not back.
     #[test]
-    fn reconcile_remarks_local_fragments_and_drops_orphans() {
+    fn reconcile_remarks_local_fragments_and_leaves_unbacked_files() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = sealed_db(dir.path());
         let frag_dir = dir.path().join("fragments");
@@ -1141,11 +1129,9 @@ mod tests {
         )
         .unwrap();
 
-        // The scan only sees fragments strictly older than the clock it
-        // is given, so look from one second in the future.
-        let (remarked, orphans) = reconcile_fragment_store(&conn, &frags, now_unix() + 1).unwrap();
+        let (remarked, unbacked) = reconcile_fragment_store(&conn, &frags).unwrap();
         assert_eq!(remarked, 1, "only the fragment actually on disk");
-        assert_eq!(orphans, 1, "the unbacked file is deleted");
+        assert_eq!(unbacked, 1, "the unbacked file is counted");
 
         let marked: i64 = conn
             .query_row(
@@ -1159,10 +1145,59 @@ mod tests {
             &frags,
             &backed_hash
         ));
-        assert!(!hopnet_storage::fragstore::fragment_exists_and_valid(
+        assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
             &frags,
             &orphan_hash
         ));
+    }
+
+    // Impact: regression guard for the 2026-10-01 loss of two uploaded
+    // videos — a straggler's own upload wrote its fragments, the join
+    // imported an inventory without their rows, and the reconcile deleted
+    // the only copies before the photo transaction reached the node.
+    // Should: keep a rowless fragment through the join reconcile.
+    // Should: let the sweep see it as present once its rows land, however
+    // old the file is.
+    #[test]
+    fn reconcile_keeps_an_upload_whose_rows_arrive_after_the_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = sealed_db(dir.path());
+        let frag_dir = dir.path().join("fragments");
+        std::fs::create_dir_all(&frag_dir).unwrap();
+        let frags = frag_dir.to_string_lossy().into_owned();
+
+        let upload = b"a fragment whose transaction is still in flight".to_vec();
+        let upload_hash = hopnet_storage::Blake3Hash::from_bytes(*blake3::hash(&upload).as_bytes());
+        hopnet_storage::fragstore::store_fragment(&frags, &upload_hash, upload).unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::db::shared::apply_connection_pragmas(&conn).unwrap();
+
+        let (_, unbacked) = reconcile_fragment_store(&conn, &frags).unwrap();
+        assert_eq!(
+            unbacked, 1,
+            "the joined inventory does not back the upload yet"
+        );
+        assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags,
+            &upload_hash
+        ));
+
+        // The upload's transaction lands after the join.
+        conn.execute(
+            "INSERT INTO fragment_hashes
+             (data_block_id, chunk_number, local_index, fragment_id, fragment_hash, chunk_type, stored_locally)
+             VALUES ('blob1', 0, 1, 'upload-0', ?, 0, 0)",
+            rusqlite::params![upload_hash.0.as_bytes().to_vec()],
+        )
+        .unwrap();
+
+        let listing = hopnet_storage::fragstore::scan_fragments_detailed(&frags).unwrap();
+        let rows = crate::db::fragments::all_fragment_flags(&conn).unwrap();
+        // A cutoff past every mtime: an orphan by age, kept only by its row.
+        let diff = hopnet_storage::sweep::diff(&listing, &rows, u64::MAX);
+        assert!(diff.orphans.is_empty());
+        assert_eq!(diff.present, vec![upload_hash]);
     }
 
     // ------------------------------------------------------------------

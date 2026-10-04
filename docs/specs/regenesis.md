@@ -770,8 +770,11 @@ protocol it checks.
     and therefore neither poll nor probe — `main.rs` starts its retry
     loop.
   - Fragment reconcile runs post-swap, pre-engine, as direct SQL:
-    re-mark what the new inventory backs and the disk verifies, drop
-    what it does not back. NOT the attestation path, whose exact
+    re-mark what the new inventory backs and the disk verifies, and
+    leave what it does not back for the existence sweep, whose grace
+    window protects the node's own in-flight uploads (a straggler can
+    join before its upload's transaction reaches it; consensus-bugs
+    20). NOT the attestation path, whose exact
     previous-count guard suits a live attestation and not a
     wholesale reconciliation. `self_verified_height` stays NULL and
     the existing self-check cron re-attests at its own pace.

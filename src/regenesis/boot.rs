@@ -934,11 +934,11 @@ fn staged_join_transition(
         Ok(fresh) => {
             let fragments_dir =
                 hopnet_storage::fragstore::get_fragments_dir().unwrap_or_else(|_| String::new());
-            match join::reconcile_fragment_store(&fresh, &fragments_dir, join::now_unix()) {
-                Ok((remarked, orphans)) => tracing::info!(
+            match join::reconcile_fragment_store(&fresh, &fragments_dir) {
+                Ok((remarked, unbacked)) => tracing::info!(
                     remarked,
-                    orphans,
-                    "fragment store reconciled against the joined epoch"
+                    unbacked,
+                    "fragment store reconciled against the joined epoch (unbacked files left for the sweep)"
                 ),
                 Err(e) => tracing::warn!("fragment reconcile failed (harmless): {e}"),
             }

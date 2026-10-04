@@ -121,8 +121,10 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       ahead of anything schema-touching; in-process epoch join for
       fresh nodes, which subsumes the height-0 bootstrap; a manual
       re-trust route for churn past the overlap window; post-import
-      fragment reconcile. Evidence: overlap/chain units, staged-boot
-      gate battery, an in-process straggler rejoin over real comms
+      fragment reconcile (re-marks only; unbacked files are left for
+      the existence sweep, consensus-bugs 20). Evidence: overlap/chain
+      units, staged-boot gate battery, an in-process straggler rejoin
+      over real comms
       ending in byte-identical state, and the orchestrator
       straggler-rejoin / diverged-node-rebuild scenarios.
   - S8 — upgrade epoch end-to-end: the version-bump flow was already
