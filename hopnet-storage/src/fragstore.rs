@@ -236,6 +236,44 @@ pub fn scan_shard(fragments_dir: &str, shard: u8) -> Result<FragmentListing, Sto
     Ok(listing)
 }
 
+/// The fragment hashes in one shard, from directory listings alone: no
+/// per-file `stat` (the entry type comes from the listing on ext4, xfs,
+/// btrfs and APFS), no content read. On a cold HDD the per-file stat of
+/// [`scan_shard`] dominates; this costs one read per directory. Temp
+/// files and unexpected names are skipped silently. A missing directory
+/// lists as empty.
+pub fn list_shard_hashes(fragments_dir: &str, shard: u8) -> Result<Vec<Blake3Hash>, StorageError> {
+    let path = std::path::Path::new(fragments_dir).join(format!("{shard:02x}"));
+    let mut hashes = Vec::new();
+    let first_level = match fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(hashes),
+        Err(e) => return Err(StorageError::Io(e)),
+    };
+    for second_level in first_level {
+        let second_level = second_level?;
+        if !second_level.file_type()?.is_dir() {
+            continue;
+        }
+        for file in fs::read_dir(second_level.path())? {
+            let file = file?;
+            if !file.file_type()?.is_file() {
+                continue;
+            }
+            let name = file.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.len() != 64 {
+                continue;
+            }
+            let mut bytes = [0u8; 32];
+            if hex::decode_to_slice(name, &mut bytes).is_ok() {
+                hashes.push(Blake3Hash::from_bytes(bytes));
+            }
+        }
+    }
+    Ok(hashes)
+}
+
 /// Walk one first-level directory (its second-level directories and
 /// their files) into `listing`.
 fn scan_first_level(
@@ -503,6 +541,50 @@ mod tests {
             .unwrap();
         let none = scan_shard(&dir, empty).unwrap();
         assert!(none.fragments.is_empty() && none.temps.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Should: name exactly the fragments under the shard's prefix, the
+    // same set the full shard scan lists.
+    // Should not: name temp files or unexpected names, or fail on a
+    // shard with no directory.
+    #[test]
+    fn shard_hash_listing_names_only_fragments() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopnet-fragstore-shard-names-{}",
+            std::process::id()
+        ));
+        let dir = dir.to_str().unwrap().to_string();
+        let _ = fs::remove_dir_all(&dir);
+        let mut hashes = Vec::new();
+        for i in 0u32..64 {
+            let data = i.to_le_bytes().to_vec();
+            let hash = Blake3Hash::new(blake3::hash(&data));
+            store_fragment(&dir, &hash, data).unwrap();
+            hashes.push(hash);
+        }
+        let shard = hashes[0].as_bytes()[0];
+        let leaf = create_fragment_path(&dir, &hashes[0]).unwrap();
+        fs::write(format!("{leaf}/{}.tmp.ab", hashes[0].to_hex()), b"x").unwrap();
+        fs::write(format!("{leaf}/notes.txt"), b"junk").unwrap();
+
+        let mut listed = list_shard_hashes(&dir, shard).unwrap();
+        let mut scanned: Vec<_> = scan_shard(&dir, shard)
+            .unwrap()
+            .fragments
+            .iter()
+            .map(|d| d.hash)
+            .collect();
+        listed.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        scanned.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert!(!listed.is_empty());
+        assert_eq!(listed, scanned);
+
+        let empty = (0..=u8::MAX)
+            .find(|b| hashes.iter().all(|h| h.as_bytes()[0] != *b))
+            .unwrap();
+        assert!(list_shard_hashes(&dir, empty).unwrap().is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

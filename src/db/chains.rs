@@ -456,6 +456,84 @@ pub fn transplant_from_scratch(
     Ok(())
 }
 
+/// What [`transplant_preserving_local_flags`] carried across the
+/// transplant.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CarriedFlags {
+    /// Rows the transplant would have reset that were flagged again
+    /// because the pre-transplant inventory held their hash locally.
+    pub carried: usize,
+    /// Distinct hashes still unflagged after the carry that the
+    /// pre-transplant inventory did not know at all (fragments that
+    /// appeared in epochs this node missed), in ascending order. Only
+    /// collected when `carried > 0`: with nothing carried the reconcile
+    /// walks the store instead and has no use for the list.
+    pub unknown: Vec<[u8; 32]>,
+}
+
+/// [`transplant_from_scratch`] that keeps this node's `stored_locally`
+/// flags (RFC-019 S7, consensus-bugs 22). The column is node-local and
+/// excluded from the artifact, so the plain transplant brings every
+/// `fragment_hashes` row back unflagged. The pre-transplant flags are
+/// the sweep-maintained truth about this node's disk, so they are
+/// snapshotted by hash before the transplant and re-applied after it,
+/// inside the CALLER's transaction. No fragment file is touched.
+///
+/// Same contract as [`transplant_from_scratch`] (FK enforcement off,
+/// [`assert_fk_clean`] afterwards).
+pub fn transplant_preserving_local_flags(
+    tx: &rusqlite::Connection,
+    plan: &crate::db::snapshot::ImportPlan,
+) -> Result<CarriedFlags, SchemaError> {
+    // One row per distinct hash: `local` = 1 if any row with that hash
+    // was flagged. Both fills are index-only scans (the partial local
+    // index, then idx_fragment_hash), so they cost seconds even at
+    // millions of rows.
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS temp.known_frag;
+         CREATE TEMP TABLE known_frag (
+             fragment_hash BLOB PRIMARY KEY,
+             local INTEGER NOT NULL
+         ) WITHOUT ROWID;
+         INSERT OR IGNORE INTO temp.known_frag (fragment_hash, local)
+             SELECT fragment_hash, 1 FROM fragment_hashes
+             WHERE stored_locally = 1 AND fragment_hash IS NOT NULL;
+         INSERT OR IGNORE INTO temp.known_frag (fragment_hash, local)
+             SELECT fragment_hash, 0 FROM fragment_hashes
+             WHERE fragment_hash IS NOT NULL;",
+    )?;
+
+    transplant_from_scratch(tx, plan)?;
+
+    let carried = tx.execute(
+        "UPDATE fragment_hashes SET stored_locally = 1
+         WHERE stored_locally = 0
+           AND fragment_hash IN (SELECT fragment_hash FROM temp.known_frag WHERE local = 1)",
+        [],
+    )?;
+    let unknown = if carried > 0 {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT fh.fragment_hash FROM fragment_hashes fh
+             WHERE fh.stored_locally = 0
+               AND NOT EXISTS (SELECT 1 FROM temp.known_frag k
+                               WHERE k.fragment_hash = fh.fragment_hash)
+             ORDER BY fh.fragment_hash",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+        let mut unknown = Vec::new();
+        for row in rows {
+            if let Ok(hash) = <[u8; 32]>::try_from(row?.as_slice()) {
+                unknown.push(hash);
+            }
+        }
+        unknown
+    } else {
+        Vec::new()
+    };
+    tx.execute_batch("DROP TABLE temp.known_frag;")?;
+    Ok(CarriedFlags { carried, unknown })
+}
+
 /// The explicit post-transplant integrity gate: zero rows from
 /// `PRAGMA foreign_key_check`, or a loud refusal naming the dangles.
 pub fn assert_fk_clean(conn: &rusqlite::Connection) -> Result<(), SchemaError> {

@@ -123,7 +123,9 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       re-trust route for churn past the overlap window; post-import
       fragment reconcile (re-marks only; unbacked files are left for
       the existence sweep, which never deletes a file the node-local
-      upload ledger names, consensus-bugs 20). Evidence: overlap/chain
+      upload ledger names, consensus-bugs 20; existence-only, with the
+      staged join carrying its flags and a reconcile-pending marker
+      walking the store after an interrupted pass, consensus-bugs 22). Evidence: overlap/chain
       units, staged-boot gate battery, an in-process straggler rejoin
       over real comms
       ending in byte-identical state, and the orchestrator
