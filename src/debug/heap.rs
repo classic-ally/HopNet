@@ -8,6 +8,9 @@
 //! - `GET  /api/debug/heap/stats`     → allocator totals + profiler state
 //! - `POST /api/debug/heap/profiling` → `{ "active": bool }`
 //! - `GET  /api/debug/heap/profile`   → gzipped pprof (409 while inactive)
+//!
+//! The profiling routes answer 503 when profiling was not enabled at startup
+//! (`MALLOC_CONF` set `prof:false`): only a restart can change that.
 
 use axum::{
     Extension, Json,
@@ -36,6 +39,17 @@ pub struct HeapStats {
     pub resident: u64,
     pub mapped: u64,
     pub retained: u64,
+    /// `stats.metadata`: jemalloc's own bookkeeping.
+    pub metadata: u64,
+    /// Dirty pages (freed, not yet purged) across all arenas, in bytes.
+    pub dirty: Option<u64>,
+    /// Muzzy pages (lazily purged, still counted resident) across all
+    /// arenas, in bytes.
+    pub muzzy: Option<u64>,
+    /// `background_thread`: background purging is switched on.
+    pub background_thread: bool,
+    /// `stats.background_thread.num_threads`: purge threads running.
+    pub background_threads: Option<u64>,
     /// `opt.prof`: profiling compiled in and enabled at startup.
     pub prof_enabled: bool,
     /// `prof.active`: allocations are currently being sampled.
@@ -117,14 +131,39 @@ mod imp {
     use axum::http::StatusCode;
     use tikv_jemalloc_ctl::{epoch, profiling, raw, stats};
 
-    const NOT_ENABLED: HeapError = (
+    pub(super) const NOT_ENABLED: HeapError = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "jemalloc profiling is not enabled in this process (opt.prof is false, \
+         e.g. MALLOC_CONF set prof:false); restart without that override",
+    );
+
+    pub(super) const INACTIVE: HeapError = (
         StatusCode::CONFLICT,
-        "jemalloc profiling is not enabled (opt.prof is false; check MALLOC_CONF)",
+        "heap profiling is inactive; POST /api/debug/heap/profiling {\"active\":true} first",
     );
 
     fn ctl_error(what: &'static str, e: impl std::fmt::Display) -> HeapError {
         tracing::warn!("jemalloc {what} failed: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, "jemalloc mallctl failed")
+    }
+
+    /// `jemalloc_pprof::PROF_CTL` is `None` when `opt.prof` was false at
+    /// startup: profiling can't be switched on without a restart.
+    pub(super) fn enabled_ctl<T>(ctl: Option<&T>) -> Result<&T, HeapError> {
+        ctl.ok_or(NOT_ENABLED)
+    }
+
+    /// Reads a `size_t` mallctl by name; `None` if jemalloc doesn't know it.
+    fn read_size(name: &'static [u8]) -> Option<u64> {
+        // SAFETY: every name passed is documented as a readable size_t:
+        // http://jemalloc.net/jemalloc.3.html#mallctl_namespace
+        unsafe { raw::read::<usize>(name) }.ok().map(|v| v as u64)
+    }
+
+    /// Reads a `bool` mallctl by name; `false` if jemalloc doesn't know it.
+    fn read_flag(name: &'static [u8]) -> bool {
+        // SAFETY: every name passed is documented as a readable bool.
+        unsafe { raw::read::<bool>(name) }.unwrap_or(false)
     }
 
     pub(super) fn read_stats() -> Result<HeapStats, HeapError> {
@@ -134,22 +173,24 @@ mod imp {
             r.map(|v| v as u64).map_err(|e| ctl_error(what, e))
         };
         let prof_enabled = profiling::prof::read().unwrap_or(false);
-        // SAFETY: "prof.active" is documented as readable and returning bool:
-        // http://jemalloc.net/jemalloc.3.html#prof.active
-        let prof_active =
-            prof_enabled && unsafe { raw::read::<bool>(b"prof.active\0") }.unwrap_or(false);
-        // SAFETY: "prof.lg_sample" is documented as readable and returning size_t:
-        // http://jemalloc.net/jemalloc.3.html#prof.lg_sample
+        let prof_active = prof_enabled && read_flag(b"prof.active\0");
         let lg_prof_sample = prof_enabled
-            .then(|| unsafe { raw::read::<usize>(b"prof.lg_sample\0") }.ok())
-            .flatten()
-            .map(|v| v as u64);
+            .then(|| read_size(b"prof.lg_sample\0"))
+            .flatten();
+        // Page counts summed over every arena (MALLCTL_ARENAS_ALL = 4096).
+        let page = read_size(b"arenas.page\0").unwrap_or(0);
+        let pages = |name: &'static [u8]| read_size(name).map(|n| n * page);
         Ok(HeapStats {
             allocated: read("stats.allocated", stats::allocated::read())?,
             active: read("stats.active", stats::active::read())?,
             resident: read("stats.resident", stats::resident::read())?,
             mapped: read("stats.mapped", stats::mapped::read())?,
             retained: read("stats.retained", stats::retained::read())?,
+            metadata: read("stats.metadata", stats::metadata::read())?,
+            dirty: pages(b"stats.arenas.4096.pdirty\0"),
+            muzzy: pages(b"stats.arenas.4096.pmuzzy\0"),
+            background_thread: read_flag(b"background_thread\0"),
+            background_threads: read_size(b"stats.background_thread.num_threads\0"),
             prof_enabled,
             prof_active,
             lg_prof_sample,
@@ -157,7 +198,7 @@ mod imp {
     }
 
     pub(super) async fn set_profiling(active: bool) -> Result<(), HeapError> {
-        let ctl = jemalloc_pprof::PROF_CTL.as_ref().ok_or(NOT_ENABLED)?;
+        let ctl = enabled_ctl(jemalloc_pprof::PROF_CTL.as_ref())?;
         let mut ctl = ctl.lock().await;
         if ctl.activated() == active {
             return Ok(());
@@ -171,13 +212,10 @@ mod imp {
     }
 
     pub(super) async fn dump_profile() -> Result<Vec<u8>, HeapError> {
-        let ctl = jemalloc_pprof::PROF_CTL.as_ref().ok_or(NOT_ENABLED)?;
+        let ctl = enabled_ctl(jemalloc_pprof::PROF_CTL.as_ref())?;
         let mut ctl = ctl.clone().lock_owned().await;
         if !ctl.activated() {
-            return Err((
-                StatusCode::CONFLICT,
-                "heap profiling is inactive; POST /api/debug/heap/profiling {\"active\":true} first",
-            ));
+            return Err(INACTIVE);
         }
         // The dump writes a temp file and parses it back: blocking I/O.
         tokio::task::spawn_blocking(move || ctl.dump_pprof())
@@ -201,30 +239,57 @@ mod imp {
 
         // Impact: the stats route is how thor's resident memory gets compared
         // against glibc's after the switch; zeros would make it useless.
-        // Should: report non-zero allocated and resident bytes once the epoch advances.
+        // Should: report allocated bytes covering a live allocation once the epoch advances.
+        // Should: report resident at least active, and active at least allocated.
+        // Should: report jemalloc's metadata size and the dirty and muzzy page totals.
         // Should: report profiling as compiled in but inactive under the built-in config.
         #[test]
         fn heap_stats_report_resident_memory() {
             let held = vec![7u8; 4 << 20];
             let stats = read_stats().expect("jemalloc stats");
             assert!(stats.allocated >= held.len() as u64, "{stats:?}");
+            assert!(stats.active >= stats.allocated, "{stats:?}");
             assert!(stats.resident >= stats.active, "{stats:?}");
             assert!(stats.mapped > 0, "{stats:?}");
-            assert!(stats.prof_enabled, "{stats:?}");
-            assert!(!stats.prof_active, "{stats:?}");
-            assert_eq!(stats.lg_prof_sample, Some(19), "{stats:?}");
+            assert!(stats.metadata > 0, "{stats:?}");
+            assert!(stats.dirty.is_some(), "{stats:?}");
+            assert!(stats.muzzy.is_some(), "{stats:?}");
+            // MALLOC_CONF (the documented override) can change the profiler
+            // state, so the built-in config is only checked without it.
+            if std::env::var_os("MALLOC_CONF").is_none() {
+                assert!(stats.prof_enabled, "{stats:?}");
+                assert!(!stats.prof_active, "{stats:?}");
+                assert_eq!(stats.lg_prof_sample, Some(19), "{stats:?}");
+            }
             drop(held);
         }
 
         // Impact: a dump with sampling off would be an empty profile that
         // reads as "nothing is allocated" rather than "nothing was sampled".
-        // Should: refuse a profile dump with 409 while profiling is inactive.
+        // Should: refuse a profile dump with 409 and the inactive message while profiling is inactive.
         #[tokio::test]
         async fn profile_dump_requires_profiling_active() {
+            // The documented MALLOC_CONF override may enable or activate
+            // profiling, which makes this path unreachable.
+            if std::env::var_os("MALLOC_CONF").is_some() {
+                return;
+            }
             let err = dump_profile()
                 .await
                 .expect_err("inactive profiler must refuse");
-            assert_eq!(err.0, StatusCode::CONFLICT);
+            assert_eq!(err, INACTIVE);
+        }
+
+        // Impact: "restart without the override" and "switch sampling on" are
+        // different operator actions; one status for both hid which applied.
+        // Should: answer 503 when profiling was not enabled at startup.
+        // Should: hand back the profiler handle when one exists.
+        #[test]
+        fn profiling_not_enabled_at_startup_is_unavailable() {
+            let err = enabled_ctl(None::<&()>).expect_err("no profiler handle");
+            assert_eq!(err, NOT_ENABLED);
+            assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(enabled_ctl(Some(&())), Ok(&()));
         }
     }
 }
