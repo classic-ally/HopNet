@@ -301,6 +301,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     // the OLD ordinals by construction — schema validation must not
     // install, fast-forward, or refuse over it.
     let mut schema_parked = false;
+    // Set when the boot could not reconcile this database's fragment
+    // flags (consensus-bugs 22): the database is live and current, but
+    // the engine must not start on partial flags. Retried next boot.
+    let mut engine_held = false;
     let pool = {
         // One code path for durable and disposable nodes alike — an ephemeral
         // node is a real SQLite file inside a throwaway directory, not a
@@ -341,7 +345,14 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!(?reason, "epoch boundary parked — engine will not start");
                 rebuild_from_peers =
                     matches!(reason, regenesis::boot::ParkReason::GateFailed { .. });
-                schema_parked = true;
+                if matches!(
+                    reason,
+                    regenesis::boot::ParkReason::FragmentReconcile { .. }
+                ) {
+                    engine_held = true;
+                } else {
+                    schema_parked = true;
+                }
             }
             regenesis::boot::BootOutcome::RestartIntoStaged { required } => {
                 // RFC-021: the nix provider flipped the profile to the
@@ -859,7 +870,12 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // now — AFTER the accept loop (QUIC handshakes only complete under
             // a polled accept; consensus participation must not precede it).
             // Fresh nodes spawn the engine from the setup/join flows instead.
-            if app_state.node_id.get().is_some()
+            if engine_held {
+                tracing::error!(
+                    "consensus engine held: the fragment reconcile did not complete; \
+                     restart to retry (see the boot log)"
+                );
+            } else if app_state.node_id.get().is_some()
                 && let Err(e) = consensus::malachite::engine::spawn_engine(&app_state)
             {
                 // A node without its engine must not keep serving as if it

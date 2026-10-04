@@ -484,6 +484,9 @@ fn create_test_app_state_on_manager(
     let (consensus_queue, _consensus_queue_rx) =
         crate::consensus::queue::ConsensusQueue::new(pool.clone(), 256);
 
+    // Production creates the fragment store at startup; the join's
+    // reconcile refuses a missing one (consensus-bugs 22).
+    let _ = std::fs::create_dir_all("/tmp/test_fragments");
     let app_state = AppState {
         db_pool: pool,
         encoding_key,

@@ -100,6 +100,12 @@ pub enum ParkReason {
     /// straggler and boots normally to stage. NOT an awaiting-upgrade
     /// park: nothing is pending, the operator overran the agreement.
     VersionAhead { agreed: u32, running: u32 },
+    /// The joined database's fragment flags could not be reconciled
+    /// against the fragment store (consensus-bugs 22). The database is
+    /// live and current, but the engine is held this boot: starting on
+    /// partial flags makes the self-check report a mass removal. The
+    /// reconcile-pending marker stays, so the next boot retries.
+    FragmentReconcile { detail: String },
 }
 
 /// Last boundary error, for the status surface (latest wins — in
@@ -404,7 +410,7 @@ fn boot_transition_at(
     let outcome = boot_transition_inner(db_path, running_code, activation, fragments_dir);
     if matches!(
         outcome,
-        BootOutcome::NoBoundary | BootOutcome::Transitioned { .. }
+        BootOutcome::NoBoundary | BootOutcome::Transitioned { .. } | BootOutcome::RolledBack { .. }
     ) && reconcile_pending(db_path)
         && Path::new(db_path).exists()
     {
@@ -416,10 +422,22 @@ fn boot_transition_at(
             fragments_dir,
             &crate::db::chains::CarriedFlags::default(),
         ) {
-            tracing::warn!("fragment reconcile walk failed (retried next boot): {e}");
+            return hold_engine(e);
         }
     }
     outcome
+}
+
+/// The boot outcome for a reconcile that could not complete: the engine
+/// is held this boot and the marker stays for the next one.
+fn hold_engine(detail: String) -> BootOutcome {
+    tracing::error!(
+        "fragment reconcile failed: holding the consensus engine until a boot completes it: {detail}"
+    );
+    if let Ok(mut slot) = BOUNDARY_ERROR.lock() {
+        *slot = Some(format!("fragment-reconcile: {detail}"));
+    }
+    BootOutcome::Parked(ParkReason::FragmentReconcile { detail })
 }
 
 fn boot_transition_inner(
@@ -758,10 +776,10 @@ fn rollback_transition(db_path: &str, running_code: u32) -> Option<BootOutcome> 
     }
 
     // A staged join would otherwise carry this node straight back across.
+    // A pending reconcile marker is KEPT: the abandoned join may have run
+    // without trusting the flags it copied, so the boot walks the
+    // restored database too (it only ever adds flags).
     crate::regenesis::join::clear_staging(&crate::regenesis::join::staging_path(db_path));
-    // The pending reconcile belonged to the abandoned database; the
-    // restored one kept the flags it had before the join.
-    clear_reconcile_pending(db_path);
     remove_with_sidecars(&next_path(db_path));
     let _ = std::fs::remove_file(awaiting_upgrade_path(db_path));
 
@@ -885,14 +903,15 @@ fn staged_join_transition(
             "join staging left behind after its swap: the fragment reconcile may not have finished"
         );
         if let Err(e) = mark_reconcile_pending(db_path) {
-            // No marker to hand the walk to: do it now.
+            // No marker to hand the walk to: do it now, and keep the
+            // staging (the only record of the problem) unless it works.
             tracing::warn!("{e}: walking the fragment store now");
             if let Err(e) = reconcile_live_flags(
                 db_path,
                 fragments_dir,
                 &crate::db::chains::CarriedFlags::default(),
             ) {
-                tracing::warn!("fragment reconcile walk failed: {e}");
+                return Some(hold_engine(e));
             }
         }
         join::clear_staging(&staging);
@@ -1092,6 +1111,8 @@ fn staged_join_transition(
     // was carried). Clears the pending marker on success; on failure the
     // marker stays and the boot walks the store before the engine
     // starts. Never strands a node that just rejoined.
+    // (The boot wrapper's walk is that fallback; if it fails too, the
+    // engine is held.)
     if let Err(e) = reconcile_live_flags(db_path, fragments_dir, &carried) {
         tracing::warn!("fragment reconcile failed (falling back to a store walk): {e}");
     }
@@ -1334,6 +1355,19 @@ pub(crate) mod tests {
     use hopnet_consensus::types::{Blake3Hash, Block, BlockData, PrivKey, Transactions};
     use hopnet_consensus::verify::wire_commit_signature;
     use rusqlite::params;
+
+    /// `boot_transition` over a fragment store beside the database
+    /// (`<db dir>/fragments`, created), so no test ever reconciles
+    /// against the developer's or CI's real store. Shadows the glob
+    /// import in this module; sibling test modules call it by path.
+    pub(crate) fn boot_transition(db_path: &str, running_code: u32) -> BootOutcome {
+        let frags = Path::new(db_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("fragments");
+        std::fs::create_dir_all(&frags).unwrap();
+        boot_transition_at(db_path, running_code, None, &frags.to_string_lossy())
+    }
 
     const H: u64 = 7;
     pub(crate) const TARGET: u32 = 20260800;
@@ -1801,6 +1835,86 @@ pub(crate) mod tests {
             "an untrusted flag is re-derived from disk, which has no file"
         );
         assert!(!reconcile_pending(&fx.db_path));
+    }
+
+    // Impact: an engine started on partial flags self-reports a mass
+    // removal; a store that cannot be read (unmounted, EIO) must not be
+    // mistaken for an empty one (consensus-bugs 22 review).
+    // Should: hold the engine and keep the pending marker when the
+    // reconcile walk cannot complete.
+    // Should not: touch the partial flags.
+    #[test]
+    fn failed_reconcile_holds_the_engine_and_keeps_the_marker() {
+        let client = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let frags = empty_fragment_store(client.path());
+        let fx = join_fixture(client.path(), server.path());
+        crossed_with_partial_flags(&fx, &frags);
+        mark_reconcile_pending(&fx.db_path).unwrap();
+        let unmounted = client
+            .path()
+            .join("not-mounted")
+            .to_string_lossy()
+            .into_owned();
+
+        match boot_transition_at(&fx.db_path, TARGET, None, &unmounted) {
+            BootOutcome::Parked(ParkReason::FragmentReconcile { .. }) => {}
+            other => panic!("expected the engine held, got {other:?}"),
+        }
+        assert!(reconcile_pending(&fx.db_path), "retried next boot");
+        assert_eq!(held_flag(&open(&fx.db_path)), 0);
+    }
+
+    // Impact: leftover staging is the only evidence of an older binary's
+    // interrupted reconcile; clearing it with no marker written and no
+    // walk done would lose that evidence for good.
+    // Should: keep the leftover staging and hold the engine when neither
+    // the marker nor the immediate walk succeeds.
+    #[test]
+    fn leftover_staging_survives_a_failed_marker_and_walk() {
+        let client = tempfile::tempdir().unwrap();
+        let server = tempfile::tempdir().unwrap();
+        let frags = empty_fragment_store(client.path());
+        let fx = join_fixture(client.path(), server.path());
+        crossed_with_partial_flags(&fx, &frags);
+        fx.stage(None);
+        // A directory where the marker file goes makes its write fail.
+        std::fs::create_dir_all(reconcile_pending_path(&fx.db_path)).unwrap();
+        let unmounted = client
+            .path()
+            .join("not-mounted")
+            .to_string_lossy()
+            .into_owned();
+
+        match boot_transition_at(&fx.db_path, TARGET, None, &unmounted) {
+            BootOutcome::Parked(ParkReason::FragmentReconcile { .. }) => {}
+            other => panic!("expected the engine held, got {other:?}"),
+        }
+        assert!(fx.staging.exists(), "leftover staging kept");
+    }
+
+    // Impact: the abandoned join may have run without trusting its
+    // copied flags, so the restored database's flags are not known good.
+    // Should: keep the pending marker across a rollback and walk the
+    // restored database before the engine starts.
+    #[test]
+    fn rollback_keeps_the_pending_marker_and_walks_the_restored_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = crossed(dir.path());
+        let frags = empty_fragment_store(dir.path());
+        hold_fragment(&frags);
+        open(&sealed_path(&db_path).to_string_lossy())
+            .execute("UPDATE fragment_hashes SET stored_locally = 0", [])
+            .unwrap();
+        mark_reconcile_pending(&db_path).unwrap();
+        write_rollback_marker(&db_path);
+
+        match boot_transition_at(&db_path, TARGET, None, &frags) {
+            BootOutcome::RolledBack { epoch: 1 } => {}
+            other => panic!("expected a rollback, got {other:?}"),
+        }
+        assert_eq!(held_flag(&open(&db_path)), 1, "restored database walked");
+        assert!(!reconcile_pending(&db_path));
     }
 
     /// The previous release's straggler, frozen: its own database and the
@@ -2636,7 +2750,8 @@ pub(crate) mod tests {
         );
 
         let activation = crate::upgrade::ActivationEnv::Nix(env.clone());
-        let outcome = boot_transition_with(&db_path, TARGET + 1, Some(&activation));
+        let frags = dir.path().join("fragments").to_string_lossy().into_owned();
+        let outcome = boot_transition_at(&db_path, TARGET + 1, Some(&activation), &frags);
         assert!(
             matches!(outcome, BootOutcome::RestartIntoStaged { required: TARGET }),
             "got {outcome:?}"
@@ -2670,7 +2785,8 @@ pub(crate) mod tests {
         let env = crate::upgrade::nix_provider::tests::test_env(&nix_dir);
         let activation = crate::upgrade::ActivationEnv::Nix(env);
 
-        let outcome = boot_transition_with(&db_path, TARGET + 1, Some(&activation));
+        let frags = dir.path().join("fragments").to_string_lossy().into_owned();
+        let outcome = boot_transition_at(&db_path, TARGET + 1, Some(&activation), &frags);
         assert!(
             matches!(
                 outcome,

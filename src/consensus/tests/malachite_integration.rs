@@ -1251,8 +1251,10 @@ fn regenesis_transition_restarts_into_epoch_2() {
     });
 
     // ---- The boundary: the boot transition over the same data dir --------
-    let outcome =
-        crate::regenesis::boot::boot_transition(&db_path, crate::version::effective_running_code());
+    let outcome = crate::regenesis::boot::tests::boot_transition(
+        &db_path,
+        crate::version::effective_running_code(),
+    );
     let crate::regenesis::boot::BootOutcome::Transitioned { epoch } = outcome else {
         panic!("expected Transitioned, got {outcome:?}");
     };
@@ -1545,7 +1547,10 @@ fn straggler_rejoins_across_an_epoch_boundary() {
     });
 
     let crate::regenesis::boot::BootOutcome::Transitioned { epoch: 2 } =
-        crate::regenesis::boot::boot_transition(&db_path, crate::version::effective_running_code())
+        crate::regenesis::boot::tests::boot_transition(
+            &db_path,
+            crate::version::effective_running_code(),
+        )
     else {
         panic!("the mesh failed to cross its own boundary");
     };
@@ -1625,7 +1630,7 @@ fn straggler_rejoins_across_an_epoch_boundary() {
     });
 
     // ---- The straggler's boot path rebuilds it onto the new epoch.
-    let outcome = crate::regenesis::boot::boot_transition(
+    let outcome = crate::regenesis::boot::tests::boot_transition(
         &straggler_db,
         crate::version::effective_running_code(),
     );

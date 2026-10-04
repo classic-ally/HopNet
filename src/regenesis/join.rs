@@ -872,7 +872,14 @@ pub async fn epoch_join_bootstrap_with(
             )
         }) {
         Ok(_) => crate::regenesis::boot::clear_reconcile_pending(&db_path),
-        Err(e) => tracing::warn!("fragment reconcile after join failed (walked next boot): {e}"),
+        // The join does not complete: no engine on partial flags. The
+        // marker stays, so the next boot walks the store before its
+        // engine starts.
+        Err(e) => {
+            return Err(
+                format!("fragment reconcile after join failed (retried next boot): {e}").into(),
+            );
+        }
     }
 
     set_state(format!(
@@ -996,6 +1003,19 @@ impl ReconcileProgress {
 ///   flags, so any flags already set stay set. Listed files with no row
 ///   are counted as unbacked.
 ///
+/// Fails (and the caller holds the engine, keeping the pending marker)
+/// when the store root is missing, a shard cannot be listed, or a path
+/// cannot be examined: an unreadable store must never read as an empty
+/// one.
+///
+/// Known limitation: partial flags left by 2026.10.12 or earlier (whose
+/// reconcile ran before staging was cleared and wrote no marker) are
+/// detected only while that staging is still on disk. A node that has
+/// already rebooted past an interrupted reconcile, or an older
+/// in-process join, is not detected; there is deliberately no one-off
+/// walk on every node's first boot of this release. The rolling sweep's
+/// present-but-unflagged pass re-flags such files as it rotates.
+///
 /// Never deletes anything. A file the new inventory does not back is
 /// the existence sweep's job (`hopnet_storage::sweep`,
 /// `storage_host::jobs::reap_orphans`): a rowless file past the sweep's
@@ -1018,6 +1038,13 @@ pub fn reconcile_fragment_store(
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM fragment_hashes", [], |r| r.get(0))
         .map_err(|e| format!("row count: {e}"))?;
+    // An absent root lists every shard as empty, which would read as
+    // "this node holds nothing" — an unmounted store must fail instead.
+    if !Path::new(fragments_dir).is_dir() {
+        return Err(format!(
+            "fragment store {fragments_dir:?} is missing or not a directory"
+        ));
+    }
     let targeted = carried.carried > 0;
     tracing::info!(
         rows,
@@ -1074,22 +1101,35 @@ fn reconcile_targeted(
         started,
     );
     for (i, batch) in unknown.chunks(RECONCILE_MARK_BATCH).enumerate() {
-        let present: Vec<&[u8; 32]> = batch
-            .iter()
-            .filter(|raw| {
-                let hex = hex::encode(raw);
-                let path = format!("{fragments_dir}/{}/{}/{hex}", &hex[0..2], &hex[2..4]);
-                std::fs::metadata(path).is_ok_and(|m| m.is_file())
-            })
-            .collect();
+        let mut present: Vec<&[u8; 32]> = Vec::with_capacity(batch.len());
+        for raw in batch {
+            if fragment_file_present(fragments_dir, raw)? {
+                present.push(raw);
+            }
+        }
         remarked += mark_present(conn, &present, false)?.0;
         progress.tick(i + 1, remarked);
     }
     Ok(remarked)
 }
 
+/// Whether `hash`'s file is in the store, judged the way the walk's
+/// listing judges it: a regular file (a symlink is not followed). Only
+/// `NotFound` means absent; any other error (EACCES, EIO) fails the
+/// reconcile rather than silently under-flagging.
+fn fragment_file_present(fragments_dir: &str, hash: &[u8; 32]) -> Result<bool, String> {
+    let hex = hex::encode(hash);
+    let path = format!("{fragments_dir}/{}/{}/{hex}", &hex[0..2], &hex[2..4]);
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) => Ok(m.file_type().is_file()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("stat {path}: {e}")),
+    }
+}
+
 /// The walk plan: list each shard, flag what is present, count what has
-/// no row — one transaction per non-empty shard.
+/// no row — one transaction per non-empty shard. Any shard that cannot be
+/// listed fails the walk: a missing shard would read as fragments lost.
 fn reconcile_walk(
     conn: &rusqlite::Connection,
     fragments_dir: &str,
@@ -1099,17 +1139,12 @@ fn reconcile_walk(
     let mut unbacked = 0usize;
     let mut progress = ReconcileProgress::new("walk", FRAGMENT_SHARDS, started);
     for shard in 0..=u8::MAX {
-        match hopnet_storage::fragstore::list_shard_hashes(fragments_dir, shard) {
-            Ok(listed) => {
-                let hashes: Vec<&[u8; 32]> = listed.iter().map(|h| h.0.as_bytes()).collect();
-                let (marked, rowless) = mark_present(conn, &hashes, true)?;
-                remarked += marked;
-                unbacked += rowless;
-            }
-            // One unreadable directory must not leave the rest of the
-            // store unflagged; the sweep revisits this shard later.
-            Err(e) => tracing::warn!(shard, "fragment reconcile: shard listing failed: {e:?}"),
-        }
+        let listed = hopnet_storage::fragstore::list_shard_hashes(fragments_dir, shard)
+            .map_err(|e| format!("listing shard {shard:02x}: {e:?}"))?;
+        let hashes: Vec<&[u8; 32]> = listed.iter().map(|h| h.0.as_bytes()).collect();
+        let (marked, rowless) = mark_present(conn, &hashes, true)?;
+        remarked += marked;
+        unbacked += rowless;
         progress.tick(shard as usize + 1, remarked);
     }
     Ok((remarked, unbacked))
@@ -1237,7 +1272,7 @@ mod tests {
 
     fn transitioned(dir: &Path) -> String {
         let db_path = sealed_db(dir);
-        match crate::regenesis::boot::boot_transition(&db_path, TARGET) {
+        match crate::regenesis::boot::tests::boot_transition(&db_path, TARGET) {
             crate::regenesis::boot::BootOutcome::Transitioned { epoch: 2 } => {}
             other => panic!("fixture transition failed: {other:?}"),
         }
@@ -1508,6 +1543,115 @@ mod tests {
         assert!(is_flagged(&conn, &unknown));
         assert!(!is_flagged(&conn, &known), "known rows are the sweep's");
         assert!(!is_flagged(&conn, &absent));
+    }
+
+    /// Run `f` with `path`'s mode set to `mode`, restoring 0o755 after.
+    /// Returns `None` when the mode bits do not bind (running as root).
+    fn with_mode<T>(path: &Path, mode: u32, f: impl FnOnce() -> T) -> Option<T> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let binds = std::fs::read_dir(path).is_err();
+        let out = binds.then(f);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        out
+    }
+
+    // Impact: a shard that cannot be listed would read as every fragment
+    // in it lost, and the self-check would report their removal.
+    // Should: fail the walk when any shard cannot be listed.
+    // Should not: flag anything as if the shard were empty and succeed.
+    #[test]
+    fn reconcile_walk_fails_when_a_shard_cannot_be_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, frags) = reconcile_fixture(dir.path());
+        let hashes = store_fragments(&frags, 1, "unlistable");
+        add_unflagged_rows(&conn, &hashes);
+        let shard = Path::new(&frags).join(&hex::encode(hashes[0])[0..2]);
+
+        let Some(result) = with_mode(&shard, 0o000, || {
+            reconcile_fragment_store(&conn, &frags, &CarriedFlags::default())
+        }) else {
+            return;
+        };
+        assert!(result.is_err(), "got {result:?}");
+    }
+
+    // Impact: an unmounted store lists every shard as empty.
+    // Should: fail on both plans when the store root is missing.
+    #[test]
+    fn reconcile_fails_when_the_fragment_store_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, _) = reconcile_fixture(dir.path());
+        let missing = dir
+            .path()
+            .join("not-mounted")
+            .to_string_lossy()
+            .into_owned();
+        add_unflagged_rows(&conn, &[[0x11; 32]]);
+        for carried in [
+            CarriedFlags::default(),
+            CarriedFlags {
+                carried: 1,
+                unknown: vec![[0x11; 32]],
+            },
+        ] {
+            assert!(reconcile_fragment_store(&conn, &missing, &carried).is_err());
+        }
+    }
+
+    // Impact: treating EACCES or EIO as "absent" under-flags silently.
+    // Should: fail the targeted plan when a fragment path cannot be
+    // examined.
+    #[test]
+    fn targeted_reconcile_fails_on_an_unreadable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, frags) = reconcile_fixture(dir.path());
+        let hashes = store_fragments(&frags, 1, "unreadable");
+        add_unflagged_rows(&conn, &hashes);
+        let shard = Path::new(&frags).join(&hex::encode(hashes[0])[0..2]);
+
+        let carried = CarriedFlags {
+            carried: 1,
+            unknown: hashes.clone(),
+        };
+        let Some(result) = with_mode(&shard, 0o000, || {
+            reconcile_fragment_store(&conn, &frags, &carried)
+        }) else {
+            return;
+        };
+        assert!(result.is_err(), "got {result:?}");
+    }
+
+    // Should not: flag a fragment whose name is a symlink, on either
+    // plan (both judge a file by its own entry, not its target).
+    #[test]
+    fn reconcile_does_not_follow_symlinks() {
+        for targeted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (conn, frags) = reconcile_fixture(dir.path());
+            let target = dir.path().join("elsewhere");
+            std::fs::write(&target, b"bytes outside the store").unwrap();
+            let hash = [0x77u8; 32];
+            let leaf = hopnet_storage::fragstore::create_fragment_path(
+                &frags,
+                &hopnet_storage::Blake3Hash::from_bytes(hash),
+            )
+            .unwrap();
+            std::fs::create_dir_all(&leaf).unwrap();
+            std::os::unix::fs::symlink(&target, format!("{leaf}/{}", hex::encode(hash))).unwrap();
+            add_unflagged_rows(&conn, &[hash]);
+
+            let carried = if targeted {
+                CarriedFlags {
+                    carried: 1,
+                    unknown: vec![hash],
+                }
+            } else {
+                CarriedFlags::default()
+            };
+            reconcile_fragment_store(&conn, &frags, &carried).unwrap();
+            assert!(!is_flagged(&conn, &hash), "targeted={targeted}");
+        }
     }
 
     // Impact: per-row autocommit turned every flag write into its own

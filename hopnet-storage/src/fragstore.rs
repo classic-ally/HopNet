@@ -240,8 +240,12 @@ pub fn scan_shard(fragments_dir: &str, shard: u8) -> Result<FragmentListing, Sto
 /// per-file `stat` (the entry type comes from the listing on ext4, xfs,
 /// btrfs and APFS), no content read. On a cold HDD the per-file stat of
 /// [`scan_shard`] dominates; this costs one read per directory. Temp
-/// files and unexpected names are skipped silently. A missing directory
-/// lists as empty.
+/// files and unexpected names are skipped silently, and so is a file
+/// that does not sit under its own hash's `AB/CD/` prefix: path-based
+/// reads could never find it. ([`scan_shard`] still lists such a file;
+/// its consumer, the sweep, treats it as an ordinary rowless file.) A
+/// missing shard directory lists as empty; any other listing error fails
+/// the whole shard rather than shrinking it.
 pub fn list_shard_hashes(fragments_dir: &str, shard: u8) -> Result<Vec<Blake3Hash>, StorageError> {
     let path = std::path::Path::new(fragments_dir).join(format!("{shard:02x}"));
     let mut hashes = Vec::new();
@@ -250,11 +254,16 @@ pub fn list_shard_hashes(fragments_dir: &str, shard: u8) -> Result<Vec<Blake3Has
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(hashes),
         Err(e) => return Err(StorageError::Io(e)),
     };
+    let shard_hex = format!("{shard:02x}");
     for second_level in first_level {
         let second_level = second_level?;
         if !second_level.file_type()?.is_dir() {
             continue;
         }
+        let dir_name = second_level.file_name();
+        let Some(dir_name) = dir_name.to_str().map(str::to_owned) else {
+            continue;
+        };
         for file in fs::read_dir(second_level.path())? {
             let file = file?;
             if !file.file_type()?.is_file() {
@@ -262,7 +271,7 @@ pub fn list_shard_hashes(fragments_dir: &str, shard: u8) -> Result<Vec<Blake3Has
             }
             let name = file.file_name();
             let Some(name) = name.to_str() else { continue };
-            if name.len() != 64 {
+            if name.len() != 64 || name[0..2] != shard_hex || name[2..4] != dir_name {
                 continue;
             }
             let mut bytes = [0u8; 32];
@@ -585,6 +594,30 @@ mod tests {
             .find(|b| hashes.iter().all(|h| h.as_bytes()[0] != *b))
             .unwrap();
         assert!(list_shard_hashes(&dir, empty).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Impact: a misplaced file can never be read by path, so naming it
+    // would flag a fragment the node cannot serve.
+    // Should not: name a hash-named file outside its own AB/CD prefix,
+    // in either the wrong shard or the wrong second-level directory.
+    #[test]
+    fn shard_hash_listing_skips_misplaced_files() {
+        let dir =
+            std::env::temp_dir().join(format!("hopnet-fragstore-misplaced-{}", std::process::id()));
+        let dir = dir.to_str().unwrap().to_string();
+        let _ = fs::remove_dir_all(&dir);
+        let hash = Blake3Hash::from_bytes([0xAB; 32]);
+        let hex = hash.to_hex();
+        // Right shard, wrong second level; then wrong shard altogether.
+        fs::create_dir_all(format!("{dir}/ab/00")).unwrap();
+        fs::write(format!("{dir}/ab/00/{hex}"), b"x").unwrap();
+        fs::create_dir_all(format!("{dir}/00/ab")).unwrap();
+        fs::write(format!("{dir}/00/ab/{hex}"), b"x").unwrap();
+
+        assert!(list_shard_hashes(&dir, 0xab).unwrap().is_empty());
+        assert!(list_shard_hashes(&dir, 0x00).unwrap().is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
