@@ -32,6 +32,23 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+/// jemalloc on the Linux node: glibc's per-thread arenas stranded gigabytes
+/// of freed memory under tokio's churning blocking pool, and jemalloc can
+/// profile what is still live (owner-only `/api/debug/heap/*`). macOS keeps
+/// the system allocator.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Built-in jemalloc options (see `debug::heap::MALLOC_CONF`), read through
+/// the unprefixed `malloc_conf` symbol before `main`. `MALLOC_CONF` in the
+/// environment overrides it.
+#[cfg(target_os = "linux")]
+#[unsafe(export_name = "malloc_conf")]
+static JEMALLOC_CONF: Option<&'static std::ffi::c_char> =
+    // SAFETY: points at the first byte of a 'static NUL-terminated string.
+    Some(unsafe { &*hopnet::debug::heap::MALLOC_CONF.as_ptr() });
+
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
 /// Default port for the pinned-HTTPS listener — the node's ONLY network
@@ -924,6 +941,13 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .route("/debug/iroh-ping", get(net::routes::debug_iroh_ping))
                 .route("/debug/db-stats", get(consensus::routes::get_db_stats))
+                // Owner-only (checked in the handlers); 501 off Linux.
+                .route("/debug/heap/stats", get(debug::heap::get_heap_stats))
+                .route(
+                    "/debug/heap/profiling",
+                    post(debug::heap::post_heap_profiling),
+                )
+                .route("/debug/heap/profile", get(debug::heap::get_heap_profile))
                 .route("/storage/view", get(storage_host::routes::get_storage_view))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))

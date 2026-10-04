@@ -326,6 +326,9 @@
             # test (fusermount3 for the daemon's stale-mount cleanup);
             # busybox gives docker exec a shell for debugging and test IO.
             contents = [ hopnet hopnet-mount pkgs.fuse3 pkgs.busybox iroh-relay ];
+            # A world-writable /tmp: the heap profile dump
+            # (/api/debug/heap/profile) has jemalloc write a temp file there.
+            extraCommands = "mkdir -m 1777 tmp";
             config = {
               Entrypoint = [ "${hopnet}/bin/hopnet" ];
               ExposedPorts."34632/tcp" = {};

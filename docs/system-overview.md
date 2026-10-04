@@ -870,6 +870,7 @@ Automated background processes ensuring network health and storage efficiency.
 - [ ] Consensus state management and archival
 - [x] Fragment filesystem cleanup for orphaned files — the disk-truth sweep (RFC-STORAGE-003 S5); orphaned data-block cleanup registered daily (S6)
 - [ ] Job coordination using node ID proximity to minimize duplicate work
+- [~] Linux node on jemalloc (glibc's per-thread arenas stranded ~4.3 GB freed on thor) with owner-only on-demand heap profiling: `GET /api/debug/heap/stats`, `POST /api/debug/heap/profiling`, `GET /api/debug/heap/profile` (pprof); macOS keeps the system allocator (501). Branch `feat-jemalloc-heap-profiling`, unreleased (targets 2026.10.11)
 
 ### 8. User Data Takeout & Import System ([RFC-010](specs/user-data-takeout.md))
 **Status**: Takeout complete; Import backend (Phase 3) + Frontend MVP (Phase 4) complete; onboarding architecture in place for future steps.
