@@ -803,6 +803,39 @@ pub fn release_local_uploads(
     Ok(hashes)
 }
 
+/// Drop `blob_id`'s ledger entries for `fragment_hashes` only (an
+/// abandoned upload giving up one batch); another blob's entry for the
+/// same hash is left alone. Returns the rows dropped. The caller owns the
+/// transaction.
+pub fn release_local_upload_hashes<'a>(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+    fragment_hashes: impl IntoIterator<Item = &'a Blake3Hash>,
+) -> Result<usize, rusqlite::Error> {
+    let mut stmt = conn.prepare_cached(
+        "DELETE FROM hopnet_storage_local_uploads WHERE fragment_hash = ?1 AND blob_id = ?2",
+    )?;
+    let mut released = 0;
+    for hash in fragment_hashes {
+        released += stmt.execute(params![hash, blob_id])?;
+    }
+    Ok(released)
+}
+
+/// The newest ledger stamp of `blob_id`'s entries, `None` when it holds
+/// nothing — the purge's guard against taking an upload whose transaction
+/// may still land.
+pub fn newest_local_upload_unix(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+) -> Result<Option<i64>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT MAX(written_unix) FROM hopnet_storage_local_uploads WHERE blob_id = ?1",
+        params![blob_id],
+        |row| row.get(0),
+    )
+}
+
 /// Fragment files an unlink pass deleted, with their on-disk bytes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DeletedFragments {

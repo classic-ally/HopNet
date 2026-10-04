@@ -351,21 +351,68 @@ pub async fn abandon_own_upload(
 /// (busy_timeout 5 s), and a cold disk's unlinks are not quick.
 pub const UNLINK_BATCH: usize = 32;
 
-/// `stat` outside the lock, then re-check and unlink inside one write
-/// transaction, for one batch of candidates.
+/// `stat` outside the lock, then inside one write transaction drop
+/// `release`'s own holds on the batch, if given, and re-check and unlink
+/// it. Dropping the holds first matters to an abandoned upload's leftover
+/// batch: its own entries would otherwise make the re-check keep every
+/// file.
 fn unlink_batch(
-    conn: &mut rusqlite::Connection,
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     fragments_dir: &str,
+    release: Option<&hopnet_storage::BlobId>,
     batch: &[hopnet_storage::Blake3Hash],
-) -> Result<hopnet_storage::store::DeletedFragments, String> {
+) -> Result<hopnet_storage::store::DeletedFragments, LedgerError> {
     let sized = hopnet_storage::store::stat_fragments(fragments_dir, batch);
+    let mut conn = pool
+        .get()
+        .map_err(|e| LedgerError::Transient(format!("pool: {e}")))?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| format!("tx: {e}"))?;
+        .map_err(|e| ledger_sqlite_error(e, "tx"))?;
+    if let Some(blob_id) = release {
+        hopnet_storage::store::release_local_upload_hashes(&tx, blob_id, batch)
+            .map_err(|e| ledger_sqlite_error(e, "release batch"))?;
+    }
     let gone = hopnet_storage::store::delete_unclaimed_fragments(&tx, fragments_dir, &sized)
-        .map_err(|e| format!("unlink re-check: {e}"))?;
-    crate::dbstats::commit_timed(tx).map_err(|e| format!("unlink commit: {e}"))?;
+        .map_err(|e| ledger_sqlite_error(e, "unlink re-check"))?;
+    crate::dbstats::commit_timed(tx).map_err(|e| ledger_sqlite_error(e, "unlink commit"))?;
     Ok(gone)
+}
+
+/// Drop every ledger entry of `blob_id` in one write transaction, and
+/// return their hashes.
+fn release_blob(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    blob_id: &hopnet_storage::BlobId,
+) -> Result<Vec<hopnet_storage::Blake3Hash>, LedgerError> {
+    let mut conn = pool
+        .get()
+        .map_err(|e| LedgerError::Transient(format!("pool: {e}")))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ledger_sqlite_error(e, "tx"))?;
+    let candidates = hopnet_storage::store::release_local_uploads(&tx, blob_id)
+        .map_err(|e| ledger_sqlite_error(e, "release"))?;
+    crate::dbstats::commit_timed(tx).map_err(|e| ledger_sqlite_error(e, "release commit"))?;
+    Ok(candidates)
+}
+
+/// Drop `blob_id`'s ledger entries for one batch in one transaction.
+fn release_batch(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    blob_id: &hopnet_storage::BlobId,
+    batch: &[hopnet_storage::Blake3Hash],
+) -> Result<usize, LedgerError> {
+    let mut conn = pool
+        .get()
+        .map_err(|e| LedgerError::Transient(format!("pool: {e}")))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ledger_sqlite_error(e, "tx"))?;
+    let released = hopnet_storage::store::release_local_upload_hashes(&tx, blob_id, batch)
+        .map_err(|e| ledger_sqlite_error(e, "release batch"))?;
+    crate::dbstats::commit_timed(tx).map_err(|e| ledger_sqlite_error(e, "release commit"))?;
+    Ok(released)
 }
 
 fn abandon_own_upload_blocking(
@@ -373,19 +420,38 @@ fn abandon_own_upload_blocking(
     fragments_dir: &str,
     blob_id: &hopnet_storage::BlobId,
 ) -> Result<usize, String> {
-    let mut conn = pool.get().map_err(|e| format!("pool: {e}"))?;
-    let candidates = {
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| format!("tx: {e}"))?;
-        let candidates = hopnet_storage::store::release_local_uploads(&tx, blob_id)
-            .map_err(|e| format!("release: {e}"))?;
-        crate::dbstats::commit_timed(tx).map_err(|e| format!("release commit: {e}"))?;
-        candidates
-    };
+    abandon_own_upload_with(
+        pool,
+        fragments_dir,
+        blob_id,
+        LEDGER_RETRY_BUDGET,
+        std::thread::sleep,
+    )
+}
+
+/// `abandon_own_upload_blocking` with the retry budget and `sleep`
+/// injected. The release and each unlink batch retry transient failures
+/// under the same budget as a ledger write, so a moment of write-lock
+/// contention does not leave a failed put held for the whole retention.
+fn abandon_own_upload_with(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    fragments_dir: &str,
+    blob_id: &hopnet_storage::BlobId,
+    budget: std::time::Duration,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<usize, String> {
+    let candidates = retry_transient(|| release_blob(pool, blob_id), budget, &mut sleep)
+        .map_err(|e| e.to_string())?;
     let mut unlinked = 0;
     for batch in candidates.chunks(UNLINK_BATCH) {
-        unlinked += unlink_batch(&mut conn, fragments_dir, batch)?.hashes.len();
+        unlinked += retry_transient(
+            || unlink_batch(pool, fragments_dir, None, batch),
+            budget,
+            &mut sleep,
+        )
+        .map_err(|e| e.to_string())?
+        .hashes
+        .len();
     }
     Ok(unlinked)
 }
@@ -454,10 +520,14 @@ pub fn retry_transient<T>(
 /// (`put_own_upload`), retrying transient failures under
 /// `LEDGER_RETRY_BUDGET` (it runs on a blocking thread). Once the upload
 /// is `abandoned` (the future was dropped) it refuses the batch, so the
-/// detached chunk task stops ledgering and writing, and unlinks the one
-/// batch it let through last — the abandon may have run before those files
-/// landed. A ledger failure aborts the put, so the client retries rather
-/// than proceeding with files nothing protects.
+/// detached chunk task stops ledgering and writing, and releases and
+/// unlinks the one batch it let through last — the abandon may have run
+/// before those files landed, and their own holds must go first or the
+/// unlink's re-check would keep every file. A batch whose ledger write was
+/// still retrying when the upload was abandoned is refused too, after its
+/// fresh holds are released: the abandon may have released the blob before
+/// that write committed. A ledger failure aborts the put, so the client
+/// retries rather than proceeding with files nothing protects.
 pub fn upload_ledger_hook(
     pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     fragments_dir: String,
@@ -465,29 +535,64 @@ pub fn upload_ledger_hook(
     abandoned: Arc<AtomicBool>,
 ) -> impl FnMut(&[hopnet_storage::Blake3Hash]) -> Result<(), hopnet_storage::StorageError> + Send + 'static
 {
+    let record_pool = pool.clone();
+    let record_blob = blob_id.clone();
+    upload_ledger_hook_with(pool, fragments_dir, blob_id, abandoned, move |hashes| {
+        retry_transient(
+            || record_own_upload(&record_pool, &record_blob, hashes),
+            LEDGER_RETRY_BUDGET,
+            std::thread::sleep,
+        )
+    })
+}
+
+/// `upload_ledger_hook` with the ledger write (`record`, retries included)
+/// injected.
+fn upload_ledger_hook_with(
+    pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    fragments_dir: String,
+    blob_id: hopnet_storage::BlobId,
+    abandoned: Arc<AtomicBool>,
+    mut record: impl FnMut(&[hopnet_storage::Blake3Hash]) -> Result<usize, LedgerError> + Send + 'static,
+) -> impl FnMut(&[hopnet_storage::Blake3Hash]) -> Result<(), hopnet_storage::StorageError> + Send + 'static
+{
+    let refused = || {
+        Err(hopnet_storage::StorageError::Host(
+            "upload abandoned".into(),
+        ))
+    };
     let mut last_batch: Vec<hopnet_storage::Blake3Hash> = Vec::new();
     move |hashes| {
         if abandoned.load(Ordering::SeqCst) {
             if !last_batch.is_empty() {
-                let unlinked = pool
-                    .get()
-                    .map_err(|e| format!("pool: {e}"))
-                    .and_then(|mut conn| unlink_batch(&mut conn, &fragments_dir, &last_batch));
+                let unlinked = retry_transient(
+                    || unlink_batch(&pool, &fragments_dir, Some(&blob_id), &last_batch),
+                    LEDGER_RETRY_BUDGET,
+                    std::thread::sleep,
+                );
                 if let Err(e) = unlinked {
                     tracing::warn!(%blob_id, "abandoned upload's last batch not unlinked: {e}");
                 }
             }
             last_batch.clear();
-            return Err(hopnet_storage::StorageError::Host(
-                "upload abandoned".into(),
-            ));
+            return refused();
         }
-        retry_transient(
-            || record_own_upload(&pool, &blob_id, hashes),
-            LEDGER_RETRY_BUDGET,
-            std::thread::sleep,
-        )
-        .map_err(|e| hopnet_storage::StorageError::Host(e.to_string()))?;
+        record(hashes).map_err(|e| hopnet_storage::StorageError::Host(e.to_string()))?;
+        if abandoned.load(Ordering::SeqCst) {
+            // Abandoned while the write was in flight: the abandon's
+            // release may have run before it committed. Nothing of this
+            // batch is written yet, so dropping its holds is enough.
+            let released = retry_transient(
+                || release_batch(&pool, &blob_id, hashes),
+                LEDGER_RETRY_BUDGET,
+                std::thread::sleep,
+            );
+            if let Err(e) = released {
+                tracing::warn!(%blob_id, "abandoned upload's last holds not released: {e}");
+            }
+            last_batch.clear();
+            return refused();
+        }
         last_batch.clear();
         last_batch.extend_from_slice(hashes);
         Ok(())
@@ -704,6 +809,181 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// `count` distinct fragments tagged `tag`: a hash (first byte `tag`,
+    /// second the index) and a payload. The store does not check one
+    /// against the other.
+    fn batch_of(tag: u8, count: u8) -> Vec<(hopnet_storage::Blake3Hash, Vec<u8>)> {
+        (0..count)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = tag;
+                bytes[1] = i;
+                let data = format!("fragment {i} of batch {tag}").into_bytes();
+                (hopnet_storage::Blake3Hash::from_bytes(bytes), data)
+            })
+            .collect()
+    }
+
+    fn hashes_of(
+        batch: &[(hopnet_storage::Blake3Hash, Vec<u8>)],
+    ) -> Vec<hopnet_storage::Blake3Hash> {
+        batch.iter().map(|(hash, _)| *hash).collect()
+    }
+
+    fn write_files(frags: &str, batch: &[(hopnet_storage::Blake3Hash, Vec<u8>)]) {
+        for (hash, data) in batch {
+            hopnet_storage::fragstore::store_fragment(frags, hash, data.clone()).unwrap();
+        }
+    }
+
+    // Impact: a batch's ledger write can retry for up to a minute. If the
+    // put is dropped meanwhile, the abandon's release can run before that
+    // write commits; letting the batch through would then write files whose
+    // fresh holds keep them for the whole retention.
+    // Should: refuse a batch whose upload was abandoned while its ledger
+    // write was in flight, dropping the holds that write left.
+    // Should not: leave a ledger entry or a fragment file of that batch.
+    #[test]
+    fn a_batch_abandoned_during_its_ledger_write_leaves_nothing_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let frags = dir.path().join("fragments").to_string_lossy().into_owned();
+        let pool = storage_pool();
+        let blob_id = hopnet_storage::BlobId::new(None);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let batch = batch_of(0x10, 3);
+
+        let recorder = {
+            let pool = pool.clone();
+            let frags = frags.clone();
+            let blob_id = blob_id.clone();
+            let abandoned = abandoned.clone();
+            move |hashes: &[hopnet_storage::Blake3Hash]| {
+                // The put is dropped and its abandon runs while this write
+                // is still retrying; the write commits afterwards.
+                abandoned.store(true, Ordering::SeqCst);
+                abandon_own_upload_blocking(&pool, &frags, &blob_id).unwrap();
+                record_own_upload(&pool, &blob_id, hashes)
+            }
+        };
+        let mut hook = upload_ledger_hook_with(
+            pool.clone(),
+            frags.clone(),
+            blob_id.clone(),
+            abandoned,
+            recorder,
+        );
+        let accepted = hook(&hashes_of(&batch));
+        if accepted.is_ok() {
+            // What the chunk task does with a batch the hook lets through.
+            write_files(&frags, &batch);
+        }
+
+        assert!(accepted.is_err(), "the abandoned upload's batch is refused");
+        assert!(
+            hopnet_storage::store::held_local_uploads(&pool.get().unwrap())
+                .unwrap()
+                .is_empty(),
+            "no hold of the refused batch survives"
+        );
+        assert!(
+            hopnet_storage::fragstore::scan_fragments_detailed(&frags)
+                .unwrap_or_default()
+                .is_empty(),
+            "no file of the refused batch is written"
+        );
+    }
+
+    // Impact: when the abandon's own pass runs before the last batch's
+    // files land, the next hook call is the only clean-up of that batch,
+    // and its own holds would make every unlink re-check keep the file.
+    // Should: on the first call after the upload is abandoned, release the
+    // last accepted batch's holds and unlink its files.
+    #[test]
+    fn an_abandoned_upload_releases_its_last_batch_before_unlinking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let frags = dir.path().join("fragments").to_string_lossy().into_owned();
+        let pool = storage_pool();
+        let blob_id = hopnet_storage::BlobId::new(None);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let mut hook = upload_ledger_hook(
+            pool.clone(),
+            frags.clone(),
+            blob_id.clone(),
+            abandoned.clone(),
+        );
+
+        let first = batch_of(0x20, 4);
+        hook(&hashes_of(&first)).unwrap();
+        write_files(&frags, &first);
+        abandoned.store(true, Ordering::SeqCst);
+        assert!(hook(&hashes_of(&batch_of(0x21, 2))).is_err());
+
+        assert!(
+            hopnet_storage::store::held_local_uploads(&pool.get().unwrap())
+                .unwrap()
+                .is_empty(),
+            "the last batch's holds are released"
+        );
+        assert!(
+            hopnet_storage::fragstore::scan_fragments_detailed(&frags)
+                .unwrap()
+                .is_empty(),
+            "the last batch's files are unlinked"
+        );
+    }
+
+    // Impact: the abandon competes with consensus apply for the write
+    // lock; giving up on the first SQLITE_BUSY would leave a failed put's
+    // files held for the whole retention.
+    // Should: retry the abandon's release and unlinks through a transient
+    // busy database, and still release every hold and unlink every file.
+    #[test]
+    fn an_abandon_retries_through_a_busy_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let frags = dir.path().join("fragments").to_string_lossy().into_owned();
+        let db_path = dir.path().join("node.db");
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .build(r2d2_sqlite::SqliteConnectionManager::file(&db_path))
+            .unwrap();
+        {
+            let conn = pool.get().unwrap();
+            let chain = &hopnet_storage::store::CHAIN;
+            hopnet_common::chain::replay(&conn, chain, chain.head()).unwrap();
+            // Give up on a lock fast, so the test does not wait out the
+            // default busy_timeout.
+            conn.execute_batch("PRAGMA busy_timeout = 50;").unwrap();
+        }
+        let blob_id = hopnet_storage::BlobId::new(None);
+        let batch = batch_of(0x30, 5);
+        record_own_upload(&pool, &blob_id, &hashes_of(&batch)).unwrap();
+        write_files(&frags, &batch);
+
+        // Another writer holds the database until the first retry's wait.
+        let locker = rusqlite::Connection::open(&db_path).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let mut locker = Some(locker);
+        let mut waits = 0;
+        let unlinked =
+            abandon_own_upload_with(&pool, &frags, &blob_id, LEDGER_RETRY_BUDGET, |_| {
+                waits += 1;
+                if let Some(locker) = locker.take() {
+                    locker.execute_batch("ROLLBACK;").unwrap();
+                }
+            });
+
+        assert_eq!(unlinked, Ok(5));
+        assert_eq!(waits, 1, "one transient busy, one retry");
+        assert!(
+            hopnet_storage::store::held_local_uploads(&pool.get().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(hopnet_storage::fragstore::scan_fragments_detailed(&frags)
+            .unwrap()
+            .is_empty());
     }
 
     // Impact: each ledger batch needs a pool checkout and the write lock; a

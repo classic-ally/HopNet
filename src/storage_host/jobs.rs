@@ -936,9 +936,10 @@ pub const HELD_LISTING_LIMIT: usize = 1000;
 pub struct PurgedUploads {
     /// Blobs whose holds were released.
     pub blobs: usize,
-    /// Blobs refused because a put for them is in flight in this process
-    /// (`hopnet_projection::host::upload_is_live`).
-    pub skipped_streaming: Vec<CustomUUID>,
+    /// Blobs refused as possibly still landing: a put for them is in flight
+    /// in this process (`hopnet_projection::host::upload_is_live`), or
+    /// their newest hold is younger than `PURGE_MIN_AGE_SECS`.
+    pub skipped_recent: Vec<CustomUUID>,
     pub fragments_deleted: usize,
     pub bytes_freed: u64,
 }
@@ -968,10 +969,17 @@ pub async fn held_uploads(
 /// indistinguishable from a slow one by anything but the operator (the
 /// retention reclaims it eventually), and the blob ids are also the handle
 /// for re-uploading. A blob with a put in flight in this process is
-/// skipped and reported (`skipped_streaming`): the live-put registry is
-/// exact, where a ledger-stamp age was not (a slow client can take longer
-/// than the orphan grace per chunk), and a put never outlives the process,
-/// so after a restart every hold is purgeable. Disk and database work runs
+/// skipped and reported (`skipped_recent`), and so is a blob whose newest
+/// hold is younger than `PURGE_MIN_AGE_SECS`. The registry alone is not
+/// enough: it covers only the put itself, while the `fragment_hashes` rows
+/// land with a later transaction — the photos publisher uploads every
+/// resource of a photo before its one `photo_add`, a stalled mesh delays
+/// commits, and a transaction already proposed before a restart can still
+/// commit after it — so a just-finished upload is not yet a stuck one.
+/// The age alone is not enough either: a slow client can take longer than
+/// any fixed age per chunk. A hold stamped in the future (a clock step)
+/// is purgeable, or it could neither expire nor be purged. Disk and
+/// database work runs
 /// on the blocking pool, in `UNLINK_BATCH` write transactions, each
 /// re-checking every file right before its unlink
 /// (`store::delete_unclaimed_fragments`).
@@ -982,13 +990,13 @@ pub async fn purge_held_uploads(
     let pool = app_state.db_pool.clone();
     let fragments_dir = app_state.fragments_dir.clone();
     let report = tokio::task::spawn_blocking(move || {
-        purge_held_uploads_blocking(&pool, &fragments_dir, &blob_ids)
+        purge_held_uploads_blocking(&pool, &fragments_dir, &blob_ids, unix_now())
     })
     .await
     .map_err(|e| format!("purge task: {e}"))??;
     tracing::info!(
         blobs = report.blobs,
-        skipped_streaming = report.skipped_streaming.len(),
+        skipped_recent = report.skipped_recent.len(),
         fragments_deleted = report.fragments_deleted,
         bytes_freed = report.bytes_freed,
         "purged held uploads at the operator's request"
@@ -996,18 +1004,31 @@ pub async fn purge_held_uploads(
     Ok(report)
 }
 
-/// `purge_held_uploads` proper, synchronous: one blob at a time, its
-/// release in one write transaction and its unlinks in batches of
-/// `UNLINK_BATCH`, each its own write transaction.
+/// The youngest a blob's newest hold may be for the operator's purge to
+/// take it: a day, comfortably past any transaction still on its way to
+/// landing after its put finished (see `purge_held_uploads`).
+pub const PURGE_MIN_AGE_SECS: i64 = 86_400;
+
+/// Whether a blob whose newest hold was stamped `newest_unix` is too
+/// recent to purge at `now_unix`. A future stamp (a clock step) is not.
+fn hold_is_recent(newest_unix: i64, now_unix: u64) -> bool {
+    let now = i64::try_from(now_unix).unwrap_or(i64::MAX);
+    (0..PURGE_MIN_AGE_SECS).contains(&now.saturating_sub(newest_unix))
+}
+
+/// `purge_held_uploads` proper, synchronous, at `now_unix`: one blob at a
+/// time, its age check and release in one write transaction and its
+/// unlinks in batches of `UNLINK_BATCH`, each its own write transaction.
 pub(crate) fn purge_held_uploads_blocking(
     pool: &r2d2::Pool<crate::db::SqliteConnectionManager>,
     fragments_dir: &str,
     blob_ids: &[CustomUUID],
+    now_unix: u64,
 ) -> Result<PurgedUploads, String> {
     let mut report = PurgedUploads::default();
     for blob_id in blob_ids {
         if hopnet_projection::host::upload_is_live(blob_id) {
-            report.skipped_streaming.push(blob_id.clone());
+            report.skipped_recent.push(blob_id.clone());
             continue;
         }
         let candidates = {
@@ -1015,6 +1036,13 @@ pub(crate) fn purge_held_uploads_blocking(
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| format!("tx: {e}"))?;
+            let newest = hopnet_storage::store::newest_local_upload_unix(&tx, blob_id)
+                .map_err(|e| format!("newest hold: {e}"))?;
+            if newest.is_some_and(|newest| hold_is_recent(newest, now_unix)) {
+                // Dropping the transaction rolls it back; it wrote nothing.
+                report.skipped_recent.push(blob_id.clone());
+                continue;
+            }
             let candidates = hopnet_storage::store::release_local_uploads(&tx, blob_id)
                 .map_err(|e| format!("release: {e}"))?;
             crate::db::shared::commit_timed(tx).map_err(|e| format!("release commit: {e}"))?;
@@ -2307,12 +2335,13 @@ mod tests {
         .unwrap();
 
         let report =
-            purge_held_uploads_blocking(&pool, &frags, std::slice::from_ref(&blob)).unwrap();
+            purge_held_uploads_blocking(&pool, &frags, std::slice::from_ref(&blob), unix_now())
+                .unwrap();
         assert_eq!(
             report,
             PurgedUploads {
                 blobs: 1,
-                skipped_streaming: vec![],
+                skipped_recent: vec![],
                 fragments_deleted: count,
                 bytes_freed: bytes,
             }
@@ -2331,8 +2360,8 @@ mod tests {
 
     // Impact: a purge issued while the blob's put is still streaming would
     // unlink chunks the put has written and ledgered, under a running
-    // upload. A ledger-stamp age cannot tell: a slow client takes longer
-    // than the orphan grace per 40 MB chunk. The live-put registry can.
+    // upload. A ledger-stamp age cannot tell: a slow client can take longer
+    // than any fixed age per chunk. The live-put registry can.
     // Should: skip a blob with a put in flight, report it, purge the
     // others, and purge it once its put is over.
     // Should not: release or unlink anything of the skipped blob.
@@ -2368,15 +2397,18 @@ mod tests {
             .unwrap();
         }
         let live = hopnet_projection::host::LiveUpload::register(streaming.clone());
+        // Two days on, past the purge's age guard: only the registry
+        // protects the streaming blob.
+        let later = now + 2 * 86_400;
 
         let report =
-            purge_held_uploads_blocking(&pool, &frags, &[streaming.clone(), stuck.clone()])
+            purge_held_uploads_blocking(&pool, &frags, &[streaming.clone(), stuck.clone()], later)
                 .unwrap();
         assert_eq!(
             report,
             PurgedUploads {
                 blobs: 1,
-                skipped_streaming: vec![streaming.clone()],
+                skipped_recent: vec![streaming.clone()],
                 fragments_deleted: 1,
                 bytes_freed: b"stuck upload from last week".len() as u64,
             }
@@ -2400,9 +2432,10 @@ mod tests {
 
         drop(live);
         let report =
-            purge_held_uploads_blocking(&pool, &frags, std::slice::from_ref(&streaming)).unwrap();
+            purge_held_uploads_blocking(&pool, &frags, std::slice::from_ref(&streaming), later)
+                .unwrap();
         assert_eq!(report.blobs, 1);
-        assert!(report.skipped_streaming.is_empty());
+        assert!(report.skipped_recent.is_empty());
         assert_eq!(report.fragments_deleted, 1);
         assert!(!hopnet_storage::fragstore::fragment_exists_and_valid(
             &frags,
@@ -2428,13 +2461,79 @@ mod tests {
         .unwrap();
 
         let report =
-            purge_held_uploads_blocking(&pool, &frags, std::slice::from_ref(&blob)).unwrap();
+            purge_held_uploads_blocking(&pool, &frags, std::slice::from_ref(&blob), unix_now())
+                .unwrap();
         assert_eq!(report.blobs, 1);
-        assert!(report.skipped_streaming.is_empty());
+        assert!(report.skipped_recent.is_empty());
         assert_eq!(report.fragments_deleted, 1);
         assert!(!hopnet_storage::fragstore::fragment_exists_and_valid(
             &frags, &hash
         ));
+    }
+
+    // Impact: the live-put registry covers only the put; its rows land
+    // with a later transaction (a photo's resources all upload before its
+    // one photo_add, a stalled mesh delays commits, a transaction proposed
+    // before a restart can still commit after it). Purging in that window
+    // unlinks the only copy of an upload that is about to be confirmed.
+    // Should: skip and report a blob with no put in flight whose newest
+    // hold is an hour old, leaving its hold and file in place.
+    // Should: purge a blob whose newest hold is past a day old.
+    #[test]
+    fn a_purge_skips_a_recently_finished_upload() {
+        let (_dir, frags, pool) = orphan_fixture();
+        let landing = CustomUUID::new(None);
+        let stuck = CustomUUID::new(None);
+        let landing_hash = store_aged(&frags, b"finished an hour ago", 3600);
+        let stuck_hash = store_aged(&frags, b"finished yesterday", 3600);
+        let now = unix_now();
+        {
+            let conn = pool.get().unwrap();
+            hopnet_storage::store::record_local_uploads(
+                &conn,
+                &landing,
+                [&landing_hash],
+                now - 3600,
+            )
+            .unwrap();
+            hopnet_storage::store::record_local_uploads(
+                &conn,
+                &stuck,
+                [&stuck_hash],
+                now - 25 * 3600,
+            )
+            .unwrap();
+        }
+
+        let report =
+            purge_held_uploads_blocking(&pool, &frags, &[landing.clone(), stuck.clone()], now)
+                .unwrap();
+        assert_eq!(
+            report,
+            PurgedUploads {
+                blobs: 1,
+                skipped_recent: vec![landing.clone()],
+                fragments_deleted: 1,
+                bytes_freed: b"finished yesterday".len() as u64,
+            }
+        );
+        assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags,
+            &landing_hash
+        ));
+        assert!(!hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags,
+            &stuck_hash
+        ));
+        assert_eq!(
+            hopnet_storage::store::held_local_uploads(&pool.get().unwrap())
+                .unwrap()
+                .into_iter()
+                .map(|u| u.blob_id)
+                .collect::<Vec<_>>(),
+            vec![landing],
+            "the recent blob's hold is untouched"
+        );
     }
 
     // Impact: at a crossing every node reboots; repair taking the grid's

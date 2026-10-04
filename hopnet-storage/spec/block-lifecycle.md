@@ -1231,15 +1231,26 @@ optimization and carries no proof obligation.
     skips the batch (counted as `orphan_batches_skipped`) and never
     fails the shard. A put that fails part-way, or whose future is
     dropped by a client disconnect (`host::put_own_upload`'s guard),
-    releases its blob's holds and unlinks its rowless files; the hook
+    releases its blob's holds and unlinks its rowless files, the release
+    and unlinks retrying transient failures like a ledger write; the hook
     retries transient ledger failures (pool checkout, SQLITE_BUSY) for
-    up to a minute before the put fails. Stuck uploads are visible under
+    up to a minute before the put fails, refuses a batch whose upload
+    was abandoned while its ledger write was in flight (dropping that
+    write's holds), and drops the last accepted batch's own holds before
+    unlinking it. Stuck uploads are visible under
     `held` on the orphan route (rowless computed at read time, grouped
     by blob in SQL, capped at 1000 blobs with totals, counts not bytes);
     the node's owner can purge them early (`purge-held`, by blob id, on
-    the blocking pool), which skips and reports a blob whose put is in
-    flight in this process (an exact in-process registry; a put never
-    outlives the process, so after a restart every hold is purgeable).
+    the blocking pool), which skips and reports (`skipped_recent`) a
+    blob whose put is in flight in this process (an exact in-process
+    registry; a slow client can outlast any fixed age per chunk) or
+    whose newest hold is under a day old (`PURGE_MIN_AGE_SECS`): the
+    registry covers only the put, and the rows land with a later
+    transaction — a photo's resources all upload before its one
+    `photo_add`, a stalled mesh delays commits, and a transaction
+    proposed before a restart can commit after it. A hold stamped in
+    the future (a clock step) is purgeable, or it could neither expire
+    nor be purged.
     Storage step 0006 moves the hashed format_version to 6; storage@5
     artifacts import through the frozen
     `PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION`.
