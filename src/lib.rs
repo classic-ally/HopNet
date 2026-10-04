@@ -69,6 +69,9 @@ pub struct AppState {
     /// The last disk-truth sweep's report (RFC-STORAGE-003 S5) — the
     /// operator route's payload. Process state.
     pub last_sweep: Arc<std::sync::Mutex<Option<hopnet_storage::sweep::SweepReport>>>,
+    /// The rolling walker's rotation in progress, with its running step
+    /// timings — the operator route's `in_progress`. Process state.
+    pub sweep_progress: Arc<std::sync::Mutex<Option<hopnet_storage::sweep::SweepProgress>>>,
     /// The last policy tick's tally (RFC-STORAGE-003 S7) — the pane's
     /// re-encode backlog source. Process state.
     pub last_tick: Arc<std::sync::Mutex<Option<storage_host::jobs::PolicyTickReport>>>,

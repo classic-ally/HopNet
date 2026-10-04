@@ -464,6 +464,12 @@ pub(crate) struct Rotation {
     truth: hopnet_storage::sweep::PageBuffer,
     /// The rotation's prompt surplus release budget.
     surplus_left: usize,
+    /// The current shard step's timings, filled step by step so a failed
+    /// shard still reports the steps it got through.
+    shard: hopnet_storage::sweep::ShardTimings,
+    /// Shards since the last progress line, and when it was logged.
+    progress_shards: usize,
+    progress_at: std::time::Instant,
 }
 
 impl Rotation {
@@ -477,8 +483,16 @@ impl Rotation {
             belief: Default::default(),
             truth: Default::default(),
             surplus_left: SURPLUS_RELEASE_MAX_PER_SWEEP,
+            shard: Default::default(),
+            progress_shards: 0,
+            progress_at: std::time::Instant::now(),
         }
     }
+}
+
+/// Milliseconds since `since`.
+fn ms_since(since: std::time::Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The rolling disk-truth sweep (RFC-STORAGE-003 S5) — discharges
@@ -524,10 +538,29 @@ pub async fn run_rolling_sweep(app_state: AppState) {
                 rotation.report.failed_shards += 1;
             }
         }
-        flush_buffers(&host, rotation, false).await;
+        let flushed = flush_buffers(&host, rotation, false).await;
+        let work_ms = ms_since(step_started);
+        rotation.report.ms_work += work_ms;
+        log_shard_timings(cursor.next_shard, &rotation.shard, &flushed, work_ms);
 
         let height = current_height(&app_state).unwrap_or(cursor.started_height);
         let (next, completed) = cursor.advance(unix_now(), height);
+        rotation.progress_shards += 1;
+        if !completed
+            && hopnet_storage::sweep::progress_due(
+                rotation.progress_shards,
+                rotation.progress_at.elapsed().as_secs(),
+            )
+        {
+            tracing::info!(
+                "sweep: rotation {} progress at shard {:02x}: {}",
+                cursor.rotation,
+                cursor.next_shard,
+                rotation.report.timing_summary()
+            );
+            rotation.progress_shards = 0;
+            rotation.progress_at = std::time::Instant::now();
+        }
         if completed {
             flush_buffers(&host, rotation, true).await;
             let fresh = Rotation::new(rotation.node_id, next.started_unix);
@@ -547,9 +580,51 @@ pub async fn run_rolling_sweep(app_state: AppState) {
         {
             tracing::warn!("sweep: cursor not saved: {e}");
         }
+        *app_state.sweep_progress.lock().unwrap() = Some(hopnet_storage::sweep::SweepProgress {
+            rotation: cursor.rotation,
+            next_shard: cursor.next_shard,
+            started_unix: cursor.started_unix,
+            started_height: cursor.started_height,
+            avg_ms_per_shard: rotation.report.avg_ms_per_shard(),
+            report: rotation.report.clone(),
+        });
 
+        let slept = std::time::Instant::now();
         tokio::time::sleep(per_shard.saturating_sub(step_started.elapsed())).await;
+        rotation.report.ms_sleep += ms_since(slept);
     }
+}
+
+/// The per-shard DEBUG line: each step's milliseconds, the walk's file
+/// count, whether the shard was scrubbed, and the flush that followed.
+fn log_shard_timings(
+    shard: u8,
+    t: &hopnet_storage::sweep::ShardTimings,
+    flushed: &hopnet_storage::sweep::FlushTimings,
+    work_ms: u64,
+) {
+    tracing::debug!(
+        "sweep: shard {shard:02x} timings: {} files, {work_ms} ms work; ms: height={} walk={} db={} diff={} mark={} temps={} orphans={} scrub={} (scrubbed={}, {} files, {} bytes) release={} buffer={} flush={} ({} pages, {} ok, {} failed, slowest {})",
+        t.files,
+        t.ms_height,
+        t.ms_walk,
+        t.ms_db,
+        t.ms_diff,
+        t.ms_mark,
+        t.ms_temps,
+        t.ms_orphans,
+        t.ms_scrub,
+        t.scrubbed,
+        t.scrub_files,
+        t.scrub_bytes,
+        t.ms_release,
+        t.ms_buffer,
+        flushed.ms,
+        flushed.pages,
+        flushed.ok,
+        flushed.failed,
+        flushed.slowest_ms,
+    );
 }
 
 /// The cursor a step may persist: only once both buffers are empty, i.e.
@@ -606,7 +681,7 @@ fn finish_rotation(
         .map(|tip| tip.saturating_sub(started_height))
         .unwrap_or(0);
     tracing::info!(
-        "sweep: rotation of {} shards in {}s ({} heights): {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} orphans held (own uploads), {} held uploads expired, {} orphan batches skipped (busy), {} corrupt deleted, {} surplus released, {} temp files deleted, {} belief pages ({} failed), {} attestation pages ({} failed), {} shards failed",
+        "sweep: rotation of {} shards in {}s ({} heights): {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} orphans held (own uploads), {} held uploads expired, {} orphan batches skipped (busy), {} corrupt deleted, {} surplus released, {} temp files deleted, {} belief pages ({} failed), {} attestation pages ({} failed), {} shards failed; timings: {}",
         report.shards,
         report.rotation_secs,
         report.rotation_heights,
@@ -626,6 +701,7 @@ fn finish_rotation(
         report.attested_pages,
         report.attest_failed_pages,
         report.failed_shards,
+        report.timing_summary(),
     );
     if report.rotation_heights > hopnet_storage::lifecycle::ATTESTATION_RECENCY_HEIGHTS / 2 {
         tracing::warn!(
@@ -656,6 +732,9 @@ fn finish_rotation(
 ///   5. release surplus copies from the rotation's budget;
 ///   6. buffer the shard's belief differential (over repaired flags) and
 ///      its present hashes; `flush_buffers` pages them out.
+///
+/// Each step is timed into `rotation.shard` and folded into the report's
+/// totals, a failed shard's up to the step it failed at.
 pub(crate) async fn sweep_shard(
     app_state: &AppState,
     host: &SubstrateHost,
@@ -663,40 +742,70 @@ pub(crate) async fn sweep_shard(
     shard: u8,
     orphan_grace_secs: u64,
 ) -> Result<(), Error> {
+    rotation.shard = Default::default();
+    let result = sweep_shard_steps(app_state, host, rotation, shard, orphan_grace_secs).await;
+    let timings = rotation.shard;
+    rotation.report.add_shard_timings(&timings);
+    result
+}
+
+async fn sweep_shard_steps(
+    app_state: &AppState,
+    host: &SubstrateHost,
+    rotation: &mut Rotation,
+    shard: u8,
+    orphan_grace_secs: u64,
+) -> Result<(), Error> {
     use hopnet_storage::traits::LocalStateSink;
+    use std::time::Instant;
 
     let fail = |what: &str, e: String| Error::Failed(Arc::new(format!("{what}: {e}").into()));
     let fragments_dir = app_state.fragments_dir.clone();
     let now = unix_now();
 
     // (1)
-    let height = current_height(app_state)?;
+    let t = Instant::now();
+    let height = current_height(app_state);
+    rotation.shard.ms_height = ms_since(t);
+    let height = height?;
 
     // (2)
+    let t = Instant::now();
     let dir = fragments_dir.clone();
     let walk =
         tokio::task::spawn_blocking(move || hopnet_storage::fragstore::scan_shard(&dir, shard))
-            .await
-            .map_err(|e| fail("walk join", e.to_string()))?
-            .map_err(|e| fail("walk", e.to_string()))?;
+            .await;
+    rotation.shard.ms_walk = ms_since(t);
+    let walk = walk
+        .map_err(|e| fail("walk join", e.to_string()))?
+        .map_err(|e| fail("walk", e.to_string()))?;
     let listing = walk.fragments;
-    let rows = {
-        let conn = app_state
-            .db_pool
-            .get()
-            .map_err(|e| fail("pool", e.to_string()))?;
-        crate::db::fragments::shard_fragment_flags(&conn, shard)
-            .map_err(|e| fail("fragment flags", format!("{e:?}")))?
-    };
+    rotation.shard.files = listing.len();
+    let t = Instant::now();
+    let rows = app_state
+        .db_pool
+        .get()
+        .map_err(|e| fail("pool", e.to_string()))
+        .and_then(|conn| {
+            crate::db::fragments::shard_fragment_flags(&conn, shard)
+                .map_err(|e| fail("fragment flags", format!("{e:?}")))
+        });
+    rotation.shard.ms_db = ms_since(t);
+    let rows = rows?;
+    let t = Instant::now();
     let diff = hopnet_storage::sweep::diff(&listing, &rows, now.saturating_sub(orphan_grace_secs));
+    rotation.shard.ms_diff = ms_since(t);
+    let t = Instant::now();
     for hash in &diff.present_unflagged {
         host.mark_local(*hash).await;
     }
     if !diff.flagged_missing.is_empty() {
         host.mark_remote_batch(diff.flagged_missing.clone()).await;
     }
+    rotation.shard.ms_mark = ms_since(t);
 
     // (3)
+    let t = Instant::now();
     let report = &mut rotation.report;
     for path in
         hopnet_storage::sweep::stale_temps(&walk.temps, now.saturating_sub(orphan_grace_secs))
@@ -707,6 +816,8 @@ pub(crate) async fn sweep_shard(
             Err(e) => tracing::warn!("sweep: delete temp file {} failed: {e}", path.display()),
         }
     }
+    rotation.shard.ms_temps = ms_since(t);
+    let t = Instant::now();
     let deleted = reap_orphans(
         &app_state.db_pool,
         &fragments_dir,
@@ -716,12 +827,15 @@ pub(crate) async fn sweep_shard(
         report,
     )
     .await;
+    rotation.shard.ms_orphans = ms_since(t);
 
     // (4) Only a content hash mismatch is corruption; a file that vanished
     // or a read the OS refused is counted, never deleted or un-flagged.
     let day = (now / 86400) as i64;
     let mut present = diff.present.clone();
     if hopnet_storage::sweep::scrub_due(shard, day) && claim_scrub(day, shard) {
+        let t = Instant::now();
+        rotation.shard.scrubbed = true;
         let dir = fragments_dir.clone();
         let deleted: std::collections::HashSet<_> = deleted.into_iter().collect();
         let to_scrub: Vec<_> = listing
@@ -737,8 +851,11 @@ pub(crate) async fn sweep_shard(
                 hopnet_storage::sweep::SCRUB_SLICES,
             )
         })
-        .await
-        .map_err(|e| fail("scrub join", e.to_string()))?;
+        .await;
+        rotation.shard.ms_scrub = ms_since(t);
+        let outcome = outcome.map_err(|e| fail("scrub join", e.to_string()))?;
+        rotation.shard.scrub_files = outcome.files_read;
+        rotation.shard.scrub_bytes = outcome.bytes_read;
         report.scrub_unreadable += outcome.unreadable;
         if !outcome.corrupt.is_empty() {
             tracing::warn!(
@@ -753,10 +870,12 @@ pub(crate) async fn sweep_shard(
             report.corrupt_deleted += outcome.corrupt.len();
             host.mark_remote_batch(outcome.corrupt).await;
         }
+        rotation.shard.ms_scrub = ms_since(t);
     }
 
     // (5) Before the belief: the shard's differential below carries the
     // removals, and the attestation never stamps a file this step deleted.
+    let t = Instant::now();
     if rotation.surplus_left > 0 {
         let input = hopnet_storage::sweep::release_listing(
             &listing,
@@ -777,8 +896,10 @@ pub(crate) async fn sweep_shard(
             Err(e) => tracing::warn!("sweep: surplus release failed: {e}"),
         }
     }
+    rotation.shard.ms_release = ms_since(t);
 
     // (6) Belief and truth, both at the height read before the listing.
+    let t = Instant::now();
     let pool = app_state.db_pool.clone();
     let node_id = rotation.node_id;
     let differential = tokio::task::spawn_blocking(move || {
@@ -788,9 +909,11 @@ pub(crate) async fn sweep_shard(
         )
         .map_err(|e| format!("{e:?}"))
     })
-    .await
-    .map_err(|e| fail("differential join", e.to_string()))?
-    .map_err(|e| fail("inventory differential", e))?;
+    .await;
+    rotation.shard.ms_buffer = ms_since(t);
+    let differential = differential
+        .map_err(|e| fail("differential join", e.to_string()))?
+        .map_err(|e| fail("inventory differential", e))?;
     rotation
         .belief
         .added
@@ -800,6 +923,7 @@ pub(crate) async fn sweep_shard(
         .removed
         .push(height, now, differential.fragments_removed);
     rotation.truth.push(height, now, present.iter().copied());
+    rotation.shard.ms_buffer = ms_since(t);
 
     let report = &mut rotation.report;
     report.shards += 1;
@@ -1062,21 +1186,25 @@ pub(crate) fn purge_held_uploads_blocking(
 /// hash older than `MAX_BUFFER_AGE_SECS`), or unconditionally when
 /// `force`. Belief first: attestation stamps only rows that already exist.
 /// A failed belief page never blocks the truth pages, and a failed
-/// attestation page never blocks the next.
+/// attestation page never blocks the next. Returns the call's timings,
+/// also folded into the rotation's report (zero when nothing was due).
 pub(crate) async fn flush_buffers<S: hopnet_storage::traits::TxSubmitter>(
     submitter: &S,
     rotation: &mut Rotation,
     force: bool,
-) {
+) -> hopnet_storage::sweep::FlushTimings {
     let page = hopnet_storage::engine::policy::ATTEST_PAGE_SIZE;
     let now = unix_now();
+    let mut timings = hopnet_storage::sweep::FlushTimings::default();
     if !force
         && !rotation.truth.due(now, page, MAX_BUFFER_AGE_SECS)
         && !rotation.belief.due(now, page, MAX_BUFFER_AGE_SECS)
     {
-        return;
+        return timings;
     }
+    let started = std::time::Instant::now();
     while let Some(report) = rotation.belief.take_report(rotation.node_id, page) {
+        let submit_started = std::time::Instant::now();
         let submitted = match bincode::serde::encode_to_vec(&report, bincode::config::standard()) {
             Ok(payload) => submitter
                 .submit(hopnet_storage::engine::policy::SELF_CHECK_FN, payload)
@@ -1084,11 +1212,17 @@ pub(crate) async fn flush_buffers<S: hopnet_storage::traits::TxSubmitter>(
                 .map_err(|e| format!("{e:?}")),
             Err(e) => Err(e.to_string()),
         };
+        timings.slowest_ms = timings.slowest_ms.max(ms_since(submit_started));
+        timings.pages += 1;
         match submitted {
-            Ok(()) => rotation.report.belief_pages += 1,
+            Ok(()) => {
+                rotation.report.belief_pages += 1;
+                timings.ok += 1;
+            }
             Err(e) => {
                 tracing::warn!("sweep: self-check page failed, attesting anyway: {e}");
                 rotation.report.belief_failed_pages += 1;
+                timings.failed += 1;
             }
         }
     }
@@ -1101,9 +1235,26 @@ pub(crate) async fn flush_buffers<S: hopnet_storage::traits::TxSubmitter>(
             suspect: Vec::new(),
         });
     }
-    let (committed, failed) = submit_attestation_pages(submitter, pages).await;
+    timings.pages += pages.len();
+    let (committed, failed, slowest_ms) = submit_attestation_pages(submitter, pages).await;
     rotation.report.attested_pages += committed;
     rotation.report.attest_failed_pages += failed;
+    timings.ok += committed;
+    timings.failed += failed;
+    timings.slowest_ms = timings.slowest_ms.max(slowest_ms);
+    timings.ms = ms_since(started);
+    rotation.report.add_flush_timings(&timings);
+    if timings.pages > 0 {
+        tracing::debug!(
+            "sweep: flushed {} pages ({} ok, {} failed) in {} ms, slowest submit {} ms",
+            timings.pages,
+            timings.ok,
+            timings.failed,
+            timings.ms,
+            timings.slowest_ms
+        );
+    }
+    timings
 }
 
 /// One full rotation now, unpaced — the operator routes and orchestrator
@@ -1149,13 +1300,13 @@ pub async fn run_disk_truth_sweep(
 /// Submit the sweep's attestation pages one at a time, carrying on past a
 /// failed page: each page stands alone (`apply_attestation` is
 /// idempotent), so one timed-out page must not cost the others their
-/// stamps. Returns `(committed, failed)`.
+/// stamps. Returns `(committed, failed, slowest submit in ms)`.
 pub(crate) async fn submit_attestation_pages<S: hopnet_storage::traits::TxSubmitter>(
     submitter: &S,
     pages: Vec<hopnet_storage::FragmentAttestation>,
-) -> (usize, usize) {
+) -> (usize, usize, u64) {
     let total = pages.len();
-    let (mut committed, mut failed) = (0usize, 0usize);
+    let (mut committed, mut failed, mut slowest_ms) = (0usize, 0usize, 0u64);
     for (i, attestation) in pages.into_iter().enumerate() {
         let payload = match bincode::serde::encode_to_vec(&attestation, bincode::config::standard())
         {
@@ -1166,10 +1317,12 @@ pub(crate) async fn submit_attestation_pages<S: hopnet_storage::traits::TxSubmit
                 continue;
             }
         };
-        match submitter
+        let submit_started = std::time::Instant::now();
+        let submitted = submitter
             .submit(hopnet_storage::engine::policy::ATTEST_FN, payload)
-            .await
-        {
+            .await;
+        slowest_ms = slowest_ms.max(ms_since(submit_started));
+        match submitted {
             Ok(()) => committed += 1,
             Err(e) => {
                 tracing::warn!(
@@ -1180,7 +1333,7 @@ pub(crate) async fn submit_attestation_pages<S: hopnet_storage::traits::TxSubmit
             }
         }
     }
-    (committed, failed)
+    (committed, failed, slowest_ms)
 }
 
 /// Kept for callers that only want belief refreshed (tests, routes): the

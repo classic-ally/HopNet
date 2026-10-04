@@ -344,6 +344,10 @@ pub struct ScrubOutcome {
     pub vanished: usize,
     /// Listed files the read failed on for any other reason (logged).
     pub unreadable: usize,
+    /// Files whose content was read and hashed (verified or corrupt), and
+    /// their listed bytes.
+    pub files_read: usize,
+    pub bytes_read: u64,
 }
 
 /// Deep-verify one slice of the local fragment store (rolling scrub,
@@ -372,8 +376,15 @@ pub fn verify_listing(
             continue;
         }
         match fetch_and_verify_fragment(&d.hash, fragments_dir) {
-            Ok(_) => {}
-            Err(StorageError::HashMismatch) => outcome.corrupt.push(d.hash),
+            Ok(_) => {
+                outcome.files_read += 1;
+                outcome.bytes_read = outcome.bytes_read.saturating_add(d.size);
+            }
+            Err(StorageError::HashMismatch) => {
+                outcome.files_read += 1;
+                outcome.bytes_read = outcome.bytes_read.saturating_add(d.size);
+                outcome.corrupt.push(d.hash);
+            }
             Err(StorageError::Io(e)) | Err(StorageError::Read(e))
                 if e.kind() == std::io::ErrorKind::NotFound =>
             {

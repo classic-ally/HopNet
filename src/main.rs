@@ -551,6 +551,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 port,
                 test_mode: cfg!(debug_assertions) || std::env::var("HOPNET_TEST_MODE").is_ok(),
                 last_sweep: Arc::new(std::sync::Mutex::new(None)),
+                sweep_progress: Arc::new(std::sync::Mutex::new(None)),
                 last_tick: Arc::new(std::sync::Mutex::new(None)),
                 comms,
                 setup_complete,

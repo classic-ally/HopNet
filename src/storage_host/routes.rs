@@ -474,8 +474,17 @@ async fn report_with_held(
     let mut body = serde_json::to_value(report).unwrap_or_default();
     if let serde_json::Value::Object(fields) = &mut body {
         fields.insert("held".into(), held_section(app_state).await);
+        fields.insert("in_progress".into(), in_progress_section(app_state));
     }
     body
+}
+
+/// The `in_progress` section: the rolling walker's current rotation — its
+/// cursor and running report with the step timings so far — or null
+/// before its first shard.
+fn in_progress_section(app_state: &AppState) -> serde_json::Value {
+    let progress = app_state.sweep_progress.lock().unwrap().clone();
+    serde_json::to_value(progress).unwrap_or_default()
 }
 
 /// GET /maintenance/orphaned-fragments
@@ -483,7 +492,9 @@ async fn report_with_held(
 /// two-call scan/delete API folded into the sweep, which deletes orphans
 /// past the grace period itself — plus `held`: the rowless files it is
 /// holding because they are this node's own uploads (consensus-bugs 20),
-/// by blob, with counts, bytes and the oldest write. `?run=true` sweeps
+/// by blob, with counts, bytes and the oldest write — and `in_progress`:
+/// the rolling walker's current rotation with its step timings so far,
+/// also on the 404 before any rotation has finished. `?run=true` sweeps
 /// now and reports that.
 pub async fn get_orphaned_fragments_scan(
     State(app_state): State<AppState>,
@@ -536,6 +547,7 @@ pub async fn get_orphaned_fragments_scan(
                 "status": "error",
                 "error": "no sweep has run yet on this node; use ?run=true",
                 "held": held_section(&app_state).await,
+                "in_progress": in_progress_section(&app_state),
             })),
         )
             .into_response(),
