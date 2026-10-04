@@ -38,8 +38,12 @@ pub enum PublishStep {
     Members,
     /// One resource upload (once per resource, with its bytes).
     Upload,
+    /// A resource upload that failed (no bytes: how much streamed is unknown).
+    UploadFailed,
     /// The `photo_add` submit, which waits for the consensus decision.
     Submit,
+    /// A submit that failed (refused, timed out, or rejected).
+    SubmitFailed,
     /// The whole publish call, client-side work between the steps included.
     Total,
 }
@@ -51,7 +55,9 @@ impl PublishStep {
             PublishStep::Admission => "admission",
             PublishStep::Members => "members",
             PublishStep::Upload => "upload",
+            PublishStep::UploadFailed => "upload_failed",
             PublishStep::Submit => "submit",
+            PublishStep::SubmitFailed => "submit_failed",
             PublishStep::Total => "total",
         }
     }

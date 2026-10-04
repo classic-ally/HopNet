@@ -16,9 +16,11 @@
 //! time; minus encode + ledger + write it is blocking-pool queueing).
 //! `upload_failed` times failed puts.
 //!
-//! Transaction steps: `tx_gate` (the responsibility check), `tx_sign`,
-//! `tx_decide` (enqueue to the consensus decision, the submit_batch wait)
-//! and `tx_total`; `tx_failed` times failed submits. Instrumentation only:
+//! Transaction steps, keyed by kind so `photo_add` latency stands apart
+//! from deletes, restores and edits: `tx_gate.<kind>` (the responsibility
+//! check), `tx_sign.<kind>`, `tx_decide.<kind>` (enqueue to the consensus
+//! decision, the submit_batch wait) and `tx_total.<kind>`; `tx_failed.<kind>`
+//! times failed submits. `<kind>` is `photo_add` or `other`. Instrumentation only:
 //! nothing here changes what either handler does.
 
 use std::sync::{LazyLock, Mutex};
@@ -105,23 +107,66 @@ pub fn record_transaction(
         total_ms = millis(total),
         "ingest transaction timed"
     );
-    record_transaction_into(&mut window(), gate, submit, total, ok, Instant::now());
+    record_transaction_into(
+        &mut window(),
+        TxSteps::for_type(tx_type),
+        gate,
+        submit,
+        total,
+        ok,
+        Instant::now(),
+    );
+}
+
+/// One transaction kind's step names (the window keys are static).
+struct TxSteps {
+    gate: &'static str,
+    sign: &'static str,
+    decide: &'static str,
+    total: &'static str,
+    failed: &'static str,
+}
+
+impl TxSteps {
+    fn for_type(tx_type: &str) -> &'static TxSteps {
+        const PHOTO_ADD: TxSteps = TxSteps {
+            gate: "tx_gate.photo_add",
+            sign: "tx_sign.photo_add",
+            decide: "tx_decide.photo_add",
+            total: "tx_total.photo_add",
+            failed: "tx_failed.photo_add",
+        };
+        const OTHER: TxSteps = TxSteps {
+            gate: "tx_gate.other",
+            sign: "tx_sign.other",
+            decide: "tx_decide.other",
+            total: "tx_total.other",
+            failed: "tx_failed.other",
+        };
+        if tx_type == "photo_add" {
+            &PHOTO_ADD
+        } else {
+            &OTHER
+        }
+    }
 }
 
 fn record_transaction_into(
     window: &mut RollingSteps,
+    steps: &TxSteps,
     gate: Duration,
     submit: Option<SubmitTimings>,
     total: Duration,
     ok: bool,
     now: Instant,
 ) {
-    window.record("tx_gate", gate, 0, now);
+    window.record(steps.gate, gate, 0, now);
     if let Some(s) = submit {
-        window.record("tx_sign", s.sign, 0, now);
-        window.record("tx_decide", s.decide, 0, now);
+        window.record(steps.sign, s.sign, 0, now);
+        window.record(steps.decide, s.decide, 0, now);
     }
-    window.record(if ok { "tx_total" } else { "tx_failed" }, total, 0, now);
+    let end = if ok { steps.total } else { steps.failed };
+    window.record(end, total, 0, now);
 }
 
 /// The current window, summarized.
@@ -189,16 +234,45 @@ mod tests {
             sign: ms(2),
             decide: ms(900),
         };
-        record_transaction_into(&mut window, ms(1), Some(submit), ms(903), true, now);
-        record_transaction_into(&mut window, ms(1), None, ms(5), false, now);
+        let add = TxSteps::for_type("photo_add");
+        record_transaction_into(&mut window, add, ms(1), Some(submit), ms(903), true, now);
+        record_transaction_into(&mut window, add, ms(1), None, ms(5), false, now);
 
         let steps = window.summary(now).steps;
-        assert_eq!(steps["tx_gate"].count, 2);
-        assert_eq!(steps["tx_decide"].count, 1);
-        assert_eq!(steps["tx_decide"].max_ms, 900);
-        assert_eq!(steps["tx_total"].count, 1);
-        assert_eq!(steps["tx_total"].max_ms, 903);
-        assert_eq!(steps["tx_failed"].count, 1);
+        assert_eq!(steps["tx_gate.photo_add"].count, 2);
+        assert_eq!(steps["tx_decide.photo_add"].count, 1);
+        assert_eq!(steps["tx_decide.photo_add"].max_ms, 900);
+        assert_eq!(steps["tx_total.photo_add"].count, 1);
+        assert_eq!(steps["tx_total.photo_add"].max_ms, 903);
+        assert_eq!(steps["tx_failed.photo_add"].count, 1);
+    }
+
+    // Should: time photo_add apart from every other transaction kind.
+    // Should not: let a slow delete or edit show up in photo_add's decide.
+    #[test]
+    fn photo_add_is_timed_apart_from_other_transaction_kinds() {
+        let mut window = RollingSteps::new(8, WINDOW_AGE);
+        let now = Instant::now();
+        let fast = SubmitTimings {
+            sign: ms(1),
+            decide: ms(40),
+        };
+        let slow = SubmitTimings {
+            sign: ms(1),
+            decide: ms(9000),
+        };
+        let add = TxSteps::for_type("photo_add");
+        record_transaction_into(&mut window, add, ms(1), Some(fast), ms(42), true, now);
+        for kind in ["photo_delete", "photo_edit_content", "photo_restore"] {
+            let steps = TxSteps::for_type(kind);
+            record_transaction_into(&mut window, steps, ms(1), Some(slow), ms(9002), true, now);
+        }
+
+        let steps = window.summary(now).steps;
+        assert_eq!(steps["tx_decide.photo_add"].count, 1);
+        assert_eq!(steps["tx_decide.photo_add"].max_ms, 40);
+        assert_eq!(steps["tx_decide.other"].count, 3);
+        assert_eq!(steps["tx_total.other"].max_ms, 9002);
     }
 
     // Impact: the route sits behind auth_middleware, which admits any user

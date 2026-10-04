@@ -236,7 +236,11 @@ impl PhotoDispatch for HttpDispatch {
         let result = self
             .submit_transaction_untimed(tx_type, payload_bytes)
             .await;
-        timing::record(PublishStep::Submit, started.elapsed(), 0);
+        let step = match result {
+            Ok(()) => PublishStep::Submit,
+            Err(_) => PublishStep::SubmitFailed,
+        };
+        timing::record(step, started.elapsed(), 0);
         result
     }
 
@@ -258,7 +262,12 @@ impl PhotoDispatch for HttpDispatch {
         let result = self
             .upload_data_block_untimed(blob_id, source, file_size, per_blob_key)
             .await;
-        timing::record(PublishStep::Upload, started.elapsed(), file_size as u64);
+        // Failures sit apart so they skew neither the latency percentiles
+        // nor the rate (how much of a failed body streamed is unknown).
+        match result {
+            Ok(_) => timing::record(PublishStep::Upload, started.elapsed(), file_size as u64),
+            Err(_) => timing::record(PublishStep::UploadFailed, started.elapsed(), 0),
+        }
         result
     }
 

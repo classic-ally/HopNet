@@ -40,6 +40,7 @@ async fn fresh_migrate_creates_schema() {
         vec![
             "idx_blobs_unevicted",
             "idx_ingest_log_photo",
+            "idx_ingest_log_type",
             "idx_photo_resources_edit_pending",
             "idx_photo_resources_hash",
             "idx_photos_deleted",
@@ -183,9 +184,35 @@ async fn migrate_is_idempotent() {
         .fetch_one(second.raw_pool())
         .await
         .unwrap();
-    assert_eq!(n, 11);
+    assert_eq!(n, 12);
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// Impact: the ingest log keeps 180 days of rows; the status view's
+// publish-timing read would otherwise scan all of them on every `status`.
+// Should: read the newest events of one type through the type index.
+// Should not: sort the matches in a temporary B-tree.
+#[tokio::test]
+async fn newest_events_of_a_type_read_through_the_type_index() {
+    let (store, _) = store_with_personal().await;
+
+    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN SELECT * FROM ingest_log \
+         WHERE event_type = 'publish_pass' AND at >= '2026-01-01' ORDER BY id DESC LIMIT 200",
+    )
+    .fetch_all(store.raw_pool())
+    .await
+    .unwrap();
+    let detail: Vec<&str> = plan.iter().map(|(_, _, _, d)| d.as_str()).collect();
+    assert!(
+        detail.iter().any(|d| d.contains("idx_ingest_log_type")),
+        "plan: {detail:?}"
+    );
+    assert!(
+        !detail.iter().any(|d| d.contains("TEMP B-TREE")),
+        "plan: {detail:?}"
+    );
 }
 
 // Impact: existing archives (real ones on the macbook) only get thumbnails
