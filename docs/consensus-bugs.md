@@ -228,14 +228,15 @@ t=60.2s: Nodes B,C,D receive TC → advance view without commit
 - **The window runs from the reply.** `DEDUP_TTL` is 60 s from when the reply is written, or its write fails, or the stream task is dropped. Before, it ran from first sight. The longest rpc timeout among these scopes is 30 s (setup JoinDeliver), and the redial adds up to 10 s (`CONNECTION_TIMEOUT`), so the retry lands within ~40 s. That leaves 20 s of margin.
   - A 30 s TTL from first sight would have re-run a JoinDeliver whose JoinAck was lost. The coordinator would then get "already initialized" and give up on a node that had joined.
 - **Same-id safety.** The TTL removal checks `Arc::ptr_eq` and holds only a `Weak`, so an older request's timer never evicts a newer entry for the same id.
-- **Byte bound.** Cached replies are charged against a 64 MiB budget (`DEDUP_BUDGET_BYTES`). A reply that would cross the budget, or exceeds the 8 MiB frame cap, is still sent but not cached.
+- **Byte bound.** A reply over 1 MiB (`DEDUP_MAX_ENTRY_BYTES`) is still sent but never cached. Otherwise a catch-up's decided fetches (up to ~6 MiB each) would fill the budget and crowd out the small acks the cache is for. So every handler whose replies can exceed 1 MiB must be idempotent. Among the scopes that keep dedup, the only such reply is consensus DecidedFetch, a read of decided history; setup, metrics and status replies are small. Behind that, cached replies share a 64 MiB budget (`DEDUP_BUDGET_BYTES`), and a reply that would cross it is also sent but not cached.
 
 Tests in iroh_impl.rs:
 - `opted_out_handler_never_caches_a_large_response`
 - `same_id_retry_after_reply_is_served_from_cache`
 - `dedup_window_runs_from_the_reply` (fails with a 30 s or a first-sight TTL)
-- `ttl_cleanup_spares_newer_entry_for_same_id`
+- `ttl_cleanup_spares_newer_entry_for_same_id` (keeps the older cell alive, so it fails without the `Arc::ptr_eq` check)
 - `dedup_cache_never_exceeds_the_byte_budget` and `over_budget_reply_is_delivered_but_not_cached` (both fail without the budget)
+- `large_replies_never_crowd_out_small_ones` (fails with the old 8 MiB entry cap)
 - `reply_over_frame_cap_is_not_cached`
 - `dedup_same_request_id_invokes_handler_once`
 

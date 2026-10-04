@@ -618,6 +618,11 @@ mod tests {
             }
             .dedup()
         );
+        let status: Arc<dyn RpcHandler> = Arc::new(crate::consensus::evidence::StatusScope {
+            app_state: app_state(),
+        });
+        assert!(status.dedup());
+        assert!(crate::consensus::evidence::StatusCompatG0 { inner: status }.dedup());
     }
 
     #[test]

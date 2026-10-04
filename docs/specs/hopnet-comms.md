@@ -76,8 +76,9 @@ vision says they never touch the network.
 connection eviction, SAME id reused so the receiver dedups (response-
 byte cache, rpc scopes only; every entry is kept 60s from when its reply
 is written, delivered or not, since a finished write does not prove the
-sender got it; cached replies share a 64 MiB budget, and a reply over it
-or over the frame cap is sent but not kept; a handler whose requests are
+sender got it; a reply over 1 MiB is sent but never kept, so a handler
+whose replies can exceed 1 MiB must be idempotent; cached replies share a
+64 MiB budget, and a reply over it is sent but not kept; a handler whose requests are
 safe to re-execute opts out via `RpcHandler::dedup` — the storage and
 regenesis scopes do; consensus-bugs.md entry 21). `open_call`: multi-frame, no
 auto-retry, no dedup — streamed protocols own idempotency (txforward:

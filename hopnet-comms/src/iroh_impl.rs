@@ -277,9 +277,20 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 /// entry 21).
 const DEDUP_TTL: Duration = Duration::from_secs(60);
 
-/// Ceiling on the response bytes the dedup cache holds at once. A reply
-/// that would cross it is still sent, just not cached (its retry, if any,
-/// runs the handler again).
+/// Largest reply the dedup cache keeps. Larger replies are still sent, just
+/// never cached, so a retry runs the handler again: every handler whose
+/// replies can exceed this must be idempotent. Today that is consensus
+/// DecidedFetch (a read of decided history, up to ~6 MiB); storage and
+/// regenesis, the other bulk servers, opt out of dedup entirely. Without
+/// this cap a catch-up's decided fetches fill the budget below and the
+/// small acks the cache exists for (setup JoinAck, gossip Ack) stop being
+/// cached.
+const DEDUP_MAX_ENTRY_BYTES: usize = 1024 * 1024;
+
+/// Ceiling on the response bytes the dedup cache holds at once — a
+/// backstop behind [`DEDUP_MAX_ENTRY_BYTES`]. A reply that would cross it
+/// is still sent, just not cached (its retry, if any, runs the handler
+/// again).
 const DEDUP_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// Dedicated runtime for iroh networking: the endpoint's internal actors
@@ -498,9 +509,9 @@ impl DedupCache {
     }
 
     /// Admit `cell`'s computed reply of `len` bytes. False when it is not
-    /// cached: over the frame cap (no reader accepts it, so no retry can
-    /// use it), over the byte budget (dropped from the map), or no longer
-    /// the entry for `request_id`.
+    /// cached (and dropped from the map): over the per-entry cap, or over
+    /// the byte budget. Also false when `cell` is no longer the entry for
+    /// `request_id`.
     fn charge(&mut self, request_id: u64, cell: &DedupCell, len: usize) -> bool {
         let Some((current, charged)) = self.entries.get_mut(&request_id) else {
             return false;
@@ -511,7 +522,7 @@ impl DedupCache {
         if charged.is_some() {
             return true;
         }
-        if len > MAX_MESSAGE_SIZE || self.bytes + len > DEDUP_BUDGET_BYTES {
+        if len > DEDUP_MAX_ENTRY_BYTES || self.bytes + len > DEDUP_BUDGET_BYTES {
             self.entries.remove(&request_id);
             return false;
         }
@@ -1376,7 +1387,7 @@ impl IrohComms {
                         ) {
                             tracing::debug!(
                                 bytes = response.len(),
-                                "rpc reply not cached for dedup (frame cap or byte budget)"
+                                "rpc reply not cached for dedup (entry cap or byte budget)"
                             );
                         }
                         response
@@ -1820,7 +1831,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ttl_cleanup_spares_newer_entry_for_same_id() {
         let map: Arc<DedupMap> = Arc::default();
-        drop(DedupHold::join(&map, 7));
+        // Keep the older cell alive so its timer upgrades and must rely on
+        // the identity check, not on the cell being gone.
+        let hold = DedupHold::join(&map, 7);
+        let _older = hold.cell.clone();
+        drop(hold);
         let newer: DedupCell = Arc::new(tokio::sync::OnceCell::new());
         map.lock().unwrap().entries.insert(7, (newer.clone(), None));
 
@@ -1869,9 +1884,9 @@ mod tests {
     #[test]
     fn dedup_cache_never_exceeds_the_byte_budget() {
         let mut cache = DedupCache::default();
-        let reply = 4 * 1024 * 1024;
+        let reply = DEDUP_MAX_ENTRY_BYTES;
         let mut cached = 0;
-        for id in 0..20u64 {
+        for id in 0..80u64 {
             let cell = cache.join(id);
             if cache.charge(id, &cell, reply) {
                 cached += 1;
@@ -1900,10 +1915,10 @@ mod tests {
             }),
         );
         let (a, b, peer_b) = pair(Arc::new(AllowAll), scopes).await;
-        // Fill the budget to within 10 bytes with stand-in 4 MiB entries.
+        // Fill the budget to within 10 bytes with stand-in 1 MiB entries.
         {
             let mut cache = b.dedup.lock().unwrap();
-            let chunk = 4 * 1024 * 1024;
+            let chunk = DEDUP_MAX_ENTRY_BYTES;
             let fillers = (DEDUP_BUDGET_BYTES / chunk) as u64;
             for filler in 0..fillers {
                 let len = if filler + 1 == fillers {
@@ -1925,6 +1940,41 @@ mod tests {
         let cache = b.dedup.lock().unwrap();
         assert!(!cache.entries.contains_key(&id));
         assert_eq!(cache.bytes, DEDUP_BUDGET_BYTES - 10);
+    }
+
+    // Impact: a catch-up's decided fetches (up to ~6 MiB each, back to
+    // back) would otherwise fill the whole budget for a TTL, and the small
+    // acks the cache exists for (setup JoinAck, gossip Ack) would stop
+    // being cached.
+    // Should: deliver a reply over the per-entry cap without caching it.
+    // Should: still cache a small reply after many large ones.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn large_replies_never_crowd_out_small_ones() {
+        let mut scopes = ScopeRegistry::new();
+        scopes.rpc(
+            "echo",
+            Arc::new(Echo {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let (a, b, peer_b) = pair(Arc::new(AllowAll), scopes).await;
+
+        let large = vec![9; 2 * 1024 * 1024];
+        for _ in 0..40 {
+            let id: u64 = rand::random();
+            let (reply, _) = a
+                .rpc_with_id(&peer_b, "echo", large.clone(), Duration::from_secs(10), id)
+                .await
+                .unwrap();
+            assert_eq!(reply.len(), large.len());
+            assert!(!b.dedup.lock().unwrap().entries.contains_key(&id));
+        }
+
+        let id: u64 = rand::random();
+        a.rpc_with_id(&peer_b, "echo", b"ack".to_vec(), Duration::from_secs(5), id)
+            .await
+            .unwrap();
+        assert!(b.dedup.lock().unwrap().entries.contains_key(&id));
     }
 
     #[tokio::test(flavor = "multi_thread")]
