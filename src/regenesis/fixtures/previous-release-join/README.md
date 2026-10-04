@@ -5,7 +5,7 @@ A straggler as the PREVIOUS release's binary leaves it: its own
 downloaded from a peer that crossed into epoch 2 (`epoch-2.bin` lineage
 record, `snapshot.bin` artifact, `manifest.bin`).
 
-Current contents: written by **2026.10.9** (storage section @5).
+Current contents: written by **2026.10.10** (storage section @5).
 
 Consumed by:
 - `previous_release_straggler_crosses_into_this_build` (src/regenesis/boot.rs)
