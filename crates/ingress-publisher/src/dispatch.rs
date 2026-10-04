@@ -16,6 +16,8 @@ use hopnet_photos_core::PhotosCoreError;
 use hopnet_photos_core::dispatch::{
     LibraryMembership, PhotoDispatch, SyncBatch, UploadedDataBlock,
 };
+use ingress_core::timing::{self, PublishStep};
+use std::time::Instant;
 
 pub(crate) const UNREACHABLE_PREFIX: &str = "node-unreachable: ";
 
@@ -230,6 +232,55 @@ impl PhotoDispatch for HttpDispatch {
         tx_type: &str,
         payload_bytes: Vec<u8>,
     ) -> Result<(), PhotosCoreError> {
+        let started = Instant::now();
+        let result = self
+            .submit_transaction_untimed(tx_type, payload_bytes)
+            .await;
+        timing::record(PublishStep::Submit, started.elapsed(), 0);
+        result
+    }
+
+    async fn fetch_photos_since(&self, _height: u64) -> Result<SyncBatch, PhotosCoreError> {
+        // Publishing never syncs; the daemon's gallery is the node itself.
+        Err(PhotosCoreError::Dispatch(
+            "sync is unsupported on the ingress dispatch".into(),
+        ))
+    }
+
+    async fn upload_data_block(
+        &self,
+        blob_id: hopnet_storage::BlobId,
+        source: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        file_size: usize,
+        per_blob_key: chacha20poly1305::Key,
+    ) -> Result<UploadedDataBlock, PhotosCoreError> {
+        let started = Instant::now();
+        let result = self
+            .upload_data_block_untimed(blob_id, source, file_size, per_blob_key)
+            .await;
+        timing::record(PublishStep::Upload, started.elapsed(), file_size as u64);
+        result
+    }
+
+    async fn fetch_library_members(
+        &self,
+        library_id: Option<CustomUUID>,
+    ) -> Result<LibraryMembership, PhotosCoreError> {
+        let started = Instant::now();
+        let result = self.fetch_library_members_untimed(library_id).await;
+        timing::record(PublishStep::Members, started.elapsed(), 0);
+        result
+    }
+}
+
+/// The requests behind the `PhotoDispatch` impl, which times each one into
+/// the running photo publish (`ingress_core::timing`).
+impl HttpDispatch {
+    async fn submit_transaction_untimed(
+        &self,
+        tx_type: &str,
+        payload_bytes: Vec<u8>,
+    ) -> Result<(), PhotosCoreError> {
         let response = self
             .client
             .post(self.url("/transaction"))
@@ -245,14 +296,7 @@ impl PhotoDispatch for HttpDispatch {
         Ok(())
     }
 
-    async fn fetch_photos_since(&self, _height: u64) -> Result<SyncBatch, PhotosCoreError> {
-        // Publishing never syncs; the daemon's gallery is the node itself.
-        Err(PhotosCoreError::Dispatch(
-            "sync is unsupported on the ingress dispatch".into(),
-        ))
-    }
-
-    async fn upload_data_block(
+    async fn upload_data_block_untimed(
         &self,
         blob_id: hopnet_storage::BlobId,
         source: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
@@ -280,7 +324,7 @@ impl PhotoDispatch for HttpDispatch {
             .map_err(|e| PhotosCoreError::Dispatch(format!("upload response: {e}")))
     }
 
-    async fn fetch_library_members(
+    async fn fetch_library_members_untimed(
         &self,
         library_id: Option<CustomUUID>,
     ) -> Result<LibraryMembership, PhotosCoreError> {

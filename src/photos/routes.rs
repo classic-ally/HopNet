@@ -408,17 +408,34 @@ async fn submit_photos_transaction(
     uid: i32,
     body: TransactionBody,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    submit_photos_transaction_timed(state, uid, body).await.0
+}
+
+/// [`submit_photos_transaction`], plus the submit's timings (None when the
+/// tx type was refused before signing).
+async fn submit_photos_transaction_timed(
+    state: AppState,
+    uid: i32,
+    body: TransactionBody,
+) -> (
+    Result<StatusCode, (StatusCode, String)>,
+    Option<crate::debug::ingest::SubmitTimings>,
+) {
     if !hopnet_photos::handlers::USER_TX_FUNCTIONS.contains(&body.tx_type.as_str()) {
-        return Err((
+        let refused = (
             StatusCode::BAD_REQUEST,
             format!("unsupported photos tx_type: {}", body.tx_type),
-        ));
+        );
+        return (Err(refused), None);
     }
     let sub = Submitter::new(std::sync::Arc::new(state), uid);
-    sub.submit_transaction(&body.tx_type, body.payload)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(StatusCode::OK)
+    let (result, timings) = sub
+        .submit_transaction_timed(&body.tx_type, body.payload)
+        .await;
+    let result = result
+        .map(|()| StatusCode::OK)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    (result, Some(timings))
 }
 
 async fn post_transaction(
@@ -1053,11 +1070,19 @@ async fn post_client_data_block(
         consumed: 0,
     };
 
+    let started = std::time::Instant::now();
     let sub = Submitter::new(std::sync::Arc::new(state), uid);
-    let uploaded = sub
-        .upload_data_block(blob_id, Box::new(source), file_size, key)
-        .await
-        .map_err(map_upload_error)?;
+    let put = sub
+        .upload_data_block_timed(blob_id.clone(), Box::new(source), file_size, key)
+        .await;
+    let (uploaded, timings) = match put {
+        Ok(put) => put,
+        Err(e) => {
+            crate::debug::ingest::record_upload_failure(&blob_id, started.elapsed());
+            return Err(map_upload_error(e));
+        }
+    };
+    crate::debug::ingest::record_upload(&blob_id, &timings);
     Ok((StatusCode::CREATED, Json(uploaded)))
 }
 
@@ -1139,6 +1164,7 @@ async fn post_client_transaction(
         ));
     }
 
+    let started = std::time::Instant::now();
     let pool = state.db_pool.clone();
     let tx_type = body.tx_type.clone();
     let payload = body.payload.clone();
@@ -1168,8 +1194,18 @@ async fn post_client_transaction(
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    let gate = started.elapsed();
 
-    submit_photos_transaction(state, uid, body).await
+    let tx_type = body.tx_type.clone();
+    let (result, submit) = submit_photos_transaction_timed(state, uid, body).await;
+    crate::debug::ingest::record_transaction(
+        &tx_type,
+        gate,
+        submit,
+        started.elapsed(),
+        result.is_ok(),
+    );
+    result
 }
 
 /// Resolve batch size ceiling. Must stay >= the ingress publisher's claim

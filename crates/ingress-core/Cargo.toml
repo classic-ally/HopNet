@@ -30,6 +30,8 @@ uuid = { version = "1.17.0", features = ["v7", "serde"] }
 blake3 = "1.8.2"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0"
+# Shared step-timing summaries (percentiles), path-depped like the publisher.
+hopnet-common = { path = "../../common" }
 thiserror = "2.0.18"
 
 [dev-dependencies]

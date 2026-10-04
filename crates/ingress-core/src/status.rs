@@ -48,6 +48,10 @@ pub struct PipelineStatus {
     pub spool_stuck: SpoolStuck,
     #[serde(flatten)]
     pub retries: RetrySummary,
+    /// Where publishing spends its time: per-step stats over the newest
+    /// photos the daemon published in the last hour (rebuilt from its
+    /// `publish_pass` log events). None when nothing was published.
+    pub publish_timing: Option<crate::timing::TimingWindow>,
 }
 
 /// The `status` overview: per-library counters plus pipeline posture.
@@ -71,11 +75,25 @@ pub async fn status(store: &StateStore, retry_cap: i64) -> Result<StatusReport> 
             )
             .await?,
         retries: store.retry_summary(retry_cap).await?,
+        publish_timing: publish_timing(store).await?,
     };
     Ok(StatusReport {
         libraries,
         pipeline,
     })
+}
+
+/// The rolling publish-timing window. Every pass logs at least one photo,
+/// so the newest `WINDOW_PHOTOS` events always cover the photo cap.
+async fn publish_timing(store: &StateStore) -> Result<Option<crate::timing::TimingWindow>> {
+    let since = chrono::Utc::now()
+        - chrono::Duration::from_std(crate::timing::WINDOW).expect("an hour fits");
+    let events = store
+        .log_events_since("publish_pass", since, crate::timing::WINDOW_PHOTOS as i64)
+        .await?;
+    Ok(crate::timing::window(
+        events.iter().filter_map(|e| e.detail.as_deref()),
+    ))
 }
 
 #[derive(Debug, serde::Serialize)]

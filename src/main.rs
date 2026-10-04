@@ -949,6 +949,11 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     post(debug::heap::post_heap_profiling),
                 )
                 .route("/debug/heap/profile", get(debug::heap::get_heap_profile))
+                // Owner-only (checked in the handler).
+                .route(
+                    "/debug/ingest/timings",
+                    get(debug::ingest::get_ingest_timings),
+                )
                 .route("/storage/view", get(storage_host::routes::get_storage_view))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))

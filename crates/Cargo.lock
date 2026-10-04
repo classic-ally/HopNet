@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-common"
-version = "2026.10.8"
+version = "2026.10.12"
 dependencies = [
  "bincode",
  "blake3",
@@ -1015,11 +1015,11 @@ dependencies = [
 
 [[package]]
 name = "hopnet-comms"
-version = "2026.10.8"
+version = "2026.10.12"
 
 [[package]]
 name = "hopnet-photos"
-version = "2026.10.8"
+version = "2026.10.12"
 dependencies = [
  "bincode",
  "hopnet-common",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-photos-core"
-version = "2026.10.8"
+version = "2026.10.12"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "hopnet-storage"
-version = "2026.10.8"
+version = "2026.10.12"
 dependencies = [
  "bincode",
  "blake3",
@@ -1335,6 +1335,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "chrono",
+ "hopnet-common",
  "ingress-core",
  "libc",
  "serde",

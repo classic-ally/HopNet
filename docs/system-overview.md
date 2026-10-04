@@ -982,6 +982,7 @@ PhotoKit→HopNet on-ramp daemon (personal + iCloud Shared Photo Library). Bytes
 - [~] Phase 7: Hardening (packaging + provisioning + live smoke done; full personal-library soak remaining)
 - [x] Phase 8: Interim viewer — retired; crate deleted in Phase 9, gallery lives in HopNet's frontend
 - [x] Phase 9: HopNet transplant (descriptor capsule, spool eviction on decided publish, roots/sidecars/snapshots/recover demolished, token-only provisioning)
+- [~] Publish throughput (macbook drains in bursts of 32 every ~3–4 min): instrumentation landed first, no behaviour change — the daemon times each publish step (probe, admission, members, per-resource upload, submit) into a `publish_pass` log line per pass and a rolling window in `ingress-cli status`; the node times the thin-client upload (permit wait, receive, encode, ledger, writes) and transaction (gate, sign, decide) routes at owner-only `GET /api/debug/ingest/timings`. Branch `feat-ingest-timings`, unreleased; fixes follow from the numbers
 
 ### Reliability Goals
 - **Single node failure**: No data loss, minimal performance impact
