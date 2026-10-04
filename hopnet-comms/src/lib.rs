@@ -241,6 +241,16 @@ pub enum ScopeClass {
 /// requests by request id (response-byte cache) for rpc scopes.
 pub trait RpcHandler: Send + Sync {
     fn handle(&self, peer: PeerRef, payload: Vec<u8>) -> BoxFuture<'_, Vec<u8>>;
+
+    /// Whether the transport's receiver-side dedup cache covers this
+    /// handler. With it, a sender retrying the same request id after a
+    /// transport failure gets the first execution's response bytes instead
+    /// of a second execution. A handler whose requests are all safe to
+    /// re-execute returns false: its requests skip the cache entirely, so
+    /// a large response is never held past its write.
+    fn dedup(&self) -> bool {
+        true
+    }
 }
 
 /// Multi-frame scope handler (two-phase protocols like transaction

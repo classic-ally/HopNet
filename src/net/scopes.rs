@@ -416,6 +416,18 @@ impl RpcHandler for StorageScope {
                 .expect("storage task panicked")
         })
     }
+
+    /// Storage requests skip the transport's dedup cache: every one is safe
+    /// to re-execute on a retry. Health and fetch are read-only; store is
+    /// content-addressed — the server hashes the bytes against the request's
+    /// hash, answers `StoreOutcome::AlreadyExisted` when a valid copy is on
+    /// disk, writes via temp file + atomic rename, and `mark_local` only sets
+    /// a flag. Caching instead held every served fragment (whole fetch
+    /// responses) for the TTL — gigabytes on a busy node (consensus-bugs.md
+    /// entry 21).
+    fn dedup(&self) -> bool {
+        false
+    }
 }
 
 // ============================================================================

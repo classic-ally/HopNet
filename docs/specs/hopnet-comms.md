@@ -74,7 +74,11 @@ vision says they never touch the network.
 
 `rpc`: random u64 request id, one retry on retryable errors with
 connection eviction, SAME id reused so the receiver dedups (response-
-byte cache, rpc scopes only, 300s TTL). `open_call`: multi-frame, no
+byte cache, rpc scopes only; every entry is kept 30s, delivered or not,
+since a finished write does not prove the sender got it; replies over
+the frame cap are not kept; a handler whose requests are safe to
+re-execute opts out via `RpcHandler::dedup` — the storage scope does;
+consensus-bugs.md entry 21). `open_call`: multi-frame, no
 auto-retry, no dedup — streamed protocols own idempotency (txforward:
 the nonce table across proposers, and the proposer's nonce-unique
 pending pool within one, so a re-forwarded transaction joins its
