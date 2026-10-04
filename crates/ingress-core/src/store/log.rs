@@ -41,6 +41,24 @@ impl StateStore {
         )
     }
 
+    /// The newest events of one type at or after `since`, newest first, at
+    /// most `limit` of them — the CLI status view's rolling windows.
+    pub async fn log_events_since(
+        &self,
+        event_type: &str,
+        since: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<LogEvent>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM ingest_log WHERE event_type = ? AND at >= ? ORDER BY id DESC LIMIT ?",
+        )
+        .bind(event_type)
+        .bind(since)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?)
+    }
+
     /// The newest events for one photo, newest first — the CLI's per-photo
     /// history view.
     pub async fn log_tail_for_photo(&self, id: &PhotoId, limit: i64) -> Result<Vec<LogEvent>> {

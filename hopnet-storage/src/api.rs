@@ -20,6 +20,7 @@ use crate::types::BlobId;
 use hopnet_common::{Blake3Hash, CustomUUID};
 use rand::Rng;
 use reed_solomon_simd::ReedSolomonEncoder;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// One produced fragment (original or recovery).
@@ -40,6 +41,30 @@ pub struct PutOutcome {
     pub fragments: Vec<PutFragment>,
     /// Padding added to the LAST chunk (stripped after reconstruction).
     pub added_bytes: u8,
+    /// Where the put spent its time (instrumentation only).
+    pub timings: PutTimings,
+}
+
+/// Wall time of one put, by phase. `receive` is time spent awaiting the
+/// source (the client's upload rate, for a streamed body). `encode`,
+/// `ledger` and `write` are measured inside the blocking chunk tasks and sum
+/// to less than `process`, their wall time; the rest is blocking-pool
+/// queueing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PutTimings {
+    /// Waiting for one of the process-wide put permits.
+    pub permit_wait: Duration,
+    pub receive: Duration,
+    /// Padding, per-fragment encryption, hashing and Reed-Solomon encoding.
+    pub encode: Duration,
+    /// The before-store hook (the host's upload ledger writes).
+    pub ledger: Duration,
+    /// Fragment file writes.
+    pub write: Duration,
+    /// Wall time of the chunk tasks, blocking-pool queueing included.
+    pub process: Duration,
+    pub total: Duration,
+    pub bytes: u64,
 }
 
 /// Ingest a plaintext stream: encrypt per fragment, RS-encode, store
@@ -91,11 +116,17 @@ where
     if file_size == 0 {
         return Err(StorageError::Rs);
     }
+    let started = Instant::now();
+    let mut timings = PutTimings {
+        bytes: file_size as u64,
+        ..PutTimings::default()
+    };
     // Bounds concurrent ingests (memory, CPU); held for the whole put.
     let _permit = put_permits()
         .acquire()
         .await
         .map_err(|_| StorageError::Io(std::io::Error::other("put permits closed")))?;
+    timings.permit_wait = started.elapsed();
     // Held for the whole ingest: concurrent puts see each other's footprint.
     let _reservation = crate::admission::reserve_ingest(fragments_dir, file_size)?;
 
@@ -132,10 +163,12 @@ where
     let mut read_buf = vec![0u8; READ_BUF_SIZE];
 
     loop {
+        let reading = Instant::now();
         let n = source
             .read(&mut read_buf)
             .await
             .map_err(StorageError::Read)?;
+        timings.receive += reading.elapsed();
         if n == 0 {
             break;
         }
@@ -152,6 +185,7 @@ where
                 current_chunk_number,
                 per_blob_key,
                 fragments_dir,
+                &mut timings,
             )
             .await?;
             encoder = returned;
@@ -171,6 +205,7 @@ where
             current_chunk_number,
             per_blob_key,
             fragments_dir,
+            &mut timings,
         )
         .await?;
         fragments.extend(chunk_fragments);
@@ -186,10 +221,12 @@ where
         last_chunk_padding
     );
 
+    timings.total = started.elapsed();
     Ok(PutOutcome {
         integrity_hash,
         fragments,
         added_bytes: last_chunk_padding as u8,
+        timings,
     })
 }
 
@@ -206,27 +243,35 @@ async fn process_chunk_blocking<F>(
     chunk_number: u32,
     per_blob_key: &chacha20poly1305::Key,
     fragments_dir: &str,
+    timings: &mut PutTimings,
 ) -> Result<(ReedSolomonEncoder, F, Vec<PutFragment>, usize), StorageError>
 where
     F: FnMut(&[Blake3Hash]) -> Result<(), StorageError> + Send + 'static,
 {
     let key = *per_blob_key;
     let dir = fragments_dir.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let mut fragments = Vec::new();
-        let padding = process_logical_chunk(
-            &mut encoder,
-            &mut before_store,
-            &chunk_data,
-            chunk_number,
-            &key,
-            &dir,
-            &mut fragments,
-        )?;
-        Ok((encoder, before_store, fragments, padding))
-    })
-    .await
-    .map_err(|e| StorageError::Io(std::io::Error::other(format!("chunk task: {e}"))))?
+    let started = Instant::now();
+    let (encoder, before_store, fragments, padding, chunk) =
+        tokio::task::spawn_blocking(move || {
+            let mut fragments = Vec::new();
+            let (padding, chunk) = process_logical_chunk(
+                &mut encoder,
+                &mut before_store,
+                &chunk_data,
+                chunk_number,
+                &key,
+                &dir,
+                &mut fragments,
+            )?;
+            Ok::<_, StorageError>((encoder, before_store, fragments, padding, chunk))
+        })
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(format!("chunk task: {e}"))))??;
+    timings.encode += chunk.encode;
+    timings.ledger += chunk.ledger;
+    timings.write += chunk.write;
+    timings.process += started.elapsed();
+    Ok((encoder, before_store, fragments, padding))
 }
 
 /// Concurrent `put`s allowed per process. Each holds a 40MB logical chunk,
@@ -258,8 +303,10 @@ fn process_logical_chunk(
     per_blob_key: &chacha20poly1305::Key,
     fragments_dir: &str,
     fragments: &mut Vec<PutFragment>,
-) -> Result<usize, StorageError> {
+) -> Result<(usize, PutTimings), StorageError> {
     let chunk_size = chunk_data.len();
+    let started = Instant::now();
+    let mut timings = PutTimings::default();
 
     // Calculate padding needed to evenly divide into 10 fragments
     let padding = calculate_chunk_padding(chunk_size, ORIGINAL_FRAGMENTS_PER_CHUNK);
@@ -289,7 +336,9 @@ fn process_logical_chunk(
         .iter()
         .map(|(_, _, hash)| *hash)
         .collect();
+    let ledgering = Instant::now();
     before_store(&original_hashes)?;
+    timings.ledger += ledgering.elapsed();
 
     // All encrypted fragments have the same size (RS requirement)
     let encrypted_fragment_size = encrypted_fragments[0].1.len();
@@ -316,7 +365,9 @@ fn process_logical_chunk(
             .add_original_shard(&encrypted_fragment)
             .map_err(|_| StorageError::Rs)?;
 
+        let writing = Instant::now();
         fragstore::store_fragment(fragments_dir, &fragment_hash, encrypted_fragment)?;
+        timings.write += writing.elapsed();
 
         fragments.push(PutFragment {
             chunk_number,
@@ -334,7 +385,9 @@ fn process_logical_chunk(
         .recovery_iter()
         .map(|fragment| Blake3Hash::new(blake3::hash(fragment)))
         .collect();
+    let ledgering = Instant::now();
     before_store(&recovery_hashes)?;
+    timings.ledger += ledgering.elapsed();
 
     for (i, (recovery_fragment, fragment_hash)) in recovery_generator
         .recovery_iter()
@@ -343,7 +396,9 @@ fn process_logical_chunk(
     {
         let fragment_id = CustomUUID::new(None);
 
+        let writing = Instant::now();
         fragstore::store_fragment(fragments_dir, &fragment_hash, recovery_fragment.to_vec())?;
+        timings.write += writing.elapsed();
 
         fragments.push(PutFragment {
             chunk_number,
@@ -354,7 +409,11 @@ fn process_logical_chunk(
         });
     }
 
-    Ok(padding)
+    // Everything that was not a ledger call or a file write.
+    timings.encode = started
+        .elapsed()
+        .saturating_sub(timings.ledger + timings.write);
+    Ok((padding, timings))
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,6 +1321,41 @@ mod tests {
         )
         .await;
         assert!(matches!(refused, Err(StorageError::Host(_))));
+    }
+
+    // Should: charge the time the before-store hook takes to `ledger`.
+    // Should: report the blob's size and a total covering every phase.
+    // Should not: count ledger time as encode time.
+    #[tokio::test]
+    async fn put_with_reports_where_the_put_spent_its_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().to_str().unwrap().to_string();
+        let key: chacha20poly1305::Key = [0x42u8; 32].into();
+        let blob_id = CustomUUID::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap();
+        let plaintext: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+
+        let hook_pause = Duration::from_millis(150);
+        let outcome = put_with(
+            plaintext.as_slice(),
+            plaintext.len(),
+            blob_id,
+            &key,
+            &dir,
+            move |_| {
+                std::thread::sleep(hook_pause);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        let t = &outcome.timings;
+        assert_eq!(t.bytes, plaintext.len() as u64);
+        // One chunk: the originals batch, then the recovery batch.
+        assert!(t.ledger >= hook_pause * 2, "ledger {:?}", t.ledger);
+        assert!(t.encode < hook_pause, "encode {:?}", t.encode);
+        assert!(t.process >= t.encode + t.ledger + t.write);
+        assert!(t.total >= t.permit_wait + t.receive + t.process);
     }
 
     use std::sync::Mutex;

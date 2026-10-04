@@ -300,9 +300,34 @@ pub struct PublishReport {
     /// hold ingress responsibility (adoption still ran). No attempts
     /// consumed — a claim/transfer unparks the next pass.
     pub parked_responsibility: bool,
+    /// Per-photo step timings of this pass's publishes, in join order. Per
+    /// pass only: [`PublishReport::absorb`] leaves them out of running
+    /// totals; each pass logs its own (`publish_pass`, see `crate::timing`).
+    pub timings: Vec<crate::timing::PhotoTiming>,
 }
 
+/// What one publish task hands back to the pass.
+type PublishJoin = (
+    PhotoRecord,
+    std::result::Result<PublishOutcome, PublishError>,
+    crate::timing::PhotoTiming,
+);
+
 impl PublishReport {
+    /// The `publish_pass` ingest-log detail. None when no photo was
+    /// published this pass, so idle passes log nothing.
+    pub fn pass_log(&self) -> Option<crate::timing::PassLog<'_>> {
+        (!self.timings.is_empty()).then(|| crate::timing::PassLog {
+            published: self.published,
+            already_published: self.already_published,
+            failed: self.failed,
+            gave_up: self.gave_up,
+            parked: self.parked,
+            summary: crate::timing::summarize(&self.timings),
+            samples: self.timings.as_slice().into(),
+        })
+    }
+
     pub fn absorb(&mut self, other: &PublishReport) {
         self.published += other.published;
         self.already_published += other.already_published;
@@ -491,6 +516,13 @@ pub async fn run_publish_pass(
     report.evicted_blobs =
         crate::cleanup::evict_published_blobs(store, spool, EVICT_BATCH).await?;
 
+    // The pass's timing line: what `status` rebuilds its window from.
+    if let Some(pass) = report.pass_log() {
+        let _ = store
+            .append_log("publish_pass", None, serde_json::to_value(pass).ok())
+            .await;
+    }
+
     Ok(report)
 }
 
@@ -671,8 +703,7 @@ async fn run_scope_pass(
     // Photos never spawned burn no attempt, preserving the guarantee that
     // matters; in-flight peers may burn one, which `retry_cap` absorbs.
     let mut pending = remaining.into_iter();
-    let mut tasks: JoinSet<(PhotoRecord, std::result::Result<PublishOutcome, PublishError>)> =
-        JoinSet::new();
+    let mut tasks: JoinSet<PublishJoin> = JoinSet::new();
     // Clamped: a 0 window would join an empty set immediately and drop the
     // whole batch silently rather than publishing it.
     let full_window = cfg.concurrency.max(1);
@@ -724,16 +755,17 @@ async fn run_scope_pass(
                 .await
                 .expect("semaphore open");
             tasks.spawn(async move {
-                let outcome = publisher.publish(item).await;
+                let (outcome, timing) = crate::timing::timed(publisher.publish(item)).await;
                 drop(permit);
-                (photo, outcome)
+                (photo, outcome, timing)
             });
         }
 
         let Some(joined) = tasks.join_next().await else {
             break;
         };
-        let (photo, outcome) = joined.expect("publish task panicked");
+        let (photo, outcome, timing) = joined.expect("publish task panicked");
+        report.timings.push(timing);
 
         match outcome {
             Ok(outcome) => {

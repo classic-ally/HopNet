@@ -14,6 +14,7 @@ pub mod release_feed;
 pub mod setup;
 pub mod shares;
 pub mod snapshot;
+pub mod timing;
 pub mod users;
 pub mod version;
 pub mod views;

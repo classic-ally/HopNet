@@ -190,6 +190,12 @@ impl Publisher for FakePublisher {
             .unwrap()
             .push(item.cloud_fingerprint.clone());
         self.seen_sidecars.lock().unwrap().push(item.sidecar.clone());
+        // Stands in for the real publisher's per-step recording.
+        ingress_core::timing::record(
+            ingress_core::timing::PublishStep::Upload,
+            Duration::from_millis(5),
+            100,
+        );
         if let Some(gate) = &self.gate {
             let _permit = gate.acquire().await.unwrap();
         }
@@ -485,6 +491,42 @@ async fn pass_marks_published_and_drains_queue() {
         assert!(row.publish_last_error.is_none());
     }
     assert!(claim(&rig).await.is_empty());
+}
+
+// Should: log one publish_pass event for a pass that published, carrying
+// each photo's step samples and their summary.
+// Should: surface those samples in the status view's timing window.
+// Should not: log a pass that published nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn publishing_pass_logs_its_timings_for_status() {
+    use ingress_core::timing::{PassLog, PublishStep};
+
+    let rig = rig().await;
+    materialize(&rig, "a", b"a-bytes").await;
+    materialize(&rig, "b", b"b-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.timings.len(), 2);
+    let idle = pass(&rig, &publisher, &mut state).await;
+    assert!(idle.timings.is_empty());
+
+    let events = rig.store.log_events("publish_pass").await.unwrap();
+    assert_eq!(events.len(), 1, "the idle pass logs nothing");
+    let logged: PassLog<'_> = serde_json::from_str(events[0].detail.as_deref().unwrap()).unwrap();
+    assert_eq!(logged.published, 2);
+    assert_eq!(logged.samples.len(), 2);
+    assert_eq!(logged.summary.photos, 2);
+    assert_eq!(logged.summary.bytes, 200);
+    assert_eq!(logged.summary.steps[&PublishStep::Upload].count, 2);
+    assert_eq!(logged.summary.steps[&PublishStep::Total].count, 2);
+
+    let status = ingress_core::status::status(&rig.store, 5).await.unwrap();
+    let window = status.pipeline.publish_timing.expect("a timed pass");
+    assert_eq!(window.passes, 1);
+    assert_eq!(window.summary.photos, 2);
+    assert_eq!(window.summary.bytes, 200);
 }
 
 // Should: stamp a photo the confirm probe found already committed without

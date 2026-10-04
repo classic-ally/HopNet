@@ -25,6 +25,7 @@ pub mod scheduler;
 pub mod sidecar;
 pub mod status;
 pub mod store;
+pub mod timing;
 pub mod transition;
 pub mod writer;
 

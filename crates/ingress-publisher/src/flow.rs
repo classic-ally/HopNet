@@ -10,6 +10,7 @@
 //! no remapping), minted at first discovery.
 
 use std::str::FromStr;
+use std::time::Instant;
 
 use hopnet_common::CustomUUID;
 use hopnet_photos_core::PhotosCoreError;
@@ -23,6 +24,7 @@ use ingress_core::publish::{
     EditItem, PublishError, PublishItem, PublishOutcome, Publisher, ResolveEntry, ResolveOutcome,
     Responsibility, TombstoneOp,
 };
+use ingress_core::timing::{self, PublishStep};
 
 use crate::dispatch::{AdmitProbe, CommitProbe, HttpDispatch, UNREACHABLE_PREFIX};
 
@@ -44,11 +46,13 @@ impl Publisher for NodePublisher {
         // 1. Confirm-first, EVERY call: a previous ambiguous attempt (submit
         //    timeout, 500 after the consensus wait, daemon crash mid-pass)
         //    may have committed. 404 ⇒ the same photo_id is safe to submit.
-        match self
+        let probing = Instant::now();
+        let probe = self
             .dispatch
             .check_committed(item.photo.photo_id.as_str())
-            .await
-        {
+            .await;
+        timing::record(PublishStep::Probe, probing.elapsed(), 0);
+        match probe {
             CommitProbe::Committed => return Ok(PublishOutcome::AlreadyPublished),
             CommitProbe::NotCommitted => {}
             CommitProbe::Unreachable(msg) => return Err(PublishError::NodeUnreachable(msg)),
@@ -75,7 +79,10 @@ impl Publisher for NodePublisher {
             .iter()
             .map(|r| r.size_bytes.max(0) as u64)
             .collect();
-        if let AdmitProbe::Unreachable(msg) = self.dispatch.check_admission(&sizes).await {
+        let admitting = Instant::now();
+        let admission = self.dispatch.check_admission(&sizes).await;
+        timing::record(PublishStep::Admission, admitting.elapsed(), 0);
+        if let AdmitProbe::Unreachable(msg) = admission {
             return Err(PublishError::NodeUnreachable(msg));
         }
 

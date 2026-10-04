@@ -512,11 +512,12 @@ CREATE TABLE ingest_log (
 );
 
 CREATE INDEX idx_ingest_log_photo ON ingest_log(photo_id) WHERE photo_id IS NOT NULL;
+CREATE INDEX idx_ingest_log_type ON ingest_log(event_type, id);  -- newest events of one type (status timing window)
 ```
 
 The ingest log is **authoritative for nothing**. No code path reads it to make a decision; deleting the table changes no behavior. State tables answer "what is"; the log answers "what happened" — it is the black-box recorder for a daemon that deletes irreplaceable data. Its primary consumer is forensics: after a hard delete, the state tables retain no trace of the photo, and the log is the only artifact that can answer "where did my photo go?" (`deletion_observed` on March 3, `hard_delete` on April 2). Secondary consumers are CLI history views and incident debugging (publish parks, ingest stalls). It does not migrate to RFC-011 — deletion state flows through `photos` columns, not log replay.
 
-Logging rule: an event is logged if it **destroys bytes** or **explains a stall**. Per-retry fetch failures are never logged — `retry_count` / `last_error` on `photo_resources` carry current failure state, and a flaky iCloud connection over a 50k-asset library would flood the log.
+Logging rule: an event is logged if it **destroys bytes** or **explains a stall**. The one periodic event, `publish_pass`, qualifies as the second: one diagnostic line per pass that published anything, carrying the step timings that explain a slow drain. Per-retry fetch failures are never logged — `retry_count` / `last_error` on `photo_resources` carry current failure state, and a flaky iCloud connection over a 50k-asset library would flood the log.
 
 | Event | photo_id | detail |
 |---|---|---|
@@ -533,6 +534,7 @@ Logging rule: an event is logged if it **destroys bytes** or **explains a stall*
 | `publish_descriptor_missing` | yes | NULL capsule at publish claim (self-heals via scan) |
 | `storage_low` / `storage_recovered` | no | free bytes, reserve floor (data-dir disk) |
 | `node_unreachable` / `node_regained` | no | publish reachability edges |
+| `publish_pass` | no | per-step publish timings of a pass that published anything: counters, a per-step summary (count, p50/p95/max ms, bytes) and each photo's raw step samples |
 | `scope_unmapped` | no | PhotoKit scope id encountered with no binding |
 
 Shape is deliberately loose — `event_type` as TEXT (readable in a `sqlite3` shell, new types cost nothing), `detail` as freeform JSON — because nothing downstream parses it. Rows older than 180 days are pruned by the hourly cleanup job.
@@ -700,6 +702,7 @@ The daemon-loop tick (`ingress-core/src/publish.rs`; concrete publisher in `crat
 - **Retry ledger**: transient failures back off exponentially (base 60s, max 6h) up to `publish_attempts = cap` (terminal until operator reset); permanent rejections (mapping/validation, malformed fingerprints) jump straight to the cap. Node unreachability (connect/timeout/HTTP 503 shedding) consumes **no** attempts — the pass parks.
 - **Auth**: an RFC-012 device token (`{device_id}.{secret}`), so the daemon can target any node holding the consensus state, and revoking the device row kills its access mesh-wide. The node derives the device identity for the responsibility gate from the same token.
 - **Eviction rides the pass.** After each publish pass — and again on the hourly cleanup tick, which catches strays — blobs whose every referencing photo in the library is decided (`NOT EXISTS … published_at IS NULL`) are stamped `evicted_at` and their spool files deleted under the spool-wide hash-liveness gate. Stamp first, then unlink: a crash between the two leaves a lingering file that fsck classifies as a benign orphan, never byte loss. `spool_evicted` is logged when a pass reclaims anything. This is the point of the spool — residence is bounded by publish latency, not library size.
+- **Step timings (instrumentation only).** Each publish times its network steps — confirm probe, admission probe, membership fetch, one upload per resource (with bytes), the `photo_add` submit (which waits for the decision), and the whole call; failed uploads and submits are timed apart (`upload_failed`, `submit_failed`, no bytes) (`crates/ingress-core/src/timing.rs`, recorded by `crates/ingress-publisher`). A pass that published anything logs them as one `publish_pass` event; `ingress-cli status` (and `--json` `pipeline.publish_timing`) shows per-step stats over the newest 200 photos of the last hour. The node keeps the matching server-side split (put permit wait, body receive, encode, ledger, fragment writes; responsibility gate, sign, decide) at the owner-only `GET /api/debug/ingest/timings`.
 - **Driver exit codes** (`ingress-publish-e2e publish`): 0 drained, 2 unreachable-park, 3 = SOME scope responsibility-parked — since the pass is scope-partitioned, healthy scopes were still drained first (read `published`/`parked_responsibility` in the JSON, not just the code).
 - **Kick mid-stream**: a member removed from the mesh library loses the scope on both ends — the remove handler dissolves their responsibility row, and their daemon's next scoped resolve 403s (`library_not_member`), burning attempts toward `gave_up` for that scope only. No ingress-side reaction beyond the backoff this cycle; clearing the local mesh binding stops the attempts.
 - **Out of scope (this phase)**: favorites (Phase 4). Everything else that once sat here now rides this same pass: tombstones and restores (§Propagation to the mesh), edits and metadata refreshes (§Propagation of edits), and shared-library publish via the scope partition above. A re-materialized published photo is still never re-enqueued *here* — `published_at` is terminal — but it is no longer stranded: its content divergence is the edit queue's.

@@ -551,6 +551,85 @@ async fn happy_path_streams_bytes_in_order() {
     assert_ne!(uploads[0].key_hex, uploads[1].key_hex);
 }
 
+// Impact: the daemon's publish timings are only as good as this: a step
+// the publisher stops recording silently vanishes from `status`.
+// Should: time every network step of a publish in order, one upload per
+// resource carrying its byte count, then the whole call.
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_times_each_step() {
+    use ingress_core::timing::{PublishStep, StepSample, timed};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_stub, base_url) = start_stub().await;
+    let item = make_item(
+        dir.path(),
+        vec![
+            ("original", "jpg", vec![0x5Au8; 8192]),
+            ("edited", "jpg", vec![0x66u8; 1024]),
+        ],
+    );
+    let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
+    let (outcome, timing) = timed(publisher.publish(item)).await;
+
+    assert_eq!(outcome.unwrap(), PublishOutcome::Published);
+    let steps: Vec<(PublishStep, u64)> = timing
+        .samples
+        .iter()
+        .map(|StepSample(step, _, bytes)| (*step, *bytes))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            (PublishStep::Probe, 0),
+            (PublishStep::Admission, 0),
+            (PublishStep::Members, 0),
+            (PublishStep::Upload, 8192),
+            (PublishStep::Upload, 1024),
+            (PublishStep::Submit, 0),
+            (PublishStep::Total, 0),
+        ]
+    );
+}
+
+// Impact: a failed upload or submit timed as a success would drag the
+// latency percentiles and inflate the upload rate with bytes never stored.
+// Should: time a failed upload under its own step, carrying no bytes.
+// Should: time a failed submit under its own step.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_steps_are_timed_apart_from_successes() {
+    use ingress_core::timing::{PublishStep, StepSample, timed};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (stub, base_url) = start_stub().await;
+    let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
+    let steps = |samples: &[StepSample]| -> Vec<(PublishStep, u64)> {
+        samples.iter().map(|StepSample(s, _, b)| (*s, *b)).collect()
+    };
+
+    stub.upload_statuses.lock().unwrap().push_back(422);
+    let item = make_item(dir.path(), vec![("original", "jpg", vec![0x5Au8; 8192])]);
+    let (outcome, timing) = timed(publisher.publish(item)).await;
+    assert!(outcome.is_err());
+    assert_eq!(
+        steps(&timing.samples),
+        vec![
+            (PublishStep::Probe, 0),
+            (PublishStep::Admission, 0),
+            (PublishStep::Members, 0),
+            (PublishStep::UploadFailed, 0),
+            (PublishStep::Total, 0),
+        ]
+    );
+
+    stub.tx_statuses.lock().unwrap().push_back(500);
+    let item = make_item(dir.path(), vec![("original", "jpg", vec![0x5Au8; 8192])]);
+    let (outcome, timing) = timed(publisher.publish(item)).await;
+    assert!(outcome.is_err());
+    let recorded = steps(&timing.samples);
+    assert_eq!(recorded[3], (PublishStep::Upload, 8192));
+    assert_eq!(recorded[4], (PublishStep::SubmitFailed, 0));
+}
+
 // Impact: this is the ambiguous-outcome disambiguation loop of the
 // idempotency contract — a submit that failed opaquely but actually
 // committed must resolve to AlreadyPublished on the next attempt.

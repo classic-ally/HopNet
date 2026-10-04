@@ -113,6 +113,37 @@ pub fn print_status(report: &StatusReport) {
     );
     println!("  gave up:           {}", p.retries.gave_up);
     println!("  unmapped photos:   {}", p.unmapped_photos);
+
+    if let Some(timing) = &p.publish_timing {
+        let s = &timing.summary;
+        println!(
+            "\nPUBLISH TIMING (newest {} photos over {} passes, last {} min; {} uploaded)",
+            s.photos,
+            timing.passes,
+            timing.window_secs / 60,
+            bytes(s.bytes),
+        );
+        let rows: Vec<Vec<String>> = s
+            .steps
+            .iter()
+            .map(|(step, st)| {
+                let rate = if st.bytes > 0 {
+                    format!("{}/s", bytes(st.bytes_per_sec))
+                } else {
+                    "-".into()
+                };
+                vec![
+                    step.as_str().to_string(),
+                    st.count.to_string(),
+                    st.p50_ms.to_string(),
+                    st.p95_ms.to_string(),
+                    st.max_ms.to_string(),
+                    rate,
+                ]
+            })
+            .collect();
+        table(&["STEP", "N", "P50 MS", "P95 MS", "MAX MS", "RATE"], &rows);
+    }
 }
 
 pub fn print_photo(view: &PhotoStatus) {
