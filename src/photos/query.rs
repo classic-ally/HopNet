@@ -717,6 +717,7 @@ mod tests {
             blob_id.clone(),
             &per_blob_key,
             &fragments_dir,
+            &pool,
         )
         .await
         .unwrap();

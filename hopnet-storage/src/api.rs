@@ -47,13 +47,47 @@ pub struct PutOutcome {
 ///
 /// Rejects empty input — empty content is a projection concern
 /// (`data_id = NULL`), never a blob.
+///
+/// A host ingest goes through [`put_with`], whose hook ledgers each
+/// fragment before its file exists; this plain form is for callers that
+/// write the `fragment_hashes` rows themselves, and tests.
 pub async fn put<R: AsyncRead + Unpin>(
-    mut source: R,
+    source: R,
     file_size: usize,
     blob_id: BlobId,
     per_blob_key: &chacha20poly1305::Key,
     fragments_dir: &str,
 ) -> Result<PutOutcome, StorageError> {
+    put_with(
+        source,
+        file_size,
+        blob_id,
+        per_blob_key,
+        fragments_dir,
+        |_| Ok(()),
+    )
+    .await
+}
+
+/// [`put`] with a hook that runs BEFORE each batch of fragment files is
+/// written, with the hashes about to be stored (the ten originals of a
+/// chunk, then its twenty recovery fragments). A host records them in its
+/// upload ledger there, so at no instant is a fragment on disk without a
+/// ledger row naming it: an upload streaming for longer than the sweep's
+/// orphan grace would otherwise have its early chunks deleted as orphans
+/// mid-upload (consensus-bugs 20). A hook error aborts the put.
+pub async fn put_with<R, F>(
+    mut source: R,
+    file_size: usize,
+    blob_id: BlobId,
+    per_blob_key: &chacha20poly1305::Key,
+    fragments_dir: &str,
+    mut before_store: F,
+) -> Result<PutOutcome, StorageError>
+where
+    R: AsyncRead + Unpin,
+    F: FnMut(&[Blake3Hash]) -> Result<(), StorageError> + Send + 'static,
+{
     if file_size == 0 {
         return Err(StorageError::Rs);
     }
@@ -111,8 +145,9 @@ pub async fn put<R: AsyncRead + Unpin>(
 
         while logical_chunk_buffer.len() >= CHUNK_SIZE {
             let chunk_data: Vec<u8> = logical_chunk_buffer.drain(..CHUNK_SIZE).collect();
-            let (returned, chunk_fragments, padding) = process_chunk_blocking(
+            let (returned, hook, chunk_fragments, padding) = process_chunk_blocking(
                 encoder,
+                before_store,
                 chunk_data,
                 current_chunk_number,
                 per_blob_key,
@@ -120,6 +155,7 @@ pub async fn put<R: AsyncRead + Unpin>(
             )
             .await?;
             encoder = returned;
+            before_store = hook;
             fragments.extend(chunk_fragments);
             last_chunk_padding = padding;
             current_chunk_number += 1;
@@ -128,8 +164,9 @@ pub async fn put<R: AsyncRead + Unpin>(
 
     // Process final partial chunk (if any remaining data < 40MB)
     if !logical_chunk_buffer.is_empty() {
-        let (_, chunk_fragments, padding) = process_chunk_blocking(
+        let (_, _, chunk_fragments, padding) = process_chunk_blocking(
             encoder,
+            before_store,
             logical_chunk_buffer,
             current_chunk_number,
             per_blob_key,
@@ -160,28 +197,33 @@ pub async fn put<R: AsyncRead + Unpin>(
 /// RS encoding and thirty synchronous fragment writes per 40MB chunk are
 /// CPU and disk work; inline on an async worker, a handful of concurrent
 /// uploads would hold every worker of the host's main runtime and starve
-/// its API and peer serving. The encoder moves in and back out so its
-/// buffers are reused across chunks.
-async fn process_chunk_blocking(
+/// its API and peer serving. The encoder and the before-store hook move in
+/// and back out, so the encoder's buffers are reused across chunks.
+async fn process_chunk_blocking<F>(
     mut encoder: ReedSolomonEncoder,
+    mut before_store: F,
     chunk_data: Vec<u8>,
     chunk_number: u32,
     per_blob_key: &chacha20poly1305::Key,
     fragments_dir: &str,
-) -> Result<(ReedSolomonEncoder, Vec<PutFragment>, usize), StorageError> {
+) -> Result<(ReedSolomonEncoder, F, Vec<PutFragment>, usize), StorageError>
+where
+    F: FnMut(&[Blake3Hash]) -> Result<(), StorageError> + Send + 'static,
+{
     let key = *per_blob_key;
     let dir = fragments_dir.to_owned();
     tokio::task::spawn_blocking(move || {
         let mut fragments = Vec::new();
         let padding = process_logical_chunk(
             &mut encoder,
+            &mut before_store,
             &chunk_data,
             chunk_number,
             &key,
             &dir,
             &mut fragments,
         )?;
-        Ok((encoder, fragments, padding))
+        Ok((encoder, before_store, fragments, padding))
     })
     .await
     .map_err(|e| StorageError::Io(std::io::Error::other(format!("chunk task: {e}"))))?
@@ -206,9 +248,11 @@ fn put_permits() -> &'static tokio::sync::Semaphore {
 }
 
 /// Process a single logical chunk with Reed-Solomon encoding (10 original +
-/// 20 recovery). Returns the padding bytes added to this chunk.
+/// 20 recovery). `before_store` sees each batch's hashes before any of its
+/// files is written. Returns the padding bytes added to this chunk.
 fn process_logical_chunk(
     encoder: &mut ReedSolomonEncoder,
+    before_store: &mut dyn FnMut(&[Blake3Hash]) -> Result<(), StorageError>,
     chunk_data: &[u8],
     chunk_number: u32,
     per_blob_key: &chacha20poly1305::Key,
@@ -238,8 +282,14 @@ fn process_logical_chunk(
     for fragment_data in fragment_chunks.into_iter() {
         let fragment_id = CustomUUID::new(None);
         let encrypted_fragment = crypto::encrypt_chunk(fragment_data, per_blob_key, &fragment_id)?;
-        encrypted_fragments.push((fragment_id, encrypted_fragment));
+        let fragment_hash = Blake3Hash::new(blake3::hash(&encrypted_fragment));
+        encrypted_fragments.push((fragment_id, encrypted_fragment, fragment_hash));
     }
+    let original_hashes: Vec<Blake3Hash> = encrypted_fragments
+        .iter()
+        .map(|(_, _, hash)| *hash)
+        .collect();
+    before_store(&original_hashes)?;
 
     // All encrypted fragments have the same size (RS requirement)
     let encrypted_fragment_size = encrypted_fragments[0].1.len();
@@ -259,10 +309,9 @@ fn process_logical_chunk(
         })?;
 
     // Add encrypted fragments to the encoder and store them
-    for (local_index, (fragment_id, encrypted_fragment)) in
+    for (local_index, (fragment_id, encrypted_fragment, fragment_hash)) in
         encrypted_fragments.into_iter().enumerate()
     {
-        let fragment_hash = Blake3Hash::new(blake3::hash(&encrypted_fragment));
         encoder
             .add_original_shard(&encrypted_fragment)
             .map_err(|_| StorageError::Rs)?;
@@ -278,13 +327,21 @@ fn process_logical_chunk(
         });
     }
 
-    // Generate recovery fragments
+    // Generate recovery fragments: hash them all (the iterator borrows the
+    // generator, so no copies) and ledger before the first write.
     let recovery_generator = encoder.encode().map_err(|_| StorageError::Rs)?;
-    let recovery_iter = recovery_generator.recovery_iter();
+    let recovery_hashes: Vec<Blake3Hash> = recovery_generator
+        .recovery_iter()
+        .map(|fragment| Blake3Hash::new(blake3::hash(fragment)))
+        .collect();
+    before_store(&recovery_hashes)?;
 
-    for (i, recovery_fragment) in recovery_iter.enumerate() {
+    for (i, (recovery_fragment, fragment_hash)) in recovery_generator
+        .recovery_iter()
+        .zip(recovery_hashes)
+        .enumerate()
+    {
         let fragment_id = CustomUUID::new(None);
-        let fragment_hash = Blake3Hash::new(blake3::hash(recovery_fragment));
 
         fragstore::store_fragment(fragments_dir, &fragment_hash, recovery_fragment.to_vec())?;
 
@@ -1141,6 +1198,70 @@ mod tests {
         assert!(put(&b""[..], 0, blob_id, &key, &dir).await.is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Impact: an upload streaming for longer than the sweep's orphan grace
+    // has its first chunks on disk, rowless, an hour before put returns; a
+    // ledger written after put would not cover them and the sweep would
+    // delete the node's own upload mid-stream (consensus-bugs 20).
+    // Should: hand the hook every fragment hash before that fragment's
+    // file exists, in batches, so the ledger row always precedes the file.
+    // Should: abort the put when the hook fails.
+    // Should not: write a file whose hash the hook has not yet seen.
+    #[tokio::test]
+    async fn put_with_runs_the_hook_before_each_fragment_is_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().to_str().unwrap().to_string();
+        let key: chacha20poly1305::Key = [0x42u8; 32].into();
+        let blob_id = CustomUUID::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap();
+        let plaintext: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+
+        // Per hook call: the batch, and whether any of its files already
+        // existed when the hook ran.
+        let seen: Arc<Mutex<Vec<(Vec<Blake3Hash>, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let hook_dir = dir.clone();
+        let hook_seen = seen.clone();
+        let outcome = put_with(
+            plaintext.as_slice(),
+            plaintext.len(),
+            blob_id.clone(),
+            &key,
+            &dir,
+            move |hashes| {
+                let on_disk = hashes
+                    .iter()
+                    .any(|h| fragstore::fragment_exists_and_valid(&hook_dir, h));
+                hook_seen.lock().unwrap().push((hashes.to_vec(), on_disk));
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "originals, then recovery, for one chunk");
+        assert!(
+            seen.iter().all(|(_, on_disk)| !on_disk),
+            "no batch had a file on disk when the hook ran"
+        );
+        let ledgered: std::collections::HashSet<Blake3Hash> =
+            seen.iter().flat_map(|(h, _)| h.iter().copied()).collect();
+        assert_eq!(ledgered.len(), outcome.fragments.len());
+        for f in &outcome.fragments {
+            assert!(ledgered.contains(&f.fragment_hash));
+            assert!(fragstore::fragment_exists_and_valid(&dir, &f.fragment_hash));
+        }
+
+        let refused = put_with(
+            plaintext.as_slice(),
+            plaintext.len(),
+            blob_id,
+            &key,
+            &dir,
+            |_| Err(StorageError::Host("ledger down".into())),
+        )
+        .await;
+        assert!(matches!(refused, Err(StorageError::Host(_))));
     }
 
     use std::sync::Mutex;

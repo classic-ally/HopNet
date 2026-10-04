@@ -8,7 +8,11 @@
 //!   un-attests, and the responsible's obligation check refetches;
 //! - a file with no `fragment_hashes` row at all: an orphan, deleted once
 //!   older than the grace period (racing an in-flight store is the only
-//!   way a fresh file lacks its row).
+//!   way a fresh file lacks its row) — unless this node's upload ledger
+//!   names it (`split_orphans`): an own upload is written before the
+//!   transaction carrying its row, and that row may be hours away or, for
+//!   a straggler that joined meanwhile, never replayed. Held files are
+//!   reported, never deleted (consensus-bugs 20).
 //!
 //! Belief is dishonest for at most one sweep cycle; the cycle therefore
 //! sits inside the convergence bound. Pure over its inputs — the host owns
@@ -28,6 +32,9 @@ pub struct DiskFragment {
     pub mtime: u64,
 }
 
+/// A rowless file past the grace period: `(hash, size)`.
+pub type Orphan = (Blake3Hash, u64);
+
 /// The sweep's verdict over one walk.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepDiff {
@@ -35,8 +42,9 @@ pub struct SweepDiff {
     pub present_unflagged: Vec<Blake3Hash>,
     /// Flag says present, bytes gone → un-flag it.
     pub flagged_missing: Vec<Blake3Hash>,
-    /// On disk, no table row, older than the grace period → delete.
-    pub orphans: Vec<(Blake3Hash, u64)>,
+    /// On disk, no table row, older than the grace period → delete,
+    /// unless the upload ledger holds it (`split_orphans`).
+    pub orphans: Vec<Orphan>,
     /// On disk and in the table (flagged or not) — the attestation's
     /// `present` list, sorted.
     pub present: Vec<Blake3Hash>,
@@ -89,6 +97,20 @@ pub fn diff(disk: &[DiskFragment], rows: &[(Blake3Hash, bool)], grace_cutoff: u6
     out
 }
 
+/// Split the diff's orphans by this node's upload ledger into
+/// `(delete, held)`: a rowless file the ledger names is this node's own
+/// upload whose `fragment_hashes` row has not arrived, and is never
+/// deleted. Order is preserved on both sides.
+pub fn split_orphans(
+    orphans: &[Orphan],
+    ledger: &HashSet<Blake3Hash>,
+) -> (Vec<Orphan>, Vec<Orphan>) {
+    orphans
+        .iter()
+        .copied()
+        .partition(|(hash, _)| !ledger.contains(hash))
+}
+
 /// The sweep's disk-truth attestation, split into `page`-sized
 /// `attest_fragments` payloads (RFC-STORAGE-003 S5). One transaction per
 /// page keeps every page under the wire frame and the queue's deadline
@@ -124,6 +146,21 @@ pub struct SweepReport {
     pub unflagged: usize,
     pub orphans_deleted: usize,
     pub orphan_bytes_freed: u64,
+    /// Rowless files past the grace that this node's upload ledger names
+    /// (its own uploads, rows not yet landed): held on disk, not deleted.
+    #[serde(default)]
+    pub orphans_held: usize,
+    #[serde(default)]
+    pub orphan_bytes_held: u64,
+    /// Ledger entries given up on this walk: no row landed within the
+    /// retention, so their files are ordinary orphans from here on.
+    #[serde(default)]
+    pub uploads_expired: usize,
+    /// Orphan steps (a shard's ledger read, or one unlink batch) skipped
+    /// because the database was busy or locked; those files wait for the
+    /// next rotation. Never fails the shard.
+    #[serde(default)]
+    pub orphan_batches_skipped: usize,
     pub young_orphans: usize,
     pub corrupt_deleted: usize,
     /// Scrub-slice files the read failed on for a reason other than
@@ -442,6 +479,25 @@ mod tests {
         assert_eq!(d.flagged_missing, vec![h(5)]);
         assert_eq!(d.orphans, vec![(h(3), 10)]);
         assert_eq!(d.young_orphans, 1);
+    }
+
+    // Impact: the 2026-10-01 loss — a node's own upload is rowless until
+    // its transaction lands, and only the node knows it uploaded; the
+    // ledger is that knowledge, and the split is where it spares the file.
+    // Should: hand every orphan the ledger names to the held side and the
+    // rest to the delete side, sizes and order intact.
+    // Should not: hold anything when the ledger is empty.
+    #[test]
+    fn split_orphans_spares_own_uploads() {
+        let orphans = [(h(1), 10), (h(2), 20), (h(3), 30)];
+        let ledger = HashSet::from([h(2), h(9)]);
+        let (delete, held) = split_orphans(&orphans, &ledger);
+        assert_eq!(delete, vec![(h(1), 10), (h(3), 30)]);
+        assert_eq!(held, vec![(h(2), 20)]);
+
+        let (delete, held) = split_orphans(&orphans, &HashSet::new());
+        assert_eq!(delete, orphans.to_vec());
+        assert!(held.is_empty());
     }
 
     // Should: treat a hash flagged on any of its rows as flagged, and

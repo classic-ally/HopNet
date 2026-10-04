@@ -226,6 +226,7 @@ async fn run_round_trip(plaintext: Vec<u8>) {
     let fragments_dir = temp_dir.path().to_str().unwrap().to_string();
     let dataid = CustomUUID::new(None);
     let per_file_key = ChaCha20Poly1305::generate_key(&mut ChaChaOsRng);
+    let pool = setup_test_db();
 
     let source = Cursor::new(plaintext.clone());
     let blob_op = process_uploaded_file(
@@ -234,6 +235,7 @@ async fn run_round_trip(plaintext: Vec<u8>) {
         dataid.clone(),
         &per_file_key,
         &fragments_dir,
+        &pool,
     )
     .await
     .expect("process_uploaded_file should succeed");
@@ -268,6 +270,40 @@ async fn run_round_trip(plaintext: Vec<u8>) {
         reconstructed, plaintext,
         "reconstructed bytes must match plaintext"
     );
+}
+
+// Impact: the ingest writes fragments before the transaction carrying
+// their rows is signed; without the ledger the sweep reads them as
+// orphans and deletes this node's own upload (consensus-bugs 20).
+// Should: leave one upload-ledger row per fragment the ingest wrote,
+// under the blob's id, every one still held (no rows have landed).
+#[tokio::test(flavor = "multi_thread")]
+async fn process_uploaded_file_records_every_fragment_in_the_upload_ledger() {
+    let temp_dir = TempDir::new().unwrap();
+    let fragments_dir = temp_dir.path().to_str().unwrap().to_string();
+    let dataid = CustomUUID::new(None);
+    let per_file_key = ChaCha20Poly1305::generate_key(&mut ChaChaOsRng);
+    let pool = setup_test_db();
+    let plaintext = generate_random_data(100 * 1024);
+
+    let blob_op = process_uploaded_file(
+        Cursor::new(plaintext.clone()),
+        plaintext.len(),
+        dataid.clone(),
+        &per_file_key,
+        &fragments_dir,
+        &pool,
+    )
+    .await
+    .unwrap();
+
+    let held = hopnet_storage::store::held_local_uploads(&pool.get().unwrap()).unwrap();
+    assert_eq!(held.len(), blob_op.fragments.len());
+    assert!(held.iter().all(|u| u.blob_id == dataid));
+    let ledgered: std::collections::HashSet<_> = held.iter().map(|u| u.fragment_hash).collect();
+    for fragment in &blob_op.fragments {
+        assert!(ledgered.contains(&fragment.fragment_hash));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

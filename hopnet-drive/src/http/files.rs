@@ -58,20 +58,26 @@ pub fn router<S: Clone + Send + Sync + 'static>(state: DriveState) -> Router<S> 
 /// (encrypt-then-RS, fragment store, keyed integrity hash) lives in the
 /// substrate crate; this wrapper returns the substrate's BlobInsertOp —
 /// the wire sub-payload that rides the drive envelope. The caller attaches
-/// the recipient wraps (`access`).
+/// the recipient wraps (`access`). The fragments are on disk long before
+/// the caller's transaction is signed, so each batch is ledgered in
+/// `ledger` as this node's own upload before its files are written and a
+/// failed put is abandoned (`hopnet_projection::host::put_own_upload`); the
+/// sweep holds the ledgered files until the retention.
 pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
     source: R,
     file_size: usize,
     dataid: CustomUUID,
     per_file_key: &chacha20poly1305::Key,
     fragments_dir: &str,
+    ledger: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
 ) -> Result<hopnet_storage::store::BlobInsertOp, StatusCode> {
-    let outcome = hopnet_storage::api::put(
+    let outcome = hopnet_projection::host::put_own_upload(
+        ledger,
+        fragments_dir,
+        dataid.clone(),
         source,
         file_size,
-        dataid.clone(),
         per_file_key,
-        fragments_dir,
     )
     .await
     .map_err(|e| match e {
@@ -79,6 +85,10 @@ pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
         hopnet_storage::StorageError::Io(_)
         | hopnet_storage::StorageError::InsufficientSpace { .. } => {
             StatusCode::INSUFFICIENT_STORAGE
+        }
+        hopnet_storage::StorageError::Host(e) => {
+            tracing::error!("upload {dataid} not ledgered: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
@@ -232,6 +242,7 @@ pub async fn prepare_content_update(
             dataid.clone(),
             &per_file_key,
             &state.fragments_dir,
+            &state.db_pool,
         )
         .await?
     };
