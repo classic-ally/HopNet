@@ -416,6 +416,18 @@ impl RpcHandler for StorageScope {
                 .expect("storage task panicked")
         })
     }
+
+    /// Storage requests skip the transport's dedup cache: every one is safe
+    /// to re-execute on a retry. Health and fetch are read-only; store is
+    /// content-addressed — the server hashes the bytes against the request's
+    /// hash, answers `StoreOutcome::AlreadyExisted` when a valid copy is on
+    /// disk, writes via temp file + atomic rename, and `mark_local` only sets
+    /// a flag. Caching instead held every served fragment (whole fetch
+    /// responses) for the TTL — gigabytes on a busy node (consensus-bugs.md
+    /// entry 21).
+    fn dedup(&self) -> bool {
+        false
+    }
 }
 
 // ============================================================================
@@ -564,6 +576,53 @@ mod tests {
             crate::consensus::status_compat_g0::GENERATION,
             compat_floor(COMPAT_HEAD)
         );
+    }
+
+    // Impact: storage fetches and regenesis snapshot chunks are the large,
+    // high-volume replies; cached, they pinned gigabytes (thor's OOM kills,
+    // consensus-bugs.md entry 21). Every other rpc scope relies on the
+    // cache to make a same-id retry harmless.
+    // Should: opt exactly the storage and regenesis scopes out of the
+    // transport's dedup cache.
+    #[test]
+    fn only_storage_and_regenesis_skip_rpc_dedup() {
+        let app_state = crate::consensus::tests::create_test_app_state();
+        let app_state = || app_state.clone();
+        assert!(
+            !StorageScope {
+                app_state: app_state()
+            }
+            .dedup()
+        );
+        assert!(
+            !crate::regenesis::rpc::RegenesisScope {
+                app_state: app_state()
+            }
+            .dedup()
+        );
+        assert!(
+            ConsensusScope {
+                app_state: app_state()
+            }
+            .dedup()
+        );
+        assert!(
+            MetricsScope {
+                app_state: app_state()
+            }
+            .dedup()
+        );
+        assert!(
+            SetupScope {
+                app_state: app_state()
+            }
+            .dedup()
+        );
+        let status: Arc<dyn RpcHandler> = Arc::new(crate::consensus::evidence::StatusScope {
+            app_state: app_state(),
+        });
+        assert!(status.dedup());
+        assert!(crate::consensus::evidence::StatusCompatG0 { inner: status }.dedup());
     }
 
     #[test]

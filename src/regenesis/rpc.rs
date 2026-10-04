@@ -52,6 +52,19 @@ impl RpcHandler for RegenesisScope {
     fn handle(&self, peer: PeerRef, payload: Vec<u8>) -> BoxFuture<'_, Vec<u8>> {
         Box::pin(async move { encode_payload(&self.serve(peer, payload).await) })
     }
+
+    /// Regenesis requests skip the transport's dedup cache: every one is
+    /// safe to re-execute on a retry. EpochInfo, LineageFetch and
+    /// SnapshotChunk only read (a read-only connection and files);
+    /// SnapshotInfo may materialize the seal artifact, but only bytes whose
+    /// blake3 matches the lineage record's snapshot_hash, via temp file and
+    /// rename, so a second run finds the file and returns the same answer.
+    /// Caching instead held up to a 4 MiB snapshot chunk per request for
+    /// the TTL while a joiner streams them back to back (consensus-bugs.md
+    /// entry 21).
+    fn dedup(&self) -> bool {
+        false
+    }
 }
 
 /// The whole server side over explicit paths — plain connections, no pool

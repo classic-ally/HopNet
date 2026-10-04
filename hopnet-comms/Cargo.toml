@@ -31,3 +31,7 @@ tracing = { version = "0.1", optional = true }
 [features]
 default = []
 iroh = ["dep:hopnet-common", "dep:iroh", "dep:rand", "dep:tokio", "dep:tracing"]
+
+# Paused-clock tests of the dedup TTL.
+[dev-dependencies]
+tokio = { version = "1.45.1", features = ["test-util"] }
