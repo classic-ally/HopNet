@@ -203,6 +203,199 @@ pub struct SweepReport {
     /// Shards whose step failed (logged; retried next rotation).
     #[serde(default)]
     pub failed_shards: usize,
+    /// Wall-clock milliseconds per shard step, summed over the rotation
+    /// (`ShardTimings`): where a slow disk's rotation time goes.
+    #[serde(default)]
+    pub ms_height: u64,
+    #[serde(default)]
+    pub ms_walk: u64,
+    #[serde(default)]
+    pub ms_db: u64,
+    #[serde(default)]
+    pub ms_diff: u64,
+    #[serde(default)]
+    pub ms_mark: u64,
+    #[serde(default)]
+    pub ms_temps: u64,
+    #[serde(default)]
+    pub ms_orphans: u64,
+    #[serde(default)]
+    pub ms_scrub: u64,
+    /// Shards scrubbed, and the files and bytes their scrubs read.
+    #[serde(default)]
+    pub shards_scrubbed: usize,
+    #[serde(default)]
+    pub scrub_files: usize,
+    #[serde(default)]
+    pub scrub_bytes: u64,
+    #[serde(default)]
+    pub ms_release: u64,
+    #[serde(default)]
+    pub ms_buffer: u64,
+    /// Page flushes: total time, pages submitted and the slowest single
+    /// submit.
+    #[serde(default)]
+    pub ms_flush: u64,
+    #[serde(default)]
+    pub flush_pages: usize,
+    #[serde(default)]
+    pub flush_slowest_ms: u64,
+    /// The rolling walker's per-shard work (step plus flush, including any
+    /// wait for `SWEEP_LOCK` behind an operator sweep) and its pacing sleep
+    /// between shards.
+    #[serde(default)]
+    pub ms_work: u64,
+    #[serde(default)]
+    pub ms_sleep: u64,
+    /// Shards whose step timings are in the totals above (a failed shard
+    /// counts, up to the step it failed at).
+    #[serde(default)]
+    pub shards_timed: usize,
+}
+
+/// One shard step's wall-clock milliseconds, by step of `sweep_shard`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShardTimings {
+    pub ms_height: u64,
+    pub ms_walk: u64,
+    pub ms_db: u64,
+    pub ms_diff: u64,
+    pub ms_mark: u64,
+    pub ms_temps: u64,
+    pub ms_orphans: u64,
+    pub ms_scrub: u64,
+    pub scrubbed: bool,
+    pub scrub_files: usize,
+    pub scrub_bytes: u64,
+    pub ms_release: u64,
+    pub ms_buffer: u64,
+    /// Files the walk listed.
+    pub files: usize,
+}
+
+/// One `flush_buffers` call: pages submitted, how many committed and
+/// failed, its wall time and its slowest single submit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlushTimings {
+    pub pages: usize,
+    pub ok: usize,
+    pub failed: usize,
+    pub ms: u64,
+    pub slowest_ms: u64,
+}
+
+/// The rolling sweep logs its rotation's progress at DEBUG after this many
+/// shards since the last progress line...
+pub const PROGRESS_EVERY_SHARDS: usize = 16;
+/// ...and at INFO at most this often (a healthy walker passes 16 shards
+/// every few minutes; INFO stays sparse).
+pub const PROGRESS_EVERY_SECS: u64 = 900;
+
+/// The level a progress line is due at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressLine {
+    Debug,
+    Info,
+}
+
+/// Which progress line is due, `shards` shards after the last line of
+/// either level and `secs_since_info` seconds after the last INFO one (or
+/// the rotation's start): INFO once the INFO interval has passed, else
+/// DEBUG every `PROGRESS_EVERY_SHARDS` shards. Never without a new shard
+/// to report.
+pub fn progress_due(shards: usize, secs_since_info: u64) -> Option<ProgressLine> {
+    if shards == 0 {
+        None
+    } else if secs_since_info >= PROGRESS_EVERY_SECS {
+        Some(ProgressLine::Info)
+    } else if shards >= PROGRESS_EVERY_SHARDS {
+        Some(ProgressLine::Debug)
+    } else {
+        None
+    }
+}
+
+impl SweepReport {
+    /// Fold one shard's step timings into the rotation's totals.
+    pub fn add_shard_timings(&mut self, t: &ShardTimings) {
+        self.ms_height += t.ms_height;
+        self.ms_walk += t.ms_walk;
+        self.ms_db += t.ms_db;
+        self.ms_diff += t.ms_diff;
+        self.ms_mark += t.ms_mark;
+        self.ms_temps += t.ms_temps;
+        self.ms_orphans += t.ms_orphans;
+        self.ms_scrub += t.ms_scrub;
+        self.shards_scrubbed += usize::from(t.scrubbed);
+        self.scrub_files += t.scrub_files;
+        self.scrub_bytes = self.scrub_bytes.saturating_add(t.scrub_bytes);
+        self.ms_release += t.ms_release;
+        self.ms_buffer += t.ms_buffer;
+        self.shards_timed += 1;
+    }
+
+    /// Fold one page flush into the rotation's totals.
+    pub fn add_flush_timings(&mut self, f: &FlushTimings) {
+        self.ms_flush += f.ms;
+        self.flush_pages += f.pages;
+        self.flush_slowest_ms = self.flush_slowest_ms.max(f.slowest_ms);
+    }
+
+    /// Average timed milliseconds per shard, flushes included.
+    pub fn avg_ms_per_shard(&self) -> u64 {
+        let total = self.ms_height
+            + self.ms_walk
+            + self.ms_db
+            + self.ms_diff
+            + self.ms_mark
+            + self.ms_temps
+            + self.ms_orphans
+            + self.ms_scrub
+            + self.ms_release
+            + self.ms_buffer
+            + self.ms_flush;
+        total / self.shards_timed.max(1) as u64
+    }
+
+    /// The timing totals, for one log line.
+    pub fn timing_summary(&self) -> String {
+        format!(
+            "{} shards timed, avg {} ms/shard; total ms: height={} walk={} db={} diff={} mark={} temps={} orphans={} scrub={} ({} shards, {} files, {} bytes) release={} buffer={} flush={} ({} pages, slowest {}) work={} sleep={}",
+            self.shards_timed,
+            self.avg_ms_per_shard(),
+            self.ms_height,
+            self.ms_walk,
+            self.ms_db,
+            self.ms_diff,
+            self.ms_mark,
+            self.ms_temps,
+            self.ms_orphans,
+            self.ms_scrub,
+            self.shards_scrubbed,
+            self.scrub_files,
+            self.scrub_bytes,
+            self.ms_release,
+            self.ms_buffer,
+            self.ms_flush,
+            self.flush_pages,
+            self.flush_slowest_ms,
+            self.ms_work,
+            self.ms_sleep,
+        )
+    }
+}
+
+/// The rolling walker's rotation in progress, for the operator: where it
+/// is, and its running report with the step timings so far. The report is
+/// in memory: it counts from the walker's (re)start, not the rotation's.
+#[derive(Debug, Clone, Serialize)]
+pub struct SweepProgress {
+    pub rotation: u64,
+    pub next_shard: u8,
+    pub started_unix: u64,
+    pub started_height: u64,
+    pub avg_ms_per_shard: u64,
+    pub report: SweepReport,
 }
 
 /// Where a node's rolling sweep resumes (`hopnet_storage_sweep_cursor`,
@@ -434,6 +627,95 @@ mod tests {
             ]
         );
         assert!(stale_temps(&temps, 5).is_empty());
+    }
+
+    // Impact: thor's walker never finishes a rotation, so this line is the
+    // only log of where its rotation time goes.
+    // Should: log progress at INFO once 15 minutes have passed since the
+    // last INFO line, however few shards.
+    // Should: log progress at DEBUG every 16 shards in between.
+    // Should not: log progress at INFO more often than every 15 minutes.
+    // Should not: log progress before a single new shard was swept.
+    #[test]
+    fn progress_line_is_info_every_15_minutes_and_debug_every_16_shards() {
+        assert_eq!(progress_due(0, 0), None);
+        assert_eq!(progress_due(0, 10_000), None);
+        assert_eq!(progress_due(15, 899), None);
+        assert_eq!(progress_due(16, 0), Some(ProgressLine::Debug));
+        assert_eq!(progress_due(64, 899), Some(ProgressLine::Debug));
+        assert_eq!(progress_due(1, 900), Some(ProgressLine::Info));
+        assert_eq!(progress_due(40, 3_600), Some(ProgressLine::Info));
+    }
+
+    // Should: sum each step's milliseconds and the scrub's reads over every
+    // shard folded in, counting the timed and scrubbed shards.
+    // Should: keep the slowest single submit across flushes, not their sum.
+    #[test]
+    fn report_accumulates_step_timings_across_shards() {
+        let mut report = SweepReport::default();
+        let shard = |ms: u64, scrubbed: bool| ShardTimings {
+            ms_height: ms,
+            ms_walk: 10 * ms,
+            ms_db: 2 * ms,
+            ms_diff: ms,
+            ms_mark: 3 * ms,
+            ms_temps: ms,
+            ms_orphans: 4 * ms,
+            ms_scrub: if scrubbed { 100 } else { 0 },
+            scrubbed,
+            scrub_files: if scrubbed { 5 } else { 0 },
+            scrub_bytes: if scrubbed { 5_000 } else { 0 },
+            ms_release: ms,
+            ms_buffer: 2 * ms,
+            files: 7,
+        };
+        report.add_shard_timings(&shard(1, false));
+        report.add_shard_timings(&shard(2, true));
+        report.add_flush_timings(&FlushTimings {
+            pages: 3,
+            ok: 2,
+            failed: 1,
+            ms: 40,
+            slowest_ms: 30,
+        });
+        report.add_flush_timings(&FlushTimings {
+            pages: 1,
+            ok: 1,
+            failed: 0,
+            ms: 20,
+            slowest_ms: 20,
+        });
+
+        assert_eq!(report.shards_timed, 2);
+        assert_eq!(
+            (
+                report.ms_height,
+                report.ms_walk,
+                report.ms_db,
+                report.ms_diff
+            ),
+            (3, 30, 6, 3)
+        );
+        assert_eq!(
+            (report.ms_mark, report.ms_temps, report.ms_orphans),
+            (9, 3, 12)
+        );
+        assert_eq!((report.ms_release, report.ms_buffer), (3, 6));
+        assert_eq!(
+            (
+                report.ms_scrub,
+                report.shards_scrubbed,
+                report.scrub_files,
+                report.scrub_bytes
+            ),
+            (100, 1, 5, 5_000)
+        );
+        assert_eq!(
+            (report.ms_flush, report.flush_pages, report.flush_slowest_ms),
+            (60, 4, 30)
+        );
+        // (3+30+6+3+9+3+12+100+3+6+60) / 2
+        assert_eq!(report.avg_ms_per_shard(), 117);
     }
 
     fn h(b: u8) -> Blake3Hash {

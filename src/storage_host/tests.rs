@@ -862,7 +862,7 @@ async fn attestation_continues_past_a_failed_page() {
         calls: Default::default(),
     };
 
-    let (committed, failed) =
+    let (committed, failed, _) =
         crate::storage_host::jobs::submit_attestation_pages(&submitter, pages).await;
 
     assert_eq!((committed, failed), (3, 2));

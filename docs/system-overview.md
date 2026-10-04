@@ -608,7 +608,9 @@ apply functions inside consensus handlers.
       orphan unlink re-checks for a row inside the write transaction, a
       failed put abandons its files, and stuck uploads are reported
       under `held` for the owner to purge early (consensus-bugs.md 20,
-      2026.10.11). The
+      2026.10.11). Each sweep step is timed: a DEBUG line per shard, a
+      progress line every 16 shards (DEBUG) or 15 minutes (INFO), and the running
+      totals under `in_progress` on `GET /maintenance/orphaned-fragments`. The
       pull pipeline (2026.10.8): a planner walks the whole in-flight set
       (the tick's LIMIT-64 kick had re-sent the same 64 blobs forever
       once one transition gave every blob the same goal), keeps what

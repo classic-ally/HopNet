@@ -496,6 +496,7 @@ fn create_test_app_state_on_manager(
         port: 3000,
         test_mode: true,
         last_sweep: Arc::new(std::sync::Mutex::new(None)),
+        sweep_progress: Arc::new(std::sync::Mutex::new(None)),
         last_tick: Arc::new(std::sync::Mutex::new(None)),
         comms,
         setup_complete,
