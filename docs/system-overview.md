@@ -603,10 +603,12 @@ apply functions inside consensus handlers.
       sweep never deletes this node's own unconfirmed upload: every
       `api::put` site ledgers each fragment before its file is written
       (node-local upload ledger, storage step 0006, storage@6), a
-      ledgered rowless file is held for up to 14 days and retired when
-      its row lands, after which it is reclaimed as an ordinary orphan;
-      stuck uploads are reported under `held` and the owner can purge
-      them early (consensus-bugs.md 20, 2026.10.11). The
+      ledgered rowless file is held for 14 days (never retired by its
+      row landing) and then reclaimed as an ordinary orphan, every
+      orphan unlink re-checks for a row inside the write transaction, a
+      failed put abandons its files, and stuck uploads are reported
+      under `held` for the owner to purge early (consensus-bugs.md 20,
+      2026.10.11). The
       pull pipeline (2026.10.8): a planner walks the whole in-flight set
       (the tick's LIMIT-64 kick had re-sent the same 64 blobs forever
       once one transition gave every blob the same goal), keeps what

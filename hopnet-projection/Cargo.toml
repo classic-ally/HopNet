@@ -8,11 +8,11 @@ description = "HopNet projection seam: the transaction-handler contract, change 
 
 [dependencies]
 hopnet-common = { path = "../common", features = ["database"] }
-# Default features only (no engine): BlobStreamer's vocabulary types
-# (BlobManifest, StorageError) are un-gated. RFC-016 layering decision:
-# projection → storage, so blob streaming can live in HostCapabilities;
-# consequence: hopnet-storage must never depend on hopnet-projection.
-hopnet-storage = { path = "../hopnet-storage" }
+# RFC-016 layering decision: projection → storage, so blob streaming can
+# live in HostCapabilities; consequence: hopnet-storage must never depend
+# on hopnet-projection. The engine feature is for `host::put_own_upload`,
+# the one ingest wrapper every projection's put goes through.
+hopnet-storage = { path = "../hopnet-storage", features = ["engine"] }
 # Default features only (no shell/tokio): the canonical consensus-height
 # read, exposed here so projections dep ONLY hopnet-projection (RFC-017
 # north star) instead of growing their own consensus edges.
@@ -33,7 +33,11 @@ parking_lot = "0.12.5"
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.45.1", features = ["sync"] }
+tokio = { version = "1.45.1", features = ["sync", "rt"] }
 tokio-stream = "0.1.17"
 tracing = "0.1"
 x25519-dalek = { version = "2.0.1", features = ["serde", "static_secrets"] }
+
+[dev-dependencies]
+tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"] }
+tempfile = "3"

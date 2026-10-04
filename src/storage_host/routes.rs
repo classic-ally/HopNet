@@ -589,7 +589,7 @@ pub async fn post_purge_held_uploads(
         "Purge of {} held uploads requested by user {uid}",
         request.blob_ids.len()
     );
-    match super::jobs::purge_held_uploads(&app_state, &request.blob_ids) {
+    match super::jobs::purge_held_uploads(&app_state, request.blob_ids).await {
         Ok(report) => (StatusCode::OK, Json(report)).into_response(),
         Err(e) => {
             tracing::error!("Purge of held uploads failed: {e}");

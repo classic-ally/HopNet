@@ -790,10 +790,14 @@ optimization and carries no proof obligation.
     `hopnet_storage_local_uploads` (storage step 0006, storage@6,
     frozen `PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION` for storage@5
     artifacts) before each fragment file is written, the sweep holds a
-    ledgered rowless file for up to 14 days (reported as
-    `orphans_held`; `LOCAL_UPLOAD_RETENTION_SECS`), retires the entry
-    once the row lands, and expires it past the retention, after which
-    the file is an ordinary orphan (consensus-bugs 20). The two-call
+    ledgered rowless file for 14 days (reported as `orphans_held`;
+    `LOCAL_UPLOAD_RETENTION_SECS`) and then expires the hold, after
+    which the file is an ordinary orphan; a hold is never retired by
+    its row landing (that would race the orphan snapshot and expose the
+    file to a later re-import without the row), and every orphan
+    unlink re-checks for a row and a hold inside the write transaction
+    (consensus-bugs 20). A put that fails part-way abandons its blob:
+    holds released, rowless files unlinked. The two-call
     scan/delete API and its process-memory scan cache die; the manual
     route becomes a report of the sweep's last findings plus the held
     uploads by blob, and `POST /maintenance/orphaned-fragments/purge-held`
@@ -1212,15 +1216,24 @@ optimization and carries no proof obligation.
     `hopnet_storage_local_uploads` names it: the node's own uploads,
     recorded per blob by a hook inside `put` before each batch of
     fragment files is written (so a multi-hour upload is covered from
-    its first chunk), held for up to 14 days
-    (`LOCAL_UPLOAD_RETENTION_SECS`, env
-    `HOPNET_STORAGE_LOCAL_UPLOAD_RETENTION_SECS`), retired by SQL once
-    the row lands whatever became of the file, and expired past the
-    retention into ordinary orphans. Stuck uploads are visible under
-    `held` on the orphan route; the node's owner can purge them early
-    (`purge-held`, by blob id), which deletes a file only when it has
-    no row and no other upload holds it, in the same transaction.
-    Storage step 0006 moves the hashed format_version to 6; storage@5
+    its first chunk), held for 14 days (`LOCAL_UPLOAD_RETENTION_SECS`,
+    env `HOPNET_STORAGE_LOCAL_UPLOAD_RETENTION_SECS`) and then expired
+    into ordinary orphans. A hold is never retired by its row landing:
+    a rowed fragment is ordinary for placement, eviction and surplus
+    release, the ledger only shields orphan deletion, and retiring on
+    the row would race the sweep's orphan snapshot and expose the file
+    to a later staged join importing an inventory without the row. The
+    one unlink primitive (`store::delete_unclaimed_fragments`) re-checks
+    each file for a row and a hold inside a write transaction, in
+    batches of 256, for the sweep, the owner's purge and an abandoned
+    put alike. A put that fails part-way (`host::put_own_upload`)
+    releases its blob's holds and unlinks its rowless files. Stuck
+    uploads are visible under `held` on the orphan route (rowless
+    computed at read time); the node's owner can purge them early
+    (`purge-held`, by blob id, on the blocking pool), which skips and
+    reports a blob whose newest ledger batch is younger than the orphan
+    grace (it may still be streaming). Storage step 0006 moves the
+    hashed format_version to 6; storage@5
     artifacts import through the frozen
     `PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION`.
   - Pull pipeline (2026-10-03, branch `pull-pipeline` on

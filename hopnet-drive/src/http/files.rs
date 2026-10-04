@@ -60,8 +60,9 @@ pub fn router<S: Clone + Send + Sync + 'static>(state: DriveState) -> Router<S> 
 /// the wire sub-payload that rides the drive envelope. The caller attaches
 /// the recipient wraps (`access`). The fragments are on disk long before
 /// the caller's transaction is signed, so each batch is ledgered in
-/// `ledger` as this node's own upload before its files are written
-/// (`record_own_upload`), and the sweep holds them until their rows land.
+/// `ledger` as this node's own upload before its files are written and a
+/// failed put is abandoned (`hopnet_projection::host::put_own_upload`); the
+/// sweep holds the ledgered files until the retention.
 pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
     source: R,
     file_size: usize,
@@ -70,13 +71,13 @@ pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
     fragments_dir: &str,
     ledger: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
 ) -> Result<hopnet_storage::store::BlobInsertOp, StatusCode> {
-    let outcome = hopnet_storage::api::put_with(
+    let outcome = hopnet_projection::host::put_own_upload(
+        ledger,
+        fragments_dir,
+        dataid.clone(),
         source,
         file_size,
-        dataid.clone(),
         per_file_key,
-        fragments_dir,
-        hopnet_projection::host::upload_ledger_hook(ledger.clone(), dataid.clone()),
     )
     .await
     .map_err(|e| match e {

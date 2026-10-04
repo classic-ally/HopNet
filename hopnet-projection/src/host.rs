@@ -171,14 +171,99 @@ impl HostCapabilities {
     }
 }
 
+/// The host ingest: `api::put_with` under the upload-ledger hook, and the
+/// clean-up when it fails. Every site that writes fragments before their
+/// `fragment_hashes` rows exist goes through here (the drive's
+/// `process_uploaded_file`, the photos `Submitter`). Each batch of
+/// fragments is ledgered as this node's own upload before its files are
+/// written, so the sweep holds the rowless files instead of deleting them
+/// as orphans (consensus-bugs 20). A put that fails part-way — the client
+/// disconnected, a read error, no space, a ledger write refused — would
+/// otherwise leave its first chunks held for the whole retention, so the
+/// blob is abandoned: its holds released and its files unlinked, each
+/// re-checked for a row and another upload's hold first. The put's error
+/// is returned either way; the client retries.
+pub async fn put_own_upload<R: tokio::io::AsyncRead + Unpin>(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    fragments_dir: &str,
+    blob_id: hopnet_storage::BlobId,
+    source: R,
+    file_size: usize,
+    per_blob_key: &chacha20poly1305::Key,
+) -> Result<hopnet_storage::api::PutOutcome, hopnet_storage::StorageError> {
+    let outcome = hopnet_storage::api::put_with(
+        source,
+        file_size,
+        blob_id.clone(),
+        per_blob_key,
+        fragments_dir,
+        upload_ledger_hook(pool.clone(), blob_id.clone()),
+    )
+    .await;
+    if outcome.is_err() {
+        match abandon_own_upload(pool.clone(), fragments_dir.to_owned(), blob_id.clone()).await {
+            Ok(unlinked) => tracing::info!(%blob_id, unlinked, "abandoned a failed upload"),
+            Err(e) => {
+                tracing::warn!(%blob_id, "failed upload not abandoned, held until the retention: {e}")
+            }
+        }
+    }
+    outcome
+}
+
+/// Release a failed put's ledger holds and unlink its fragments that have
+/// no `fragment_hashes` row and no other upload's hold, on the blocking
+/// pool, in batches of `UNLINK_BATCH` write transactions. Returns the
+/// files unlinked.
+pub async fn abandon_own_upload(
+    pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    fragments_dir: String,
+    blob_id: hopnet_storage::BlobId,
+) -> Result<usize, String> {
+    tokio::task::spawn_blocking(move || {
+        abandon_own_upload_blocking(&pool, &fragments_dir, &blob_id)
+    })
+    .await
+    .map_err(|e| format!("abandon task: {e}"))?
+}
+
+/// Rowless files unlinked per write transaction (the host's sweep and
+/// purge use the same bound).
+pub const UNLINK_BATCH: usize = 256;
+
+fn abandon_own_upload_blocking(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    fragments_dir: &str,
+    blob_id: &hopnet_storage::BlobId,
+) -> Result<usize, String> {
+    let mut conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    let candidates = {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("tx: {e}"))?;
+        let candidates = hopnet_storage::store::release_local_uploads(&tx, blob_id)
+            .map_err(|e| format!("release: {e}"))?;
+        crate::dbstats::commit_timed(tx).map_err(|e| format!("release commit: {e}"))?;
+        candidates
+    };
+    let mut unlinked = 0;
+    for batch in candidates.chunks(UNLINK_BATCH) {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("tx: {e}"))?;
+        unlinked += hopnet_storage::store::delete_unclaimed_fragments(&tx, fragments_dir, batch)
+            .map_err(|e| format!("unlink re-check: {e}"))?
+            .hashes
+            .len();
+        crate::dbstats::commit_timed(tx).map_err(|e| format!("unlink commit: {e}"))?;
+    }
+    Ok(unlinked)
+}
+
 /// The `api::put_with` hook for a host ingest: ledgers each batch of
-/// fragments as this node's own upload before their files are written.
-/// Every site that writes fragments before their `fragment_hashes` rows
-/// exist uses it (the drive's `process_uploaded_file`, the photos
-/// `Submitter`); the sweep then holds the rowless files instead of
-/// deleting them as orphans, until the rows land (consensus-bugs 20). A
-/// ledger failure aborts the put, so the client retries rather than
-/// proceeding with files nothing protects.
+/// fragments as this node's own upload before their files are written
+/// (`put_own_upload`). A ledger failure aborts the put, so the client
+/// retries rather than proceeding with files nothing protects.
 pub fn upload_ledger_hook(
     pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     blob_id: hopnet_storage::BlobId,
@@ -237,5 +322,97 @@ pub async fn write_gate(
         Ok(()) => Ok(next.run(req).await),
         Err(WriteCheckError::Denied(_)) => Err(StatusCode::CONFLICT),
         Err(WriteCheckError::Internal) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A plaintext source that streams `good` zero bytes and then fails,
+    /// the way a client disconnect does.
+    struct Disconnects {
+        left: usize,
+    }
+
+    impl tokio::io::AsyncRead for Disconnects {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.left == 0 {
+                return Poll::Ready(Err(std::io::Error::other("client went away")));
+            }
+            let n = self.left.min(buf.remaining());
+            buf.put_slice(&vec![0u8; n]);
+            self.left -= n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn storage_pool() -> r2d2::Pool<r2d2_sqlite::SqliteConnectionManager> {
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .build(r2d2_sqlite::SqliteConnectionManager::memory())
+            .unwrap();
+        let chain = &hopnet_storage::store::CHAIN;
+        hopnet_common::chain::replay(&pool.get().unwrap(), chain, chain.head()).unwrap();
+        pool
+    }
+
+    // Impact: a put that fails after its first chunk (client disconnect,
+    // read error, no space, a later ledger write refused) has thirty
+    // ledgered files on disk that nothing will ever give a row; left
+    // alone they would be held for the whole retention.
+    // Should: on a failed put, release the blob's holds and unlink its
+    // rowless files, and still return the put's own error.
+    // Should not: leave a ledger entry or a fragment file behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_put_that_fails_part_way_abandons_its_ledgered_fragments() {
+        let dir = tempfile::tempdir().unwrap();
+        let frags = dir.path().join("fragments").to_string_lossy().into_owned();
+        let pool = storage_pool();
+        let blob_id = hopnet_storage::BlobId::new(None);
+        let key: chacha20poly1305::Key = [0x42u8; 32].into();
+        // One full chunk streams and is encoded, ledgered and written;
+        // the source fails inside the second.
+        let one_chunk = hopnet_storage::rs::CHUNK_SIZE;
+        let err = put_own_upload(
+            &pool,
+            &frags,
+            blob_id.clone(),
+            Disconnects {
+                left: one_chunk + 1024,
+            },
+            one_chunk + 4096,
+            &key,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, hopnet_storage::StorageError::Read(_)),
+            "{err:?}"
+        );
+
+        let conn = pool.get().unwrap();
+        assert!(
+            hopnet_storage::store::held_local_uploads(&conn)
+                .unwrap()
+                .is_empty(),
+            "no hold survives the failed put"
+        );
+        assert_eq!(
+            hopnet_storage::store::newest_local_upload(&conn, &blob_id).unwrap(),
+            None
+        );
+        assert!(
+            hopnet_storage::fragstore::scan_fragments_detailed(&frags)
+                .unwrap()
+                .is_empty(),
+            "no fragment file survives the failed put"
+        );
     }
 }
