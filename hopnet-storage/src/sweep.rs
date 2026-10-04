@@ -813,11 +813,9 @@ mod tests {
             .collect();
         seen.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         assert_eq!(seen, present);
-        assert!(
-            pages
-                .iter()
-                .all(|p| p.node_id == 2 && p.height == 77 && p.suspect.is_empty())
-        );
+        assert!(pages
+            .iter()
+            .all(|p| p.node_id == 2 && p.height == 77 && p.suspect.is_empty()));
         assert!(attestation_pages(2, 77, &[], 4).is_empty());
     }
 
