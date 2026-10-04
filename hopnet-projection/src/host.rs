@@ -10,8 +10,11 @@
 //! dyn-object style (boxed futures) deliberately: these hang off axum/task
 //! state structs and cross one box per REQUEST, never per byte.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -191,24 +194,139 @@ pub async fn put_own_upload<R: tokio::io::AsyncRead + Unpin>(
     file_size: usize,
     per_blob_key: &chacha20poly1305::Key,
 ) -> Result<hopnet_storage::api::PutOutcome, hopnet_storage::StorageError> {
+    let mut guard = UploadGuard::new(pool.clone(), fragments_dir.to_owned(), blob_id.clone());
     let outcome = hopnet_storage::api::put_with(
         source,
         file_size,
         blob_id.clone(),
         per_blob_key,
         fragments_dir,
-        upload_ledger_hook(pool.clone(), blob_id.clone()),
+        upload_ledger_hook(
+            pool.clone(),
+            fragments_dir.to_owned(),
+            blob_id.clone(),
+            guard.abandoned.clone(),
+        ),
     )
     .await;
-    if outcome.is_err() {
-        match abandon_own_upload(pool.clone(), fragments_dir.to_owned(), blob_id.clone()).await {
-            Ok(unlinked) => tracing::info!(%blob_id, unlinked, "abandoned a failed upload"),
-            Err(e) => {
-                tracing::warn!(%blob_id, "failed upload not abandoned, held until the retention: {e}")
+    match &outcome {
+        Ok(_) => guard.settled(),
+        Err(_) => {
+            // Abandon here, awaited, so the caller's error response follows
+            // the clean-up; the guard then has nothing left to do.
+            guard.abandoned.store(true, Ordering::SeqCst);
+            match abandon_own_upload(pool.clone(), fragments_dir.to_owned(), blob_id.clone()).await
+            {
+                Ok(unlinked) => tracing::info!(%blob_id, unlinked, "abandoned a failed upload"),
+                Err(e) => tracing::warn!(
+                    %blob_id,
+                    "failed upload not abandoned, held until the retention: {e}"
+                ),
             }
+            guard.settled();
         }
     }
     outcome
+}
+
+/// Blob ids with a put in flight in this process — the exact signal that
+/// an upload is live, which no timestamp heuristic gives (a slow client can
+/// take longer than the orphan grace per 40 MB chunk). Registered for the
+/// life of `put_own_upload`'s guard; a put never outlives the process, so
+/// after a restart nothing is live and every hold is purgeable.
+static LIVE_UPLOADS: Mutex<Option<HashSet<hopnet_storage::BlobId>>> = Mutex::new(None);
+
+fn live_uploads() -> std::sync::MutexGuard<'static, Option<HashSet<hopnet_storage::BlobId>>> {
+    LIVE_UPLOADS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Is a put for `blob_id` in flight in this process?
+pub fn upload_is_live(blob_id: &hopnet_storage::BlobId) -> bool {
+    live_uploads()
+        .as_ref()
+        .is_some_and(|live| live.contains(blob_id))
+}
+
+/// A blob's registration as a live upload, for its holder's lifetime.
+pub struct LiveUpload(hopnet_storage::BlobId);
+
+impl LiveUpload {
+    pub fn register(blob_id: hopnet_storage::BlobId) -> Self {
+        live_uploads()
+            .get_or_insert_with(HashSet::new)
+            .insert(blob_id.clone());
+        LiveUpload(blob_id)
+    }
+}
+
+impl Drop for LiveUpload {
+    fn drop(&mut self) {
+        if let Some(live) = live_uploads().as_mut() {
+            live.remove(&self.0);
+        }
+    }
+}
+
+/// What outlives a dropped `put_own_upload` future. A client disconnect
+/// makes hyper drop the handler mid-stream: the future's `Err` path never
+/// runs, while the detached chunk task keeps encoding. Unless `settled`
+/// (the put returned), dropping the guard marks the upload abandoned — the
+/// hook refuses the detached task's next batch — and schedules the abandon
+/// on the blocking pool (inline when no runtime is at hand).
+struct UploadGuard {
+    pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    fragments_dir: String,
+    blob_id: hopnet_storage::BlobId,
+    abandoned: Arc<AtomicBool>,
+    settled: bool,
+    _live: LiveUpload,
+}
+
+impl UploadGuard {
+    fn new(
+        pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+        fragments_dir: String,
+        blob_id: hopnet_storage::BlobId,
+    ) -> Self {
+        UploadGuard {
+            pool,
+            fragments_dir,
+            _live: LiveUpload::register(blob_id.clone()),
+            blob_id,
+            abandoned: Arc::new(AtomicBool::new(false)),
+            settled: false,
+        }
+    }
+
+    fn settled(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for UploadGuard {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.abandoned.store(true, Ordering::SeqCst);
+        let pool = self.pool.clone();
+        let dir = std::mem::take(&mut self.fragments_dir);
+        let blob_id = self.blob_id.clone();
+        tracing::info!(%blob_id, "upload dropped mid-stream; abandoning");
+        let abandon = move || match abandon_own_upload_blocking(&pool, &dir, &blob_id) {
+            Ok(unlinked) => tracing::info!(%blob_id, unlinked, "abandoned a dropped upload"),
+            Err(e) => tracing::warn!(
+                %blob_id,
+                "dropped upload not abandoned, held until the retention: {e}"
+            ),
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(abandon);
+            }
+            Err(_) => abandon(),
+        }
+    }
 }
 
 /// Release a failed put's ledger holds and unlink its fragments that have
@@ -227,9 +345,28 @@ pub async fn abandon_own_upload(
     .map_err(|e| format!("abandon task: {e}"))?
 }
 
-/// Rowless files unlinked per write transaction (the host's sweep and
-/// purge use the same bound).
-pub const UNLINK_BATCH: usize = 256;
+/// Rowless files unlinked per write transaction, by the host's sweep and
+/// purge and by an abandoned put: small, because the IMMEDIATE transaction
+/// holds the database's write lock that consensus apply also needs
+/// (busy_timeout 5 s), and a cold disk's unlinks are not quick.
+pub const UNLINK_BATCH: usize = 32;
+
+/// `stat` outside the lock, then re-check and unlink inside one write
+/// transaction, for one batch of candidates.
+fn unlink_batch(
+    conn: &mut rusqlite::Connection,
+    fragments_dir: &str,
+    batch: &[hopnet_storage::Blake3Hash],
+) -> Result<hopnet_storage::store::DeletedFragments, String> {
+    let sized = hopnet_storage::store::stat_fragments(fragments_dir, batch);
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("tx: {e}"))?;
+    let gone = hopnet_storage::store::delete_unclaimed_fragments(&tx, fragments_dir, &sized)
+        .map_err(|e| format!("unlink re-check: {e}"))?;
+    crate::dbstats::commit_timed(tx).map_err(|e| format!("unlink commit: {e}"))?;
+    Ok(gone)
+}
 
 fn abandon_own_upload_blocking(
     pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
@@ -248,31 +385,112 @@ fn abandon_own_upload_blocking(
     };
     let mut unlinked = 0;
     for batch in candidates.chunks(UNLINK_BATCH) {
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| format!("tx: {e}"))?;
-        unlinked += hopnet_storage::store::delete_unclaimed_fragments(&tx, fragments_dir, batch)
-            .map_err(|e| format!("unlink re-check: {e}"))?
-            .hashes
-            .len();
-        crate::dbstats::commit_timed(tx).map_err(|e| format!("unlink commit: {e}"))?;
+        unlinked += unlink_batch(&mut conn, fragments_dir, batch)?.hashes.len();
     }
     Ok(unlinked)
 }
 
+/// A ledger write's failure, by whether waiting could help.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerError {
+    /// A pool checkout timed out or SQLite was busy/locked: another writer
+    /// held the database for a moment. Retried under `LEDGER_RETRY_BUDGET`.
+    Transient(String),
+    /// Anything else; fails the put at once.
+    Fatal(String),
+}
+
+impl std::fmt::Display for LedgerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LedgerError::Transient(e) => write!(f, "transient: {e}"),
+            LedgerError::Fatal(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+fn ledger_sqlite_error(e: rusqlite::Error, what: &str) -> LedgerError {
+    match e.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy) | Some(rusqlite::ErrorCode::DatabaseLocked) => {
+            LedgerError::Transient(format!("{what}: {e}"))
+        }
+        _ => LedgerError::Fatal(format!("{what}: {e}")),
+    }
+}
+
+/// How long one ledger batch keeps retrying transient failures before the
+/// put fails. A multi-GB put must not be thrown away because a pool
+/// checkout (2 s) or a write lock (5 s) was missed once.
+pub const LEDGER_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+const LEDGER_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(50);
+const LEDGER_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run `op` until it succeeds or fails fatally, sleeping between transient
+/// failures with exponential backoff (50 ms doubling, capped at 5 s) until
+/// `budget` is spent. `sleep` is injected so the policy is testable.
+pub fn retry_transient<T>(
+    mut op: impl FnMut() -> Result<T, LedgerError>,
+    budget: std::time::Duration,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<T, LedgerError> {
+    let mut spent = std::time::Duration::ZERO;
+    let mut wait = LEDGER_RETRY_FIRST;
+    loop {
+        match op() {
+            Err(LedgerError::Transient(e)) if spent < budget => {
+                let wait_now = wait.min(budget - spent);
+                tracing::debug!("ledger write busy, retrying in {wait_now:?}: {e}");
+                sleep(wait_now);
+                spent += wait_now;
+                wait = (wait * 2).min(LEDGER_RETRY_CAP);
+            }
+            other => return other,
+        }
+    }
+}
+
 /// The `api::put_with` hook for a host ingest: ledgers each batch of
 /// fragments as this node's own upload before their files are written
-/// (`put_own_upload`). A ledger failure aborts the put, so the client
-/// retries rather than proceeding with files nothing protects.
+/// (`put_own_upload`), retrying transient failures under
+/// `LEDGER_RETRY_BUDGET` (it runs on a blocking thread). Once the upload
+/// is `abandoned` (the future was dropped) it refuses the batch, so the
+/// detached chunk task stops ledgering and writing, and unlinks the one
+/// batch it let through last — the abandon may have run before those files
+/// landed. A ledger failure aborts the put, so the client retries rather
+/// than proceeding with files nothing protects.
 pub fn upload_ledger_hook(
     pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    fragments_dir: String,
     blob_id: hopnet_storage::BlobId,
+    abandoned: Arc<AtomicBool>,
 ) -> impl FnMut(&[hopnet_storage::Blake3Hash]) -> Result<(), hopnet_storage::StorageError> + Send + 'static
 {
+    let mut last_batch: Vec<hopnet_storage::Blake3Hash> = Vec::new();
     move |hashes| {
-        record_own_upload(&pool, &blob_id, hashes)
-            .map(|_| ())
-            .map_err(hopnet_storage::StorageError::Host)
+        if abandoned.load(Ordering::SeqCst) {
+            if !last_batch.is_empty() {
+                let unlinked = pool
+                    .get()
+                    .map_err(|e| format!("pool: {e}"))
+                    .and_then(|mut conn| unlink_batch(&mut conn, &fragments_dir, &last_batch));
+                if let Err(e) = unlinked {
+                    tracing::warn!(%blob_id, "abandoned upload's last batch not unlinked: {e}");
+                }
+            }
+            last_batch.clear();
+            return Err(hopnet_storage::StorageError::Host(
+                "upload abandoned".into(),
+            ));
+        }
+        retry_transient(
+            || record_own_upload(&pool, &blob_id, hashes),
+            LEDGER_RETRY_BUDGET,
+            std::thread::sleep,
+        )
+        .map_err(|e| hopnet_storage::StorageError::Host(e.to_string()))?;
+        last_batch.clear();
+        last_batch.extend_from_slice(hashes);
+        Ok(())
     }
 }
 
@@ -282,16 +500,21 @@ pub fn record_own_upload<'a>(
     pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     blob_id: &hopnet_storage::BlobId,
     fragment_hashes: impl IntoIterator<Item = &'a hopnet_storage::Blake3Hash>,
-) -> Result<usize, String> {
+) -> Result<usize, LedgerError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let mut conn = pool.get().map_err(|e| format!("pool: {e}"))?;
-    let tx = conn.transaction().map_err(|e| format!("tx: {e}"))?;
+    // A pool checkout fails only by timing out: transient by definition.
+    let mut conn = pool
+        .get()
+        .map_err(|e| LedgerError::Transient(format!("pool: {e}")))?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| ledger_sqlite_error(e, "tx"))?;
     let written = hopnet_storage::store::record_local_uploads(&tx, blob_id, fragment_hashes, now)
-        .map_err(|e| format!("upload ledger: {e}"))?;
-    crate::dbstats::commit_timed(tx).map_err(|e| format!("upload ledger commit: {e}"))?;
+        .map_err(|e| ledger_sqlite_error(e, "upload ledger"))?;
+    crate::dbstats::commit_timed(tx).map_err(|e| ledger_sqlite_error(e, "upload ledger commit"))?;
     Ok(written)
 }
 
@@ -404,15 +627,172 @@ mod tests {
                 .is_empty(),
             "no hold survives the failed put"
         );
-        assert_eq!(
-            hopnet_storage::store::newest_local_upload(&conn, &blob_id).unwrap(),
-            None
-        );
+        assert!(!upload_is_live(&blob_id), "the put is over");
         assert!(
             hopnet_storage::fragstore::scan_fragments_detailed(&frags)
                 .unwrap()
                 .is_empty(),
             "no fragment file survives the failed put"
         );
+    }
+
+    /// A source that streams one full chunk and then never resolves, the
+    /// way a stalled client does.
+    struct Stalls {
+        left: usize,
+    }
+
+    impl tokio::io::AsyncRead for Stalls {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.left == 0 {
+                return Poll::Pending;
+            }
+            let n = self.left.min(buf.remaining());
+            buf.put_slice(&vec![0u8; n]);
+            self.left -= n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // Impact: a client disconnect makes hyper drop the handler future; the
+    // put's Err path never runs, the detached chunk task keeps writing, and
+    // thirty ledgered files per chunk would be held for the retention.
+    // Should: register the blob as live while the put runs, and on the
+    // future being dropped mid-stream release its holds, unlink its files
+    // and deregister it, without the caller doing anything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_put_future_abandons_its_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let frags = dir.path().join("fragments").to_string_lossy().into_owned();
+        let pool = storage_pool();
+        let blob_id = hopnet_storage::BlobId::new(None);
+        let key: chacha20poly1305::Key = [0x42u8; 32].into();
+        let one_chunk = hopnet_storage::rs::CHUNK_SIZE;
+
+        let put = put_own_upload(
+            &pool,
+            &frags,
+            blob_id.clone(),
+            Stalls {
+                left: one_chunk + 1024,
+            },
+            one_chunk + 4096,
+            &key,
+        );
+        // The first chunk is encoded, ledgered and written; the source then
+        // stalls and the timeout drops the future.
+        let dropped = tokio::time::timeout(std::time::Duration::from_secs(20), put).await;
+        assert!(dropped.is_err(), "the put must not finish on its own");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let held = hopnet_storage::store::held_local_uploads(&pool.get().unwrap()).unwrap();
+            let files = hopnet_storage::fragstore::scan_fragments_detailed(&frags).unwrap();
+            if held.is_empty() && files.is_empty() && !upload_is_live(&blob_id) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "still held: {} entries, {} files on disk, live: {}",
+                held.len(),
+                files.len(),
+                upload_is_live(&blob_id)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    // Impact: each ledger batch needs a pool checkout and the write lock; a
+    // single missed checkout or SQLITE_BUSY would otherwise throw away a
+    // multi-GB put that was minutes in.
+    // Should: retry a transiently failing write with growing backoff until
+    // it succeeds, within the budget.
+    // Should: give up once the budget is spent, and fail a fatal error at
+    // once without sleeping.
+    #[test]
+    fn ledger_writes_retry_transient_failures_with_backoff() {
+        let mut failures_left = 3;
+        let mut slept = Vec::new();
+        let written = retry_transient(
+            || {
+                if failures_left > 0 {
+                    failures_left -= 1;
+                    Err(LedgerError::Transient("busy".into()))
+                } else {
+                    Ok(10usize)
+                }
+            },
+            LEDGER_RETRY_BUDGET,
+            |wait| slept.push(wait),
+        );
+        assert_eq!(written, Ok(10));
+        assert_eq!(
+            slept,
+            vec![
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(200),
+            ]
+        );
+
+        let mut slept = std::time::Duration::ZERO;
+        let exhausted = retry_transient(
+            || Err::<(), _>(LedgerError::Transient("busy".into())),
+            std::time::Duration::from_secs(1),
+            |wait| slept += wait,
+        );
+        assert!(matches!(exhausted, Err(LedgerError::Transient(_))));
+        assert_eq!(
+            slept,
+            std::time::Duration::from_secs(1),
+            "the whole budget, no more"
+        );
+
+        let mut sleeps = 0;
+        let fatal = retry_transient(
+            || Err::<(), _>(LedgerError::Fatal("constraint".into())),
+            LEDGER_RETRY_BUDGET,
+            |_| sleeps += 1,
+        );
+        assert_eq!(fatal, Err(LedgerError::Fatal("constraint".into())));
+        assert_eq!(sleeps, 0);
+    }
+
+    // Should: classify a pool checkout failure and SQLITE_BUSY/LOCKED as
+    // transient, and any other SQLite error as fatal.
+    #[test]
+    fn ledger_errors_are_transient_only_when_waiting_could_help() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(matches!(
+            ledger_sqlite_error(busy, "tx"),
+            LedgerError::Transient(_)
+        ));
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+        assert!(matches!(
+            ledger_sqlite_error(locked, "tx"),
+            LedgerError::Transient(_)
+        ));
+        let constraint = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            None,
+        );
+        assert!(matches!(
+            ledger_sqlite_error(constraint, "tx"),
+            LedgerError::Fatal(_)
+        ));
+        assert!(matches!(
+            ledger_sqlite_error(rusqlite::Error::QueryReturnedNoRows, "tx"),
+            LedgerError::Fatal(_)
+        ));
     }
 }

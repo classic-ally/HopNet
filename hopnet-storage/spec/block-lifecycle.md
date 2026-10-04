@@ -1226,14 +1226,21 @@ optimization and carries no proof obligation.
     one unlink primitive (`store::delete_unclaimed_fragments`) re-checks
     each file for a row and a hold inside a write transaction, in
     batches of 256, for the sweep, the owner's purge and an abandoned
-    put alike. A put that fails part-way (`host::put_own_upload`)
-    releases its blob's holds and unlinks its rowless files. Stuck
-    uploads are visible under `held` on the orphan route (rowless
-    computed at read time); the node's owner can purge them early
-    (`purge-held`, by blob id, on the blocking pool), which skips and
-    reports a blob whose newest ledger batch is younger than the orphan
-    grace (it may still be streaming). Storage step 0006 moves the
-    hashed format_version to 6; storage@5
+    put alike, `stat`s done outside the lock and the batch kept to 32 so
+    consensus apply never waits long for the write lock; a busy database
+    skips the batch (counted as `orphan_batches_skipped`) and never
+    fails the shard. A put that fails part-way, or whose future is
+    dropped by a client disconnect (`host::put_own_upload`'s guard),
+    releases its blob's holds and unlinks its rowless files; the hook
+    retries transient ledger failures (pool checkout, SQLITE_BUSY) for
+    up to a minute before the put fails. Stuck uploads are visible under
+    `held` on the orphan route (rowless computed at read time, grouped
+    by blob in SQL, capped at 1000 blobs with totals, counts not bytes);
+    the node's owner can purge them early (`purge-held`, by blob id, on
+    the blocking pool), which skips and reports a blob whose put is in
+    flight in this process (an exact in-process registry; a put never
+    outlives the process, so after a restart every hold is purgeable).
+    Storage step 0006 moves the hashed format_version to 6; storage@5
     artifacts import through the frozen
     `PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION`.
   - Pull pipeline (2026-10-03, branch `pull-pipeline` on

@@ -156,6 +156,11 @@ pub struct SweepReport {
     /// retention, so their files are ordinary orphans from here on.
     #[serde(default)]
     pub uploads_expired: usize,
+    /// Orphan steps (a shard's ledger read, or one unlink batch) skipped
+    /// because the database was busy or locked; those files wait for the
+    /// next rotation. Never fails the shard.
+    #[serde(default)]
+    pub orphan_batches_skipped: usize,
     pub young_orphans: usize,
     pub corrupt_deleted: usize,
     /// Scrub-slice files the read failed on for a reason other than

@@ -606,7 +606,7 @@ fn finish_rotation(
         .map(|tip| tip.saturating_sub(started_height))
         .unwrap_or(0);
     tracing::info!(
-        "sweep: rotation of {} shards in {}s ({} heights): {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} orphans held (own uploads), {} held uploads expired, {} corrupt deleted, {} surplus released, {} temp files deleted, {} belief pages ({} failed), {} attestation pages ({} failed), {} shards failed",
+        "sweep: rotation of {} shards in {}s ({} heights): {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} orphans held (own uploads), {} held uploads expired, {} orphan batches skipped (busy), {} corrupt deleted, {} surplus released, {} temp files deleted, {} belief pages ({} failed), {} attestation pages ({} failed), {} shards failed",
         report.shards,
         report.rotation_secs,
         report.rotation_heights,
@@ -617,6 +617,7 @@ fn finish_rotation(
         report.orphans_deleted,
         report.orphans_held,
         report.uploads_expired,
+        report.orphan_batches_skipped,
         report.corrupt_deleted,
         report.surplus_released,
         report.temps_deleted,
@@ -706,21 +707,15 @@ pub(crate) async fn sweep_shard(
             Err(e) => tracing::warn!("sweep: delete temp file {} failed: {e}", path.display()),
         }
     }
-    let deleted = {
-        let mut conn = app_state
-            .db_pool
-            .get()
-            .map_err(|e| fail("pool", e.to_string()))?;
-        reap_orphans(
-            &mut conn,
-            &fragments_dir,
-            shard,
-            &diff,
-            local_upload_retention(),
-            report,
-        )
-        .map_err(|e| fail("orphans", e))?
-    };
+    let deleted = reap_orphans(
+        &app_state.db_pool,
+        &fragments_dir,
+        shard,
+        &diff,
+        local_upload_retention(),
+        report,
+    )
+    .await;
 
     // (4) Only a content hash mismatch is corruption; a file that vanished
     // or a read the OS refused is counted, never deleted or un-flagged.
@@ -819,7 +814,8 @@ pub(crate) async fn sweep_shard(
 
 /// Rowless files unlinked per write transaction, by the sweep's orphan
 /// step, the operator's purge and an abandoned put alike: each batch holds
-/// the database's write lock for its re-checks and unlinks only.
+/// the database's write lock for its re-checks and unlinks only, `stat`s
+/// done beforehand.
 pub use hopnet_projection::host::UNLINK_BATCH;
 
 /// Step 3's orphan half, the only place the sweep deletes a rowless file.
@@ -836,113 +832,134 @@ pub use hopnet_projection::host::UNLINK_BATCH;
 /// and a row that landed since makes the file an ordinary fragment, not an
 /// orphan. Holds are never retired by a row landing; they last until the
 /// retention. Returns the hashes deleted, which the scrub skips.
-pub(crate) fn reap_orphans(
-    conn: &mut rusqlite::Connection,
+///
+/// Every database and disk touch runs on the blocking pool, and nothing
+/// here fails the shard: a step the database refused (busy, locked, a pool
+/// checkout missed) is skipped and counted (`orphan_batches_skipped`), its
+/// files waiting for the next rotation, so the scrub, surplus release and
+/// the belief and attestation pages always run.
+pub(crate) async fn reap_orphans(
+    pool: &r2d2::Pool<crate::db::SqliteConnectionManager>,
     fragments_dir: &str,
     shard: u8,
     diff: &hopnet_storage::sweep::SweepDiff,
     retention_secs: u64,
     report: &mut hopnet_storage::sweep::SweepReport,
-) -> Result<Vec<hopnet_storage::Blake3Hash>, String> {
-    let ledger = {
-        let tx = conn.transaction().map_err(|e| format!("tx: {e}"))?;
-        let cutoff = unix_now().saturating_sub(retention_secs);
-        report.uploads_expired += hopnet_storage::store::expire_local_uploads(&tx, shard, cutoff)
-            .map_err(|e| format!("expire ledger: {e}"))?;
-        let ledger = hopnet_storage::store::local_uploads_in(&tx, shard)
-            .map_err(|e| format!("upload ledger: {e}"))?;
-        crate::db::shared::commit_timed(tx).map_err(|e| format!("ledger commit: {e}"))?;
-        ledger
+) -> Vec<hopnet_storage::Blake3Hash> {
+    let settle_pool = pool.clone();
+    let cutoff = unix_now().saturating_sub(retention_secs);
+    let settled = tokio::task::spawn_blocking(move || settle_ledger(&settle_pool, shard, cutoff))
+        .await
+        .unwrap_or_else(|e| Err(format!("ledger task: {e}")));
+    let ledger = match settled {
+        Ok((expired, ledger)) => {
+            report.uploads_expired += expired;
+            ledger
+        }
+        Err(e) => {
+            // No ledger, no deletions: without knowing the holds, every
+            // orphan is treated as held this visit.
+            tracing::warn!("sweep: shard {shard:02x} orphan step skipped: {e}");
+            report.orphan_batches_skipped += 1;
+            return Vec::new();
+        }
     };
     let (delete, held) = hopnet_storage::sweep::split_orphans(&diff.orphans, &ledger);
-    let mut deleted = Vec::with_capacity(delete.len());
-    for batch in delete.chunks(UNLINK_BATCH) {
-        let candidates: Vec<_> = batch.iter().map(|(hash, _)| *hash).collect();
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| format!("tx: {e}"))?;
-        let gone =
-            hopnet_storage::store::delete_unclaimed_fragments(&tx, fragments_dir, &candidates)
-                .map_err(|e| format!("orphan re-check: {e}"))?;
-        crate::db::shared::commit_timed(tx).map_err(|e| format!("orphan commit: {e}"))?;
-        report.orphans_deleted += gone.hashes.len();
-        report.orphan_bytes_freed = report.orphan_bytes_freed.saturating_add(gone.bytes);
-        deleted.extend(gone.hashes);
-    }
     for (_, size) in &held {
         report.orphans_held += 1;
         report.orphan_bytes_held = report.orphan_bytes_held.saturating_add(*size);
     }
-    Ok(deleted)
+    let mut deleted = Vec::with_capacity(delete.len());
+    for batch in delete.chunks(UNLINK_BATCH) {
+        let candidates: Vec<_> = batch.iter().map(|(hash, _)| *hash).collect();
+        let (batch_pool, dir) = (pool.clone(), fragments_dir.to_owned());
+        let unlinked =
+            tokio::task::spawn_blocking(move || unlink_batch(&batch_pool, &dir, &candidates))
+                .await
+                .unwrap_or_else(|e| Err(format!("unlink task: {e}")));
+        match unlinked {
+            Ok(gone) => {
+                report.orphans_deleted += gone.hashes.len();
+                report.orphan_bytes_freed = report.orphan_bytes_freed.saturating_add(gone.bytes);
+                deleted.extend(gone.hashes);
+            }
+            Err(e) => {
+                tracing::debug!("sweep: shard {shard:02x} orphan batch skipped: {e}");
+                report.orphan_batches_skipped += 1;
+            }
+        }
+    }
+    deleted
 }
 
-/// The own uploads the sweep is holding: ledger entries still without a
-/// `fragment_hashes` row, grouped by blob — the operator's handle for
-/// re-uploading, re-attesting or purging (`GET /maintenance/orphaned-fragments`,
-/// `held`).
-#[derive(Debug, Default, serde::Serialize)]
-pub struct HeldUploads {
-    pub blobs: Vec<HeldBlob>,
-    pub fragments: usize,
-    pub bytes: u64,
+/// Expire the shard's holds past `cutoff` and read what remains, in one
+/// transaction: `(expired, ledger)`.
+fn settle_ledger(
+    pool: &r2d2::Pool<crate::db::SqliteConnectionManager>,
+    shard: u8,
+    cutoff: u64,
+) -> Result<(usize, std::collections::HashSet<hopnet_storage::Blake3Hash>), String> {
+    let mut conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    let tx = conn.transaction().map_err(|e| format!("tx: {e}"))?;
+    let expired = hopnet_storage::store::expire_local_uploads(&tx, shard, cutoff)
+        .map_err(|e| format!("expire ledger: {e}"))?;
+    let ledger = hopnet_storage::store::local_uploads_in(&tx, shard)
+        .map_err(|e| format!("upload ledger: {e}"))?;
+    crate::db::shared::commit_timed(tx).map_err(|e| format!("ledger commit: {e}"))?;
+    Ok((expired, ledger))
 }
 
-#[derive(Debug, serde::Serialize)]
-pub struct HeldBlob {
-    pub blob_id: CustomUUID,
-    pub fragments: usize,
-    /// On-disk bytes of the held files (a ledgered file already gone
-    /// counts 0).
-    pub bytes: u64,
-    pub oldest_written_unix: i64,
+/// `stat` outside the lock, then re-check and unlink inside one write
+/// transaction, for one batch of rowless candidates.
+fn unlink_batch(
+    pool: &r2d2::Pool<crate::db::SqliteConnectionManager>,
+    fragments_dir: &str,
+    batch: &[hopnet_storage::Blake3Hash],
+) -> Result<hopnet_storage::store::DeletedFragments, String> {
+    let sized = hopnet_storage::store::stat_fragments(fragments_dir, batch);
+    let mut conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("tx: {e}"))?;
+    let gone = hopnet_storage::store::delete_unclaimed_fragments(&tx, fragments_dir, &sized)
+        .map_err(|e| format!("unlink re-check: {e}"))?;
+    crate::db::shared::commit_timed(tx).map_err(|e| format!("unlink commit: {e}"))?;
+    Ok(gone)
 }
+
+/// The most blobs the `held` listing shows; `total_blobs` says how many
+/// there are.
+pub const HELD_LISTING_LIMIT: usize = 1000;
 
 /// What `purge_held_uploads` did.
 #[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct PurgedUploads {
     /// Blobs whose holds were released.
     pub blobs: usize,
-    /// Blobs refused because their newest ledger batch is younger than the
-    /// orphan grace: the upload may still be streaming.
+    /// Blobs refused because a put for them is in flight in this process
+    /// (`hopnet_projection::host::upload_is_live`).
     pub skipped_streaming: Vec<CustomUUID>,
     pub fragments_deleted: usize,
     pub bytes_freed: u64,
 }
 
-fn fragment_file_size(fragments_dir: &str, hash: &hopnet_storage::Blake3Hash) -> u64 {
-    hopnet_storage::fragstore::create_fragment_path(fragments_dir, hash)
-        .ok()
-        .and_then(|dir| std::fs::metadata(format!("{dir}/{}", hash.to_hex())).ok())
-        .map_or(0, |m| m.len())
-}
-
-/// The `held` report: every ledger entry still rowless, grouped by blob,
-/// oldest blob first.
-pub fn held_uploads(app_state: &AppState) -> Result<HeldUploads, String> {
-    let entries = {
-        let conn = app_state.db_pool.get().map_err(|e| format!("pool: {e}"))?;
-        hopnet_storage::store::held_local_uploads(&conn).map_err(|e| format!("ledger: {e}"))?
-    };
-    let mut report = HeldUploads::default();
-    // Entries arrive ordered by age, so a blob's first entry is its oldest.
-    for entry in &entries {
-        let bytes = fragment_file_size(&app_state.fragments_dir, &entry.fragment_hash);
-        report.fragments += 1;
-        report.bytes = report.bytes.saturating_add(bytes);
-        match report.blobs.iter_mut().find(|b| b.blob_id == entry.blob_id) {
-            Some(blob) => {
-                blob.fragments += 1;
-                blob.bytes = blob.bytes.saturating_add(bytes);
-            }
-            None => report.blobs.push(HeldBlob {
-                blob_id: entry.blob_id.clone(),
-                fragments: 1,
-                bytes,
-                oldest_written_unix: entry.written_unix,
-            }),
-        }
-    }
-    Ok(report)
+/// The `held` report: the own uploads the sweep is holding (ledger entries
+/// still without a `fragment_hashes` row, computed at read time), grouped
+/// by blob in SQL, oldest blob first, at most `HELD_LISTING_LIMIT` blobs
+/// with the totals beside them — the operator's handle for re-uploading,
+/// re-attesting or purging. Counts and stamps, not bytes: a byte total
+/// would mean a `stat` per held file. On the blocking pool.
+pub async fn held_uploads(
+    app_state: &AppState,
+) -> Result<hopnet_storage::store::HeldSummary, String> {
+    let pool = app_state.db_pool.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+        hopnet_storage::store::held_local_upload_summary(&conn, HELD_LISTING_LIMIT)
+            .map_err(|e| format!("ledger: {e}"))
+    })
+    .await
+    .map_err(|e| format!("held task: {e}"))?
 }
 
 /// Give up on held uploads early: release the ledger entries of `blob_ids`
@@ -950,10 +967,13 @@ pub fn held_uploads(app_state: &AppState) -> Result<HeldUploads, String> {
 /// Explicit and operator-driven by design — a stuck upload is
 /// indistinguishable from a slow one by anything but the operator (the
 /// retention reclaims it eventually), and the blob ids are also the handle
-/// for re-uploading. A blob whose newest ledger batch is younger than the
-/// orphan grace may still be streaming and is skipped, reported as such.
-/// Disk and database work runs on the blocking pool, in `UNLINK_BATCH`
-/// write transactions, each re-checking every file right before its unlink
+/// for re-uploading. A blob with a put in flight in this process is
+/// skipped and reported (`skipped_streaming`): the live-put registry is
+/// exact, where a ledger-stamp age was not (a slow client can take longer
+/// than the orphan grace per chunk), and a put never outlives the process,
+/// so after a restart every hold is purgeable. Disk and database work runs
+/// on the blocking pool, in `UNLINK_BATCH` write transactions, each
+/// re-checking every file right before its unlink
 /// (`store::delete_unclaimed_fragments`).
 pub async fn purge_held_uploads(
     app_state: &AppState,
@@ -962,7 +982,7 @@ pub async fn purge_held_uploads(
     let pool = app_state.db_pool.clone();
     let fragments_dir = app_state.fragments_dir.clone();
     let report = tokio::task::spawn_blocking(move || {
-        purge_held_uploads_blocking(&pool, &fragments_dir, &blob_ids, unix_now())
+        purge_held_uploads_blocking(&pool, &fragments_dir, &blob_ids)
     })
     .await
     .map_err(|e| format!("purge task: {e}"))??;
@@ -983,37 +1003,26 @@ pub(crate) fn purge_held_uploads_blocking(
     pool: &r2d2::Pool<crate::db::SqliteConnectionManager>,
     fragments_dir: &str,
     blob_ids: &[CustomUUID],
-    now: u64,
 ) -> Result<PurgedUploads, String> {
     let mut report = PurgedUploads::default();
-    let now = i64::try_from(now).unwrap_or(i64::MAX);
     for blob_id in blob_ids {
-        let mut conn = pool.get().map_err(|e| format!("pool: {e}"))?;
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| format!("tx: {e}"))?;
-        let newest = hopnet_storage::store::newest_local_upload(&tx, blob_id)
-            .map_err(|e| format!("ledger: {e}"))?;
-        // A batch younger than the grace (or stamped in the future) may be
-        // a put still streaming: leave it to finish or fail on its own.
-        if newest
-            .is_some_and(|written| now.saturating_sub(written) < SWEEP_ORPHAN_GRACE_SECS as i64)
-        {
-            drop(tx);
+        if hopnet_projection::host::upload_is_live(blob_id) {
             report.skipped_streaming.push(blob_id.clone());
             continue;
         }
-        let candidates = hopnet_storage::store::release_local_uploads(&tx, blob_id)
-            .map_err(|e| format!("release: {e}"))?;
-        crate::db::shared::commit_timed(tx).map_err(|e| format!("release commit: {e}"))?;
-        report.blobs += 1;
-        for batch in candidates.chunks(UNLINK_BATCH) {
+        let candidates = {
+            let mut conn = pool.get().map_err(|e| format!("pool: {e}"))?;
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| format!("tx: {e}"))?;
-            let gone = hopnet_storage::store::delete_unclaimed_fragments(&tx, fragments_dir, batch)
-                .map_err(|e| format!("unlink re-check: {e}"))?;
-            crate::db::shared::commit_timed(tx).map_err(|e| format!("unlink commit: {e}"))?;
+            let candidates = hopnet_storage::store::release_local_uploads(&tx, blob_id)
+                .map_err(|e| format!("release: {e}"))?;
+            crate::db::shared::commit_timed(tx).map_err(|e| format!("release commit: {e}"))?;
+            candidates
+        };
+        report.blobs += 1;
+        for batch in candidates.chunks(UNLINK_BATCH) {
+            let gone = unlink_batch(pool, fragments_dir, batch)?;
             report.fragments_deleted += gone.hashes.len();
             report.bytes_freed = report.bytes_freed.saturating_add(gone.bytes);
         }
@@ -1923,14 +1932,27 @@ mod tests {
     use hopnet_storage::types::Blake3Hash;
     use std::collections::HashSet;
 
+    fn test_pool() -> r2d2::Pool<crate::db::SqliteConnectionManager> {
+        let manager = crate::db::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
+            .build(manager)
+            .unwrap();
+        crate::db::chains::install(&pool.get().unwrap()).unwrap();
+        pool
+    }
+
     /// A fragment store and a head-shape database for the sweep's orphan
-    /// step: `(dir, fragments_dir, conn)`.
-    fn orphan_fixture() -> (tempfile::TempDir, String, rusqlite::Connection) {
+    /// step: `(dir, fragments_dir, pool)`.
+    fn orphan_fixture() -> (
+        tempfile::TempDir,
+        String,
+        r2d2::Pool<crate::db::SqliteConnectionManager>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let frags = dir.path().join("fragments").to_string_lossy().into_owned();
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::db::chains::install(&conn).unwrap();
-        (dir, frags, conn)
+        (dir, frags, test_pool())
     }
 
     /// Store `bytes` as a fragment whose file is `age_secs` old.
@@ -1952,10 +1974,25 @@ mod tests {
         hash
     }
 
-    /// Steps 2 and 3 of `sweep_shard` for `shard`, with the production
-    /// grace: the diff over the real walk and rows, then `reap_orphans`.
-    fn reap_shard(
-        conn: &mut rusqlite::Connection,
+    /// Step 2's diff for `shard` with the production grace.
+    fn shard_diff(
+        conn: &rusqlite::Connection,
+        frags: &str,
+        shard: u8,
+    ) -> hopnet_storage::sweep::SweepDiff {
+        let walk = hopnet_storage::fragstore::scan_shard(frags, shard).unwrap();
+        let rows = crate::db::fragments::shard_fragment_flags(conn, shard).unwrap();
+        hopnet_storage::sweep::diff(
+            &walk.fragments,
+            &rows,
+            unix_now().saturating_sub(SWEEP_ORPHAN_GRACE_SECS),
+        )
+    }
+
+    /// Steps 2 and 3 of `sweep_shard` for `shard`: the diff over the real
+    /// walk and rows, then `reap_orphans`.
+    async fn reap_shard(
+        pool: &r2d2::Pool<crate::db::SqliteConnectionManager>,
         frags: &str,
         shard: u8,
     ) -> (
@@ -1963,23 +2000,17 @@ mod tests {
         hopnet_storage::sweep::SweepDiff,
         hopnet_storage::sweep::SweepReport,
     ) {
-        let walk = hopnet_storage::fragstore::scan_shard(frags, shard).unwrap();
-        let rows = crate::db::fragments::shard_fragment_flags(conn, shard).unwrap();
-        let diff = hopnet_storage::sweep::diff(
-            &walk.fragments,
-            &rows,
-            unix_now().saturating_sub(SWEEP_ORPHAN_GRACE_SECS),
-        );
+        let diff = shard_diff(&pool.get().unwrap(), frags, shard);
         let mut report = hopnet_storage::sweep::SweepReport::default();
         let deleted = reap_orphans(
-            conn,
+            pool,
             frags,
             shard,
             &diff,
             LOCAL_UPLOAD_RETENTION_SECS,
             &mut report,
         )
-        .unwrap();
+        .await;
         (deleted, diff, report)
     }
 
@@ -2007,17 +2038,23 @@ mod tests {
     // Should: once its row lands, see it as present, with the hold kept
     // until the retention rather than retired.
     // Should not: delete the file at any point.
-    #[test]
-    fn an_own_upload_older_than_the_grace_survives_the_sweep_until_its_rows_land() {
-        let (_dir, frags, mut conn) = orphan_fixture();
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_own_upload_older_than_the_grace_survives_the_sweep_until_its_rows_land() {
+        let (_dir, frags, pool) = orphan_fixture();
         let bytes = b"a fragment whose transaction is still in flight";
         let hash = store_aged(&frags, bytes, 3 * 3600);
         let shard = hopnet_storage::sweep::shard_of(&hash);
         let blob = CustomUUID::new(None);
-        hopnet_storage::store::record_local_uploads(&conn, &blob, [&hash], unix_now()).unwrap();
+        hopnet_storage::store::record_local_uploads(
+            &pool.get().unwrap(),
+            &blob,
+            [&hash],
+            unix_now(),
+        )
+        .unwrap();
 
         for _ in 0..2 {
-            let (deleted, diff, report) = reap_shard(&mut conn, &frags, shard);
+            let (deleted, diff, report) = reap_shard(&pool, &frags, shard).await;
             assert_eq!(diff.orphans.len(), 1, "rowless and past the grace");
             assert!(deleted.is_empty());
             assert_eq!(report.orphans_deleted, 0);
@@ -2028,8 +2065,8 @@ mod tests {
             ));
         }
 
-        land_row(&conn, &blob, &hash, bytes.len());
-        let (deleted, diff, report) = reap_shard(&mut conn, &frags, shard);
+        land_row(&pool.get().unwrap(), &blob, &hash, bytes.len());
+        let (deleted, diff, report) = reap_shard(&pool, &frags, shard).await;
         assert!(deleted.is_empty());
         assert_eq!(diff.present, vec![hash]);
         assert_eq!(report.orphans_held, 0);
@@ -2037,7 +2074,7 @@ mod tests {
             &frags, &hash
         ));
         assert_eq!(
-            hopnet_storage::store::local_uploads_in(&conn, shard).unwrap(),
+            hopnet_storage::store::local_uploads_in(&pool.get().unwrap(), shard).unwrap(),
             HashSet::from([hash]),
             "the hold is not retired by the row; it lasts until the retention"
         );
@@ -2049,59 +2086,54 @@ mod tests {
     // Should: delete a rowless file past the grace that the ledger does
     // not name, counting it and its bytes as freed and returning its hash
     // for the scrub to skip.
-    #[test]
-    fn a_rowless_file_that_is_not_an_own_upload_is_still_deleted_after_the_grace() {
-        let (_dir, frags, mut conn) = orphan_fixture();
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rowless_file_that_is_not_an_own_upload_is_still_deleted_after_the_grace() {
+        let (_dir, frags, pool) = orphan_fixture();
         let bytes = b"a fragment nothing claims";
         let hash = store_aged(&frags, bytes, 3 * 3600);
         let shard = hopnet_storage::sweep::shard_of(&hash);
 
-        let (deleted, _, report) = reap_shard(&mut conn, &frags, shard);
+        let (deleted, _, report) = reap_shard(&pool, &frags, shard).await;
         assert_eq!(deleted, vec![hash]);
         assert_eq!(report.orphans_deleted, 1);
         assert_eq!(report.orphan_bytes_freed, bytes.len() as u64);
         assert_eq!(report.orphans_held, 0);
+        assert_eq!(report.orphan_batches_skipped, 0);
         assert!(!hopnet_storage::fragstore::fragment_exists_and_valid(
             &frags, &hash
         ));
     }
 
     // Impact: `diff.orphans` is a snapshot taken before awaited work in
-    // `sweep_shard`; an upload's row can land in that window. Retiring the
-    // hold on the row and then deleting from the stale snapshot would take
-    // the only copy — the orphan unlink must re-check at the last moment.
+    // `sweep_shard`; an upload's row can land in that window. Deleting
+    // from the stale snapshot would take the only copy — the orphan unlink
+    // must re-check at the last moment.
     // Should: leave a file alone whose fragment_hashes row landed between
     // the orphan snapshot and the unlink, whether or not it was ledgered.
-    #[test]
-    fn a_row_landing_after_the_orphan_snapshot_still_protects_the_file() {
-        let (_dir, frags, mut conn) = orphan_fixture();
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_row_landing_after_the_orphan_snapshot_still_protects_the_file() {
+        let (_dir, frags, pool) = orphan_fixture();
         let bytes = b"rowless when listed, rowed when reaped";
         let hash = store_aged(&frags, bytes, 3 * 3600);
         let shard = hopnet_storage::sweep::shard_of(&hash);
         let blob = CustomUUID::new(None);
 
         // Step 2's snapshot: no row, no ledger — an orphan to delete.
-        let walk = hopnet_storage::fragstore::scan_shard(&frags, shard).unwrap();
-        let rows = crate::db::fragments::shard_fragment_flags(&conn, shard).unwrap();
-        let diff = hopnet_storage::sweep::diff(
-            &walk.fragments,
-            &rows,
-            unix_now().saturating_sub(SWEEP_ORPHAN_GRACE_SECS),
-        );
+        let diff = shard_diff(&pool.get().unwrap(), &frags, shard);
         assert_eq!(diff.orphans.len(), 1);
 
         // The row lands in the window before step 3.
-        land_row(&conn, &blob, &hash, bytes.len());
+        land_row(&pool.get().unwrap(), &blob, &hash, bytes.len());
         let mut report = hopnet_storage::sweep::SweepReport::default();
         let deleted = reap_orphans(
-            &mut conn,
+            &pool,
             &frags,
             shard,
             &diff,
             LOCAL_UPLOAD_RETENTION_SECS,
             &mut report,
         )
-        .unwrap();
+        .await;
         assert!(deleted.is_empty());
         assert_eq!(report.orphans_deleted, 0);
         assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
@@ -2114,23 +2146,29 @@ mod tests {
     // leave the file an ordinary orphan, and the sweep would delete the
     // only copy within the hour. Holds last until the retention instead.
     // Should: keep holding a file whose row landed and then disappeared.
-    #[test]
-    fn a_hold_whose_row_landed_and_vanished_is_still_held() {
-        let (_dir, frags, mut conn) = orphan_fixture();
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hold_whose_row_landed_and_vanished_is_still_held() {
+        let (_dir, frags, pool) = orphan_fixture();
         let bytes = b"landed, then re-imported without its row";
         let hash = store_aged(&frags, bytes, 3 * 3600);
         let shard = hopnet_storage::sweep::shard_of(&hash);
         let blob = CustomUUID::new(None);
-        hopnet_storage::store::record_local_uploads(&conn, &blob, [&hash], unix_now()).unwrap();
-        land_row(&conn, &blob, &hash, bytes.len());
+        {
+            let conn = pool.get().unwrap();
+            hopnet_storage::store::record_local_uploads(&conn, &blob, [&hash], unix_now()).unwrap();
+            land_row(&conn, &blob, &hash, bytes.len());
+        }
 
-        let (deleted, diff, _) = reap_shard(&mut conn, &frags, shard);
+        let (deleted, diff, _) = reap_shard(&pool, &frags, shard).await;
         assert!(deleted.is_empty());
         assert_eq!(diff.present, vec![hash]);
 
         // The inventory is replaced without the row.
-        conn.execute("DELETE FROM fragment_hashes", []).unwrap();
-        let (deleted, diff, report) = reap_shard(&mut conn, &frags, shard);
+        pool.get()
+            .unwrap()
+            .execute("DELETE FROM fragment_hashes", [])
+            .unwrap();
+        let (deleted, diff, report) = reap_shard(&pool, &frags, shard).await;
         assert_eq!(diff.orphans.len(), 1, "rowless again, past the grace");
         assert!(deleted.is_empty());
         assert_eq!(report.orphans_held, 1);
@@ -2139,30 +2177,118 @@ mod tests {
         ));
     }
 
-    fn test_pool() -> r2d2::Pool<crate::db::SqliteConnectionManager> {
-        let manager = crate::db::SqliteConnectionManager::memory();
+    // Impact: an upload whose transaction never lands (rejected, given up,
+    // retried under a fresh blob id) must not hold its files forever and
+    // grow the ledger without bound; the retention is the durable bound a
+    // restart cannot reset.
+    // Should: expire a held upload written longer ago than the retention,
+    // report it, and delete its file as an ordinary orphan on the same
+    // visit.
+    // Should not: expire an entry within the retention, nor one stamped in
+    // the future by a clock step.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_upload_past_the_retention_becomes_an_ordinary_orphan() {
+        let (_dir, frags, pool) = orphan_fixture();
+        let now = unix_now();
+        let stale = store_aged(&frags, b"given up on two weeks ago", 3 * 3600);
+        let fresh = store_aged(&frags, b"uploaded yesterday", 3 * 3600);
+        let future = store_aged(&frags, b"stamped after a clock step", 3 * 3600);
+        let blob = CustomUUID::new(None);
+        {
+            let conn = pool.get().unwrap();
+            hopnet_storage::store::record_local_uploads(
+                &conn,
+                &blob,
+                [&stale],
+                now - LOCAL_UPLOAD_RETENTION_SECS - 1,
+            )
+            .unwrap();
+            hopnet_storage::store::record_local_uploads(&conn, &blob, [&fresh], now - 86_400)
+                .unwrap();
+            hopnet_storage::store::record_local_uploads(&conn, &blob, [&future], now + 86_400)
+                .unwrap();
+        }
+
+        let mut total = hopnet_storage::sweep::SweepReport::default();
+        for hash in [&stale, &fresh, &future] {
+            let (_, _, report) =
+                reap_shard(&pool, &frags, hopnet_storage::sweep::shard_of(hash)).await;
+            total.uploads_expired += report.uploads_expired;
+            total.orphans_deleted += report.orphans_deleted;
+            total.orphans_held += report.orphans_held;
+        }
+        assert_eq!(total.uploads_expired, 1);
+        assert_eq!(total.orphans_deleted, 1);
+        assert_eq!(total.orphans_held, 2);
+        assert!(!hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags, &stale
+        ));
+        assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags, &fresh
+        ));
+        assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags, &future
+        ));
+    }
+
+    // Impact: the orphan step takes the write lock that consensus apply
+    // also needs; a SQLITE_BUSY there used to fail the whole shard, losing
+    // its scrub, surplus release and belief/attestation pages for the
+    // rotation (the class of error that wedged desktop).
+    // Should: skip the orphan step while another writer holds the
+    // database, count the skip, keep the files, and reap them on the next
+    // visit once the lock is gone.
+    // Should not: fail the shard.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_busy_database_skips_the_orphan_step_without_failing_the_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let frags = dir.path().join("fragments").to_string_lossy().into_owned();
+        let db_path = dir.path().join("sweep.db");
         let pool = r2d2::Pool::builder()
             .max_size(1)
-            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
-            .build(manager)
+            .build(crate::db::SqliteConnectionManager::file(&db_path))
             .unwrap();
-        crate::db::chains::install(&pool.get().unwrap()).unwrap();
-        pool
+        {
+            let conn = pool.get().unwrap();
+            crate::db::chains::install(&conn).unwrap();
+            // The one pooled connection gives up on a lock fast, so the
+            // test does not wait out the default busy_timeout.
+            conn.execute_batch("PRAGMA busy_timeout = 50;").unwrap();
+        }
+        let hash = store_aged(&frags, b"an orphan behind a busy database", 3 * 3600);
+        let shard = hopnet_storage::sweep::shard_of(&hash);
+
+        // Another writer holds the database for the whole first visit.
+        let locker = rusqlite::Connection::open(&db_path).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let (deleted, diff, report) = reap_shard(&pool, &frags, shard).await;
+        assert_eq!(diff.orphans.len(), 1);
+        assert!(deleted.is_empty());
+        assert_eq!(report.orphan_batches_skipped, 1);
+        assert_eq!(report.orphans_deleted, 0);
+        assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags, &hash
+        ));
+
+        locker.execute_batch("ROLLBACK;").unwrap();
+        let (deleted, _, report) = reap_shard(&pool, &frags, shard).await;
+        assert_eq!(deleted, vec![hash]);
+        assert_eq!(report.orphan_batches_skipped, 0);
+        assert!(!hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags, &hash
+        ));
     }
 
     // Impact: a purged video is thousands of fragments; one transaction
-    // across every stat and unlink would hold the write lock for the
-    // whole pass, so the purge works in bounded batches and must not stop
-    // after the first.
+    // across every unlink would hold the write lock for the whole pass, so
+    // the purge works in small batches and must not stop after the first.
     // Should: release and delete every eligible file of a blob larger than
     // one batch, reporting the full count and bytes.
     #[test]
     fn a_purge_larger_than_one_batch_deletes_everything_eligible() {
-        let dir = tempfile::tempdir().unwrap();
-        let frags = dir.path().join("fragments").to_string_lossy().into_owned();
-        let pool = test_pool();
+        let (_dir, frags, pool) = orphan_fixture();
         let blob = CustomUUID::new(None);
-        let count = UNLINK_BATCH + 44;
+        let count = UNLINK_BATCH + 7;
         let mut hashes = Vec::with_capacity(count);
         let mut bytes = 0u64;
         for i in 0..count {
@@ -2172,17 +2298,16 @@ mod tests {
             hopnet_storage::fragstore::store_fragment(&frags, &hash, data).unwrap();
             hashes.push(hash);
         }
-        let now = unix_now();
         hopnet_storage::store::record_local_uploads(
             &pool.get().unwrap(),
             &blob,
             &hashes,
-            now - 2 * SWEEP_ORPHAN_GRACE_SECS,
+            unix_now() - 7 * 86_400,
         )
         .unwrap();
 
         let report =
-            purge_held_uploads_blocking(&pool, &frags, std::slice::from_ref(&blob), now).unwrap();
+            purge_held_uploads_blocking(&pool, &frags, std::slice::from_ref(&blob)).unwrap();
         assert_eq!(
             report,
             PurgedUploads {
@@ -2206,15 +2331,14 @@ mod tests {
 
     // Impact: a purge issued while the blob's put is still streaming would
     // unlink chunks the put has written and ledgered, under a running
-    // upload; the newest ledger stamp is the signal the put is live.
-    // Should: skip a blob whose newest ledger batch is younger than the
-    // orphan grace, report it, and purge the others.
+    // upload. A ledger-stamp age cannot tell: a slow client takes longer
+    // than the orphan grace per 40 MB chunk. The live-put registry can.
+    // Should: skip a blob with a put in flight, report it, purge the
+    // others, and purge it once its put is over.
     // Should not: release or unlink anything of the skipped blob.
     #[test]
-    fn a_purge_skips_a_blob_that_may_still_be_streaming() {
-        let dir = tempfile::tempdir().unwrap();
-        let frags = dir.path().join("fragments").to_string_lossy().into_owned();
-        let pool = test_pool();
+    fn a_purge_skips_a_blob_with_a_live_put() {
+        let (_dir, frags, pool) = orphan_fixture();
         let streaming = CustomUUID::new(None);
         let stuck = CustomUUID::new(None);
         let store = |bytes: &[u8]| {
@@ -2223,23 +2347,16 @@ mod tests {
             hash
         };
         let first_chunk = store(b"streaming upload, first chunk");
-        let latest_chunk = store(b"streaming upload, chunk written just now");
         let given_up = store(b"stuck upload from last week");
         let now = unix_now();
         {
             let conn = pool.get().unwrap();
+            // A slow client: the only batch so far is hours old.
             hopnet_storage::store::record_local_uploads(
                 &conn,
                 &streaming,
                 [&first_chunk],
                 now - 2 * SWEEP_ORPHAN_GRACE_SECS,
-            )
-            .unwrap();
-            hopnet_storage::store::record_local_uploads(
-                &conn,
-                &streaming,
-                [&latest_chunk],
-                now - 60,
             )
             .unwrap();
             hopnet_storage::store::record_local_uploads(
@@ -2250,9 +2367,10 @@ mod tests {
             )
             .unwrap();
         }
+        let live = hopnet_projection::host::LiveUpload::register(streaming.clone());
 
         let report =
-            purge_held_uploads_blocking(&pool, &frags, &[streaming.clone(), stuck.clone()], now)
+            purge_held_uploads_blocking(&pool, &frags, &[streaming.clone(), stuck.clone()])
                 .unwrap();
         assert_eq!(
             report,
@@ -2267,10 +2385,6 @@ mod tests {
             &frags,
             &first_chunk
         ));
-        assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
-            &frags,
-            &latest_chunk
-        ));
         assert!(!hopnet_storage::fragstore::fragment_exists_and_valid(
             &frags, &given_up
         ));
@@ -2280,57 +2394,46 @@ mod tests {
                 .iter()
                 .filter(|u| u.blob_id == streaming)
                 .count(),
-            2,
-            "the streaming blob's holds are untouched"
+            1,
+            "the streaming blob's hold is untouched"
         );
+
+        drop(live);
+        let report =
+            purge_held_uploads_blocking(&pool, &frags, std::slice::from_ref(&streaming)).unwrap();
+        assert_eq!(report.blobs, 1);
+        assert!(report.skipped_streaming.is_empty());
+        assert_eq!(report.fragments_deleted, 1);
+        assert!(!hopnet_storage::fragstore::fragment_exists_and_valid(
+            &frags,
+            &first_chunk
+        ));
     }
 
-    // Impact: an upload whose transaction never lands (rejected, given up,
-    // retried under a fresh blob id) must not hold its files forever and
-    // grow the ledger without bound; the retention is the durable bound a
-    // restart cannot reset.
-    // Should: expire a held upload written longer ago than the retention,
-    // report it, and delete its file as an ordinary orphan on the same
-    // visit.
-    // Should not: expire an entry within the retention, nor one stamped in
-    // the future by a clock step.
+    // Impact: a forward clock step stamps holds in the future; expiry
+    // rightly treats them as fresh, so the purge must be able to take them
+    // or they could neither expire nor be purged.
+    // Should: purge a blob whose holds are stamped in the future.
     #[test]
-    fn a_held_upload_past_the_retention_becomes_an_ordinary_orphan() {
-        let (_dir, frags, mut conn) = orphan_fixture();
-        let now = unix_now();
-        let stale = store_aged(&frags, b"given up on two weeks ago", 3 * 3600);
-        let fresh = store_aged(&frags, b"uploaded yesterday", 3 * 3600);
-        let future = store_aged(&frags, b"stamped after a clock step", 3 * 3600);
+    fn a_future_stamped_hold_is_purgeable() {
+        let (_dir, frags, pool) = orphan_fixture();
         let blob = CustomUUID::new(None);
+        let hash = store_aged(&frags, b"stamped after a clock step", 3 * 3600);
         hopnet_storage::store::record_local_uploads(
-            &conn,
+            &pool.get().unwrap(),
             &blob,
-            [&stale],
-            now - LOCAL_UPLOAD_RETENTION_SECS - 1,
+            [&hash],
+            unix_now() + 30 * 86_400,
         )
         .unwrap();
-        hopnet_storage::store::record_local_uploads(&conn, &blob, [&fresh], now - 86_400).unwrap();
-        hopnet_storage::store::record_local_uploads(&conn, &blob, [&future], now + 86_400).unwrap();
 
-        let mut total = hopnet_storage::sweep::SweepReport::default();
-        for hash in [&stale, &fresh, &future] {
-            let (_, _, report) =
-                reap_shard(&mut conn, &frags, hopnet_storage::sweep::shard_of(hash));
-            total.uploads_expired += report.uploads_expired;
-            total.orphans_deleted += report.orphans_deleted;
-            total.orphans_held += report.orphans_held;
-        }
-        assert_eq!(total.uploads_expired, 1);
-        assert_eq!(total.orphans_deleted, 1);
-        assert_eq!(total.orphans_held, 2);
+        let report =
+            purge_held_uploads_blocking(&pool, &frags, std::slice::from_ref(&blob)).unwrap();
+        assert_eq!(report.blobs, 1);
+        assert!(report.skipped_streaming.is_empty());
+        assert_eq!(report.fragments_deleted, 1);
         assert!(!hopnet_storage::fragstore::fragment_exists_and_valid(
-            &frags, &stale
-        ));
-        assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
-            &frags, &fresh
-        ));
-        assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
-            &frags, &future
+            &frags, &hash
         ));
     }
 

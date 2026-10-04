@@ -457,22 +457,23 @@ fn default_grace_period_hours() -> i64 {
 }
 
 /// The `held` section: this node's own uploads the sweep is holding
-/// (ledger entries still without a row), grouped by blob.
-fn held_section(app_state: &AppState) -> serde_json::Value {
-    match super::jobs::held_uploads(app_state) {
+/// (ledger entries still without a row), grouped by blob, capped at
+/// `HELD_LISTING_LIMIT` with the totals.
+async fn held_section(app_state: &AppState) -> serde_json::Value {
+    match super::jobs::held_uploads(app_state).await {
         Ok(held) => serde_json::to_value(held).unwrap_or_default(),
         Err(e) => serde_json::json!({ "error": e }),
     }
 }
 
 /// A sweep report with the `held` section beside its fields.
-fn report_with_held(
+async fn report_with_held(
     app_state: &AppState,
     report: &hopnet_storage::sweep::SweepReport,
 ) -> serde_json::Value {
     let mut body = serde_json::to_value(report).unwrap_or_default();
     if let serde_json::Value::Object(fields) = &mut body {
-        fields.insert("held".into(), held_section(app_state));
+        fields.insert("held".into(), held_section(app_state).await);
     }
     body
 }
@@ -507,9 +508,11 @@ pub async fn get_orphaned_fragments_scan(
         );
         let grace = (params.grace_period_hours as u64).saturating_mul(3600);
         return match super::jobs::run_disk_truth_sweep(&app_state, grace).await {
-            Ok(report) => {
-                (StatusCode::OK, Json(report_with_held(&app_state, &report))).into_response()
-            }
+            Ok(report) => (
+                StatusCode::OK,
+                Json(report_with_held(&app_state, &report).await),
+            )
+                .into_response(),
             Err(e) => {
                 tracing::error!("Disk-truth sweep failed: {:?}", e);
                 (
@@ -522,15 +525,17 @@ pub async fn get_orphaned_fragments_scan(
     }
     let last = app_state.last_sweep.lock().unwrap().clone();
     match last {
-        Some(report) => {
-            (StatusCode::OK, Json(report_with_held(&app_state, &report))).into_response()
-        }
+        Some(report) => (
+            StatusCode::OK,
+            Json(report_with_held(&app_state, &report).await),
+        )
+            .into_response(),
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "status": "error",
                 "error": "no sweep has run yet on this node; use ?run=true",
-                "held": held_section(&app_state),
+                "held": held_section(&app_state).await,
             })),
         )
             .into_response(),
