@@ -781,10 +781,27 @@ optimization and carries no proof obligation.
 - **The absorbed lifecycle jobs fold into existing machinery.**
   - Orphaned fragment files stop being a mechanism: a file with no
     `fragment_hashes` row is the third case of the existence
-    sweep's diff, deleted in the same walk after the grace period.
-    The two-call scan/delete API and its process-memory scan cache
-    die; the manual route becomes a report of the sweep's last
-    findings.
+    sweep's diff, deleted in the same walk after the grace period —
+    unless this node's upload ledger names it. An upload writes its
+    fragments (`api::put`) before the transaction carrying their rows
+    is signed, and those rows may take hours, or, for a straggler
+    whose join imported an inventory without them, never arrive; so
+    every put-before-row site records its hashes in the node-local
+    `hopnet_storage_local_uploads` (storage step 0006, storage@6,
+    frozen `PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION` for storage@5
+    artifacts) before each fragment file is written, the sweep holds a
+    ledgered rowless file for 14 days (reported as `orphans_held`;
+    `LOCAL_UPLOAD_RETENTION_SECS`) and then expires the hold, after
+    which the file is an ordinary orphan; a hold is never retired by
+    its row landing (that would race the orphan snapshot and expose the
+    file to a later re-import without the row), and every orphan
+    unlink re-checks for a row and a hold inside the write transaction
+    (consensus-bugs 20). A put that fails part-way abandons its blob:
+    holds released, rowless files unlinked. The two-call
+    scan/delete API and its process-memory scan cache die; the manual
+    route becomes a report of the sweep's last findings plus the held
+    uploads by blob, and `POST /maintenance/orphaned-fragments/purge-held`
+    is the owner's explicit way to give one up early.
   - Orphaned data-block cleanup stays a slow cron — deletion
     policy, not convergence — but actually registered on a
     schedule, keeping the manual route and the takeout gate. The
@@ -1190,7 +1207,53 @@ optimization and carries no proof obligation.
     `PRE_ROLLING_SWEEP_SNAPSHOT_SECTION` for storage@4 artifacts), so a
     restarting node resumes instead of rescanning from the top. The
     operator routes run one unpaced rotation, exclusive with the walker
-    per shard. "Paging the sweep's walk" is closed by this.
+    per shard. "Paging the sweep's walk" is closed by this. The node-local
+    storage tables are `hopnet_storage_pins`, `hopnet_storage_sweep_cursor`
+    and `hopnet_storage_local_uploads` (step 0006, below); all three ride
+    the staged-join copy untouched.
+  - Own-upload ledger (2026-10-04, PR #108, consensus-bugs 20). The
+    sweep's orphan case deletes a rowless file past the grace unless
+    `hopnet_storage_local_uploads` names it: the node's own uploads,
+    recorded per blob by a hook inside `put` before each batch of
+    fragment files is written (so a multi-hour upload is covered from
+    its first chunk), held for 14 days (`LOCAL_UPLOAD_RETENTION_SECS`,
+    env `HOPNET_STORAGE_LOCAL_UPLOAD_RETENTION_SECS`) and then expired
+    into ordinary orphans. A hold is never retired by its row landing:
+    a rowed fragment is ordinary for placement, eviction and surplus
+    release, the ledger only shields orphan deletion, and retiring on
+    the row would race the sweep's orphan snapshot and expose the file
+    to a later staged join importing an inventory without the row. The
+    one unlink primitive (`store::delete_unclaimed_fragments`) re-checks
+    each file for a row and a hold inside a write transaction, in
+    batches of 256, for the sweep, the owner's purge and an abandoned
+    put alike, `stat`s done outside the lock and the batch kept to 32 so
+    consensus apply never waits long for the write lock; a busy database
+    skips the batch (counted as `orphan_batches_skipped`) and never
+    fails the shard. A put that fails part-way, or whose future is
+    dropped by a client disconnect (`host::put_own_upload`'s guard),
+    releases its blob's holds and unlinks its rowless files, the release
+    and unlinks retrying transient failures like a ledger write; the hook
+    retries transient ledger failures (pool checkout, SQLITE_BUSY) for
+    up to a minute before the put fails, refuses a batch whose upload
+    was abandoned while its ledger write was in flight (dropping that
+    write's holds), and drops the last accepted batch's own holds before
+    unlinking it. Stuck uploads are visible under
+    `held` on the orphan route (rowless computed at read time, grouped
+    by blob in SQL, capped at 1000 blobs with totals, counts not bytes);
+    the node's owner can purge them early (`purge-held`, by blob id, on
+    the blocking pool), which skips and reports (`skipped_recent`) a
+    blob whose put is in flight in this process (an exact in-process
+    registry; a slow client can outlast any fixed age per chunk) or
+    whose newest hold is under a day old (`PURGE_MIN_AGE_SECS`): the
+    registry covers only the put, and the rows land with a later
+    transaction — a photo's resources all upload before its one
+    `photo_add`, a stalled mesh delays commits, and a transaction
+    proposed before a restart can commit after it. A hold stamped in
+    the future (a clock step) is purgeable, or it could neither expire
+    nor be purged.
+    Storage step 0006 moves the hashed format_version to 6; storage@5
+    artifacts import through the frozen
+    `PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION`.
   - Pull pipeline (2026-10-03, branch `pull-pipeline` on
     `feat-rolling-sweep`, decided with Allison; ships as 2026.10.8).
     Production after the 10.6 crossing: 68,878 in-flight blobs, pulls

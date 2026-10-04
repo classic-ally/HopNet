@@ -934,11 +934,11 @@ fn staged_join_transition(
         Ok(fresh) => {
             let fragments_dir =
                 hopnet_storage::fragstore::get_fragments_dir().unwrap_or_else(|_| String::new());
-            match join::reconcile_fragment_store(&fresh, &fragments_dir, join::now_unix()) {
-                Ok((remarked, orphans)) => tracing::info!(
+            match join::reconcile_fragment_store(&fresh, &fragments_dir) {
+                Ok((remarked, unbacked)) => tracing::info!(
                     remarked,
-                    orphans,
-                    "fragment store reconciled against the joined epoch"
+                    unbacked,
+                    "fragment store reconciled against the joined epoch (unbacked files left for the sweep)"
                 ),
                 Err(e) => tracing::warn!("fragment reconcile failed (harmless): {e}"),
             }
@@ -2492,14 +2492,15 @@ pub(crate) mod tests {
         // post-baseline step: identity 0001 (schema_ordinals), storage
         // 0002 (RFC-STORAGE-003: the goal column, its indexes, the
         // transition record), storage 0003 (the disk-truth columns),
-        // storage 0004 (the held-fragment index) and storage 0005 (the
-        // sweep cursor).
+        // storage 0004 (the held-fragment index), storage 0005 (the sweep
+        // cursor) and storage 0006 (the own-upload ledger).
         // Fingerprints compare DDL text, so the reverts must restore the
         // baseline statements byte for byte.
         {
             let conn = open(&db_path);
             conn.execute_batch(
                 "DROP TABLE schema_ordinals;
+                 DROP TABLE hopnet_storage_local_uploads;
                  DROP TABLE hopnet_storage_sweep_cursor;
                  DROP INDEX idx_fragment_hashes_local;
                  DROP INDEX idx_fragment_inventory_verified;

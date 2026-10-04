@@ -96,12 +96,16 @@ pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionS
     // v5 (rolling sweep): storage step 0005 adds the node-local sweep
     // cursor; the covered set is unchanged, and storage@4 artifacts import
     // through the frozen v4 spec below.
-    format_version: 5,
+    // v6 (own-upload ledger): storage step 0006 adds the node-local
+    // upload ledger; the covered set is unchanged, and storage@5
+    // artifacts import through the frozen v5 spec below.
+    format_version: 6,
     tables: STORAGE_TABLES,
 };
 
-/// The covered tables shared by every spec since v3: the v4 (index) and
-/// v5 (node-local cursor) bumps changed no covered table or column.
+/// The covered tables shared by every spec since v3: the v4 (index), v5
+/// (node-local cursor) and v6 (node-local ledger) bumps changed no covered
+/// table or column.
 const STORAGE_TABLES: &[hopnet_common::TableSpec] = &[
     hopnet_common::TableSpec::exported("data_blocks"),
     hopnet_common::TableSpec::exported("storage_view_transitions"),
@@ -140,6 +144,17 @@ pub const PRE_ROLLING_SWEEP_SNAPSHOT_SECTION: hopnet_common::SectionSpec =
     hopnet_common::SectionSpec {
         name: "storage",
         format_version: 4,
+        tables: STORAGE_TABLES,
+    };
+
+/// The storage section as sealed by 2026.10.7 through 2026.10.10
+/// (ordinal 5). FROZEN — the import mapping for storage@5 artifacts (the
+/// seals from epoch 12 on and the previous-release join fixture).
+/// Identical tables; only the hashed format_version differs.
+pub const PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION: hopnet_common::SectionSpec =
+    hopnet_common::SectionSpec {
+        name: "storage",
+        format_version: 5,
         tables: STORAGE_TABLES,
     };
 
@@ -201,7 +216,11 @@ pub const PRE_LIFECYCLE_SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_co
 };
 
 /// Node-local tables — outside the snapshot universe entirely.
-pub const NODE_LOCAL_TABLES: &[&str] = &["hopnet_storage_pins", "hopnet_storage_sweep_cursor"];
+pub const NODE_LOCAL_TABLES: &[&str] = &[
+    "hopnet_storage_pins",
+    "hopnet_storage_sweep_cursor",
+    "hopnet_storage_local_uploads",
+];
 
 /// This module's schema chain (RFC-020): replay is the only installer.
 /// Head ordinal == SNAPSHOT_SECTION.format_version, pinned by host
@@ -233,6 +252,11 @@ pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
             5,
             "sweep_cursor",
             include_str!("../migrations/storage/0005_sweep_cursor.sql"),
+        ),
+        hopnet_common::Step::sql(
+            6,
+            "local_uploads",
+            include_str!("../migrations/storage/0006_local_uploads.sql"),
         ),
     ],
 };
@@ -650,6 +674,283 @@ pub fn write_sweep_cursor(
         ],
     )
     .map(|_| ())
+}
+
+/// Record a `put`'s fragments in this node's upload ledger
+/// (`hopnet_storage_local_uploads`, node-local), before the transaction
+/// carrying their `fragment_hashes` rows is signed. Until those rows land
+/// the files are rowless, and the sweep spares a rowless file the ledger
+/// names (consensus-bugs 20). The caller owns the transaction. Returns
+/// the rows written.
+pub fn record_local_uploads<'a>(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+    fragment_hashes: impl IntoIterator<Item = &'a Blake3Hash>,
+    now_unix: u64,
+) -> Result<usize, rusqlite::Error> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR REPLACE INTO hopnet_storage_local_uploads
+         (fragment_hash, blob_id, written_unix) VALUES (?1, ?2, ?3)",
+    )?;
+    let mut written = 0;
+    for hash in fragment_hashes {
+        written += stmt.execute(params![hash, blob_id, now_unix as i64])?;
+    }
+    Ok(written)
+}
+
+/// The ledger's hashes in one rolling-sweep shard — the rowless files the
+/// sweep must hold.
+pub fn local_uploads_in(
+    conn: &rusqlite::Connection,
+    shard: u8,
+) -> Result<HashSet<Blake3Hash>, rusqlite::Error> {
+    let (lo, hi) = crate::sweep::shard_bounds(shard);
+    let sql = format!(
+        "SELECT fragment_hash FROM hopnet_storage_local_uploads WHERE {}",
+        shard_clause("fragment_hash", hi.is_none())
+    );
+    let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&lo];
+    if let Some(hi) = &hi {
+        bound.push(hi);
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(bound.as_slice(), |row| row.get(0))?;
+    rows.collect()
+}
+
+/// A ledger entry is never retired by its row landing. The hold lasts until
+/// the retention expires it (`expire_local_uploads`), the uploader abandons
+/// it or the operator purges it (`release_local_uploads`): a rowed fragment
+/// is an ordinary fragment for placement, eviction and surplus release, and
+/// the ledger only ever shields orphan deletion, so a stale hold costs
+/// nothing — while retiring on the row would race the sweep's orphan
+/// snapshot (a row landing between the diff and the unlink would lift the
+/// hold on a file the diff still calls an orphan) and would expose the file
+/// to a later staged join that imports an inventory without the row.
+///
+/// Expire the shard's ledger entries written at or before `cutoff_unix`
+/// (now minus the retention): an upload whose transaction has not landed
+/// in that long is given up on, and its files become ordinary orphans. An
+/// entry stamped in the future (a clock step) is fresh. Returns the rows
+/// expired. The caller owns the transaction.
+pub fn expire_local_uploads(
+    conn: &rusqlite::Connection,
+    shard: u8,
+    cutoff_unix: u64,
+) -> Result<usize, rusqlite::Error> {
+    let (lo, hi) = crate::sweep::shard_bounds(shard);
+    let cutoff = i64::try_from(cutoff_unix).unwrap_or(i64::MAX);
+    let sql = format!(
+        "DELETE FROM hopnet_storage_local_uploads WHERE {} AND written_unix <= {}",
+        shard_clause("fragment_hash", hi.is_none()),
+        if hi.is_none() { "?2" } else { "?3" }
+    );
+    let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&lo];
+    if let Some(hi) = &hi {
+        bound.push(hi);
+    }
+    bound.push(&cutoff);
+    conn.execute(&sql, bound.as_slice())
+}
+
+/// One ledger entry whose upload has not landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldUpload {
+    pub blob_id: BlobId,
+    pub fragment_hash: Blake3Hash,
+    pub written_unix: i64,
+}
+
+/// Ledger entries still without a `fragment_hashes` row — the files the
+/// sweep is holding — oldest first.
+pub fn held_local_uploads(conn: &rusqlite::Connection) -> Result<Vec<HeldUpload>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT l.blob_id, l.fragment_hash, l.written_unix
+         FROM hopnet_storage_local_uploads l
+         WHERE NOT EXISTS (SELECT 1 FROM fragment_hashes f WHERE f.fragment_hash = l.fragment_hash)
+         ORDER BY l.written_unix, l.fragment_hash",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(HeldUpload {
+            blob_id: row.get(0)?,
+            fragment_hash: row.get(1)?,
+            written_unix: row.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Drop `blob_id`'s ledger entries (the uploader abandoning a failed put,
+/// the operator giving up on a stuck one) and return their hashes — the
+/// candidates for `delete_unclaimed_fragments`. The caller owns the
+/// transaction.
+pub fn release_local_uploads(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+) -> Result<Vec<Blake3Hash>, rusqlite::Error> {
+    let hashes = {
+        let mut held = conn.prepare_cached(
+            "SELECT fragment_hash FROM hopnet_storage_local_uploads WHERE blob_id = ?1",
+        )?;
+        let rows = held.query_map(params![blob_id], |row| row.get::<_, Blake3Hash>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    conn.execute(
+        "DELETE FROM hopnet_storage_local_uploads WHERE blob_id = ?1",
+        params![blob_id],
+    )?;
+    Ok(hashes)
+}
+
+/// Drop `blob_id`'s ledger entries for `fragment_hashes` only (an
+/// abandoned upload giving up one batch); another blob's entry for the
+/// same hash is left alone. Returns the rows dropped. The caller owns the
+/// transaction.
+pub fn release_local_upload_hashes<'a>(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+    fragment_hashes: impl IntoIterator<Item = &'a Blake3Hash>,
+) -> Result<usize, rusqlite::Error> {
+    let mut stmt = conn.prepare_cached(
+        "DELETE FROM hopnet_storage_local_uploads WHERE fragment_hash = ?1 AND blob_id = ?2",
+    )?;
+    let mut released = 0;
+    for hash in fragment_hashes {
+        released += stmt.execute(params![hash, blob_id])?;
+    }
+    Ok(released)
+}
+
+/// The newest ledger stamp of `blob_id`'s entries, `None` when it holds
+/// nothing — the purge's guard against taking an upload whose transaction
+/// may still land.
+pub fn newest_local_upload_unix(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+) -> Result<Option<i64>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT MAX(written_unix) FROM hopnet_storage_local_uploads WHERE blob_id = ?1",
+        params![blob_id],
+        |row| row.get(0),
+    )
+}
+
+/// Fragment files an unlink pass deleted, with their on-disk bytes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeletedFragments {
+    pub hashes: Vec<Blake3Hash>,
+    pub bytes: u64,
+}
+
+/// The on-disk size of each of `hashes` (0 for a file already gone) — the
+/// `stat` half of an unlink pass, done OUTSIDE the write transaction so a
+/// cold disk never holds the database's write lock.
+pub fn stat_fragments(fragments_dir: &str, hashes: &[Blake3Hash]) -> Vec<(Blake3Hash, u64)> {
+    hashes
+        .iter()
+        .map(|hash| {
+            let bytes = fragstore::create_fragment_path(fragments_dir, hash)
+                .ok()
+                .and_then(|dir| std::fs::metadata(format!("{dir}/{}", hash.to_hex())).ok())
+                .map_or(0, |m| m.len());
+            (*hash, bytes)
+        })
+        .collect()
+}
+
+/// The one way a fragment file is deleted for having no row: unlink each
+/// of `candidates` (hash and its pre-`stat`ed size, `stat_fragments`) that,
+/// checked inside `tx` right before the unlink, has no `fragment_hashes`
+/// row and no ledger entry. `tx` must be a write (IMMEDIATE) transaction,
+/// so no row can land between the check and the unlink — the sweep's
+/// orphan list is a snapshot taken earlier in the step, and the operator's
+/// purge list is older still. A claimed candidate is skipped: a row makes
+/// it an ordinary fragment, a ledger entry makes it another upload's hold.
+/// Inside the lock only the re-check and the unlink run; callers bound
+/// `candidates` to a small batch so consensus apply never waits long for
+/// the write lock.
+pub fn delete_unclaimed_fragments(
+    tx: &rusqlite::Transaction<'_>,
+    fragments_dir: &str,
+    candidates: &[(Blake3Hash, u64)],
+) -> Result<DeletedFragments, rusqlite::Error> {
+    let mut unclaimed = tx.prepare_cached(
+        "SELECT NOT EXISTS (SELECT 1 FROM fragment_hashes WHERE fragment_hash = ?1)
+            AND NOT EXISTS (SELECT 1 FROM hopnet_storage_local_uploads WHERE fragment_hash = ?1)",
+    )?;
+    let mut deleted = DeletedFragments::default();
+    for (hash, bytes) in candidates {
+        let free: bool = unclaimed.query_row(params![hash], |row| row.get(0))?;
+        if !free {
+            tracing::debug!(
+                "orphan {} was claimed before its unlink; kept",
+                hash.to_hex()
+            );
+            continue;
+        }
+        match fragstore::delete_fragment(fragments_dir, hash) {
+            Ok(()) => {
+                deleted.hashes.push(*hash);
+                deleted.bytes = deleted.bytes.saturating_add(*bytes);
+            }
+            Err(e) => tracing::warn!("delete orphan {} failed: {e}", hash.to_hex()),
+        }
+    }
+    Ok(deleted)
+}
+
+/// One blob's held uploads, as the operator's listing shows them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HeldBlob {
+    pub blob_id: BlobId,
+    pub fragments: usize,
+    pub oldest_written_unix: i64,
+    pub newest_written_unix: i64,
+}
+
+/// The held uploads grouped by blob, oldest blob first, at most `limit`
+/// blobs, with the totals over every held blob.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct HeldSummary {
+    pub blobs: Vec<HeldBlob>,
+    pub total_blobs: usize,
+    pub total_fragments: usize,
+}
+
+/// Ledger entries still without a `fragment_hashes` row, grouped by blob
+/// in SQL (`idx_local_uploads_blob`), capped at `limit` blobs. Counts and
+/// stamps only: byte totals would need a `stat` per held file.
+pub fn held_local_upload_summary(
+    conn: &rusqlite::Connection,
+    limit: usize,
+) -> Result<HeldSummary, rusqlite::Error> {
+    const HELD: &str = "FROM hopnet_storage_local_uploads l
+         WHERE NOT EXISTS (SELECT 1 FROM fragment_hashes f WHERE f.fragment_hash = l.fragment_hash)";
+    let (total_blobs, total_fragments): (i64, i64) = conn.query_row(
+        &format!("SELECT COUNT(DISTINCT l.blob_id), COUNT(*) {HELD}"),
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT l.blob_id, COUNT(*), MIN(l.written_unix), MAX(l.written_unix) {HELD}
+         GROUP BY l.blob_id ORDER BY MIN(l.written_unix), l.blob_id LIMIT ?1"
+    ))?;
+    let blobs = stmt
+        .query_map(params![limit as i64], |row| {
+            Ok(HeldBlob {
+                blob_id: row.get(0)?,
+                fragments: row.get::<_, i64>(1)? as usize,
+                oldest_written_unix: row.get(2)?,
+                newest_written_unix: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(HeldSummary {
+        blobs,
+        total_blobs: total_blobs as usize,
+        total_fragments: total_fragments as usize,
+    })
 }
 
 /// SQL bounding `col` to one rolling-sweep shard, binding `?1` (and `?2`
@@ -1573,6 +1874,247 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    /// The ledger beside a real fragment store: `(dir, fragments_dir, conn)`.
+    fn ledger_fixture() -> (tempfile::TempDir, String, rusqlite::Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let frags = dir.path().join("fragments").to_string_lossy().into_owned();
+        let conn = test_conn();
+        conn.execute_batch(include_str!("../migrations/storage/0006_local_uploads.sql"))
+            .unwrap();
+        (dir, frags, conn)
+    }
+
+    fn insert_row(conn: &rusqlite::Connection, blob: &BlobId, hash: &Blake3Hash) {
+        conn.execute(
+            "INSERT INTO fragment_hashes (data_block_id, chunk_number, local_index,
+                 fragment_id, fragment_hash, chunk_type, stored_locally)
+             VALUES (?1, 0, 0, 'f', ?2, 0, 1)",
+            params![blob, hash],
+        )
+        .unwrap();
+    }
+
+    // Impact: the ledger is the only record that a rowless file is this
+    // node's own upload (consensus-bugs 20); a hash it loses is a file the
+    // sweep deletes, a hash it keeps past its row is a file the operator
+    // is told is stuck.
+    // Should: record one row per fragment per blob, so two uploads sharing
+    // a hash each hold it; key the shard read for the sweep; list every
+    // entry still without a row as held, oldest first.
+    // Should: keep an entry whose row has landed (the hold lasts until the
+    // retention or a release), and leave it out of the held report while
+    // the row exists.
+    // Should: release one blob's entries, returning its hashes, without
+    // touching another blob's hold on a shared hash.
+    #[test]
+    fn local_upload_ledger_records_holds_and_releases_per_blob() {
+        let (_dir, _frags, conn) = ledger_fixture();
+        let h = |b: u8| Blake3Hash::from_bytes([b; 32]);
+        let blob_a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap();
+        let blob_b = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap();
+        assert_eq!(
+            record_local_uploads(&conn, &blob_a, &[h(0x10), h(0x11)], 1_000).unwrap(),
+            2
+        );
+        assert_eq!(
+            record_local_uploads(&conn, &blob_b, &[h(0x10), h(0x20)], 2_000).unwrap(),
+            2
+        );
+
+        assert_eq!(
+            local_uploads_in(&conn, 0x10).unwrap(),
+            HashSet::from([h(0x10)]),
+            "the shared hash, once"
+        );
+        assert_eq!(
+            local_uploads_in(&conn, 0x11).unwrap(),
+            HashSet::from([h(0x11)])
+        );
+        assert!(local_uploads_in(&conn, 0x12).unwrap().is_empty());
+
+        let held = held_local_uploads(&conn).unwrap();
+        assert_eq!(
+            held.iter()
+                .map(|u| (u.blob_id.clone(), u.fragment_hash, u.written_unix))
+                .collect::<Vec<_>>(),
+            vec![
+                (blob_a.clone(), h(0x10), 1_000),
+                (blob_a.clone(), h(0x11), 1_000),
+                (blob_b.clone(), h(0x10), 2_000),
+                (blob_b.clone(), h(0x20), 2_000),
+            ]
+        );
+
+        // Blob a lands: its entries stay (the hold is not retired by the
+        // row) but leave the held report while the row exists.
+        insert_row(&conn, &blob_a, &h(0x10));
+        insert_row(&conn, &blob_a, &h(0x11));
+        assert_eq!(
+            local_uploads_in(&conn, 0x10).unwrap(),
+            HashSet::from([h(0x10)]),
+            "the hold outlives the row landing"
+        );
+        assert_eq!(
+            held_local_uploads(&conn)
+                .unwrap()
+                .iter()
+                .map(|u| u.fragment_hash)
+                .collect::<Vec<_>>(),
+            vec![h(0x20)]
+        );
+
+        // Blob b is released: its two hashes come back, blob a's hold on
+        // the shared hash stays.
+        let mut released = release_local_uploads(&conn, &blob_b).unwrap();
+        released.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(released, vec![h(0x10), h(0x20)]);
+        assert_eq!(
+            local_uploads_in(&conn, 0x10).unwrap(),
+            HashSet::from([h(0x10)])
+        );
+        assert!(local_uploads_in(&conn, 0x20).unwrap().is_empty());
+        assert!(held_local_uploads(&conn).unwrap().is_empty());
+    }
+
+    // Impact: an upload whose transaction never lands (a rejected submit,
+    // ingress retrying under fresh blob ids) would otherwise hold its files
+    // forever and grow the ledger without bound.
+    // Should: expire a shard's entries written at or before the cutoff and
+    // report how many.
+    // Should not: expire an entry written after the cutoff, including one
+    // stamped in the future by a clock step.
+    #[test]
+    fn local_upload_ledger_expires_entries_past_the_cutoff() {
+        let (_dir, _frags, conn) = ledger_fixture();
+        let h = |b: u8| Blake3Hash::from_bytes([b; 32]);
+        let blob = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap();
+        record_local_uploads(&conn, &blob, &[h(0x10)], 1_000).unwrap();
+        record_local_uploads(&conn, &blob, &[h(0x11)], 5_000).unwrap();
+        record_local_uploads(&conn, &blob, &[h(0x12)], 9_000_000).unwrap();
+
+        assert_eq!(expire_local_uploads(&conn, 0x10, 999).unwrap(), 0);
+        assert_eq!(
+            expire_local_uploads(&conn, 0x10, 1_000).unwrap(),
+            1,
+            "at the cutoff"
+        );
+        assert_eq!(expire_local_uploads(&conn, 0x11, 4_000).unwrap(), 0);
+        assert_eq!(
+            expire_local_uploads(&conn, 0x12, 6_000).unwrap(),
+            0,
+            "a future stamp is fresh"
+        );
+        assert_eq!(
+            held_local_uploads(&conn)
+                .unwrap()
+                .iter()
+                .map(|u| u.fragment_hash)
+                .collect::<Vec<_>>(),
+            vec![h(0x11), h(0x12)]
+        );
+    }
+
+    // Impact: this is the one primitive that unlinks a rowless file — for
+    // the sweep, the operator's purge and an abandoned put alike; it must
+    // never take a fragment that has become real or that another upload
+    // still holds, however stale the caller's candidate list.
+    // Should: delete the candidates that have no row and no ledger entry,
+    // reporting their hashes and bytes.
+    // Should not: delete a candidate that has a fragment_hashes row, or one
+    // a ledgered upload holds — a released blob's shared hash included.
+    #[test]
+    fn delete_unclaimed_fragments_skips_rowed_and_held_candidates() {
+        let (_dir, frags, mut conn) = ledger_fixture();
+        let blob_a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap();
+        let blob_b = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap();
+        let store = |bytes: &[u8]| {
+            let hash = Blake3Hash::from_bytes(*blake3::hash(bytes).as_bytes());
+            fragstore::store_fragment(&frags, &hash, bytes.to_vec()).unwrap();
+            hash
+        };
+        let shared = store(b"held by both uploads");
+        let landed = store(b"gained a row after all");
+        let stuck = store(b"only blob a, never landed");
+        record_local_uploads(&conn, &blob_a, &[shared, landed, stuck], 1_000).unwrap();
+        record_local_uploads(&conn, &blob_b, &[shared], 1_000).unwrap();
+        insert_row(&conn, &blob_a, &landed);
+
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let candidates = release_local_uploads(&tx, &blob_a).unwrap();
+        assert_eq!(candidates.len(), 3);
+        let deleted =
+            delete_unclaimed_fragments(&tx, &frags, &stat_fragments(&frags, &candidates)).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            deleted,
+            DeletedFragments {
+                hashes: vec![stuck],
+                bytes: b"only blob a, never landed".len() as u64,
+            }
+        );
+        assert!(!fragstore::fragment_exists_and_valid(&frags, &stuck));
+        assert!(fragstore::fragment_exists_and_valid(&frags, &shared));
+        assert!(fragstore::fragment_exists_and_valid(&frags, &landed));
+        assert_eq!(
+            held_local_uploads(&conn)
+                .unwrap()
+                .iter()
+                .map(|u| (u.blob_id.clone(), u.fragment_hash))
+                .collect::<Vec<_>>(),
+            vec![(blob_b, shared)],
+            "blob b's hold survives blob a's release"
+        );
+    }
+
+    // Impact: the operator's listing used to walk every held entry and
+    // stat every file on the request thread; a node with thousands of held
+    // fragments made the maintenance route a disk walk.
+    // Should: group the held entries by blob in SQL, oldest blob first,
+    // with per-blob counts and stamps, capped at the limit, and report the
+    // totals over every held blob regardless of the cap.
+    // Should not: list an entry whose row has landed.
+    #[test]
+    fn held_summary_groups_by_blob_and_caps_the_listing() {
+        let (_dir, _frags, conn) = ledger_fixture();
+        let h = |b: u8| Blake3Hash::from_bytes([b; 32]);
+        let blob_a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap();
+        let blob_b = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap();
+        let blob_c = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a3").unwrap();
+        record_local_uploads(&conn, &blob_b, &[h(0x20), h(0x21)], 2_000).unwrap();
+        record_local_uploads(&conn, &blob_b, &[h(0x22)], 2_500).unwrap();
+        record_local_uploads(&conn, &blob_a, &[h(0x10), h(0x11)], 1_000).unwrap();
+        record_local_uploads(&conn, &blob_c, &[h(0x30)], 3_000).unwrap();
+        insert_row(&conn, &blob_a, &h(0x11));
+
+        let summary = held_local_upload_summary(&conn, 2).unwrap();
+        assert_eq!(summary.total_blobs, 3);
+        assert_eq!(
+            summary.total_fragments, 5,
+            "blob a's landed entry is not held"
+        );
+        assert_eq!(
+            summary.blobs,
+            vec![
+                HeldBlob {
+                    blob_id: blob_a,
+                    fragments: 1,
+                    oldest_written_unix: 1_000,
+                    newest_written_unix: 1_000,
+                },
+                HeldBlob {
+                    blob_id: blob_b,
+                    fragments: 3,
+                    oldest_written_unix: 2_000,
+                    newest_written_unix: 2_500,
+                },
+            ],
+            "two of three, oldest first"
+        );
+        assert_eq!(held_local_upload_summary(&conn, 10).unwrap().blobs.len(), 3);
     }
 
     // Impact: the rolling sweep pages belief per shard; a range that

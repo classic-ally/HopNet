@@ -140,6 +140,7 @@ pub async fn assemble_file_inode<R: AsyncRead + Unpin>(
         dataid.clone(),
         &per_file_key,
         &state.fragments_dir,
+        &state.db_pool,
     )
     .await?;
     blob_op.access = vec![file_access];

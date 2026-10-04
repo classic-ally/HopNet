@@ -908,6 +908,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     get(storage_host::routes::get_orphaned_fragments_scan),
                 )
                 .route(
+                    "/maintenance/orphaned-fragments/purge-held",
+                    post(storage_host::routes::post_purge_held_uploads),
+                )
+                .route(
                     "/maintenance/watermark-eviction",
                     post(storage_host::routes::post_watermark_eviction),
                 )
