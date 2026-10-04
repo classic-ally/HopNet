@@ -85,14 +85,22 @@ pub fn ensure_database_dir(db_path: &str) -> Result<(), std::io::Error> {
 ///
 /// `HOPNET_DB_SYNCHRONOUS` — OFF | NORMAL | FULL | EXTRA (default: SQLite picks FULL under WAL)
 /// `HOPNET_DB_CACHE_KIB`    — positive integer; applied as `PRAGMA cache_size = -<N>` (KiB form).
-///                            Default 262144 (256 MiB): SQLite's own 2 MB default against a
-///                            multi-GB database with 16 KiB pages made every inventory scan a
-///                            pread storm (5.5 billion read syscalls in a day on one node).
+///                            Default 32768 (32 MiB). The cache is private to each pooled
+///                            connection, so the old 256 MiB default reached ~8 GiB of
+///                            anonymous memory across the 32-connection pool (12 GB RSS on
+///                            a 30 GB laptop, an OOM kill on thor, 2026-10-03). Reads that
+///                            miss it go through the shared mmap below instead of pread.
 /// `HOPNET_DB_JOURNAL_SIZE_LIMIT_BYTES` — non-negative integer; `PRAGMA journal_size_limit`.
 ///                            Default 1073741824 (1 GiB): the WAL file is truncated back to
 ///                            this after a checkpoint instead of keeping its high-water mark
 ///                            (one node carried a 10.8 GB dead WAL).
-/// `HOPNET_DB_MMAP_BYTES`   — non-negative integer; applied as `PRAGMA mmap_size = <N>`
+/// `HOPNET_DB_MMAP_BYTES`   — non-negative integer; applied as `PRAGMA mmap_size = <N>`.
+///                            Default 2 GiB (SQLite clamps it to its compile-time maximum).
+///                            The mapping is the OS page cache, shared by every connection
+///                            and reclaimable, so one copy of the hot pages serves the whole
+///                            pool, and a cache miss is a page fault rather than a pread
+///                            (the storm the old 256 MiB private cache was sized against:
+///                            5.5 billion read syscalls in a day on one node). 0 turns it off.
 /// `HOPNET_DB_TEMP_STORE`   — DEFAULT | FILE | MEMORY
 /// `HOPNET_DB_PAGE_SIZE`    — power of 2 in [512, 65536]. Only takes effect on a fresh
 ///                            (empty) database. On a populated DB the PRAGMA is silently
@@ -126,10 +134,16 @@ fn page_size_pragma() -> String {
     format!("PRAGMA page_size = {};\n", chosen)
 }
 
-/// Per-connection page cache, KiB. 256 MiB: the hot inventory tables and
-/// their indexes stay resident across a scan instead of being re-read a
-/// page at a time through the OS cache.
-const DEFAULT_CACHE_KIB: u64 = 256 * 1024;
+/// Per-connection page cache, KiB. Private to each pooled connection, so
+/// the pool's worst case is this times `DB_POOL_MAX_SIZE`: 32 MiB keeps
+/// that near 1 GiB. The shared mmap (`DEFAULT_MMAP_BYTES`) holds the hot
+/// inventory pages once for everyone.
+const DEFAULT_CACHE_KIB: u64 = 32 * 1024;
+
+/// Memory-mapped I/O window, bytes. Reads come from the shared,
+/// reclaimable OS page cache instead of per-connection copies and pread
+/// syscalls. SQLite clamps the request to its compile-time maximum.
+const DEFAULT_MMAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// WAL truncation threshold after a checkpoint, bytes. 1 GiB leaves room
 /// for a big transaction without carrying its high-water mark forever.
@@ -172,6 +186,24 @@ fn journal_size_limit_pragma(env: Option<&str>) -> String {
     format!("PRAGMA journal_size_limit = {bytes};\n")
 }
 
+/// `PRAGMA mmap_size` from an optional `HOPNET_DB_MMAP_BYTES` value; an
+/// absent or invalid value yields the HopNet default, and 0 turns mmap off.
+fn mmap_pragma(env: Option<&str>) -> String {
+    let bytes = match env.map(|v| v.trim().parse::<u64>()) {
+        Some(Ok(bytes)) => bytes,
+        Some(Err(_)) => {
+            tracing::warn!(
+                "ignoring invalid HOPNET_DB_MMAP_BYTES={}; using default {}",
+                env.unwrap_or(""),
+                DEFAULT_MMAP_BYTES
+            );
+            DEFAULT_MMAP_BYTES
+        }
+        None => DEFAULT_MMAP_BYTES,
+    };
+    format!("PRAGMA mmap_size = {bytes};\n")
+}
+
 fn env_pragma_overrides() -> String {
     let mut out = String::new();
 
@@ -194,14 +226,9 @@ fn env_pragma_overrides() -> String {
             .as_deref(),
     ));
 
-    if let Ok(v) = std::env::var("HOPNET_DB_MMAP_BYTES") {
-        match v.trim().parse::<u64>() {
-            Ok(bytes) => {
-                out.push_str(&format!("PRAGMA mmap_size = {};\n", bytes));
-            }
-            Err(_) => tracing::warn!("ignoring invalid HOPNET_DB_MMAP_BYTES={}", v),
-        }
-    }
+    out.push_str(&mmap_pragma(
+        std::env::var("HOPNET_DB_MMAP_BYTES").ok().as_deref(),
+    ));
 
     if let Ok(v) = std::env::var("HOPNET_DB_TEMP_STORE") {
         let upper = v.trim().to_ascii_uppercase();
@@ -385,20 +412,43 @@ pub fn read_upgrade_node_settings(
 mod tests {
     use super::*;
 
-    // Impact: SQLite's 2 MB default page cache against a multi-GB database
-    // turned every inventory scan into a pread storm; the default must be
-    // HopNet's, with the env var still winning.
-    // Should: emit the 256 MiB default when the variable is absent or
+    // Impact: the page cache is private to each of the pool's connections;
+    // a 256 MiB default reached ~8 GiB of anonymous memory across the pool
+    // and OOM-killed thor (2026-10-03). The default must be HopNet's, with
+    // the env var still winning.
+    // Should: emit the 32 MiB default when the variable is absent or
     // invalid, and the given KiB when it is valid.
     #[test]
     fn cache_pragma_defaults_and_overrides() {
-        assert_eq!(cache_pragma(None), "PRAGMA cache_size = -262144;\n");
-        assert_eq!(
-            cache_pragma(Some("garbage")),
-            "PRAGMA cache_size = -262144;\n"
-        );
-        assert_eq!(cache_pragma(Some("0")), "PRAGMA cache_size = -262144;\n");
+        let default = "PRAGMA cache_size = -32768;\n";
+        assert_eq!(cache_pragma(None), default);
+        assert_eq!(cache_pragma(Some("garbage")), default);
+        assert_eq!(cache_pragma(Some("0")), default);
         assert_eq!(cache_pragma(Some(" 4096 ")), "PRAGMA cache_size = -4096;\n");
+    }
+
+    // Should: keep the pool's worst-case private cache near 1 GiB.
+    #[test]
+    fn the_pools_private_cache_stays_near_a_gibibyte() {
+        let pool_bytes = DEFAULT_CACHE_KIB * 1024 * u64::from(crate::db::DB_POOL_MAX_SIZE);
+        assert!(pool_bytes <= 1024 * 1024 * 1024, "{pool_bytes}");
+    }
+
+    // Impact: with the private cache cut, the shared mmap is what keeps
+    // inventory scans from turning back into a pread storm.
+    // Should: emit the 2 GiB mmap default when the variable is absent or
+    // invalid, and the given byte count when it is valid.
+    // Should: allow 0, which turns memory-mapped I/O off.
+    #[test]
+    fn mmap_pragma_defaults_and_overrides() {
+        let default = "PRAGMA mmap_size = 2147483648;\n";
+        assert_eq!(mmap_pragma(None), default);
+        assert_eq!(mmap_pragma(Some("lots")), default);
+        assert_eq!(mmap_pragma(Some("0")), "PRAGMA mmap_size = 0;\n");
+        assert_eq!(
+            mmap_pragma(Some(" 1048576 ")),
+            "PRAGMA mmap_size = 1048576;\n"
+        );
     }
 
     // Should: emit the 1 GiB journal_size_limit default when the variable
@@ -436,5 +486,21 @@ mod tests {
             .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
             .unwrap();
         assert_eq!(limit, DEFAULT_JOURNAL_SIZE_LIMIT_BYTES as i64);
+    }
+
+    // Should: leave a file-backed connection with memory-mapped I/O on
+    // (SQLite clamps the 2 GiB request to its compile-time maximum).
+    #[test]
+    fn a_file_connection_maps_the_database() {
+        if std::env::var_os("HOPNET_DB_MMAP_BYTES").is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("mmap.db")).unwrap();
+        apply_connection_pragmas(&conn).unwrap();
+        let mmap: i64 = conn
+            .query_row("PRAGMA mmap_size", [], |r| r.get(0))
+            .unwrap();
+        assert!(mmap > 0, "mmap_size = {mmap}");
     }
 }
