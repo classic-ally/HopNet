@@ -764,6 +764,11 @@ pub async fn epoch_join_bootstrap_with(
                 .is_none_or(|target| *target == c.head())
         });
 
+    // The imported inventory's flags are unreconciled until the pass
+    // below completes; an interruption is walked on the next boot.
+    // (`data_dir` is the database's directory: see the engine's caller.)
+    let db_path = data_dir.join("database.db").to_string_lossy().into_owned();
+    crate::regenesis::boot::mark_reconcile_pending(&db_path)?;
     {
         let mut conn = app_state.db_pool.get().map_err(|e| e.to_string())?;
         if at_head {
@@ -851,11 +856,34 @@ pub async fn epoch_join_bootstrap_with(
     clear_staging(&staging);
 
     // A re-registered node may already hold fragments from a previous
-    // life; the imported inventory does not know that yet.
-    if let Ok(conn) = app_state.db_pool.get()
-        && let Err(e) = reconcile_fragment_store(&conn, &app_state.fragments_dir)
-    {
-        tracing::warn!("fragment reconcile after join failed (harmless): {e}");
+    // life; the imported inventory does not know that yet. This path
+    // imports into an empty database (it refuses non-empty exported
+    // tables), so there are no flags to carry: the reconcile walks.
+    // The pending marker is cleared only once this pass completes.
+    match app_state
+        .db_pool
+        .get()
+        .map_err(|e| e.to_string())
+        .and_then(|conn| {
+            reconcile_fragment_store(
+                &conn,
+                &app_state.fragments_dir,
+                &crate::db::chains::CarriedFlags::default(),
+            )
+        }) {
+        Ok(_) => crate::regenesis::boot::clear_reconcile_pending(&db_path),
+        // The join does not complete: no engine on partial flags. The
+        // marker stays, so the next boot walks the store before its
+        // engine starts; ask the binary to restart into that boot (a
+        // boot whose walk fails again holds its engine and retries after
+        // a delay, so this cannot spin). Restarting is safe: the import
+        // committed, and a joined node's next boot is an ordinary one.
+        Err(e) => {
+            app_state.restart_signal.notify_one();
+            return Err(
+                format!("fragment reconcile after join failed (retried next boot): {e}").into(),
+            );
+        }
     }
 
     set_state(format!(
@@ -865,77 +893,317 @@ pub async fn epoch_join_bootstrap_with(
     Ok(())
 }
 
+/// What one [`reconcile_fragment_store`] pass did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Rows the epoch build carried across the transplant (0 when the
+    /// reconcile had to walk the store).
+    pub carried: usize,
+    /// Rows this pass flagged.
+    pub remarked: usize,
+    /// On-disk fragments with no row in the new inventory. `None` when
+    /// the pass did not walk the store (the targeted plan never lists it).
+    pub unbacked: Option<usize>,
+    pub elapsed_ms: u64,
+}
+
+/// Hashes checked, and rows flagged, per transaction on the targeted plan.
+const RECONCILE_MARK_BATCH: usize = 8192;
+/// INFO progress on a long reconcile: every this many units (shards on
+/// the walk, batches on the targeted plan) ...
+const RECONCILE_PROGRESS_UNITS: usize = 16;
+/// ... or this much time, whichever comes first.
+const RECONCILE_PROGRESS_EVERY: Duration = Duration::from_secs(60);
+/// First-level directories in the fragment store (one per hash byte).
+const FRAGMENT_SHARDS: usize = 256;
+
+/// Whether a long pass is due an INFO progress line: `done` units now,
+/// `logged` units at the last line, `since` the last line.
+pub fn reconcile_progress_due(done: usize, logged: usize, since: Duration) -> bool {
+    done.saturating_sub(logged) >= RECONCILE_PROGRESS_UNITS || since >= RECONCILE_PROGRESS_EVERY
+}
+
+/// Linear ETA for `done` of `total` units after `elapsed`.
+fn reconcile_eta(done: usize, total: usize, elapsed: Duration) -> Duration {
+    if done == 0 || done >= total {
+        return Duration::ZERO;
+    }
+    elapsed.mul_f64((total - done) as f64 / done as f64)
+}
+
+/// Tracks the INFO progress cadence for one reconcile plan.
+struct ReconcileProgress {
+    plan: &'static str,
+    total: usize,
+    started: std::time::Instant,
+    logged: usize,
+    logged_at: std::time::Instant,
+}
+
+impl ReconcileProgress {
+    fn new(plan: &'static str, total: usize, started: std::time::Instant) -> Self {
+        ReconcileProgress {
+            plan,
+            total,
+            started,
+            logged: 0,
+            logged_at: started,
+        }
+    }
+
+    fn tick(&mut self, done: usize, remarked: usize) {
+        if done >= self.total
+            || !reconcile_progress_due(done, self.logged, self.logged_at.elapsed())
+        {
+            return;
+        }
+        self.logged = done;
+        self.logged_at = std::time::Instant::now();
+        tracing::info!(
+            plan = self.plan,
+            done,
+            of = self.total,
+            remarked,
+            pct = done * 100 / self.total,
+            eta_s = reconcile_eta(done, self.total, self.started.elapsed()).as_secs(),
+            "fragment reconcile progress"
+        );
+    }
+}
+
 /// Reconcile the fragment store against a freshly imported inventory
-/// (RFC-019 S7). A fragment the new epoch's inventory backs but that
-/// imported with `stored_locally = 0` is re-marked if the bytes are on
-/// disk and hash correctly (a joiner has no old database to carry the
-/// flag from).
+/// (RFC-019 S7) so the node starts consensus with `stored_locally`
+/// matching its disk. BLOCKING by design: starting with flags missing
+/// makes the self-check differential report a mass removal. So it must
+/// be cheap, and it is EXISTENCE-ONLY: a present file is flagged without
+/// being read. Content verification is deferred to the rolling sweep's
+/// scrub and to serve-time verification (`fetch_and_verify_fragment`).
+/// Reading and hashing every unflagged row here cost thor an estimated
+/// ~31 hours on an HDD (consensus-bugs 22).
 ///
-/// A file the new inventory does not back at all is counted and left on
-/// disk. Deleting it is the existence sweep's job (`hopnet_storage::sweep`,
+/// Two plans, chosen by what the epoch build carried:
+///
+/// * **Targeted** (`carried.carried > 0`, the straggler's staged join):
+///   the build already re-applied the old database's flags by hash
+///   ([`crate::db::chains::transplant_preserving_local_flags`]). Those
+///   flags are the sweep's own record of this disk, so they are trusted
+///   as they are, and a row the old inventory knew but had unflagged
+///   stays unflagged for the same reason. That leaves `carried.unknown`:
+///   the hashes the old inventory never had, i.e. fragments that
+///   appeared in the epochs this node missed. It can hold some of those
+///   (its own upload whose commit it never saw, consensus-bugs 20), so
+///   each gets one `stat`, in path order, and nothing else. The cost is
+///   one stat per fragment new to this node instead of one full read per
+///   row of the inventory. A carried flag whose file has since vanished
+///   is left for the sweep to unflag (its flagged-but-missing pass).
+///   The store is not walked, so `unbacked` is `None`.
+/// * **Walk** (nothing carried, or the carried flags are untrusted): a
+///   fresh node, the in-process join into an empty database, or a boot
+///   that finds an earlier reconcile was interrupted (see
+///   `regenesis::boot`'s reconcile-pending marker). List the store one
+///   shard at a time (`list_shard_hashes`: directory reads only, no
+///   per-file stat, no content read) and flag every unflagged row whose
+///   hash is present, one transaction per shard. It only ever adds
+///   flags, so any flags already set stay set. Listed files with no row
+///   are counted as unbacked.
+///
+/// Fails (and the caller holds the engine, keeping the pending marker)
+/// when the store root is missing, a shard cannot be listed, or a path
+/// cannot be examined: an unreadable store must never read as an empty
+/// one.
+///
+/// Known limitation: partial flags left by 2026.10.12 or earlier (whose
+/// reconcile ran before staging was cleared and wrote no marker) are
+/// detected only while that staging is still on disk. A node that has
+/// already rebooted past an interrupted reconcile, or an older
+/// in-process join, is not detected; there is deliberately no one-off
+/// walk on every node's first boot of this release. The rolling sweep's
+/// present-but-unflagged pass re-flags such files as it rotates.
+///
+/// Never deletes anything. A file the new inventory does not back is
+/// the existence sweep's job (`hopnet_storage::sweep`,
 /// `storage_host::jobs::reap_orphans`): a rowless file past the sweep's
-/// grace is deleted unless this node's upload ledger names it, and a
-/// ledgered file is never deleted. A join is not a quiet moment: this
-/// node's own upload writes its fragments before its transaction commits,
-/// a straggler can join before it sees that commit, and the imported
-/// inventory may never carry the rows at all. Deleting rowless files here
-/// lost two uploaded videos in production (consensus-bugs 20).
-/// Under-collecting is harmless, over-collecting is not.
+/// grace is deleted unless this node's upload ledger names it. A join is
+/// not a quiet moment: this node's own upload writes its fragments
+/// before its transaction commits, and a straggler can join before it
+/// sees that commit. Deleting rowless files here lost two uploaded
+/// videos in production (consensus-bugs 20).
 ///
-/// Direct SQL, deliberately NOT the attestation path: a self-check rides a
-/// consensus round, and at boot there is no engine yet to carry a
+/// Direct SQL, deliberately NOT the attestation path: a self-check rides
+/// a consensus round, and at boot there is no engine yet to carry a
 /// wholesale post-import reconciliation. `self_verified_height` is left
-/// NULL — the existing self-check cron re-attests over time, at its own
-/// pace.
-///
-/// Returns `(remarked, unbacked)`.
+/// as imported; the self-check cron re-attests at its own pace.
 pub fn reconcile_fragment_store(
     conn: &rusqlite::Connection,
     fragments_dir: &str,
-) -> Result<(usize, usize), String> {
-    let unmarked: Vec<(String, i64, i64, Vec<u8>)> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT data_block_id, chunk_number, local_index, fragment_hash
-                 FROM fragment_hashes WHERE stored_locally = 0",
-            )
-            .map_err(|e| format!("unmarked query: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .map_err(|e| format!("unmarked rows: {e}"))?;
-        rows.collect::<Result<_, _>>()
-            .map_err(|e| format!("unmarked collect: {e}"))?
-    };
+    carried: &crate::db::chains::CarriedFlags,
+) -> Result<ReconcileReport, String> {
+    let started = std::time::Instant::now();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM fragment_hashes", [], |r| r.get(0))
+        .map_err(|e| format!("row count: {e}"))?;
+    // An absent root lists every shard as empty, which would read as
+    // "this node holds nothing" — an unmounted store must fail instead.
+    if !Path::new(fragments_dir).is_dir() {
+        return Err(format!(
+            "fragment store {fragments_dir:?} is missing or not a directory"
+        ));
+    }
+    let targeted = carried.carried > 0;
+    tracing::info!(
+        rows,
+        carried = carried.carried,
+        unknown = carried.unknown.len(),
+        plan = if targeted { "targeted" } else { "walk" },
+        "fragment reconcile starting (existence-only)"
+    );
 
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS reconcile_present (
+             fragment_hash BLOB PRIMARY KEY
+         ) WITHOUT ROWID;",
+    )
+    .map_err(|e| format!("present table: {e}"))?;
+    let outcome = if targeted {
+        reconcile_targeted(conn, fragments_dir, &carried.unknown, started)
+            .map(|remarked| (remarked, None))
+    } else {
+        reconcile_walk(conn, fragments_dir, started)
+            .map(|(remarked, unbacked)| (remarked, Some(unbacked)))
+    };
+    let _ = conn.execute_batch("DROP TABLE IF EXISTS temp.reconcile_present;");
+    let (remarked, unbacked) = outcome?;
+
+    let report = ReconcileReport {
+        carried: carried.carried,
+        remarked,
+        unbacked,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    };
+    tracing::info!(
+        carried = report.carried,
+        remarked = report.remarked,
+        unbacked = ?report.unbacked,
+        elapsed_ms = report.elapsed_ms,
+        "fragment reconcile done (unbacked files left for the sweep; content checks deferred to scrub and serve)"
+    );
+    Ok(report)
+}
+
+/// The targeted plan: one `stat` per unknown hash, flags set in
+/// [`RECONCILE_MARK_BATCH`]-sized transactions.
+fn reconcile_targeted(
+    conn: &rusqlite::Connection,
+    fragments_dir: &str,
+    unknown: &[[u8; 32]],
+    started: std::time::Instant,
+) -> Result<usize, String> {
     let mut remarked = 0usize;
-    for (block_id, chunk, index, hash_bytes) in unmarked {
-        let Ok(raw) = <[u8; 32]>::try_from(hash_bytes.as_slice()) else {
-            continue;
-        };
-        let hash = hopnet_storage::Blake3Hash::from_bytes(raw);
-        if !hopnet_storage::fragstore::fragment_exists_and_valid(fragments_dir, &hash) {
-            continue;
+    let mut progress = ReconcileProgress::new(
+        "targeted",
+        unknown.len().div_ceil(RECONCILE_MARK_BATCH),
+        started,
+    );
+    for (i, batch) in unknown.chunks(RECONCILE_MARK_BATCH).enumerate() {
+        let mut present: Vec<&[u8; 32]> = Vec::with_capacity(batch.len());
+        for raw in batch {
+            if fragment_file_present(fragments_dir, raw)? {
+                present.push(raw);
+            }
         }
-        conn.execute(
+        remarked += mark_present(conn, &present, false)?.0;
+        progress.tick(i + 1, remarked);
+    }
+    Ok(remarked)
+}
+
+/// Whether `hash`'s file is in the store, judged the way the walk's
+/// listing judges it: a regular file (a symlink is not followed). Only
+/// `NotFound` means absent; any other error (EACCES, EIO) fails the
+/// reconcile rather than silently under-flagging.
+fn fragment_file_present(fragments_dir: &str, hash: &[u8; 32]) -> Result<bool, String> {
+    let hex = hex::encode(hash);
+    let path = format!("{fragments_dir}/{}/{}/{hex}", &hex[0..2], &hex[2..4]);
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) => Ok(m.file_type().is_file()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("stat {path}: {e}")),
+    }
+}
+
+/// The walk plan: list each shard, flag what is present, count what has
+/// no row — one transaction per non-empty shard. Any shard that cannot be
+/// listed fails the walk: a missing shard would read as fragments lost.
+fn reconcile_walk(
+    conn: &rusqlite::Connection,
+    fragments_dir: &str,
+    started: std::time::Instant,
+) -> Result<(usize, usize), String> {
+    let mut remarked = 0usize;
+    let mut unbacked = 0usize;
+    let mut progress = ReconcileProgress::new("walk", FRAGMENT_SHARDS, started);
+    for shard in 0..=u8::MAX {
+        let listed = hopnet_storage::fragstore::list_shard_hashes(fragments_dir, shard)
+            .map_err(|e| format!("listing shard {shard:02x}: {e:?}"))?;
+        let hashes: Vec<&[u8; 32]> = listed.iter().map(|h| h.0.as_bytes()).collect();
+        let (marked, rowless) = mark_present(conn, &hashes, true)?;
+        remarked += marked;
+        unbacked += rowless;
+        progress.tick(shard as usize + 1, remarked);
+    }
+    Ok((remarked, unbacked))
+}
+
+/// Flag every unflagged row whose hash is in `present`, in ONE
+/// transaction; optionally count the hashes with no row at all.
+/// Returns `(rows flagged, rowless hashes)`.
+fn mark_present(
+    conn: &rusqlite::Connection,
+    present: &[&[u8; 32]],
+    count_rowless: bool,
+) -> Result<(usize, usize), String> {
+    if present.is_empty() {
+        return Ok((0, 0));
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("reconcile tx: {e}"))?;
+    {
+        let mut insert = tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO temp.reconcile_present (fragment_hash) VALUES (?)",
+            )
+            .map_err(|e| format!("present prepare: {e}"))?;
+        for hash in present {
+            insert
+                .execute([hash.as_slice()])
+                .map_err(|e| format!("present insert: {e}"))?;
+        }
+    }
+    let marked = tx
+        .execute(
             "UPDATE fragment_hashes SET stored_locally = 1
-             WHERE data_block_id = ? AND chunk_number = ? AND local_index = ?",
-            rusqlite::params![block_id, chunk, index],
+             WHERE stored_locally = 0
+               AND fragment_hash IN (SELECT fragment_hash FROM temp.reconcile_present)",
+            [],
         )
         .map_err(|e| format!("re-mark: {e}"))?;
-        remarked += 1;
-    }
-
-    // Files with no row in the freshly imported table: counted for the
-    // log, left for the sweep.
-    let listing = hopnet_storage::fragstore::scan_fragments_detailed(fragments_dir)
-        .map_err(|e| format!("unbacked walk: {e:?}"))?;
-    let rows = crate::db::fragments::all_fragment_flags(conn)
-        .map_err(|e| format!("fragment flags: {e:?}"))?;
-    let backed: std::collections::HashSet<_> = rows.iter().map(|(hash, _)| hash).collect();
-    let unbacked = listing.iter().filter(|d| !backed.contains(&d.hash)).count();
-    Ok((remarked, unbacked))
+    let rowless = if count_rowless {
+        tx.query_row(
+            "SELECT COUNT(*) FROM temp.reconcile_present p
+             WHERE NOT EXISTS (SELECT 1 FROM fragment_hashes fh
+                               WHERE fh.fragment_hash = p.fragment_hash)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("unbacked count: {e}"))? as usize
+    } else {
+        0
+    };
+    tx.execute("DELETE FROM temp.reconcile_present", [])
+        .map_err(|e| format!("present clear: {e}"))?;
+    crate::db::shared::commit_timed(tx).map_err(|e| format!("reconcile commit: {e}"))?;
+    Ok((marked, rowless))
 }
 
 /// Spawn an epoch join unless one is already inflight. The trigger seam
@@ -1008,7 +1276,7 @@ mod tests {
 
     fn transitioned(dir: &Path) -> String {
         let db_path = sealed_db(dir);
-        match crate::regenesis::boot::boot_transition(&db_path, TARGET) {
+        match crate::regenesis::boot::tests::boot_transition(&db_path, TARGET) {
             crate::regenesis::boot::BootOutcome::Transitioned { epoch: 2 } => {}
             other => panic!("fixture transition failed: {other:?}"),
         }
@@ -1094,9 +1362,10 @@ mod tests {
     // but the inventory it is measured against is replaced wholesale —
     // without this pass a joiner reports holding nothing it actually
     // holds.
-    // Should: re-mark on-disk fragments the new inventory backs.
+    // Should: walk the store when the build carried no flags, re-marking
+    // on-disk fragments the new inventory backs.
     // Should: count on-disk fragments it does not back.
-    // Should not: re-mark a row whose bytes are absent or corrupt.
+    // Should not: re-mark a row whose bytes are absent.
     // Should not: delete a fragment the new inventory does not back.
     #[test]
     fn reconcile_remarks_local_fragments_and_leaves_unbacked_files() {
@@ -1131,9 +1400,10 @@ mod tests {
         )
         .unwrap();
 
-        let (remarked, unbacked) = reconcile_fragment_store(&conn, &frags).unwrap();
-        assert_eq!(remarked, 1, "only the fragment actually on disk");
-        assert_eq!(unbacked, 1, "the unbacked file is counted");
+        let report = reconcile_fragment_store(&conn, &frags, &CarriedFlags::default()).unwrap();
+        assert_eq!(report.carried, 0);
+        assert_eq!(report.remarked, 1, "only the fragment actually on disk");
+        assert_eq!(report.unbacked, Some(1), "the unbacked file is counted");
 
         let marked: i64 = conn
             .query_row(
@@ -1151,6 +1421,393 @@ mod tests {
             &frags,
             &orphan_hash
         ));
+    }
+
+    use crate::db::chains::CarriedFlags;
+
+    /// A sealed fixture database with an empty inventory and a fragment
+    /// directory beside it.
+    fn reconcile_fixture(dir: &Path) -> (rusqlite::Connection, String) {
+        let db_path = sealed_db(dir);
+        let frag_dir = dir.join("fragments");
+        std::fs::create_dir_all(&frag_dir).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::db::shared::apply_connection_pragmas(&conn).unwrap();
+        conn.execute("DELETE FROM fragment_hashes", []).unwrap();
+        (conn, frag_dir.to_string_lossy().into_owned())
+    }
+
+    /// Unflagged inventory rows for `hashes`, in one transaction.
+    fn add_unflagged_rows(conn: &rusqlite::Connection, hashes: &[[u8; 32]]) {
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO fragment_hashes
+                     (data_block_id, chunk_number, local_index, fragment_id, fragment_hash, chunk_type, stored_locally)
+                     VALUES ('blob1', 0, ?, ?, ?, 0, 0)",
+                )
+                .unwrap();
+            for (i, hash) in hashes.iter().enumerate() {
+                stmt.execute(rusqlite::params![
+                    i as i64,
+                    format!("frag{i}"),
+                    hash.as_slice()
+                ])
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    fn is_flagged(conn: &rusqlite::Connection, hash: &[u8; 32]) -> bool {
+        conn.query_row(
+            "SELECT MAX(stored_locally) FROM fragment_hashes WHERE fragment_hash = ?",
+            [hash.as_slice()],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .unwrap()
+            == Some(1)
+    }
+
+    /// Store `n` fragments with real content; returns their hashes.
+    fn store_fragments(frags: &str, n: usize, tag: &str) -> Vec<[u8; 32]> {
+        (0..n)
+            .map(|i| {
+                let bytes = format!("{tag} fragment {i}").into_bytes();
+                let hash = *blake3::hash(&bytes).as_bytes();
+                hopnet_storage::fragstore::store_fragment(
+                    frags,
+                    &hopnet_storage::Blake3Hash::from_bytes(hash),
+                    bytes,
+                )
+                .unwrap();
+                hash
+            })
+            .collect()
+    }
+
+    // Impact: the reconcile blocks consensus start; reading and hashing
+    // every fragment took thor an estimated ~31 hours on an HDD
+    // (consensus-bugs 22). Content is checked later by the sweep's scrub
+    // and by serve-time verification, which delete or refuse bad bytes.
+    // Should: flag a row whose file is present even when the bytes do
+    // not match the hash, on both the walk and the targeted plan.
+    #[test]
+    fn reconcile_marks_present_files_without_reading_them() {
+        for targeted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (conn, frags) = reconcile_fixture(dir.path());
+            let hash = [0x5Au8; 32];
+            hopnet_storage::fragstore::store_fragment(
+                &frags,
+                &hopnet_storage::Blake3Hash::from_bytes(hash),
+                b"bytes that do not hash to the name".to_vec(),
+            )
+            .unwrap();
+            add_unflagged_rows(&conn, &[hash]);
+
+            let carried = if targeted {
+                CarriedFlags {
+                    carried: 1,
+                    unknown: vec![hash],
+                }
+            } else {
+                CarriedFlags::default()
+            };
+            let report = reconcile_fragment_store(&conn, &frags, &carried).unwrap();
+            assert_eq!(report.remarked, 1, "targeted={targeted}");
+            assert!(is_flagged(&conn, &hash), "targeted={targeted}");
+        }
+    }
+
+    // Impact: the build carried the old database's flags, which the
+    // sweep maintains; re-deriving them from disk is the hours-long work
+    // this plan exists to avoid.
+    // Should: flag a present fragment the old inventory never knew.
+    // Should not: look at rows the old inventory already knew, even
+    // when a file for one is present (the sweep owns those).
+    // Should not: walk the store (no unbacked count).
+    #[test]
+    fn reconcile_with_carried_flags_checks_only_unknown_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, frags) = reconcile_fixture(dir.path());
+        let stored = store_fragments(&frags, 2, "targeted");
+        let (known, unknown, absent) = (stored[0], stored[1], [0xA5u8; 32]);
+        add_unflagged_rows(&conn, &[known, unknown, absent]);
+
+        let carried = CarriedFlags {
+            carried: 5,
+            unknown: vec![unknown, absent],
+        };
+        let report = reconcile_fragment_store(&conn, &frags, &carried).unwrap();
+        assert_eq!(report.carried, 5);
+        assert_eq!(report.remarked, 1);
+        assert_eq!(report.unbacked, None);
+        assert!(is_flagged(&conn, &unknown));
+        assert!(!is_flagged(&conn, &known), "known rows are the sweep's");
+        assert!(!is_flagged(&conn, &absent));
+    }
+
+    /// Run `f` with `path`'s mode set to `mode`, restoring 0o755 after.
+    /// Returns `None` when the mode bits do not bind (running as root).
+    fn with_mode<T>(path: &Path, mode: u32, f: impl FnOnce() -> T) -> Option<T> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let binds = std::fs::read_dir(path).is_err();
+        let out = binds.then(f);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        out
+    }
+
+    // Impact: a shard that cannot be listed would read as every fragment
+    // in it lost, and the self-check would report their removal.
+    // Should: fail the walk when any shard cannot be listed.
+    // Should not: flag anything as if the shard were empty and succeed.
+    #[test]
+    fn reconcile_walk_fails_when_a_shard_cannot_be_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, frags) = reconcile_fixture(dir.path());
+        let hashes = store_fragments(&frags, 1, "unlistable");
+        add_unflagged_rows(&conn, &hashes);
+        let shard = Path::new(&frags).join(&hex::encode(hashes[0])[0..2]);
+
+        let Some(result) = with_mode(&shard, 0o000, || {
+            reconcile_fragment_store(&conn, &frags, &CarriedFlags::default())
+        }) else {
+            return;
+        };
+        assert!(result.is_err(), "got {result:?}");
+    }
+
+    // Impact: an unmounted store lists every shard as empty.
+    // Should: fail on both plans when the store root is missing.
+    #[test]
+    fn reconcile_fails_when_the_fragment_store_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, _) = reconcile_fixture(dir.path());
+        let missing = dir
+            .path()
+            .join("not-mounted")
+            .to_string_lossy()
+            .into_owned();
+        add_unflagged_rows(&conn, &[[0x11; 32]]);
+        for carried in [
+            CarriedFlags::default(),
+            CarriedFlags {
+                carried: 1,
+                unknown: vec![[0x11; 32]],
+            },
+        ] {
+            assert!(reconcile_fragment_store(&conn, &missing, &carried).is_err());
+        }
+    }
+
+    // Impact: treating EACCES or EIO as "absent" under-flags silently.
+    // Should: fail the targeted plan when a fragment path cannot be
+    // examined.
+    #[test]
+    fn targeted_reconcile_fails_on_an_unreadable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, frags) = reconcile_fixture(dir.path());
+        let hashes = store_fragments(&frags, 1, "unreadable");
+        add_unflagged_rows(&conn, &hashes);
+        let shard = Path::new(&frags).join(&hex::encode(hashes[0])[0..2]);
+
+        let carried = CarriedFlags {
+            carried: 1,
+            unknown: hashes.clone(),
+        };
+        let Some(result) = with_mode(&shard, 0o000, || {
+            reconcile_fragment_store(&conn, &frags, &carried)
+        }) else {
+            return;
+        };
+        assert!(result.is_err(), "got {result:?}");
+    }
+
+    // Should not: flag a fragment whose name is a symlink, on either
+    // plan (both judge a file by its own entry, not its target).
+    #[test]
+    fn reconcile_does_not_follow_symlinks() {
+        for targeted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (conn, frags) = reconcile_fixture(dir.path());
+            let target = dir.path().join("elsewhere");
+            std::fs::write(&target, b"bytes outside the store").unwrap();
+            let hash = [0x77u8; 32];
+            let leaf = hopnet_storage::fragstore::create_fragment_path(
+                &frags,
+                &hopnet_storage::Blake3Hash::from_bytes(hash),
+            )
+            .unwrap();
+            std::fs::create_dir_all(&leaf).unwrap();
+            std::os::unix::fs::symlink(&target, format!("{leaf}/{}", hex::encode(hash))).unwrap();
+            add_unflagged_rows(&conn, &[hash]);
+
+            let carried = if targeted {
+                CarriedFlags {
+                    carried: 1,
+                    unknown: vec![hash],
+                }
+            } else {
+                CarriedFlags::default()
+            };
+            reconcile_fragment_store(&conn, &frags, &carried).unwrap();
+            assert!(!is_flagged(&conn, &hash), "targeted={targeted}");
+        }
+    }
+
+    // Impact: per-row autocommit turned every flag write into its own
+    // commit (consensus-bugs 22).
+    // Should: flag 20k present fragments in at most one transaction per
+    // shard on the walk, and one per batch on the targeted plan.
+    #[test]
+    fn reconcile_commits_in_batches_not_per_row() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        const N: usize = 20_000;
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, frags) = reconcile_fixture(dir.path());
+        let hashes = store_fragments(&frags, N, "batched");
+        add_unflagged_rows(&conn, &hashes);
+
+        let commits = Arc::new(AtomicUsize::new(0));
+        let hook = Arc::clone(&commits);
+        conn.commit_hook(Some(move || {
+            hook.fetch_add(1, Ordering::Relaxed);
+            false
+        }))
+        .unwrap();
+
+        let report = reconcile_fragment_store(&conn, &frags, &CarriedFlags::default()).unwrap();
+        assert_eq!(report.remarked, N);
+        let walk_commits = commits.swap(0, Ordering::Relaxed);
+        assert!(
+            walk_commits <= FRAGMENT_SHARDS + 2,
+            "walk committed {walk_commits} times for {N} rows"
+        );
+
+        conn.execute("UPDATE fragment_hashes SET stored_locally = 0", [])
+            .unwrap();
+        commits.store(0, Ordering::Relaxed);
+        let mut unknown = hashes;
+        unknown.sort();
+        let carried = CarriedFlags {
+            carried: 1,
+            unknown,
+        };
+        let report = reconcile_fragment_store(&conn, &frags, &carried).unwrap();
+        assert_eq!(report.remarked, N);
+        let targeted_commits = commits.load(Ordering::Relaxed);
+        assert!(
+            targeted_commits <= N.div_ceil(RECONCILE_MARK_BATCH) + 2,
+            "targeted committed {targeted_commits} times for {N} rows"
+        );
+    }
+
+    // Should: report progress every 16 units or every minute, whichever
+    // comes first, with a linear ETA.
+    // Should not: report again before either threshold is crossed.
+    #[test]
+    fn reconcile_progress_is_due_every_sixteen_units_or_minute() {
+        assert!(!reconcile_progress_due(15, 0, Duration::from_secs(59)));
+        assert!(reconcile_progress_due(16, 0, Duration::ZERO));
+        assert!(reconcile_progress_due(1, 0, Duration::from_secs(60)));
+        assert!(!reconcile_progress_due(40, 32, Duration::from_secs(10)));
+        assert!(reconcile_progress_due(48, 32, Duration::from_secs(10)));
+        assert_eq!(
+            reconcile_eta(64, 256, Duration::from_secs(10)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            reconcile_eta(0, 256, Duration::from_secs(10)),
+            Duration::ZERO
+        );
+    }
+
+    /// The reconcile as it was before consensus-bugs 22: read and hash
+    /// every unflagged row, one autocommit UPDATE per hit.
+    fn legacy_reconcile(conn: &rusqlite::Connection, frags: &str) -> usize {
+        let unmarked: Vec<(String, i64, i64, Vec<u8>)> = conn
+            .prepare(
+                "SELECT data_block_id, chunk_number, local_index, fragment_hash
+                 FROM fragment_hashes WHERE stored_locally = 0",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut remarked = 0;
+        for (block_id, chunk, index, hash) in unmarked {
+            let hash = hopnet_storage::Blake3Hash::from_bytes(hash.try_into().unwrap());
+            if hopnet_storage::fragstore::fragment_exists_and_valid(frags, &hash) {
+                conn.execute(
+                    "UPDATE fragment_hashes SET stored_locally = 1
+                     WHERE data_block_id = ? AND chunk_number = ? AND local_index = ?",
+                    rusqlite::params![block_id, chunk, index],
+                )
+                .unwrap();
+                remarked += 1;
+            }
+        }
+        remarked
+    }
+
+    // Not a test: before/after timing of the join reconcile.
+    //   cargo test --lib reconcile_timing_harness -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing harness; run explicitly"]
+    fn reconcile_timing_harness() {
+        const ROWS: usize = 200_000;
+        const FILES: usize = 50_000;
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, frags) = reconcile_fixture(dir.path());
+        let mut hashes = store_fragments(&frags, FILES, "timing");
+        hashes.extend(
+            (FILES..ROWS).map(|i| *blake3::hash(format!("remote {i}").as_bytes()).as_bytes()),
+        );
+        add_unflagged_rows(&conn, &hashes);
+        let reset = || {
+            conn.execute("UPDATE fragment_hashes SET stored_locally = 0", [])
+                .unwrap();
+        };
+
+        let t = std::time::Instant::now();
+        assert_eq!(legacy_reconcile(&conn, &frags), FILES);
+        println!("legacy (read+hash, per-row commit): {:?}", t.elapsed());
+
+        reset();
+        let t = std::time::Instant::now();
+        let r = reconcile_fragment_store(&conn, &frags, &CarriedFlags::default()).unwrap();
+        assert_eq!(r.remarked, FILES);
+        println!("walk (listing, per-shard commit):   {:?}", t.elapsed());
+
+        // A straggler that carried all but 1% of its flags, plus 1% of
+        // the remote rows new to it.
+        reset();
+        let carried = FILES - FILES / 100;
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare("UPDATE fragment_hashes SET stored_locally = 1 WHERE fragment_hash = ?")
+                .unwrap();
+            for hash in &hashes[..carried] {
+                stmt.execute([hash.as_slice()]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let mut unknown: Vec<[u8; 32]> = hashes[carried..FILES].to_vec();
+        unknown.extend_from_slice(&hashes[FILES..FILES + FILES / 100]);
+        unknown.sort();
+        let stats = unknown.len();
+        let t = std::time::Instant::now();
+        let r =
+            reconcile_fragment_store(&conn, &frags, &CarriedFlags { carried, unknown }).unwrap();
+        assert_eq!(r.remarked, FILES / 100);
+        println!("targeted ({stats} stats):           {:?}", t.elapsed());
     }
 
     // ------------------------------------------------------------------

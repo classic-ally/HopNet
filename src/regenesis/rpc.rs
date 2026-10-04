@@ -282,7 +282,7 @@ mod tests {
     /// but NO artifact file (the transition never writes one).
     fn transitioned_db(dir: &std::path::Path) -> String {
         let db_path = sealed_db(dir);
-        match crate::regenesis::boot::boot_transition(&db_path, TARGET) {
+        match crate::regenesis::boot::tests::boot_transition(&db_path, TARGET) {
             crate::regenesis::boot::BootOutcome::Transitioned { epoch: 2 } => {}
             other => panic!("fixture transition failed: {other:?}"),
         }

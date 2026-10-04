@@ -236,6 +236,59 @@ pub fn scan_shard(fragments_dir: &str, shard: u8) -> Result<FragmentListing, Sto
     Ok(listing)
 }
 
+/// The fragment hashes in one shard, from directory listings alone: no
+/// per-file `stat` (the entry type comes from the listing on ext4, xfs,
+/// btrfs and APFS), no content read. On a cold HDD the per-file stat of
+/// [`scan_shard`] dominates; this costs one read per directory. Temp
+/// files and unexpected names are skipped silently, and so is a file
+/// that does not sit under its own hash's `AB/CD/` prefix: path-based
+/// reads could never find it. ([`scan_shard`] still lists such a file;
+/// its consumer, the sweep, treats it as an ordinary rowless file.) A
+/// missing shard directory lists as empty; any other listing error fails
+/// the whole shard rather than shrinking it.
+pub fn list_shard_hashes(fragments_dir: &str, shard: u8) -> Result<Vec<Blake3Hash>, StorageError> {
+    let path = std::path::Path::new(fragments_dir).join(format!("{shard:02x}"));
+    let mut hashes = Vec::new();
+    let first_level = match fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(hashes),
+        Err(e) => return Err(StorageError::Io(e)),
+    };
+    let shard_hex = format!("{shard:02x}");
+    for second_level in first_level {
+        let second_level = second_level?;
+        if !second_level.file_type()?.is_dir() {
+            continue;
+        }
+        let dir_name = second_level.file_name();
+        let Some(dir_name) = dir_name.to_str().map(str::to_owned) else {
+            continue;
+        };
+        for file in fs::read_dir(second_level.path())? {
+            let file = file?;
+            if !file.file_type()?.is_file() {
+                continue;
+            }
+            let name = file.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // ASCII first: the prefix checks slice bytes, and a 64-byte
+            // name with a multi-byte character would split it.
+            if !name.is_ascii()
+                || name.len() != 64
+                || name[0..2] != shard_hex
+                || name[2..4] != dir_name
+            {
+                continue;
+            }
+            let mut bytes = [0u8; 32];
+            if hex::decode_to_slice(name, &mut bytes).is_ok() {
+                hashes.push(Blake3Hash::from_bytes(bytes));
+            }
+        }
+    }
+    Ok(hashes)
+}
+
 /// Walk one first-level directory (its second-level directories and
 /// their files) into `listing`.
 fn scan_first_level(
@@ -503,6 +556,83 @@ mod tests {
             .unwrap();
         let none = scan_shard(&dir, empty).unwrap();
         assert!(none.fragments.is_empty() && none.temps.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Should: name exactly the fragments under the shard's prefix, the
+    // same set the full shard scan lists.
+    // Should not: name temp files or unexpected names, or fail on a
+    // shard with no directory.
+    #[test]
+    fn shard_hash_listing_names_only_fragments() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopnet-fragstore-shard-names-{}",
+            std::process::id()
+        ));
+        let dir = dir.to_str().unwrap().to_string();
+        let _ = fs::remove_dir_all(&dir);
+        let mut hashes = Vec::new();
+        for i in 0u32..64 {
+            let data = i.to_le_bytes().to_vec();
+            let hash = Blake3Hash::new(blake3::hash(&data));
+            store_fragment(&dir, &hash, data).unwrap();
+            hashes.push(hash);
+        }
+        let shard = hashes[0].as_bytes()[0];
+        let leaf = create_fragment_path(&dir, &hashes[0]).unwrap();
+        fs::write(format!("{leaf}/{}.tmp.ab", hashes[0].to_hex()), b"x").unwrap();
+        fs::write(format!("{leaf}/notes.txt"), b"junk").unwrap();
+
+        let mut listed = list_shard_hashes(&dir, shard).unwrap();
+        let mut scanned: Vec<_> = scan_shard(&dir, shard)
+            .unwrap()
+            .fragments
+            .iter()
+            .map(|d| d.hash)
+            .collect();
+        listed.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        scanned.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert!(!listed.is_empty());
+        assert_eq!(listed, scanned);
+
+        let empty = (0..=u8::MAX)
+            .find(|b| hashes.iter().all(|h| h.as_bytes()[0] != *b))
+            .unwrap();
+        assert!(list_shard_hashes(&dir, empty).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Impact: a misplaced file can never be read by path, so naming it
+    // would flag a fragment the node cannot serve.
+    // Should not: name a hash-named file outside its own AB/CD prefix,
+    // in either the wrong shard or the wrong second-level directory.
+    // Should not: panic on a 64-byte name with a multi-byte character.
+    #[test]
+    fn shard_hash_listing_skips_misplaced_files() {
+        let dir =
+            std::env::temp_dir().join(format!("hopnet-fragstore-misplaced-{}", std::process::id()));
+        let dir = dir.to_str().unwrap().to_string();
+        let _ = fs::remove_dir_all(&dir);
+        let hash = Blake3Hash::from_bytes([0xAB; 32]);
+        let hex = hash.to_hex();
+        // Right shard, wrong second level; then wrong shard altogether.
+        fs::create_dir_all(format!("{dir}/ab/00")).unwrap();
+        fs::write(format!("{dir}/ab/00/{hex}"), b"x").unwrap();
+        fs::create_dir_all(format!("{dir}/00/ab")).unwrap();
+        fs::write(format!("{dir}/00/ab/{hex}"), b"x").unwrap();
+
+        assert!(list_shard_hashes(&dir, 0xab).unwrap().is_empty());
+        assert!(list_shard_hashes(&dir, 0x00).unwrap().is_empty());
+
+        // A 64-byte name whose second character is two bytes wide
+        // straddles the prefix slice: skipped, never a panic.
+        let wide = format!("a\u{e9}{}", "0".repeat(61));
+        assert_eq!(wide.len(), 64);
+        fs::create_dir_all(format!("{dir}/cd/ef")).unwrap();
+        fs::write(format!("{dir}/cd/ef/{wide}"), b"x").unwrap();
+        assert!(list_shard_hashes(&dir, 0xcd).unwrap().is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

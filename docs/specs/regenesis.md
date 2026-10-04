@@ -769,9 +769,21 @@ protocol it checks.
     gossip arriving; and a boot-gate park, whose node has no engine
     and therefore neither poll nor probe — `main.rs` starts its retry
     loop.
-  - Fragment reconcile runs post-swap, pre-engine, as direct SQL:
-    re-mark what the new inventory backs and the disk verifies, and
-    leave what it does not back for the existence sweep, which
+  - Fragment reconcile runs post-swap, pre-engine, as direct SQL,
+    and is EXISTENCE-ONLY (consensus-bugs 22): a present file is
+    flagged without being read; content verification is deferred to
+    the rolling sweep's scrub and to serve-time verification. A
+    staged join carries the old database's `stored_locally` flags
+    across the transplant by hash (`transplant_preserving_local_flags`),
+    so the reconcile only `stat`s hashes the old inventory never knew;
+    with nothing carried (a fresh node) it walks the store by
+    directory listing, one transaction per shard. A durable
+    `database.db.reconcile-pending` marker, written before the swap
+    and removed once the reconcile completes, makes an interrupted
+    reconcile (or staging left behind after its swap by an older
+    binary) distrust the partial flags: no carry, and a full walk
+    before the engine starts. The reconcile re-marks what the new
+    inventory backs and the disk holds, and leaves what it does not back for the existence sweep, which
     deletes rowless files past its grace unless the node-local upload
     ledger (`hopnet_storage_local_uploads`, storage step 0006) names
     them — the node's own uploads, written before their transaction
