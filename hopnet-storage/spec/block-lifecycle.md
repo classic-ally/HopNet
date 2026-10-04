@@ -781,10 +781,21 @@ optimization and carries no proof obligation.
 - **The absorbed lifecycle jobs fold into existing machinery.**
   - Orphaned fragment files stop being a mechanism: a file with no
     `fragment_hashes` row is the third case of the existence
-    sweep's diff, deleted in the same walk after the grace period.
-    The two-call scan/delete API and its process-memory scan cache
-    die; the manual route becomes a report of the sweep's last
-    findings.
+    sweep's diff, deleted in the same walk after the grace period —
+    unless this node's upload ledger names it. An upload writes its
+    fragments (`api::put`) before the transaction carrying their rows
+    is signed, and those rows may take hours, or, for a straggler
+    whose join imported an inventory without them, never arrive; so
+    every put-before-row site records its hashes in the node-local
+    `hopnet_storage_local_uploads` (storage step 0006, storage@6,
+    frozen `PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION` for storage@5
+    artifacts), the sweep holds a ledgered rowless file at any age
+    (reported as `orphans_held`), and retires the entry once the row
+    lands (consensus-bugs 20). The two-call scan/delete API and its
+    process-memory scan cache die; the manual route becomes a report
+    of the sweep's last findings plus the held uploads by blob, and
+    `POST /maintenance/orphaned-fragments/purge-held` is the
+    operator's explicit way to give one up.
   - Orphaned data-block cleanup stays a slow cron — deletion
     policy, not convergence — but actually registered on a
     schedule, keeping the manual route and the takeout gate. The
@@ -1190,7 +1201,19 @@ optimization and carries no proof obligation.
     `PRE_ROLLING_SWEEP_SNAPSHOT_SECTION` for storage@4 artifacts), so a
     restarting node resumes instead of rescanning from the top. The
     operator routes run one unpaced rotation, exclusive with the walker
-    per shard. "Paging the sweep's walk" is closed by this.
+    per shard. "Paging the sweep's walk" is closed by this. The node-local
+    storage tables are `hopnet_storage_pins`, `hopnet_storage_sweep_cursor`
+    and `hopnet_storage_local_uploads` (step 0006, below); all three ride
+    the staged-join copy untouched.
+  - Own-upload ledger (2026-10-04, PR #108, consensus-bugs 20). The
+    sweep's orphan case deletes a rowless file past the grace unless
+    `hopnet_storage_local_uploads` names it: the node's own uploads,
+    recorded at every `api::put` site before the transaction is signed,
+    held at any age and retired when the row lands. Stuck uploads are
+    visible under `held` on the orphan route and purged only by the
+    operator (`purge-held`, by blob id). Storage step 0006 moves the
+    hashed format_version to 6; storage@5 artifacts import through the
+    frozen `PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION`.
   - Pull pipeline (2026-10-03, branch `pull-pipeline` on
     `feat-rolling-sweep`, decided with Allison; ships as 2026.10.8).
     Production after the 10.6 crossing: 68,878 in-flight blobs, pulls

@@ -12,7 +12,7 @@ use axum::{
     response::IntoResponse,
 };
 
-use crate::db::{self, Blake3Hash, DatabaseError};
+use crate::db::{self, Blake3Hash, CustomUUID, DatabaseError};
 use crate::storage_host::functions::encrypt_path;
 use serde::{Deserialize, Serialize};
 
@@ -456,10 +456,34 @@ fn default_grace_period_hours() -> i64 {
     1
 }
 
+/// The `held` section: this node's own uploads the sweep is holding
+/// (ledger entries still without a row), grouped by blob.
+fn held_section(app_state: &AppState) -> serde_json::Value {
+    match super::jobs::held_uploads(app_state) {
+        Ok(held) => serde_json::to_value(held).unwrap_or_default(),
+        Err(e) => serde_json::json!({ "error": e }),
+    }
+}
+
+/// A sweep report with the `held` section beside its fields.
+fn report_with_held(
+    app_state: &AppState,
+    report: &hopnet_storage::sweep::SweepReport,
+) -> serde_json::Value {
+    let mut body = serde_json::to_value(report).unwrap_or_default();
+    if let serde_json::Value::Object(fields) = &mut body {
+        fields.insert("held".into(), held_section(app_state));
+    }
+    body
+}
+
 /// GET /maintenance/orphaned-fragments
 /// The last disk-truth sweep's report (RFC-STORAGE-003 S5) — the former
 /// two-call scan/delete API folded into the sweep, which deletes orphans
-/// past the grace period itself. `?run=true` sweeps now and reports that.
+/// past the grace period itself — plus `held`: the rowless files it is
+/// holding because they are this node's own uploads (consensus-bugs 20),
+/// by blob, with counts, bytes and the oldest write. `?run=true` sweeps
+/// now and reports that.
 pub async fn get_orphaned_fragments_scan(
     State(app_state): State<AppState>,
     Extension(uid): Extension<i32>,
@@ -483,7 +507,9 @@ pub async fn get_orphaned_fragments_scan(
         );
         let grace = (params.grace_period_hours as u64).saturating_mul(3600);
         return match super::jobs::run_disk_truth_sweep(&app_state, grace).await {
-            Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+            Ok(report) => {
+                (StatusCode::OK, Json(report_with_held(&app_state, &report))).into_response()
+            }
             Err(e) => {
                 tracing::error!("Disk-truth sweep failed: {:?}", e);
                 (
@@ -496,15 +522,60 @@ pub async fn get_orphaned_fragments_scan(
     }
     let last = app_state.last_sweep.lock().unwrap().clone();
     match last {
-        Some(report) => (StatusCode::OK, Json(report)).into_response(),
+        Some(report) => {
+            (StatusCode::OK, Json(report_with_held(&app_state, &report))).into_response()
+        }
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "status": "error",
-                "error": "no sweep has run yet on this node; use ?run=true"
+                "error": "no sweep has run yet on this node; use ?run=true",
+                "held": held_section(&app_state),
             })),
         )
             .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PurgeHeldRequest {
+    blob_ids: Vec<CustomUUID>,
+}
+
+/// POST /maintenance/orphaned-fragments/purge-held
+/// Give up on held uploads: drop the ledger entries of `blob_ids` and
+/// delete the files among them that still have no row. Explicit by design
+/// — a held file is this node's own upload, and only the operator can tell
+/// a stuck one from a slow one.
+pub async fn post_purge_held_uploads(
+    State(app_state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    Json(request): Json<PurgeHeldRequest>,
+) -> impl IntoResponse {
+    if request.blob_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": "blob_ids is empty"
+            })),
+        )
+            .into_response();
+    }
+    tracing::info!(
+        "Purge of {} held uploads requested by user {uid}",
+        request.blob_ids.len()
+    );
+    match super::jobs::purge_held_uploads(&app_state, &request.blob_ids) {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(e) => {
+            tracing::error!("Purge of held uploads failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "status": "error", "error": e })),
+            )
+                .into_response()
+        }
     }
 }
 

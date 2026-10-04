@@ -96,12 +96,16 @@ pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionS
     // v5 (rolling sweep): storage step 0005 adds the node-local sweep
     // cursor; the covered set is unchanged, and storage@4 artifacts import
     // through the frozen v4 spec below.
-    format_version: 5,
+    // v6 (own-upload ledger): storage step 0006 adds the node-local
+    // upload ledger; the covered set is unchanged, and storage@5
+    // artifacts import through the frozen v5 spec below.
+    format_version: 6,
     tables: STORAGE_TABLES,
 };
 
-/// The covered tables shared by every spec since v3: the v4 (index) and
-/// v5 (node-local cursor) bumps changed no covered table or column.
+/// The covered tables shared by every spec since v3: the v4 (index), v5
+/// (node-local cursor) and v6 (node-local ledger) bumps changed no covered
+/// table or column.
 const STORAGE_TABLES: &[hopnet_common::TableSpec] = &[
     hopnet_common::TableSpec::exported("data_blocks"),
     hopnet_common::TableSpec::exported("storage_view_transitions"),
@@ -140,6 +144,17 @@ pub const PRE_ROLLING_SWEEP_SNAPSHOT_SECTION: hopnet_common::SectionSpec =
     hopnet_common::SectionSpec {
         name: "storage",
         format_version: 4,
+        tables: STORAGE_TABLES,
+    };
+
+/// The storage section as sealed by 2026.10.7 through 2026.10.10
+/// (ordinal 5). FROZEN — the import mapping for storage@5 artifacts (the
+/// seals from epoch 12 on and the previous-release join fixture).
+/// Identical tables; only the hashed format_version differs.
+pub const PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION: hopnet_common::SectionSpec =
+    hopnet_common::SectionSpec {
+        name: "storage",
+        format_version: 5,
         tables: STORAGE_TABLES,
     };
 
@@ -201,7 +216,11 @@ pub const PRE_LIFECYCLE_SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_co
 };
 
 /// Node-local tables — outside the snapshot universe entirely.
-pub const NODE_LOCAL_TABLES: &[&str] = &["hopnet_storage_pins", "hopnet_storage_sweep_cursor"];
+pub const NODE_LOCAL_TABLES: &[&str] = &[
+    "hopnet_storage_pins",
+    "hopnet_storage_sweep_cursor",
+    "hopnet_storage_local_uploads",
+];
 
 /// This module's schema chain (RFC-020): replay is the only installer.
 /// Head ordinal == SNAPSHOT_SECTION.format_version, pinned by host
@@ -233,6 +252,11 @@ pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
             5,
             "sweep_cursor",
             include_str!("../migrations/storage/0005_sweep_cursor.sql"),
+        ),
+        hopnet_common::Step::sql(
+            6,
+            "local_uploads",
+            include_str!("../migrations/storage/0006_local_uploads.sql"),
         ),
     ],
 };
@@ -650,6 +674,118 @@ pub fn write_sweep_cursor(
         ],
     )
     .map(|_| ())
+}
+
+/// Record a `put`'s fragments in this node's upload ledger
+/// (`hopnet_storage_local_uploads`, node-local), before the transaction
+/// carrying their `fragment_hashes` rows is signed. Until those rows land
+/// the files are rowless, and the sweep spares a rowless file the ledger
+/// names (consensus-bugs 20). The caller owns the transaction. Returns
+/// the rows written.
+pub fn record_local_uploads<'a>(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+    fragment_hashes: impl IntoIterator<Item = &'a Blake3Hash>,
+    now_unix: u64,
+) -> Result<usize, rusqlite::Error> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR REPLACE INTO hopnet_storage_local_uploads
+         (fragment_hash, blob_id, written_unix) VALUES (?1, ?2, ?3)",
+    )?;
+    let mut written = 0;
+    for hash in fragment_hashes {
+        written += stmt.execute(params![hash, blob_id, now_unix as i64])?;
+    }
+    Ok(written)
+}
+
+/// The ledger's hashes in one rolling-sweep shard — the rowless files the
+/// sweep must hold.
+pub fn local_uploads_in(
+    conn: &rusqlite::Connection,
+    shard: u8,
+) -> Result<HashSet<Blake3Hash>, rusqlite::Error> {
+    let (lo, hi) = crate::sweep::shard_bounds(shard);
+    let sql = format!(
+        "SELECT fragment_hash FROM hopnet_storage_local_uploads WHERE {}",
+        shard_clause("fragment_hash", hi.is_none())
+    );
+    let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&lo];
+    if let Some(hi) = &hi {
+        bound.push(hi);
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(bound.as_slice(), |row| row.get(0))?;
+    rows.collect()
+}
+
+/// Retire ledger entries whose upload landed (their hash now has a
+/// `fragment_hashes` row). The caller owns the transaction.
+pub fn retire_local_uploads(
+    conn: &rusqlite::Connection,
+    fragment_hashes: &[Blake3Hash],
+) -> Result<usize, rusqlite::Error> {
+    let mut stmt =
+        conn.prepare_cached("DELETE FROM hopnet_storage_local_uploads WHERE fragment_hash = ?1")?;
+    let mut retired = 0;
+    for hash in fragment_hashes {
+        retired += stmt.execute(params![hash])?;
+    }
+    Ok(retired)
+}
+
+/// One ledger entry whose upload has not landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldUpload {
+    pub blob_id: BlobId,
+    pub fragment_hash: Blake3Hash,
+    pub written_unix: i64,
+}
+
+/// Ledger entries still without a `fragment_hashes` row — the files the
+/// sweep is holding — oldest first.
+pub fn held_local_uploads(conn: &rusqlite::Connection) -> Result<Vec<HeldUpload>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT l.blob_id, l.fragment_hash, l.written_unix
+         FROM hopnet_storage_local_uploads l
+         WHERE NOT EXISTS (SELECT 1 FROM fragment_hashes f WHERE f.fragment_hash = l.fragment_hash)
+         ORDER BY l.written_unix, l.fragment_hash",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(HeldUpload {
+            blob_id: row.get(0)?,
+            fragment_hash: row.get(1)?,
+            written_unix: row.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Drop the ledger entries of `blob_ids` (the operator giving up on an
+/// upload that never committed) and return the hashes among them that
+/// are still rowless, whose files the caller may now delete. A hash that
+/// has gained a row is an ordinary fragment and is only unledgered. The
+/// caller owns the transaction.
+pub fn purge_local_uploads(
+    conn: &rusqlite::Connection,
+    blob_ids: &[BlobId],
+) -> Result<Vec<Blake3Hash>, rusqlite::Error> {
+    let mut rowless = conn.prepare_cached(
+        "SELECT l.fragment_hash FROM hopnet_storage_local_uploads l
+         WHERE l.blob_id = ?1
+           AND NOT EXISTS (SELECT 1 FROM fragment_hashes f WHERE f.fragment_hash = l.fragment_hash)",
+    )?;
+    let mut drop_rows =
+        conn.prepare_cached("DELETE FROM hopnet_storage_local_uploads WHERE blob_id = ?1")?;
+    let mut hashes = Vec::new();
+    for blob_id in blob_ids {
+        let rows = rowless.query_map(params![blob_id], |row| row.get(0))?;
+        for hash in rows {
+            hashes.push(hash?);
+        }
+        drop_rows.execute(params![blob_id])?;
+    }
+    Ok(hashes)
 }
 
 /// SQL bounding `col` to one rolling-sweep shard, binding `?1` (and `?2`
@@ -1573,6 +1709,91 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    // Impact: the ledger is the only record that a rowless file is this
+    // node's own upload (consensus-bugs 20); a hash it loses is a file the
+    // sweep deletes, a hash it keeps past its row is a file the operator
+    // is told is stuck.
+    // Should: record one row per fragment under its blob, keyed by shard
+    // for the sweep, and list every entry still without a row as held.
+    // Should: retire an entry whose fragment_hashes row has landed, and
+    // drop a purged blob's entries, returning only the hashes still rowless.
+    // Should not: hand a purge the hash of a fragment that has gained a row.
+    #[test]
+    fn local_upload_ledger_records_retires_and_purges() {
+        let conn = test_conn();
+        conn.execute_batch(include_str!("../migrations/storage/0006_local_uploads.sql"))
+            .unwrap();
+        let h = |b: u8| Blake3Hash::from_bytes([b; 32]);
+        let blob_a = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap();
+        let blob_b = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap();
+        let a = [h(0x10), h(0x11)];
+        let b = [h(0x10), h(0x20)];
+        assert_eq!(record_local_uploads(&conn, &blob_a, &a, 1_000).unwrap(), 2);
+        // A hash shared with a later upload follows the later blob.
+        assert_eq!(record_local_uploads(&conn, &blob_b, &b, 2_000).unwrap(), 2);
+
+        assert_eq!(
+            local_uploads_in(&conn, 0x10).unwrap(),
+            HashSet::from([h(0x10)]),
+            "the shard with the shared hash"
+        );
+        assert_eq!(
+            local_uploads_in(&conn, 0x11).unwrap(),
+            HashSet::from([h(0x11)])
+        );
+        assert!(local_uploads_in(&conn, 0x12).unwrap().is_empty());
+
+        let held = held_local_uploads(&conn).unwrap();
+        assert_eq!(
+            held.iter()
+                .map(|u| (u.blob_id.clone(), u.fragment_hash, u.written_unix))
+                .collect::<Vec<_>>(),
+            vec![
+                (blob_a.clone(), h(0x11), 1_000),
+                (blob_b.clone(), h(0x10), 2_000),
+                (blob_b.clone(), h(0x20), 2_000),
+            ]
+        );
+
+        // Blob a's remaining upload lands: its row exists, the entry retires.
+        conn.execute(
+            "INSERT INTO fragment_hashes (data_block_id, chunk_number, local_index,
+                 fragment_id, fragment_hash, chunk_type, stored_locally)
+             VALUES (?1, 0, 0, 'f', ?2, 0, 1)",
+            params![blob_a, h(0x11)],
+        )
+        .unwrap();
+        assert!(held_local_uploads(&conn)
+            .unwrap()
+            .iter()
+            .all(|u| u.fragment_hash != h(0x11)));
+        assert_eq!(retire_local_uploads(&conn, &[h(0x11), h(0x99)]).unwrap(), 1);
+        assert!(local_uploads_in(&conn, 0x11).unwrap().is_empty());
+
+        // Blob b is given up on, after one of its hashes gained a row.
+        conn.execute(
+            "INSERT INTO fragment_hashes (data_block_id, chunk_number, local_index,
+                 fragment_id, fragment_hash, chunk_type, stored_locally)
+             VALUES (?1, 0, 0, 'g', ?2, 0, 1)",
+            params![blob_b, h(0x20)],
+        )
+        .unwrap();
+        assert_eq!(
+            purge_local_uploads(&conn, &[blob_b]).unwrap(),
+            vec![h(0x10)],
+            "only the still-rowless file may be deleted"
+        );
+        assert!(held_local_uploads(&conn).unwrap().is_empty());
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM hopnet_storage_local_uploads",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     // Impact: the rolling sweep pages belief per shard; a range that

@@ -171,6 +171,31 @@ impl HostCapabilities {
     }
 }
 
+/// Ledger an ingest as this node's own upload, between `api::put` and the
+/// transaction that carries its `fragment_hashes` rows. Every site that
+/// writes fragments before their rows exist calls this (the drive's
+/// `process_uploaded_file`, the photos `Submitter`); the sweep then holds
+/// the rowless files instead of deleting them as orphans, until the rows
+/// land (consensus-bugs 20). One transaction, committed here so the
+/// caller can fail the upload if the ledger write fails — the client
+/// retries rather than proceeding with files nothing protects.
+pub fn record_own_upload<'a>(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    blob_id: &hopnet_storage::BlobId,
+    fragment_hashes: impl IntoIterator<Item = &'a hopnet_storage::Blake3Hash>,
+) -> Result<usize, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    let tx = conn.transaction().map_err(|e| format!("tx: {e}"))?;
+    let written = hopnet_storage::store::record_local_uploads(&tx, blob_id, fragment_hashes, now)
+        .map_err(|e| format!("upload ledger: {e}"))?;
+    crate::dbstats::commit_timed(tx).map_err(|e| format!("upload ledger commit: {e}"))?;
+    Ok(written)
+}
+
 /// Per-user write gate. Returns 409 Conflict (empty body) on any request
 /// hitting a route this layer is attached to while the host's write
 /// admission denies the authenticated user (an active takeout import

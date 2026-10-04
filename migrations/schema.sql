@@ -303,6 +303,14 @@ CREATE TABLE hopnet_storage_sweep_cursor (
     rotation_started_height INTEGER NOT NULL
 );
 
+CREATE TABLE hopnet_storage_local_uploads (
+    fragment_hash   BLOB PRIMARY KEY,
+    blob_id         TEXT NOT NULL,
+    written_unix    INTEGER NOT NULL
+);
+
+CREATE INDEX idx_local_uploads_blob ON hopnet_storage_local_uploads (blob_id);
+
 CREATE TABLE inodes (
             -- stable identifier for FileProvider (UUIDv7 encodes creation time)
             id              TEXT UNIQUE NOT NULL,

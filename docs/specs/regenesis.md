@@ -771,10 +771,13 @@ protocol it checks.
     loop.
   - Fragment reconcile runs post-swap, pre-engine, as direct SQL:
     re-mark what the new inventory backs and the disk verifies, and
-    leave what it does not back for the existence sweep, whose grace
-    window protects the node's own in-flight uploads (a straggler can
-    join before its upload's transaction reaches it; consensus-bugs
-    20). NOT the attestation path, whose exact
+    leave what it does not back for the existence sweep, which
+    deletes rowless files past its grace unless the node-local upload
+    ledger (`hopnet_storage_local_uploads`, storage step 0006) names
+    them — the node's own uploads, written before their transaction
+    and possibly never replayed into a straggler's imported inventory
+    (consensus-bugs 20). The ledger rides the staged-join copy with
+    the other node-local tables. NOT the attestation path, whose exact
     previous-count guard suits a live attestation and not a
     wholesale reconciliation. `self_verified_height` stays NULL and
     the existing self-check cron re-attests at its own pace.

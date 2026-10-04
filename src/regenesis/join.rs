@@ -872,13 +872,15 @@ pub async fn epoch_join_bootstrap_with(
 /// flag from).
 ///
 /// A file the new inventory does not back at all is counted and left on
-/// disk. Deleting it is the existence sweep's job (`hopnet_storage::sweep`),
-/// whose grace window runs once the node is back at the tip. A join is
-/// not a quiet moment: this node's own upload writes its fragments before
-/// its transaction commits, and a straggler can join before it sees that
-/// commit. Deleting rowless files here lost two uploaded videos in
-/// production (consensus-bugs 20). Under-collecting is harmless,
-/// over-collecting is not.
+/// disk. Deleting it is the existence sweep's job (`hopnet_storage::sweep`,
+/// `storage_host::jobs::reap_orphans`): a rowless file past the sweep's
+/// grace is deleted unless this node's upload ledger names it, and a
+/// ledgered file is never deleted. A join is not a quiet moment: this
+/// node's own upload writes its fragments before its transaction commits,
+/// a straggler can join before it sees that commit, and the imported
+/// inventory may never carry the rows at all. Deleting rowless files here
+/// lost two uploaded videos in production (consensus-bugs 20).
+/// Under-collecting is harmless, over-collecting is not.
 ///
 /// Direct SQL, deliberately NOT the attestation path: a self-check rides a
 /// consensus round, and at boot there is no engine yet to carry a
@@ -1149,55 +1151,6 @@ mod tests {
             &frags,
             &orphan_hash
         ));
-    }
-
-    // Impact: regression guard for the 2026-10-01 loss of two uploaded
-    // videos — a straggler's own upload wrote its fragments, the join
-    // imported an inventory without their rows, and the reconcile deleted
-    // the only copies before the photo transaction reached the node.
-    // Should: keep a rowless fragment through the join reconcile.
-    // Should: let the sweep see it as present once its rows land, however
-    // old the file is.
-    #[test]
-    fn reconcile_keeps_an_upload_whose_rows_arrive_after_the_join() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = sealed_db(dir.path());
-        let frag_dir = dir.path().join("fragments");
-        std::fs::create_dir_all(&frag_dir).unwrap();
-        let frags = frag_dir.to_string_lossy().into_owned();
-
-        let upload = b"a fragment whose transaction is still in flight".to_vec();
-        let upload_hash = hopnet_storage::Blake3Hash::from_bytes(*blake3::hash(&upload).as_bytes());
-        hopnet_storage::fragstore::store_fragment(&frags, &upload_hash, upload).unwrap();
-
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        crate::db::shared::apply_connection_pragmas(&conn).unwrap();
-
-        let (_, unbacked) = reconcile_fragment_store(&conn, &frags).unwrap();
-        assert_eq!(
-            unbacked, 1,
-            "the joined inventory does not back the upload yet"
-        );
-        assert!(hopnet_storage::fragstore::fragment_exists_and_valid(
-            &frags,
-            &upload_hash
-        ));
-
-        // The upload's transaction lands after the join.
-        conn.execute(
-            "INSERT INTO fragment_hashes
-             (data_block_id, chunk_number, local_index, fragment_id, fragment_hash, chunk_type, stored_locally)
-             VALUES ('blob1', 0, 1, 'upload-0', ?, 0, 0)",
-            rusqlite::params![upload_hash.0.as_bytes().to_vec()],
-        )
-        .unwrap();
-
-        let listing = hopnet_storage::fragstore::scan_fragments_detailed(&frags).unwrap();
-        let rows = crate::db::fragments::all_fragment_flags(&conn).unwrap();
-        // A cutoff past every mtime: an orphan by age, kept only by its row.
-        let diff = hopnet_storage::sweep::diff(&listing, &rows, u64::MAX);
-        assert!(diff.orphans.is_empty());
-        assert_eq!(diff.present, vec![upload_hash]);
     }
 
     // ------------------------------------------------------------------

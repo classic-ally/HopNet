@@ -58,13 +58,17 @@ pub fn router<S: Clone + Send + Sync + 'static>(state: DriveState) -> Router<S> 
 /// (encrypt-then-RS, fragment store, keyed integrity hash) lives in the
 /// substrate crate; this wrapper returns the substrate's BlobInsertOp —
 /// the wire sub-payload that rides the drive envelope. The caller attaches
-/// the recipient wraps (`access`).
+/// the recipient wraps (`access`). The fragments are on disk before the
+/// caller's transaction is signed, so they are ledgered in `ledger` as
+/// this node's own upload (`record_own_upload`) and the sweep holds them
+/// until their rows land.
 pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
     source: R,
     file_size: usize,
     dataid: CustomUUID,
     per_file_key: &chacha20poly1305::Key,
     fragments_dir: &str,
+    ledger: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
 ) -> Result<hopnet_storage::store::BlobInsertOp, StatusCode> {
     let outcome = hopnet_storage::api::put(
         source,
@@ -81,6 +85,15 @@ pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
             StatusCode::INSUFFICIENT_STORAGE
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
+    hopnet_projection::host::record_own_upload(
+        ledger,
+        &dataid,
+        outcome.fragments.iter().map(|f| &f.fragment_hash),
+    )
+    .map_err(|e| {
+        tracing::error!("upload {dataid} not ledgered: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     let fragments = outcome
@@ -232,6 +245,7 @@ pub async fn prepare_content_update(
             dataid.clone(),
             &per_file_key,
             &state.fragments_dir,
+            &state.db_pool,
         )
         .await?
     };

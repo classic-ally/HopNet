@@ -122,7 +122,8 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       fresh nodes, which subsumes the height-0 bootstrap; a manual
       re-trust route for churn past the overlap window; post-import
       fragment reconcile (re-marks only; unbacked files are left for
-      the existence sweep, consensus-bugs 20). Evidence: overlap/chain
+      the existence sweep, which never deletes a file the node-local
+      upload ledger names, consensus-bugs 20). Evidence: overlap/chain
       units, staged-boot gate battery, an in-process straggler rejoin
       over real comms
       ending in byte-identical state, and the orchestrator
@@ -599,6 +600,12 @@ apply functions inside consensus handlers.
       per step, a 60-minute rotation, honest per-shard heights, a
       node-local cursor (storage@5), and a required cross-release gate
       before every tag (`release-crossing`, CLAUDE.md "Releases"). The
+      sweep never deletes this node's own unconfirmed upload: every
+      `api::put` site records its fragments in the node-local upload
+      ledger (storage step 0006, storage@6), a ledgered rowless file is
+      held at any age and retired when its row lands, and stuck uploads
+      are reported under `held` and purged only by the operator
+      (consensus-bugs.md 20, 2026.10.11). The
       pull pipeline (2026.10.8): a planner walks the whole in-flight set
       (the tick's LIMIT-64 kick had re-sent the same 64 blobs forever
       once one transition gave every blob the same goal), keeps what

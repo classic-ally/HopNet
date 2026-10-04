@@ -57,11 +57,21 @@ impl PhotoDispatch for Submitter {
         let outcome = hopnet_storage::api::put(
             source,
             file_size,
-            blob_id,
+            blob_id.clone(),
             &per_blob_key,
             &self.app_state.fragments_dir,
         )
         .await?;
+        // The fragments are on disk before the photo transaction is signed;
+        // ledgered, the sweep holds them until their rows land
+        // (consensus-bugs 20). A ledger failure fails the upload, so the
+        // client retries instead of proceeding with unprotected files.
+        hopnet_projection::host::record_own_upload(
+            &self.app_state.db_pool,
+            &blob_id,
+            outcome.fragments.iter().map(|f| &f.fragment_hash),
+        )
+        .map_err(PhotosCoreError::Dispatch)?;
 
         Ok(UploadedDataBlock {
             integrity_hash: outcome.integrity_hash,
