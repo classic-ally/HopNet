@@ -1906,7 +1906,7 @@ impl TestScenario for StragglerRejoin {
 pub struct ReleaseCrossing;
 
 /// The release the gate crosses FROM. Bump with every release tag.
-pub(crate) const PREVIOUS_RELEASE: &str = "2026.10.10";
+pub(crate) const PREVIOUS_RELEASE: &str = "2026.10.11";
 
 /// The version the crossing targets: this build's, or — while the
 /// workspace still carries the previous release's number — a synthetic
