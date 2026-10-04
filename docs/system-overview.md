@@ -584,8 +584,10 @@ apply functions inside consensus handlers.
       everywhere (consensus-bugs.md 16), the self-check apply is an
       idempotent upsert + CAS on `verified_height` and the pull's prompt
       belief is blob-scoped (17), the tick scan is two indexed passes on
-      the blocking pool (storage step 0004), SQLite defaults to a 256 MiB
-      cache and a 1 GiB WAL limit, temp fragments are reaped, the ETA uses
+      the blocking pool (storage step 0004), SQLite defaults to a 32 MiB
+      per-connection cache plus a shared 2 GiB mmap (was a 256 MiB private
+      cache, ~8 GiB across the pool; thor OOM-killed 2026-10-03) and a
+      1 GiB WAL limit, temp fragments are reaped, the ETA uses
       the sustained drain rate, 507s log at debug, the ingress daemon backs
       off while parked. The recency window is 8192 heights (was 1024),
       the sweep attests even when its self-check submit fails and logs a
