@@ -874,8 +874,12 @@ pub async fn epoch_join_bootstrap_with(
         Ok(_) => crate::regenesis::boot::clear_reconcile_pending(&db_path),
         // The join does not complete: no engine on partial flags. The
         // marker stays, so the next boot walks the store before its
-        // engine starts.
+        // engine starts; ask the binary to restart into that boot (a
+        // boot whose walk fails again holds its engine and retries after
+        // a delay, so this cannot spin). Restarting is safe: the import
+        // committed, and a joined node's next boot is an ordinary one.
         Err(e) => {
+            app_state.restart_signal.notify_one();
             return Err(
                 format!("fragment reconcile after join failed (retried next boot): {e}").into(),
             );

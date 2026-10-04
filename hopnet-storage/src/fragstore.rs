@@ -271,7 +271,13 @@ pub fn list_shard_hashes(fragments_dir: &str, shard: u8) -> Result<Vec<Blake3Has
             }
             let name = file.file_name();
             let Some(name) = name.to_str() else { continue };
-            if name.len() != 64 || name[0..2] != shard_hex || name[2..4] != dir_name {
+            // ASCII first: the prefix checks slice bytes, and a 64-byte
+            // name with a multi-byte character would split it.
+            if !name.is_ascii()
+                || name.len() != 64
+                || name[0..2] != shard_hex
+                || name[2..4] != dir_name
+            {
                 continue;
             }
             let mut bytes = [0u8; 32];
@@ -602,6 +608,7 @@ mod tests {
     // would flag a fragment the node cannot serve.
     // Should not: name a hash-named file outside its own AB/CD prefix,
     // in either the wrong shard or the wrong second-level directory.
+    // Should not: panic on a 64-byte name with a multi-byte character.
     #[test]
     fn shard_hash_listing_skips_misplaced_files() {
         let dir =
@@ -618,6 +625,14 @@ mod tests {
 
         assert!(list_shard_hashes(&dir, 0xab).unwrap().is_empty());
         assert!(list_shard_hashes(&dir, 0x00).unwrap().is_empty());
+
+        // A 64-byte name whose second character is two bytes wide
+        // straddles the prefix slice: skipped, never a panic.
+        let wide = format!("a\u{e9}{}", "0".repeat(61));
+        assert_eq!(wide.len(), 64);
+        fs::create_dir_all(format!("{dir}/cd/ef")).unwrap();
+        fs::write(format!("{dir}/cd/ef/{wide}"), b"x").unwrap();
+        assert!(list_shard_hashes(&dir, 0xcd).unwrap().is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

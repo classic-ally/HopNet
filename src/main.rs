@@ -75,6 +75,13 @@ const DEFAULT_HTTPS_PORT: u16 = 34632;
 /// explicitly after observing this code.
 const EXIT_CODE_RESTART: i32 = 75;
 
+/// How long a node whose boot could not reconcile its fragment flags
+/// stays up with the engine held before it exits for a retry
+/// (consensus-bugs 22): long enough that a persistent failure does not
+/// spin the supervisor, and that the error is visible in the logs and on
+/// the status surface meanwhile.
+const ENGINE_HELD_RESTART_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Actual bound port. Populated by `run_server` after `TcpListener::bind`
 /// returns — needed in GUI mode because we bind `127.0.0.1:0` and let the
 /// kernel pick a free port, so two HopNet processes never clash.
@@ -871,10 +878,19 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // a polled accept; consensus participation must not precede it).
             // Fresh nodes spawn the engine from the setup/join flows instead.
             if engine_held {
+                // Same rule as a failed engine spawn below: a node without
+                // its engine must not keep serving as if healthy. The
+                // pending marker survives, so the next boot retries the
+                // walk before its engine starts.
                 tracing::error!(
+                    delay_s = ENGINE_HELD_RESTART_DELAY.as_secs(),
                     "consensus engine held: the fragment reconcile did not complete; \
-                     restart to retry (see the boot log)"
+                     restarting to retry after the delay (see the boot log)"
                 );
+                tokio::spawn(async {
+                    tokio::time::sleep(ENGINE_HELD_RESTART_DELAY).await;
+                    std::process::exit(EXIT_CODE_RESTART);
+                });
             } else if app_state.node_id.get().is_some()
                 && let Err(e) = consensus::malachite::engine::spawn_engine(&app_state)
             {
