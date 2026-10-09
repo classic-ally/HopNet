@@ -1025,6 +1025,11 @@ impl Sim {
     pub fn engine_height(&self, node: usize) -> u64 {
         self.nodes[node].core.height().0
     }
+
+    /// How many blocks a node's core holds in memory.
+    pub fn held_blocks(&self, node: usize) -> usize {
+        self.nodes[node].core.held_blocks()
+    }
 }
 
 fn params_for(address: Address, profile: QuorumProfile) -> Params<crate::context::HopNetContext> {

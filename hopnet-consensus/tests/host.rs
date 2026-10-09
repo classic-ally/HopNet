@@ -19,6 +19,25 @@ fn three_nodes_decide_many_heights() {
     sim.assert_agreement_common();
 }
 
+// Should: hold only the blocks of heights not yet decided, however many
+// heights go by.
+// Impact: the host kept every block it ever saw (never pruned); a laptop node
+// up five days held 11 GB of them, all cold and swapped out, until the
+// machine ran out of memory.
+#[test]
+fn decided_blocks_are_not_held_in_memory() {
+    let mut sim = Sim::new(3, QuorumProfile::Bft);
+    sim.start().unwrap();
+    sim.run(30, 3).unwrap();
+    for node in 0..3 {
+        assert!(
+            sim.held_blocks(node) <= 4,
+            "node {node} holds {} blocks after 30 heights",
+            sim.held_blocks(node)
+        );
+    }
+}
+
 // Should: still agree under randomized message delay and reordering.
 // Should not: let out-of-order delivery produce divergence.
 // Impact: reordering is the most common real-network perturbation; the engine

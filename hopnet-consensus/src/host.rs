@@ -297,6 +297,12 @@ where
         self.state.height()
     }
 
+    /// How many blocks the core holds in memory: those of heights not yet
+    /// decided (proposed, received, synced), never the decided history.
+    pub fn held_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
     /// The height this core is paused before (on-demand mode). `None` when a
     /// height is actively running.
     pub fn paused_at(&self) -> Option<Height> {
@@ -974,6 +980,11 @@ where
             })?;
 
             *ctx.last_decided = Some(height);
+            // Decided and stored: nothing reads a block at or below this
+            // height from the map again (sync serves decided blocks from
+            // storage). Kept, it grew by every block for the process's life,
+            // all of it cold: 11 GB swapped on a five-day-old laptop node.
+            ctx.blocks.retain(|(held, _), _| *held > height);
             ctx.app.on_decided(height, &block, &wire_cert);
             ctx.outputs.push(HostOutput::Decided { height });
 
