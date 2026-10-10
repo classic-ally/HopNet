@@ -32,6 +32,8 @@ pub mod rs;
 pub mod serve;
 pub mod store;
 pub mod sweep;
+#[cfg(test)]
+mod sweep_sim;
 pub mod tick;
 pub mod traits;
 pub mod types;

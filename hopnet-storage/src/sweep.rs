@@ -604,6 +604,213 @@ impl BeliefBuffer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Attestation refresh: publish only the stamps about to expire
+
+/// Heights reserved beyond the two rotations the refresh threshold budgets
+/// (`RefreshPolicy::for_rotation`): a page's wait in the buffer and the
+/// consensus queue before its stamp lands.
+pub const REFRESH_MARGIN_HEIGHTS: u64 = 512;
+
+/// The refresh's wall-clock cap: a stamp older than this is refreshed
+/// whatever its height age, so evidence stays a day fresh in real time on
+/// a quiet mesh, where the height window can span days. It also keeps
+/// height ages short while the mesh is quiet, which is what lets a sudden
+/// drain find every stamp far from the window's end. Node-local policy,
+/// not a consensus rule.
+pub const REFRESH_MAX_AGE_SECS: u64 = 86_400;
+
+/// How far below the cap a fragment's own cap may sit: a quarter of it, so
+/// stamps that landed together (a big upload, the first rotation after an
+/// upgrade) come due spread over six hours instead of in one rotation.
+pub const REFRESH_CAP_JITTER_SECS: u64 = REFRESH_MAX_AGE_SECS / 4;
+
+/// A fragment's own height threshold sits up to `threshold /
+/// REFRESH_JITTER_DIVISOR` below the policy's, for the same spreading on
+/// the height side. Wider spreads more but refreshes earlier on average,
+/// and every refresh page is itself a height that ages the rest.
+pub const REFRESH_JITTER_DIVISOR: u64 = 4;
+
+/// A refresh page goes out full, or once its oldest stamp has waited this
+/// long or this many heights (half the margin, which is what absorbs the
+/// wait). A refresh is never urgent, and a page that leaves part-full is a
+/// height spent on fewer stamps: with minute-old partial pages, refresh
+/// pages made most of a quiet mesh's heights and fed their own clock.
+pub const REFRESH_BUFFER_MAX_SECS: u64 = 1800;
+pub const REFRESH_BUFFER_MAX_HEIGHTS: u64 = REFRESH_MARGIN_HEIGHTS / 2;
+
+/// The shortest rotation the refresh budgets for, in heights: the drain
+/// traffic the recency window was sized for (~45 heights a minute over an
+/// hourly rotation; `ATTESTATION_RECENCY_HEIGHTS`). Budgeting for a quiet
+/// mesh's short rotations lets stamps age toward the window's end, where
+/// a sudden drain plus one failed sweep pushes them past it (`sweep_sim`).
+pub const REFRESH_ROTATION_FLOOR_HEIGHTS: u64 = 2_700;
+
+/// This node's replicated stamp on one fragment (`fragment_inventory`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryStamp {
+    pub verified_height: Option<u64>,
+    /// 0 for this node's own disk scan; NULL before the first attestation.
+    pub provenance: Option<i64>,
+    pub suspect: bool,
+}
+
+/// Why a present fragment rides this rotation's attestation, or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshDue {
+    /// No row yet, never verified, verified other than by this node's own
+    /// scan, or suspect: only an attestation sets the stamp right.
+    Flags,
+    /// The stamp's height age reached the fragment's threshold.
+    Age,
+    /// The stamp is older than the fragment's wall-clock cap.
+    Cap,
+    /// Fresh enough to leave out.
+    No,
+}
+
+/// One rotation's refresh policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshPolicy {
+    /// Height age at which a stamp is refreshed; 0 refreshes everything.
+    pub threshold: u64,
+    /// How far below `threshold` a fragment's own threshold may sit.
+    pub jitter_heights: u64,
+    pub max_age_secs: u64,
+    /// How far below `max_age_secs` a fragment's own cap may sit.
+    pub cap_jitter_secs: u64,
+}
+
+impl RefreshPolicy {
+    /// Attest every present fragment every rotation: the behavior before
+    /// the refresh, and the fallback while the rotation length is unknown.
+    pub const EVERY_ROTATION: Self = RefreshPolicy {
+        threshold: 0,
+        jitter_heights: 0,
+        max_age_secs: 0,
+        cap_jitter_secs: 0,
+    };
+
+    /// The policy for a sweep whose rotations span up to `rotation_heights`
+    /// (`estimate_rotation_heights`) against a `window`-height recency rule.
+    /// A stamp is visited once a rotation, so one just under the threshold
+    /// waits a rotation for its next visit and, if that sweep fails,
+    /// another: refreshing at `window - 2 rotations - margin` keeps it
+    /// inside the window through one failed sweep. The rotation counted is
+    /// never shorter than `REFRESH_ROTATION_FLOOR_HEIGHTS`, so that holds
+    /// when traffic jumps to a drain. A rotation too long for any threshold
+    /// refreshes everything, as before.
+    pub fn for_rotation(window: u64, rotation_heights: u64) -> Self {
+        let rotation_heights = rotation_heights.max(REFRESH_ROTATION_FLOOR_HEIGHTS);
+        let budget = rotation_heights
+            .saturating_mul(2)
+            .saturating_add(REFRESH_MARGIN_HEIGHTS);
+        let threshold = window.saturating_sub(budget);
+        RefreshPolicy {
+            threshold,
+            jitter_heights: threshold / REFRESH_JITTER_DIVISOR,
+            max_age_secs: REFRESH_MAX_AGE_SECS,
+            cap_jitter_secs: REFRESH_CAP_JITTER_SECS,
+        }
+    }
+}
+
+/// The longest rotation the refresh should budget for, in heights: the
+/// longest of the recent completed rotations, or the one in progress
+/// extrapolated to a full rotation, whichever is longer, so a sudden
+/// burst of traffic shortens the threshold within the rotation it starts
+/// in. `None` until a rotation has completed or `min_elapsed_secs` of the
+/// current one have passed (too short a sample to extrapolate).
+pub fn estimate_rotation_heights(
+    completed: &[u64],
+    in_progress_heights: u64,
+    in_progress_secs: u64,
+    rotation_secs: u64,
+    min_elapsed_secs: u64,
+) -> Option<u64> {
+    let longest = completed.iter().copied().max();
+    let extrapolated = (in_progress_secs >= min_elapsed_secs && in_progress_secs > 0).then(|| {
+        let full = u128::from(in_progress_heights)
+            * u128::from(rotation_secs.max(in_progress_secs))
+            / u128::from(in_progress_secs);
+        u64::try_from(full).unwrap_or(u64::MAX)
+    });
+    match (longest, extrapolated) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// This node's fixed place in each refresh jitter span for one fragment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshJitter {
+    pub height: u64,
+    pub cap: u64,
+}
+
+/// Uniform over `u64` per (node, fragment): fixed across restarts, and
+/// different on each holder so one blob's copies don't refresh in step.
+pub fn refresh_jitter(node_id: i32, hash: &Blake3Hash) -> RefreshJitter {
+    let mut hasher = blake3::Hasher::new_derive_key("hopnet attestation refresh jitter v1");
+    hasher.update(&node_id.to_le_bytes());
+    hasher.update(hash.as_bytes());
+    let out = hasher.finalize();
+    let word = |i: usize| u64::from_le_bytes(out.as_bytes()[i..i + 8].try_into().expect("8 bytes"));
+    RefreshJitter {
+        height: word(0),
+        cap: word(8),
+    }
+}
+
+/// Whether buffered refresh stamps go out as a page: a full one, or
+/// whatever is waiting once its oldest stamp has waited
+/// `REFRESH_BUFFER_MAX_SECS` or `REFRESH_BUFFER_MAX_HEIGHTS`.
+pub fn refresh_page_due(len: usize, page: usize, waited_secs: u64, waited_heights: u64) -> bool {
+    len >= page
+        || (len > 0
+            && (waited_secs >= REFRESH_BUFFER_MAX_SECS
+                || waited_heights >= REFRESH_BUFFER_MAX_HEIGHTS))
+}
+
+/// `span * jitter / 2^64`: a point in `[0, span)`, exactly.
+fn jitter_offset(span: u64, jitter: u64) -> u64 {
+    ((u128::from(span) * u128::from(jitter)) >> 64) as u64
+}
+
+/// Whether a present fragment rides this rotation's attestation. `height`
+/// is the sweep's current height; `wall_age_secs` how long ago its stamp
+/// was made, or `None` when the node can't bound that (no cap applies —
+/// the height threshold alone keeps the window). Jitter only ever lowers
+/// a fragment's threshold and cap, so it never delays a refresh.
+pub fn refresh_due(
+    stamp: Option<&InventoryStamp>,
+    height: u64,
+    wall_age_secs: Option<u64>,
+    jitter: RefreshJitter,
+    policy: &RefreshPolicy,
+) -> RefreshDue {
+    let Some(stamp) = stamp else {
+        return RefreshDue::Flags;
+    };
+    let Some(verified) = stamp.verified_height else {
+        return RefreshDue::Flags;
+    };
+    if stamp.suspect || stamp.provenance != Some(0) {
+        return RefreshDue::Flags;
+    }
+    let threshold = policy.threshold
+        - jitter_offset(policy.jitter_heights.min(policy.threshold), jitter.height);
+    if height.saturating_sub(verified) >= threshold {
+        return RefreshDue::Age;
+    }
+    let cap = policy.max_age_secs
+        - jitter_offset(policy.cap_jitter_secs.min(policy.max_age_secs), jitter.cap);
+    match wall_age_secs {
+        Some(age) if age >= cap => RefreshDue::Cap,
+        _ => RefreshDue::No,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,5 +1135,194 @@ mod tests {
         assert_eq!(second.fragments_added, vec![h(3)]);
         assert!(second.fragments_removed.is_empty());
         assert!(buf.take_report(7, 4).is_none());
+    }
+
+    const WINDOW: u64 = crate::lifecycle::ATTESTATION_RECENCY_HEIGHTS;
+
+    fn own_stamp(verified_height: u64) -> InventoryStamp {
+        InventoryStamp {
+            verified_height: Some(verified_height),
+            provenance: Some(0),
+            suspect: false,
+        }
+    }
+
+    fn jitter(height: u64, cap: u64) -> RefreshJitter {
+        RefreshJitter { height, cap }
+    }
+
+    // Impact: the recency rule is a consensus rule and the refresh is node-
+    // local; this inequality is all that keeps a quiet node's evidence from
+    // expiring under it, through one failed sweep.
+    // Should: leave two rotations and the margin between every threshold
+    // and the window's end, for any rotation length.
+    // Should: budget at least a drain-length rotation, however short the
+    // measured one.
+    // Should: fall back to refreshing everything once no threshold fits.
+    #[test]
+    fn refresh_threshold_survives_one_failed_sweep_at_any_rotation_length() {
+        assert_eq!(
+            RefreshPolicy::for_rotation(WINDOW, 0).threshold,
+            WINDOW - 2 * REFRESH_ROTATION_FLOOR_HEIGHTS - REFRESH_MARGIN_HEIGHTS
+        );
+        for rotation in 0..=WINDOW {
+            let policy = RefreshPolicy::for_rotation(WINDOW, rotation);
+            if policy.threshold > 0 {
+                assert!(
+                    policy.threshold + 2 * rotation + REFRESH_MARGIN_HEIGHTS <= WINDOW,
+                    "rotation {rotation}: threshold {}",
+                    policy.threshold
+                );
+            } else {
+                let due = refresh_due(Some(&own_stamp(100)), 100, Some(0), jitter(0, 0), &policy);
+                assert_eq!(due, RefreshDue::Age, "rotation {rotation}");
+            }
+        }
+    }
+
+    // Should: refresh a stamp once its height age reaches the threshold.
+    // Should: refresh a stamp older than the cap, however young in heights.
+    // Should not: refresh a stamp young on both clocks, or apply the cap
+    // when the stamp's wall age is unknown.
+    #[test]
+    fn refresh_is_due_on_either_clock() {
+        let policy = RefreshPolicy::for_rotation(WINDOW, 1000);
+        let t = policy.threshold;
+        let none = jitter(0, 0);
+        let at = |age_heights: u64, wall: Option<u64>| {
+            refresh_due(
+                Some(&own_stamp(10_000)),
+                10_000 + age_heights,
+                wall,
+                none,
+                &policy,
+            )
+        };
+        assert_eq!(at(t, Some(0)), RefreshDue::Age);
+        assert_eq!(at(t - 1, Some(REFRESH_MAX_AGE_SECS)), RefreshDue::Cap);
+        assert_eq!(at(t - 1, Some(REFRESH_MAX_AGE_SECS - 1)), RefreshDue::No);
+        assert_eq!(at(t - 1, None), RefreshDue::No);
+    }
+
+    // Impact: attestation is the only thing that sets these stamps right;
+    // leaving them out to save volume would strand them.
+    // Should: refresh a fragment with no row, never verified, verified by a
+    // remote challenge, or suspect, however fresh its stamp.
+    #[test]
+    fn refresh_is_due_for_any_stamp_only_an_attestation_corrects() {
+        let policy = RefreshPolicy::for_rotation(WINDOW, 1000);
+        let fresh = own_stamp(500);
+        let cases = [
+            None,
+            Some(InventoryStamp {
+                verified_height: None,
+                ..fresh
+            }),
+            Some(InventoryStamp {
+                provenance: None,
+                ..fresh
+            }),
+            Some(InventoryStamp {
+                provenance: Some(1),
+                ..fresh
+            }),
+            Some(InventoryStamp {
+                suspect: true,
+                ..fresh
+            }),
+        ];
+        for stamp in cases {
+            let due = refresh_due(stamp.as_ref(), 500, Some(0), jitter(0, 0), &policy);
+            assert_eq!(due, RefreshDue::Flags, "{stamp:?}");
+        }
+        assert_eq!(
+            refresh_due(Some(&fresh), 500, Some(0), jitter(0, 0), &policy),
+            RefreshDue::No
+        );
+    }
+
+    // Should: let jitter only lower a fragment's threshold and cap, by less
+    // than its span.
+    // Should not: let any jitter delay a refresh past the policy's own.
+    #[test]
+    fn jitter_only_brings_a_refresh_forward() {
+        let policy = RefreshPolicy::for_rotation(WINDOW, 1000);
+        for j in [0, 1, u64::MAX / 3, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
+            let jit = jitter(j, j);
+            let due_at = |age: u64, wall: u64| {
+                refresh_due(Some(&own_stamp(0)), age, Some(wall), jit, &policy)
+            };
+            assert_eq!(due_at(policy.threshold, 0), RefreshDue::Age, "jitter {j}");
+            assert_eq!(
+                due_at(0, policy.max_age_secs),
+                RefreshDue::Cap,
+                "jitter {j}"
+            );
+            let lowest = policy.threshold - policy.jitter_heights + 1;
+            assert_eq!(due_at(lowest - 1, 0), RefreshDue::No, "jitter {j}");
+            let earliest_cap = policy.max_age_secs - policy.cap_jitter_secs + 1;
+            assert_eq!(due_at(0, earliest_cap - 1), RefreshDue::No, "jitter {j}");
+        }
+    }
+
+    // Should: give every (node, fragment) the same jitter on every call.
+    // Should: give one fragment different jitter on different holders.
+    // Should: spread fragments evenly over the span on both clocks.
+    #[test]
+    fn jitter_is_fixed_per_holder_and_uniform() {
+        let hash = |i: u32| Blake3Hash::from_bytes(*blake3::hash(&i.to_le_bytes()).as_bytes());
+        assert_eq!(refresh_jitter(1, &hash(7)), refresh_jitter(1, &hash(7)));
+        assert_ne!(refresh_jitter(1, &hash(7)), refresh_jitter(2, &hash(7)));
+
+        const N: u32 = 64_000;
+        const BUCKETS: usize = 16;
+        let mut by_height = [0u32; BUCKETS];
+        let mut by_cap = [0u32; BUCKETS];
+        for i in 0..N {
+            let j = refresh_jitter(3, &hash(i));
+            by_height[(j.height >> 60) as usize] += 1;
+            by_cap[(j.cap >> 60) as usize] += 1;
+        }
+        let expected = N / BUCKETS as u32;
+        for counts in [by_height, by_cap] {
+            for (bucket, n) in counts.iter().enumerate() {
+                assert!(
+                    n.abs_diff(expected) < expected / 10,
+                    "bucket {bucket}: {n} of an expected {expected}"
+                );
+            }
+        }
+    }
+
+    // Should: budget for the longest recent rotation.
+    // Should: extrapolate the rotation in progress once it is long enough
+    // to sample, so a traffic surge shortens the threshold within the
+    // rotation it starts in.
+    // Should not: estimate anything with neither a completed rotation nor
+    // a long enough sample.
+    #[test]
+    fn rotation_estimate_takes_the_longest_of_history_and_the_current_pace() {
+        assert_eq!(
+            estimate_rotation_heights(&[300, 900, 500], 10, 600, 3600, 300),
+            Some(900)
+        );
+        assert_eq!(
+            estimate_rotation_heights(&[300], 450, 600, 3600, 300),
+            Some(2700)
+        );
+        assert_eq!(
+            estimate_rotation_heights(&[300], 450, 100, 3600, 300),
+            Some(300)
+        );
+        assert_eq!(
+            estimate_rotation_heights(&[], 450, 600, 3600, 300),
+            Some(2700)
+        );
+        assert_eq!(estimate_rotation_heights(&[], 450, 100, 3600, 300), None);
+        assert_eq!(
+            estimate_rotation_heights(&[], 5000, 5000, 3600, 300),
+            Some(5000),
+            "an overrunning rotation is its own length"
+        );
     }
 }
