@@ -58,7 +58,7 @@ fn contents(i: usize) -> Vec<u8> {
     (0..len).map(|b| ((b * 31 + i * 17) % 251) as u8).collect()
 }
 
-fn lifecycle(view: &serde_json::Value) -> (bool, u64, u64, u64) {
+pub(crate) fn lifecycle(view: &serde_json::Value) -> (bool, u64, u64, u64) {
     let l = &view["storage"]["lifecycle"];
     (
         l["converged"].as_bool().unwrap_or(false),

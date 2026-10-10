@@ -112,6 +112,7 @@ Pass means **test passed AND no divergence**. The mesh is only deleted when the 
 | `post-files-consensus-shape` | Upload N files in a single POST `/files` request; assert one consensus view advance and all N files visible on every node (tripwire for batching regressions in `post_files`) |
 | `mixed-files-and-folders-one-request` | Upload N files into a deep nested path with no pre-existing parents; assert single view advance and all parents + files visible on every node |
 | `mount-cross-node-consistency` | Run the hopnet-mount FUSE daemon inside node 0's container (containers have `/dev/fuse` + CAP_SYS_ADMIN; image carries `hopnet-mount`, `fusermount3`, busybox); kernel writes through the mount verify byte-identical via other nodes' APIs, remote API writes/deletes surface through the mount |
+| `attestation-refresh` | A sweep attests only stamps about to expire: every node self-checks to settle its stamps, again at once (must attest nothing, every present fragment fresh), then past the 60 s wall-clock cap (must refresh, and the refresh pages decide). Each run asserts on its own `SweepReport` (the self-check route returns it). Auto-managed only (needs the mesh-creation env: `HOPNET_STORAGE_ATTEST_MAX_AGE_SECS=60`) |
 
 ## Common Workflows
 
@@ -308,6 +309,7 @@ containers:
   per-round deltas scale with it). Small values (e.g. 2000) make
   leader-down round advances fast in tests.
 - `HOPNET_DB_*` — SQLite pragma tuning (see `src/db/shared.rs`).
+- `HOPNET_STORAGE_*` — storage knobs, e.g. `HOPNET_STORAGE_ATTEST_MAX_AGE_SECS=<secs>` (the attestation refresh's wall-clock cap, default 86400; `attestation-refresh` sets 60).
 
 Example:
 

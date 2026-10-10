@@ -1208,8 +1208,9 @@ optimization and carries no proof obligation.
     restarting node resumes instead of rescanning from the top. The
     operator routes run one unpaced rotation, exclusive with the walker
     per shard. "Paging the sweep's walk" is closed by this. The node-local
-    storage tables are `hopnet_storage_pins`, `hopnet_storage_sweep_cursor`
-    and `hopnet_storage_local_uploads` (step 0006, below); all three ride
+    storage tables are `hopnet_storage_pins`, `hopnet_storage_sweep_cursor`,
+    `hopnet_storage_local_uploads` (step 0006, below) and
+    `hopnet_storage_sweep_rotations` (step 0007, below); all four ride
     the staged-join copy untouched.
   - Own-upload ledger (2026-10-04, PR #108, consensus-bugs 20). The
     sweep's orphan case deletes a rowless file past the grace unless
@@ -1254,6 +1255,47 @@ optimization and carries no proof obligation.
     Storage step 0006 moves the hashed format_version to 6; storage@5
     artifacts import through the frozen
     `PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION`.
+  - Attestation refresh (2026-10-10). Every rotation re-attested every
+    present fragment, so each node applied every holder's whole
+    inventory hourly, row by row, whatever the mesh was doing: on a
+    spindle that apply outgrew the disk. The sweep now sends only what
+    is due (`sweep::refresh_due` over this node's stamps on the shard,
+    `store::shard_inventory_stamps`). `Flags` — no row, never verified,
+    not this node's own scan, suspect — go to the urgent buffer as
+    before (60 s). `Age` — height age at the threshold `window − 2R −
+    REFRESH_MARGIN_HEIGHTS` (512), R the longest of the last three
+    rotations or the current one extrapolated, never under
+    `REFRESH_ROTATION_FLOOR_HEIGHTS` (2,700, the drain the window was
+    sized for) — and `Cap` — older than a node-local 24 h cap
+    (`HOPNET_STORAGE_ATTEST_MAX_AGE_SECS`) — go to a refresh buffer
+    paged full, after 30 minutes or 256 heights, or at a rotation's
+    end. Both bounds carry deterministic per-(node, fragment) jitter
+    that only brings a refresh forward (a quarter of each), so stamps
+    that landed together do not come due together. A stamp just under
+    the threshold waits one rotation for its next visit and, if that
+    sweep fails, another: the threshold keeps it inside the recency
+    window through one failed sweep even when traffic jumps to a drain.
+    Blocks carry no time, so the cap dates a stamp on a node-local
+    `HeightClock` — the newest sample strictly below the stamp's height,
+    never understating its age — sampled every shard step and seeded
+    from `hopnet_storage_sweep_rotations`, which also persists the
+    rotation lengths. An operator run uses that history (or the floor),
+    `?all=true` attests everything, and the self-check route returns its
+    report. No consensus rule changed: recency and `evidence_complete`
+    are as before, only what a node chooses to publish. `sweep_sim`
+    models the mesh with heights made by the refresh pages themselves
+    (on a quiet mesh nearly every height is an attestation page): it set
+    the rotation floor (a quiet-mesh budget let a surge plus a failed
+    sweep push a stamp to 9,008 of 8,192 heights) and the full refresh
+    pages, and guards the window through slow nodes, failed sweeps, a
+    drain surge and a restart loop. At today's shape it applies ~20x
+    fewer stamps; past ~3x today's fragments every height is needed for
+    refresh pages and the saving vanishes — the per-shard commitment
+    successor (set hash plus set reconciliation) removes the per-fragment
+    apply altogether.
+    Storage step 0007 moves the hashed format_version to 7; storage@6
+    artifacts import through the frozen
+    `PRE_ROTATION_HISTORY_SNAPSHOT_SECTION`.
   - Pull pipeline (2026-10-03, branch `pull-pipeline` on
     `feat-rolling-sweep`, decided with Allison; ships as 2026.10.8).
     Production after the 10.6 crossing: 68,878 in-flight blobs, pulls

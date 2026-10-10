@@ -610,7 +610,19 @@ apply functions inside consensus handlers.
       orphan unlink re-checks for a row inside the write transaction, a
       failed put abandons its files, and stuck uploads are reported
       under `held` for the owner to purge early (consensus-bugs.md 20,
-      2026.10.11). Each sweep step is timed: a DEBUG line per shard, a
+      2026.10.11). The sweep attests only the stamps about to expire
+      (attestation refresh): a stamp is re-sent once its height age
+      reaches window − 2 rotations − margin (budgeting at least a
+      drain-length rotation) or it passes a node-local 24 h wall-clock
+      cap (`HOPNET_STORAGE_ATTEST_MAX_AGE_SECS`), each with deterministic
+      per-fragment jitter, in full refresh pages; missing, remote or
+      suspect stamps still go out within a minute. The threshold and the
+      cap's clock come from a node-local rotation history (storage step
+      0007, storage@7); `sweep_sim` models the mesh with heights made by
+      the pages themselves (~20x fewer stamps applied at today's shape,
+      every stamp inside the window through a drain surge and a failed
+      sweep; the saving fades past ~3x today's fragments, where the
+      per-shard commitment successor is needed). Each sweep step is timed: a DEBUG line per shard, a
       progress line every 16 shards (DEBUG) or 15 minutes (INFO), and the running
       totals under `in_progress` on `GET /maintenance/orphaned-fragments`. The
       pull pipeline (2026.10.8): a planner walks the whole in-flight set

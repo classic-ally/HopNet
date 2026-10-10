@@ -11,6 +11,7 @@ pub use crate::NodeInfo;
 pub mod files;
 
 // Test implementations
+mod attestation_refresh;
 mod auto_seam;
 mod client_version_skew;
 mod consensus_queue;
@@ -296,6 +297,9 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, String)> {
             "HOPNET_GENESIS_STORAGE_POLICY",
             "decay_tiers=60,120,180,240",
         )],
+        // A wall-clock cap short enough to wait out within the test
+        // (`attestation_refresh::CAP_SECS`).
+        "attestation-refresh" => vec![("HOPNET_STORAGE_ATTEST_MAX_AGE_SECS", "60")],
         "re-encode-after-departure" => vec![
             (
                 "HOPNET_GENESIS_STORAGE_POLICY",
@@ -703,6 +707,11 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
+        "attestation-refresh" => {
+            attestation_refresh::AttestationRefresh
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -788,6 +797,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "db-pragma-bench",
         "upload-and-confirm-placement",
         "pull-floor-holds-back",
+        "attestation-refresh",
     ]
 }
 
