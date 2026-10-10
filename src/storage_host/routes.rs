@@ -321,19 +321,30 @@ pub async fn get_fragment_inventory_differential(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct SelfCheckParams {
+    /// Attest every present fragment, not just what the refresh finds due.
+    #[serde(default)]
+    pub all: bool,
+}
+
 /// POST /maintenance/fragment-inventory-self-check
-/// Manually trigger fragment inventory self-check and consensus submission
+/// Manually trigger fragment inventory self-check and consensus submission;
+/// responds with the rotation's `SweepReport`. `?all=true` attests every
+/// present fragment.
 pub async fn post_fragment_inventory_self_check(
     State(app_state): State<AppState>,
     Extension(uid): Extension<i32>,
+    Query(params): Query<SelfCheckParams>,
 ) -> impl IntoResponse {
     tracing::info!(
-        "Manual fragment inventory self-check triggered by user {}",
-        uid
+        "Manual fragment inventory self-check triggered by user {} (all: {})",
+        uid,
+        params.all
     );
 
-    match super::jobs::run_fragment_inventory_self_check(&app_state).await {
-        Ok(_) => StatusCode::OK.into_response(),
+    match super::jobs::run_fragment_inventory_self_check(&app_state, params.all).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
         Err(e) => {
             tracing::error!("Manual fragment inventory self-check failed: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -518,7 +529,7 @@ pub async fn get_orphaned_fragments_scan(
             params.grace_period_hours
         );
         let grace = (params.grace_period_hours as u64).saturating_mul(3600);
-        return match super::jobs::run_disk_truth_sweep(&app_state, grace).await {
+        return match super::jobs::run_disk_truth_sweep(&app_state, grace, false).await {
             Ok(report) => (
                 StatusCode::OK,
                 Json(report_with_held(&app_state, &report).await),

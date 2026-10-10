@@ -203,6 +203,28 @@ pub struct SweepReport {
     /// Shards whose step failed (logged; retried next rotation).
     #[serde(default)]
     pub failed_shards: usize,
+    /// Present fragments the refresh sent, by reason (`RefreshDue`), and
+    /// the ones it left out as fresh.
+    #[serde(default)]
+    pub attested_flags: usize,
+    #[serde(default)]
+    pub attested_age: usize,
+    #[serde(default)]
+    pub attested_cap: usize,
+    #[serde(default)]
+    pub refresh_fresh: usize,
+    /// Refresh attestation pages committed and failed (the urgent `Flags`
+    /// stamps ride `attested_pages`).
+    #[serde(default)]
+    pub refresh_pages: usize,
+    #[serde(default)]
+    pub refresh_failed_pages: usize,
+    /// The last refresh policy's height threshold (0: everything) and the
+    /// rotation length it budgeted for (0: unknown yet).
+    #[serde(default)]
+    pub refresh_threshold: u64,
+    #[serde(default)]
+    pub rotation_estimate: u64,
     /// Wall-clock milliseconds per shard step, summed over the rotation
     /// (`ShardTimings`): where a slow disk's rotation time goes.
     #[serde(default)]
@@ -535,6 +557,27 @@ impl PageBuffer {
         self.hashes.is_empty()
     }
 
+    /// The lowest height a waiting hash was observed at.
+    pub fn floor_height(&self) -> Option<u64> {
+        self.min_height
+    }
+
+    /// When the oldest waiting hash arrived (unix seconds).
+    pub fn opened_at(&self) -> Option<u64> {
+        self.opened_at
+    }
+
+    /// Whether the waiting hashes go out as a refresh page now
+    /// (`refresh_page_due`), at `now` and the tip `height`.
+    pub fn refresh_due(&self, now: u64, height: u64, page: usize) -> bool {
+        refresh_page_due(
+            self.hashes.len(),
+            page,
+            self.opened_at.map_or(0, |t| now.saturating_sub(t)),
+            self.min_height.map_or(0, |h| height.saturating_sub(h)),
+        )
+    }
+
     /// A full page is waiting, or the oldest hash has waited `max_age`.
     pub fn due(&self, now: u64, page: usize, max_age_secs: u64) -> bool {
         self.hashes.len() >= page
@@ -675,6 +718,12 @@ pub struct HeightClock {
 }
 
 impl HeightClock {
+    pub const fn new() -> Self {
+        HeightClock {
+            samples: Vec::new(),
+        }
+    }
+
     /// The tip stood at `height` at `unix`. Kept only when the height has
     /// moved past the newest sample: the first sight of each height.
     pub fn record(&mut self, height: u64, unix: u64) {
@@ -709,6 +758,11 @@ impl HeightClock {
 
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
+    }
+
+    /// The oldest sample: stamps below its height get only a lower bound.
+    pub fn oldest(&self) -> Option<(u64, u64)> {
+        self.samples.first().copied()
     }
 
     /// How long ago a stamp at `verified_height` was made. Dated by the
@@ -798,6 +852,74 @@ impl RefreshPolicy {
             cap_jitter_secs: REFRESH_CAP_JITTER_SECS,
         }
     }
+
+    /// The same policy under another wall-clock cap, its jitter scaled
+    /// with it (a quarter, as `REFRESH_CAP_JITTER_SECS` is of the default).
+    pub fn with_max_age(self, max_age_secs: u64) -> Self {
+        RefreshPolicy {
+            max_age_secs,
+            cap_jitter_secs: max_age_secs / 4,
+            ..self
+        }
+    }
+}
+
+/// What one shard's present fragments became under the refresh: the
+/// hashes for the urgent attestation buffer, the ones for the refresh
+/// buffer, and the counts by reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshSplit {
+    pub urgent: Vec<Blake3Hash>,
+    pub refresh: Vec<Blake3Hash>,
+    pub flags: usize,
+    pub age: usize,
+    pub cap: usize,
+    pub fresh: usize,
+}
+
+/// Sort a shard's `present` fragments by `refresh_due`: `Flags` to the
+/// urgent buffer (a missing or wrong stamp holds up confirmation), `Age`
+/// and `Cap` to the refresh buffer, `No` left out. `stamps` is this
+/// node's `fragment_inventory` rows for the shard; a hash without one
+/// (a row the belief page is only now adding) is `Flags`.
+pub fn split_present(
+    present: &[Blake3Hash],
+    stamps: &HashMap<Blake3Hash, InventoryStamp>,
+    node_id: i32,
+    height: u64,
+    now: u64,
+    clock: &HeightClock,
+    policy: &RefreshPolicy,
+) -> RefreshSplit {
+    let mut split = RefreshSplit::default();
+    for hash in present {
+        let stamp = stamps.get(hash);
+        let wall_age = stamp
+            .and_then(|s| s.verified_height)
+            .and_then(|h| clock.wall_age(h, now));
+        match refresh_due(
+            stamp,
+            height,
+            wall_age,
+            refresh_jitter(node_id, hash),
+            policy,
+        ) {
+            RefreshDue::Flags => {
+                split.flags += 1;
+                split.urgent.push(*hash);
+            }
+            RefreshDue::Age => {
+                split.age += 1;
+                split.refresh.push(*hash);
+            }
+            RefreshDue::Cap => {
+                split.cap += 1;
+                split.refresh.push(*hash);
+            }
+            RefreshDue::No => split.fresh += 1,
+        }
+    }
+    split
 }
 
 /// The longest rotation the refresh should budget for, in heights: the
@@ -851,10 +973,25 @@ pub fn refresh_jitter(node_id: i32, hash: &Blake3Hash) -> RefreshJitter {
 /// whatever is waiting once its oldest stamp has waited
 /// `REFRESH_BUFFER_MAX_SECS` or `REFRESH_BUFFER_MAX_HEIGHTS`.
 pub fn refresh_page_due(len: usize, page: usize, waited_secs: u64, waited_heights: u64) -> bool {
+    refresh_page_due_within(
+        len,
+        page,
+        waited_secs,
+        waited_heights,
+        REFRESH_BUFFER_MAX_SECS,
+    )
+}
+
+/// `refresh_page_due` under another wait bound, for sizing it (`sweep_sim`).
+pub fn refresh_page_due_within(
+    len: usize,
+    page: usize,
+    waited_secs: u64,
+    waited_heights: u64,
+    max_secs: u64,
+) -> bool {
     len >= page
-        || (len > 0
-            && (waited_secs >= REFRESH_BUFFER_MAX_SECS
-                || waited_heights >= REFRESH_BUFFER_MAX_HEIGHTS))
+        || (len > 0 && (waited_secs >= max_secs || waited_heights >= REFRESH_BUFFER_MAX_HEIGHTS))
 }
 
 /// `span * jitter / 2^64`: a point in `[0, span)`, exactly.
@@ -1470,5 +1607,68 @@ mod tests {
         clock.prune(1_000);
         assert_eq!(clock.samples, vec![(6, 400)]);
         assert_eq!(clock.len(), 1);
+    }
+
+    // Should: send a missing or wrong stamp to the urgent buffer, a stamp
+    // past its threshold or cap to the refresh buffer, and leave a fresh
+    // one out, counting each.
+    // Should: date stamps by the clock for the cap.
+    #[test]
+    fn split_present_routes_each_stamp_by_why_it_is_due() {
+        let policy = RefreshPolicy::for_rotation(WINDOW, 0).with_max_age(1_000);
+        let height = 20_000;
+        let mut clock = HeightClock::default();
+        clock.record(height - 100, 0);
+        clock.record(height - 10, 5_000);
+        let now = 5_100;
+        let (missing, remote, old, capped, fresh) = (h(1), h(2), h(3), h(4), h(5));
+        let stamps = HashMap::from([
+            (
+                remote,
+                InventoryStamp {
+                    provenance: Some(1),
+                    ..own_stamp(height - 1)
+                },
+            ),
+            (old, own_stamp(height - policy.threshold)),
+            // Below the sample at 5 000 s: dated 5 100 s old, past the cap.
+            (capped, own_stamp(height - 50)),
+            // Above it: dated at most 100 s old.
+            (fresh, own_stamp(height - 5)),
+        ]);
+        let split = split_present(
+            &[missing, remote, old, capped, fresh],
+            &stamps,
+            7,
+            height,
+            now,
+            &clock,
+            &policy,
+        );
+        assert_eq!(split.urgent, vec![missing, remote]);
+        assert_eq!(split.refresh, vec![old, capped]);
+        assert_eq!(
+            (split.flags, split.age, split.cap, split.fresh),
+            (2, 1, 1, 1)
+        );
+    }
+
+    // Should: hold a part-full refresh page until it has waited
+    // REFRESH_BUFFER_MAX_SECS or REFRESH_BUFFER_MAX_HEIGHTS.
+    // Should: send a full page at once.
+    #[test]
+    fn refresh_buffer_waits_for_a_full_page_or_its_bounds() {
+        let mut buf = PageBuffer::default();
+        assert!(!buf.refresh_due(0, 0, 4));
+        buf.push(100, 1_000, [h(1), h(2)]);
+        assert!(!buf.refresh_due(1_000 + REFRESH_BUFFER_MAX_SECS - 1, 100, 4));
+        assert!(buf.refresh_due(1_000 + REFRESH_BUFFER_MAX_SECS, 100, 4));
+        assert!(buf.refresh_due(1_000, 100 + REFRESH_BUFFER_MAX_HEIGHTS, 4));
+        buf.push(101, 1_001, [h(3), h(4)]);
+        assert!(buf.refresh_due(1_001, 101, 4));
+        assert_eq!(
+            (buf.floor_height(), buf.opened_at()),
+            (Some(100), Some(1_000))
+        );
     }
 }

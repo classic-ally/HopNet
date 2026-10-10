@@ -421,6 +421,50 @@ pub const ROTATION_TARGET_SECS: u64 = 3600;
 /// lane, so sweep and pull evidence age out of their buffers alike.
 pub const MAX_BUFFER_AGE_SECS: u64 = hopnet_storage::engine::policy::EVIDENCE_MAX_AGE_SECS;
 
+/// The attestation refresh's wall-clock cap (`sweep::REFRESH_MAX_AGE_SECS`),
+/// overridden by `HOPNET_STORAGE_ATTEST_MAX_AGE_SECS`, read once.
+fn attest_max_age() -> u64 {
+    static MAX_AGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MAX_AGE.get_or_init(|| {
+        std::env::var("HOPNET_STORAGE_ATTEST_MAX_AGE_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(hopnet_storage::sweep::REFRESH_MAX_AGE_SECS)
+    })
+}
+
+/// The shortest slice of a rotation in progress the refresh extrapolates
+/// (`sweep::estimate_rotation_heights`).
+pub const REFRESH_MIN_SAMPLE_SECS: u64 = 300;
+
+/// Completed rotations the refresh's estimate looks back over.
+pub const REFRESH_HISTORY: usize = 3;
+
+/// When the tip stood at which height, for dating stamps against the
+/// refresh's cap: sampled at every shard step (walker and operator runs
+/// alike), seeded from the persisted rotation history when the walker
+/// starts, pruned past the cap.
+static HEIGHT_CLOCK: std::sync::Mutex<hopnet_storage::sweep::HeightClock> =
+    std::sync::Mutex::new(hopnet_storage::sweep::HeightClock::new());
+
+fn height_clock() -> std::sync::MutexGuard<'static, hopnet_storage::sweep::HeightClock> {
+    HEIGHT_CLOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The refresh policy for a sweep whose rotations span up to
+/// `rotation_heights` (`None`: unknown, refresh everything), under this
+/// node's cap.
+fn refresh_policy(rotation_heights: Option<u64>) -> hopnet_storage::sweep::RefreshPolicy {
+    match rotation_heights {
+        Some(r) => hopnet_storage::sweep::RefreshPolicy::for_rotation(
+            hopnet_storage::lifecycle::ATTESTATION_RECENCY_HEIGHTS,
+            r,
+        )
+        .with_max_age(attest_max_age()),
+        None => hopnet_storage::sweep::RefreshPolicy::EVERY_ROTATION,
+    }
+}
+
 /// Shards whose content was scrubbed today: `(day, flags)`. Each shard is
 /// read once on its day of seven (`sweep::scrub_due`); in memory, as the
 /// single scrub-day flag was before the rolling sweep.
@@ -461,7 +505,13 @@ pub(crate) struct Rotation {
     node_id: i32,
     report: hopnet_storage::sweep::SweepReport,
     belief: hopnet_storage::sweep::BeliefBuffer,
+    /// Urgent stamps (`RefreshDue::Flags`), paged on `MAX_BUFFER_AGE_SECS`.
     truth: hopnet_storage::sweep::PageBuffer,
+    /// Refresh stamps (`RefreshDue::Age`/`Cap`), paged full or on
+    /// `sweep::refresh_page_due`.
+    refresh: hopnet_storage::sweep::PageBuffer,
+    /// What the next shard's present fragments are judged by.
+    policy: hopnet_storage::sweep::RefreshPolicy,
     /// The rotation's prompt surplus release budget.
     surplus_left: usize,
     /// The current shard step's timings, filled step by step so a failed
@@ -483,11 +533,20 @@ impl Rotation {
             },
             belief: Default::default(),
             truth: Default::default(),
+            refresh: Default::default(),
+            policy: hopnet_storage::sweep::RefreshPolicy::EVERY_ROTATION,
             surplus_left: SURPLUS_RELEASE_MAX_PER_SWEEP,
             shard: Default::default(),
             progress_shards: 0,
             progress_at: std::time::Instant::now(),
         }
+    }
+
+    /// Judge the next shards by `policy`, noting it in the report.
+    fn set_policy(&mut self, policy: hopnet_storage::sweep::RefreshPolicy, estimate: Option<u64>) {
+        self.policy = policy;
+        self.report.refresh_threshold = policy.threshold;
+        self.report.rotation_estimate = estimate.unwrap_or(0);
     }
 }
 
@@ -509,10 +568,14 @@ pub async fn run_rolling_sweep(app_state: AppState) {
     let per_shard = std::time::Duration::from_secs(ROTATION_TARGET_SECS)
         / hopnet_storage::sweep::SHARD_COUNT as u32;
     let host = SubstrateHost::new(app_state.clone());
-    let mut state: Option<(hopnet_storage::sweep::SweepCursor, Rotation)> = None;
+    let mut state: Option<Walker> = None;
     loop {
         let step_started = std::time::Instant::now();
-        let (cursor, rotation) = match &mut state {
+        let Walker {
+            cursor,
+            rotation,
+            history,
+        } = match &mut state {
             Some(s) => s,
             None => match start_walker(&app_state) {
                 Ok(s) => state.insert(s),
@@ -524,6 +587,17 @@ pub async fn run_rolling_sweep(app_state: AppState) {
             },
         };
 
+        if let Ok(height) = current_height(&app_state) {
+            let completed: Vec<u64> = history.iter().copied().collect();
+            let estimate = hopnet_storage::sweep::estimate_rotation_heights(
+                &completed,
+                height.saturating_sub(cursor.started_height),
+                unix_now().saturating_sub(cursor.started_unix),
+                ROTATION_TARGET_SECS,
+                REFRESH_MIN_SAMPLE_SECS,
+            );
+            rotation.set_policy(refresh_policy(estimate), estimate);
+        }
         {
             let _guard = SWEEP_LOCK.lock().await;
             if let Err(e) = sweep_shard(
@@ -539,12 +613,12 @@ pub async fn run_rolling_sweep(app_state: AppState) {
                 rotation.report.failed_shards += 1;
             }
         }
-        let flushed = flush_buffers(&host, rotation, false).await;
+        let height = current_height(&app_state).unwrap_or(cursor.started_height);
+        let flushed = flush_buffers(&host, rotation, height, false).await;
         let work_ms = ms_since(step_started);
         rotation.report.ms_work += work_ms;
         log_shard_timings(cursor.next_shard, &rotation.shard, &flushed, work_ms);
 
-        let height = current_height(&app_state).unwrap_or(cursor.started_height);
         let (next, completed) = cursor.advance(unix_now(), height);
         rotation.progress_shards += 1;
         let due = hopnet_storage::sweep::progress_due(
@@ -563,10 +637,21 @@ pub async fn run_rolling_sweep(app_state: AppState) {
             rotation.progress_shards = 0;
         }
         if completed {
-            flush_buffers(&host, rotation, true).await;
+            flush_buffers(&host, rotation, height, true).await;
             let fresh = Rotation::new(rotation.node_id, next.started_unix);
             let done = std::mem::replace(rotation, fresh);
             finish_rotation(&app_state, done, cursor.started_height);
+            record_rotation(
+                &app_state,
+                history,
+                hopnet_storage::sweep::SweepRotation {
+                    rotation: cursor.rotation,
+                    started_unix: cursor.started_unix,
+                    started_height: cursor.started_height,
+                    ended_unix: next.started_unix,
+                    ended_height: height,
+                },
+            );
         }
         *cursor = next;
         if let Some(durable) = cursor_to_persist(rotation, next)
@@ -639,34 +724,96 @@ fn cursor_to_persist(
     rotation: &Rotation,
     next: hopnet_storage::sweep::SweepCursor,
 ) -> Option<hopnet_storage::sweep::SweepCursor> {
-    (rotation.belief.is_empty() && rotation.truth.is_empty()).then_some(next)
+    (rotation.belief.is_empty() && rotation.truth.is_empty() && rotation.refresh.is_empty())
+        .then_some(next)
 }
 
-/// The walker's starting point: the saved cursor, or a fresh rotation.
-fn start_walker(
+/// The rolling walker's state across steps.
+struct Walker {
+    cursor: hopnet_storage::sweep::SweepCursor,
+    rotation: Rotation,
+    /// The newest completed rotations' height spans, oldest first, for the
+    /// refresh's estimate.
+    history: std::collections::VecDeque<u64>,
+}
+
+/// Keep a completed rotation: persisted for the next start, in the
+/// walker's history, and in the clock (pruned to the cap and a day).
+fn record_rotation(
     app_state: &AppState,
-) -> Result<(hopnet_storage::sweep::SweepCursor, Rotation), Error> {
+    history: &mut std::collections::VecDeque<u64>,
+    done: hopnet_storage::sweep::SweepRotation,
+) {
+    if let Err(e) = app_state
+        .db_pool
+        .get()
+        .map_err(|e| e.to_string())
+        .and_then(|conn| {
+            hopnet_storage::store::record_sweep_rotation(&conn, &done).map_err(|e| e.to_string())
+        })
+    {
+        tracing::warn!("sweep: rotation {} not recorded: {e}", done.rotation);
+    }
+    history.push_back(done.heights());
+    while history.len() > REFRESH_HISTORY {
+        history.pop_front();
+    }
+    let mut clock = height_clock();
+    clock.record(done.ended_height, done.ended_unix);
+    clock.prune(done.ended_unix.saturating_sub(attest_max_age() + 86_400));
+}
+
+/// The walker's starting point: the saved cursor, or a fresh rotation,
+/// with the persisted rotation history behind the refresh's estimate and
+/// clock.
+fn start_walker(app_state: &AppState) -> Result<Walker, Error> {
     let node_id = app_state
         .get_node_id()
         .map_err(|_| Error::Failed(Arc::new("node id not set".to_string().into())))?;
-    let saved = {
+    let (saved, rotations) = {
         let conn = app_state
             .db_pool
             .get()
             .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
-        hopnet_storage::store::read_sweep_cursor(&conn)
-            .map_err(|e| Error::Failed(Arc::new(format!("cursor: {e}").into())))?
+        let saved = hopnet_storage::store::read_sweep_cursor(&conn)
+            .map_err(|e| Error::Failed(Arc::new(format!("cursor: {e}").into())))?;
+        let rotations = hopnet_storage::store::recent_sweep_rotations(
+            &conn,
+            hopnet_storage::store::SWEEP_ROTATIONS_KEPT as usize,
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!("sweep: rotation history unreadable, starting without it: {e}");
+            Vec::new()
+        });
+        (saved, rotations)
     };
     let cursor = match saved {
         Some(c) => c,
         None => hopnet_storage::sweep::SweepCursor::fresh(unix_now(), current_height(app_state)?),
     };
+    {
+        let mut clock = height_clock();
+        clock.seed(&rotations);
+        clock.record(cursor.started_height, cursor.started_unix);
+    }
+    let history = rotations
+        .iter()
+        .rev()
+        .take(REFRESH_HISTORY)
+        .rev()
+        .map(hopnet_storage::sweep::SweepRotation::heights)
+        .collect();
     tracing::info!(
-        "sweep: rolling walker resuming rotation {} at shard {:02x}",
+        "sweep: rolling walker resuming rotation {} at shard {:02x} ({} rotations of history)",
         cursor.rotation,
-        cursor.next_shard
+        cursor.next_shard,
+        rotations.len()
     );
-    Ok((cursor, Rotation::new(node_id, cursor.started_unix)))
+    Ok(Walker {
+        cursor,
+        rotation: Rotation::new(node_id, cursor.started_unix),
+        history,
+    })
 }
 
 /// Close a rotation: stamp its duration and height span, log it once, and
@@ -682,7 +829,7 @@ fn finish_rotation(
         .map(|tip| tip.saturating_sub(started_height))
         .unwrap_or(0);
     tracing::info!(
-        "sweep: rotation of {} shards in {}s ({} heights): {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} orphans held (own uploads), {} held uploads expired, {} orphan batches skipped (busy), {} corrupt deleted, {} surplus released, {} temp files deleted, {} belief pages ({} failed), {} attestation pages ({} failed), {} shards failed; timings: {}",
+        "sweep: rotation of {} shards in {}s ({} heights): {} files, {} present, {} re-flagged, {} un-flagged, {} orphans deleted, {} orphans held (own uploads), {} held uploads expired, {} orphan batches skipped (busy), {} corrupt deleted, {} surplus released, {} temp files deleted, {} belief pages ({} failed), {} attestation pages ({} failed), attested {}/{}/{} (flags/age/cap), {} fresh, {} refresh pages ({} failed), threshold {} (rotation estimate {}), {} shards failed; timings: {}",
         report.shards,
         report.rotation_secs,
         report.rotation_heights,
@@ -701,6 +848,14 @@ fn finish_rotation(
         report.belief_failed_pages,
         report.attested_pages,
         report.attest_failed_pages,
+        report.attested_flags,
+        report.attested_age,
+        report.attested_cap,
+        report.refresh_fresh,
+        report.refresh_pages,
+        report.refresh_failed_pages,
+        report.refresh_threshold,
+        report.rotation_estimate,
         report.failed_shards,
         report.timing_summary(),
     );
@@ -769,6 +924,7 @@ async fn sweep_shard_steps(
     let height = current_height(app_state);
     rotation.shard.ms_height = ms_since(t);
     let height = height?;
+    height_clock().record(height, now);
 
     // (2)
     let t = Instant::now();
@@ -900,19 +1056,24 @@ async fn sweep_shard_steps(
     rotation.shard.ms_release = ms_since(t);
 
     // (6) Belief and truth, both at the height read before the listing.
+    // Truth only for what the refresh finds due: a missing or wrong stamp
+    // to the urgent buffer, an aging one to the refresh buffer.
     let t = Instant::now();
     let pool = app_state.db_pool.clone();
     let node_id = rotation.node_id;
-    let differential = tokio::task::spawn_blocking(move || {
+    let read = tokio::task::spawn_blocking(move || {
         let mut conn = pool.get().map_err(|e| e.to_string())?;
-        crate::db::inventory::compute_shard_inventory_differential(
+        let differential = crate::db::inventory::compute_shard_inventory_differential(
             &mut conn, node_id, shard, height,
         )
-        .map_err(|e| format!("{e:?}"))
+        .map_err(|e| format!("{e:?}"))?;
+        let stamps = crate::db::inventory::shard_inventory_stamps(&conn, node_id, shard)
+            .map_err(|e| format!("{e:?}"))?;
+        Ok::<_, String>((differential, stamps))
     })
     .await;
     rotation.shard.ms_buffer = ms_since(t);
-    let differential = differential
+    let (differential, stamps) = read
         .map_err(|e| fail("differential join", e.to_string()))?
         .map_err(|e| fail("inventory differential", e))?;
     rotation
@@ -923,13 +1084,27 @@ async fn sweep_shard_steps(
         .belief
         .removed
         .push(height, now, differential.fragments_removed);
-    rotation.truth.push(height, now, present.iter().copied());
+    let split = hopnet_storage::sweep::split_present(
+        &present,
+        &stamps,
+        node_id,
+        height,
+        now,
+        &height_clock(),
+        &rotation.policy,
+    );
+    rotation.truth.push(height, now, split.urgent);
+    rotation.refresh.push(height, now, split.refresh);
     rotation.shard.ms_buffer = ms_since(t);
 
     let report = &mut rotation.report;
     report.shards += 1;
     report.files_on_disk += listing.len();
     report.present += present.len();
+    report.attested_flags += split.flags;
+    report.attested_age += split.age;
+    report.attested_cap += split.cap;
+    report.refresh_fresh += split.fresh;
     report.reflagged += diff.present_unflagged.len();
     report.unflagged += diff.flagged_missing.len();
     report.young_orphans += diff.young_orphans;
@@ -1192,14 +1367,17 @@ pub(crate) fn purge_held_uploads_blocking(
 pub(crate) async fn flush_buffers<S: hopnet_storage::traits::TxSubmitter>(
     submitter: &S,
     rotation: &mut Rotation,
+    height: u64,
     force: bool,
 ) -> hopnet_storage::sweep::FlushTimings {
     let page = hopnet_storage::engine::policy::ATTEST_PAGE_SIZE;
     let now = unix_now();
     let mut timings = hopnet_storage::sweep::FlushTimings::default();
+    let refresh_due = rotation.refresh.refresh_due(now, height, page);
     if !force
         && !rotation.truth.due(now, page, MAX_BUFFER_AGE_SECS)
         && !rotation.belief.due(now, page, MAX_BUFFER_AGE_SECS)
+        && !refresh_due
     {
         return timings;
     }
@@ -1243,6 +1421,29 @@ pub(crate) async fn flush_buffers<S: hopnet_storage::traits::TxSubmitter>(
     timings.ok += committed;
     timings.failed += failed;
     timings.slowest_ms = timings.slowest_ms.max(slowest_ms);
+
+    // Refresh pages go out full; a part-full one only once it has waited
+    // its bound, or when forced at a rotation's end.
+    let mut pages = Vec::new();
+    while rotation.refresh.len() >= page || (!rotation.refresh.is_empty() && (force || refresh_due))
+    {
+        let Some((height, present)) = rotation.refresh.take_page(page) else {
+            break;
+        };
+        pages.push(hopnet_storage::FragmentAttestation {
+            node_id: rotation.node_id,
+            height,
+            present,
+            suspect: Vec::new(),
+        });
+    }
+    timings.pages += pages.len();
+    let (committed, failed, slowest_ms) = submit_attestation_pages(submitter, pages).await;
+    rotation.report.refresh_pages += committed;
+    rotation.report.refresh_failed_pages += failed;
+    timings.ok += committed;
+    timings.failed += failed;
+    timings.slowest_ms = timings.slowest_ms.max(slowest_ms);
     timings.ms = ms_since(started);
     rotation.report.add_flush_timings(&timings);
     if timings.pages > 0 {
@@ -1261,10 +1462,12 @@ pub(crate) async fn flush_buffers<S: hopnet_storage::traits::TxSubmitter>(
 /// One full rotation now, unpaced — the operator routes and orchestrator
 /// tests (`POST /maintenance/fragment-inventory-self-check`, `GET
 /// /maintenance/orphaned-fragments?run=true`). Interleaves with the
-/// walker shard by shard and leaves its cursor alone.
+/// walker shard by shard and leaves its cursor alone. Attests what the
+/// refresh finds due, or with `all` every present fragment.
 pub async fn run_disk_truth_sweep(
     app_state: &AppState,
     orphan_grace_secs: u64,
+    all: bool,
 ) -> Result<hopnet_storage::sweep::SweepReport, Error> {
     let node_id = app_state
         .get_node_id()
@@ -1272,6 +1475,22 @@ pub async fn run_disk_truth_sweep(
     let host = SubstrateHost::new(app_state.clone());
     let started_height = current_height(app_state)?;
     let mut rotation = Rotation::new(node_id, unix_now());
+    if all {
+        rotation.set_policy(hopnet_storage::sweep::RefreshPolicy::EVERY_ROTATION, None);
+    } else {
+        // Unpaced, so nothing to extrapolate: the recorded history, or the
+        // refresh's floor without one. An operator run only adds stamps to
+        // the walker's, so no policy here can let one expire.
+        let longest = app_state
+            .db_pool
+            .get()
+            .ok()
+            .and_then(|conn| {
+                hopnet_storage::store::recent_sweep_rotations(&conn, REFRESH_HISTORY).ok()
+            })
+            .and_then(|rows| rows.iter().map(|r| r.heights()).max());
+        rotation.set_policy(refresh_policy(Some(longest.unwrap_or(0))), longest);
+    }
     for shard in 0..=u8::MAX {
         {
             let _guard = SWEEP_LOCK.lock().await;
@@ -1282,17 +1501,17 @@ pub async fn run_disk_truth_sweep(
                 rotation.report.failed_shards += 1;
             }
         }
-        flush_buffers(&host, &mut rotation, false).await;
+        let height = current_height(app_state).unwrap_or(started_height);
+        flush_buffers(&host, &mut rotation, height, false).await;
     }
-    flush_buffers(&host, &mut rotation, true).await;
+    let height = current_height(app_state).unwrap_or(started_height);
+    flush_buffers(&host, &mut rotation, height, true).await;
     let report = finish_rotation(app_state, rotation, started_height);
-    if report.attested_pages == 0 && report.attest_failed_pages > 0 {
+    let committed = report.attested_pages + report.refresh_pages;
+    let failed = report.attest_failed_pages + report.refresh_failed_pages;
+    if committed == 0 && failed > 0 {
         return Err(Error::Failed(Arc::new(
-            format!(
-                "attestation: all {} pages failed",
-                report.attest_failed_pages
-            )
-            .into(),
+            format!("attestation: all {failed} pages failed").into(),
         )));
     }
     Ok(report)
@@ -1338,11 +1557,13 @@ pub(crate) async fn submit_attestation_pages<S: hopnet_storage::traits::TxSubmit
 }
 
 /// Kept for callers that only want belief refreshed (tests, routes): the
-/// full sweep is the self-check now.
-pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(), Error> {
-    run_disk_truth_sweep(app_state, SWEEP_ORPHAN_GRACE_SECS)
-        .await
-        .map(|_| ())
+/// full sweep is the self-check now. `all` attests every present fragment
+/// instead of what the refresh finds due.
+pub async fn run_fragment_inventory_self_check(
+    app_state: &AppState,
+    all: bool,
+) -> Result<hopnet_storage::sweep::SweepReport, Error> {
+    run_disk_truth_sweep(app_state, SWEEP_ORPHAN_GRACE_SECS, all).await
 }
 
 /// Grace before a fragment file is considered by the prompt surplus
@@ -2811,10 +3032,10 @@ mod tests {
         rot.belief.added.push(40, now, [h(1)]);
         rot.truth.push(42, now, [h(1)]);
         rot.truth.push(41, now, [h(2)]);
-        flush_buffers(&rec, &mut rot, false).await;
+        flush_buffers(&rec, &mut rot, 42, false).await;
         assert!(rec.calls.lock().unwrap().is_empty(), "nothing due yet");
 
-        flush_buffers(&rec, &mut rot, true).await;
+        flush_buffers(&rec, &mut rot, 42, true).await;
         let calls = rec.calls.lock().unwrap();
         let functions: Vec<_> = calls.iter().map(|(f, _)| *f).collect();
         assert_eq!(
@@ -2838,9 +3059,9 @@ mod tests {
     // rotations; saving it past shards whose belief and truth are only
     // buffered in memory let a restart drop them while the cursor claimed
     // them done (code review of PR #95).
-    // Should: persist the cursor once a flush has drained both buffers.
-    // Should not: persist it while either buffer still holds a passed
-    // shard's hashes.
+    // Should: persist the cursor once a flush has drained every buffer.
+    // Should not: persist it while any buffer still holds a passed shard's
+    // hashes, the refresh buffer included.
     #[tokio::test]
     async fn cursor_is_persisted_only_after_the_buffers_drain() {
         let rec = Recorder::default();
@@ -2850,11 +3071,54 @@ mod tests {
 
         rot.truth.push(42, unix_now(), [h(1)]);
         assert_eq!(cursor_to_persist(&rot, next), None, "truth buffered");
-        flush_buffers(&rec, &mut rot, true).await;
+        flush_buffers(&rec, &mut rot, 42, true).await;
         assert_eq!(cursor_to_persist(&rot, next), Some(next), "drained");
 
         rot.belief.removed.push(42, unix_now(), [h(2)]);
         assert_eq!(cursor_to_persist(&rot, next), None, "belief buffered");
+        flush_buffers(&rec, &mut rot, 42, true).await;
+
+        rot.refresh.push(42, unix_now(), [h(3)]);
+        assert_eq!(cursor_to_persist(&rot, next), None, "refresh buffered");
+        flush_buffers(&rec, &mut rot, 42, true).await;
+        assert_eq!(cursor_to_persist(&rot, next), Some(next), "drained");
+    }
+
+    // Impact: every refresh page is a height that ages every other stamp;
+    // part-full pages on the urgent buffer's minute made most of a quiet
+    // mesh's heights (sweep_sim).
+    // Should: hold a part-full refresh page while the urgent buffer flushes
+    // on its minute.
+    // Should: send it once it has waited its height bound, or when forced,
+    // after the urgent stamps and counted apart from them.
+    #[tokio::test]
+    async fn refresh_pages_wait_for_their_bound_behind_urgent_stamps() {
+        let rec = Recorder::default();
+        let mut rot = Rotation::new(7, 0);
+        let now = unix_now();
+        let old = now - MAX_BUFFER_AGE_SECS;
+        rot.truth.push(40, old, [h(1)]);
+        rot.refresh.push(40, old, [h(2)]);
+        flush_buffers(&rec, &mut rot, 41, false).await;
+        assert_eq!(rec.calls.lock().unwrap().len(), 1, "only the urgent page");
+        assert_eq!(
+            (rot.report.attested_pages, rot.report.refresh_pages),
+            (1, 0)
+        );
+        assert_eq!(rot.refresh.len(), 1, "the refresh page waits");
+
+        let bound = 40 + hopnet_storage::sweep::REFRESH_BUFFER_MAX_HEIGHTS;
+        flush_buffers(&rec, &mut rot, bound, false).await;
+        assert!(rot.refresh.is_empty(), "sent once it waited its bound");
+        assert_eq!(rot.report.refresh_pages, 1);
+        let payload = rec.calls.lock().unwrap()[1].1.clone();
+        let (refresh, _): (hopnet_storage::FragmentAttestation, _) =
+            bincode::serde::decode_from_slice(&payload, bincode::config::standard()).unwrap();
+        assert_eq!((refresh.height, refresh.present), (40, vec![h(2)]));
+
+        rot.refresh.push(50, now, [h(3)]);
+        flush_buffers(&rec, &mut rot, 50, true).await;
+        assert_eq!(rot.report.refresh_pages, 2, "forced at a rotation's end");
     }
 
     // Should: hand each shard's scrub out once per day, and again on a

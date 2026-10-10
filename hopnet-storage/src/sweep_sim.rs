@@ -2,26 +2,32 @@
 //! a mesh, for sizing and guarding the refresh policy (test-only).
 //!
 //! What it keeps from production: 256 shards visited once a rotation,
-//! paced over `rotation_secs`; the decision (`sweep::refresh_due`) and the
-//! rotation estimate (`sweep::estimate_rotation_heights`) themselves; page
-//! buffers flushed when full or a minute old and stamped at their floor
-//! height; and, the part a mesh test can't reach, heights made by the
-//! pages themselves on top of background traffic — on a quiet mesh nearly
-//! every height is an attestation page (pages and heights run about one
-//! to one), so the refresh feeds back into its own clock.
+//! paced over `rotation_secs`; the decision (`sweep::refresh_due`), the
+//! rotation estimate (`sweep::estimate_rotation_heights`) and the stamp
+//! dating (`sweep::HeightClock`, sampled at every step and reseeded from
+//! completed rotations after a restart) themselves; refresh pages that go
+//! out full or bounded (`sweep::refresh_page_due_within`), stamped at
+//! their floor height; a restart that drops the buffers and resumes from
+//! the last cursor saved with them drained; and, the part a mesh test
+//! can't reach, heights made by the pages themselves on top of background
+//! traffic — on a quiet mesh nearly every height is an attestation page
+//! (pages and heights run about one to one), so the
+//! refresh feeds back into its own clock.
 //!
 //! What it leaves out: decide latency (inside `REFRESH_MARGIN_HEIGHTS`),
-//! several pages sharing a block, and the belief side. A failed sweep is a
-//! whole rotation whose pages never land. Fragment counts and page size
-//! are scaled down together; heights are not.
+//! several pages sharing a block, the belief side and the urgent buffer
+//! (every stamp here is this node's own). A failed sweep is a whole
+//! rotation whose pages never land. Fragment counts and page size are
+//! scaled down together; heights are not.
 
 use std::collections::VecDeque;
 
 use hopnet_common::Blake3Hash;
 
 use crate::sweep::{
-    estimate_rotation_heights, refresh_due, refresh_jitter, refresh_page_due, InventoryStamp,
-    RefreshDue, RefreshJitter, RefreshPolicy,
+    estimate_rotation_heights, refresh_due, refresh_jitter, refresh_page_due_within, HeightClock,
+    InventoryStamp, RefreshDue, RefreshJitter, RefreshPolicy, SweepRotation,
+    REFRESH_BUFFER_MAX_SECS,
 };
 
 const SHARDS: usize = 256;
@@ -32,6 +38,8 @@ const BUFFER_AGE_SECS: u64 = 60;
 const MIN_SAMPLE_SECS: u64 = 300;
 /// Completed rotations the estimate looks back over.
 const HISTORY: usize = 3;
+/// A restarting node is down this long before its walker resumes.
+const RESTART_DOWN_SECS: u64 = 60;
 const HOUR: u64 = 3600;
 const DAY: u64 = 24 * HOUR;
 
@@ -51,6 +59,8 @@ struct NodeSpec {
     rotation_secs: u64,
     /// Rotations (0-based) whose pages all fail.
     failed_rotations: Vec<u64>,
+    /// The process restarts this often (a crash-looping node).
+    restart_every_secs: Option<u64>,
 }
 
 impl NodeSpec {
@@ -59,6 +69,7 @@ impl NodeSpec {
             fragments,
             rotation_secs: HOUR,
             failed_rotations: Vec::new(),
+            restart_every_secs: None,
         }
     }
 }
@@ -80,6 +91,8 @@ struct Scenario {
     secs: u64,
     mode: Mode,
     burst: Option<Burst>,
+    /// How long a part-full refresh page may wait.
+    refresh_buffer_secs: u64,
 }
 
 impl Scenario {
@@ -98,6 +111,7 @@ impl Scenario {
             secs: days * DAY,
             mode,
             burst: None,
+            refresh_buffer_secs: REFRESH_BUFFER_MAX_SECS,
         }
     }
 
@@ -114,18 +128,35 @@ impl Scenario {
 struct Frag {
     jitter: RefreshJitter,
     verified: u64,
+    /// When the stamp's floor height was observed: the true time the
+    /// clock's dating must never understate.
     stamped_at: u64,
     burst: bool,
+}
+
+/// Where the walker stands, as the cursor saves it.
+#[derive(Debug, Clone, Copy)]
+struct Cursor {
+    steps: u64,
+    rotation: u64,
+    /// `(unix, height)` the rotation started at.
+    started: (u64, u64),
 }
 
 struct Node {
     spec: NodeSpec,
     frags: Vec<Frag>,
     by_shard: Vec<Vec<u32>>,
-    steps: u64,
-    rotation: u64,
-    rotation_started: (u64, u64),
+    at: Cursor,
+    /// The last cursor saved with the buffer drained: where a restart
+    /// resumes.
+    durable: Cursor,
+    /// The walker's pacing origin: `(unix, steps)` since its last start.
+    paced_from: (u64, u64),
+    /// Completed rotations, as `hopnet_storage_sweep_rotations` keeps them.
+    rotations: Vec<SweepRotation>,
     completed: VecDeque<u64>,
+    clock: HeightClock,
     buffer: Vec<u32>,
     buffer_floor: Option<u64>,
     buffer_opened: Option<u64>,
@@ -133,7 +164,8 @@ struct Node {
 
 impl Node {
     fn next_step_at(&self) -> u64 {
-        self.steps * self.spec.rotation_secs / SHARDS as u64
+        let (t0, s0) = self.paced_from;
+        t0 + (self.at.steps - s0) * self.spec.rotation_secs / SHARDS as u64
     }
 
     fn add(&mut self, node_id: i32, count: usize, height: u64, t: u64, burst: bool) {
@@ -152,6 +184,28 @@ impl Node {
         }
     }
 
+    /// The process restarts at `t`: buffered stamps are lost, the walker
+    /// resumes from the durable cursor once back up, and the clock and
+    /// history come back from the persisted rotations alone.
+    fn restart(&mut self, t: u64) {
+        self.buffer.clear();
+        self.buffer_floor = None;
+        self.buffer_opened = None;
+        self.at = self.durable;
+        self.paced_from = (t + RESTART_DOWN_SECS, self.at.steps);
+        self.clock = HeightClock::default();
+        self.clock.seed(&self.rotations);
+        self.clock.record(self.at.started.1, self.at.started.0);
+        self.completed = self
+            .rotations
+            .iter()
+            .rev()
+            .take(HISTORY)
+            .rev()
+            .map(SweepRotation::heights)
+            .collect();
+    }
+
     fn policy(&self, mode: Mode, window: u64, height: u64, t: u64) -> RefreshPolicy {
         let Mode::Refresh { cap, jitter } = mode else {
             return RefreshPolicy::EVERY_ROTATION;
@@ -159,8 +213,8 @@ impl Node {
         let completed: Vec<u64> = self.completed.iter().copied().collect();
         let Some(rotation) = estimate_rotation_heights(
             &completed,
-            height - self.rotation_started.1,
-            t - self.rotation_started.0,
+            height - self.at.started.1,
+            t.saturating_sub(self.at.started.0),
             self.spec.rotation_secs,
             MIN_SAMPLE_SECS,
         ) else {
@@ -193,6 +247,10 @@ struct Outcome {
     heights_by_hour: Vec<u64>,
     /// Burst fragments refreshed per rotation of the burst node.
     burst_refreshed_by_rotation: Vec<u64>,
+    /// Rotations each node completed.
+    rotations: Vec<u64>,
+    /// Stamps the clock dated younger than they were (must stay 0).
+    understated: u64,
 }
 
 impl Outcome {
@@ -218,10 +276,16 @@ fn run(scenario: &Scenario) -> Outcome {
         pages_by_hour: vec![0; hours],
         attested_by_hour: vec![0; hours],
         heights_by_hour: vec![0; hours],
+        rotations: vec![0; scenario.nodes.len()],
         ..Default::default()
     };
     let mut height = 0u64;
     let mut background = 0u64;
+    let start = Cursor {
+        steps: 0,
+        rotation: 0,
+        started: (0, 0),
+    };
     let mut nodes: Vec<Node> = scenario
         .nodes
         .iter()
@@ -231,10 +295,12 @@ fn run(scenario: &Scenario) -> Outcome {
                 spec: spec.clone(),
                 frags: Vec::with_capacity(spec.fragments),
                 by_shard: vec![Vec::new(); SHARDS],
-                steps: 0,
-                rotation: 0,
-                rotation_started: (0, 0),
+                at: start,
+                durable: start,
+                paced_from: (0, 0),
+                rotations: Vec::new(),
                 completed: VecDeque::new(),
+                clock: HeightClock::default(),
                 buffer: Vec::new(),
                 buffer_floor: None,
                 buffer_opened: None,
@@ -256,10 +322,18 @@ fn run(scenario: &Scenario) -> Outcome {
             nodes[burst.node].add(burst.node as i32, burst.fragments, height, t, true);
         }
         for (id, node) in nodes.iter_mut().enumerate() {
+            if node
+                .spec
+                .restart_every_secs
+                .is_some_and(|every| t > 0 && t % every == 0)
+            {
+                node.restart(t);
+            }
             if node.next_step_at() > t {
                 continue;
             }
-            let shard = (node.steps % SHARDS as u64) as usize;
+            node.clock.record(height, t);
+            let shard = (node.at.steps % SHARDS as u64) as usize;
             let policy = node.policy(scenario.mode, scenario.window, height, t);
             for &i in &node.by_shard[shard] {
                 let f = node.frags[i as usize];
@@ -268,33 +342,39 @@ fn run(scenario: &Scenario) -> Outcome {
                     provenance: Some(0),
                     suspect: false,
                 };
-                let due = refresh_due(
-                    Some(&stamp),
-                    height,
-                    Some(t - f.stamped_at),
-                    f.jitter,
-                    &policy,
-                );
+                let wall_age = node.clock.wall_age(f.verified, t);
+                // Below the oldest sample the age is a documented lower
+                // bound; everywhere else it must never fall short.
+                let dated = node.clock.oldest().is_some_and(|(h, _)| f.verified > h);
+                if dated && wall_age.is_some_and(|age| age < t - f.stamped_at) {
+                    out.understated += 1;
+                }
+                let due = refresh_due(Some(&stamp), height, wall_age, f.jitter, &policy);
                 if due != RefreshDue::No {
                     node.buffer.push(i);
                     node.buffer_floor = Some(node.buffer_floor.map_or(height, |h| h.min(height)));
                     node.buffer_opened.get_or_insert(t);
                 }
             }
-            let failed = node.spec.failed_rotations.contains(&node.rotation);
+            let failed = node.spec.failed_rotations.contains(&node.at.rotation);
+            // The rotation's last step flushes whatever waits, as production
+            // does, so the saved cursor always passes a rotation's end.
+            let last_step = (node.at.steps + 1) % SHARDS as u64 == 0;
             loop {
                 let waited_secs = node.buffer_opened.map_or(0, |o| t - o);
                 let due = match scenario.mode {
+                    _ if last_step => !node.buffer.is_empty(),
                     Mode::EveryRotation => {
                         !node.buffer.is_empty()
                             && (node.buffer.len() >= scenario.page_size
                                 || waited_secs >= BUFFER_AGE_SECS)
                     }
-                    Mode::Refresh { .. } => refresh_page_due(
+                    Mode::Refresh { .. } => refresh_page_due_within(
                         node.buffer.len(),
                         scenario.page_size,
                         waited_secs,
                         node.buffer_floor.map_or(0, |f| height - f),
+                        scenario.refresh_buffer_secs,
                     ),
                 };
                 if !due {
@@ -320,7 +400,7 @@ fn run(scenario: &Scenario) -> Outcome {
                     f.verified = floor;
                     f.stamped_at = opened;
                     if f.burst && scenario.burst.is_some_and(|b| b.node == id) {
-                        let r = node.rotation as usize;
+                        let r = node.at.rotation as usize;
                         if out.burst_refreshed_by_rotation.len() <= r {
                             out.burst_refreshed_by_rotation.resize(r + 1, 0);
                         }
@@ -328,14 +408,27 @@ fn run(scenario: &Scenario) -> Outcome {
                     }
                 }
             }
-            node.steps += 1;
-            if node.steps % SHARDS as u64 == 0 {
-                node.completed.push_back(height - node.rotation_started.1);
+            node.at.steps += 1;
+            if node.at.steps % SHARDS as u64 == 0 {
+                let done = SweepRotation {
+                    rotation: node.at.rotation,
+                    started_unix: node.at.started.0,
+                    started_height: node.at.started.1,
+                    ended_unix: t,
+                    ended_height: height,
+                };
+                node.rotations.push(done);
+                node.completed.push_back(done.heights());
                 if node.completed.len() > HISTORY {
                     node.completed.pop_front();
                 }
-                node.rotation += 1;
-                node.rotation_started = (t, height);
+                node.clock.record(height, t);
+                node.at.rotation += 1;
+                node.at.started = (t, height);
+                out.rotations[id] += 1;
+            }
+            if node.buffer.is_empty() {
+                node.durable = node.at;
             }
         }
     }
@@ -508,4 +601,46 @@ fn volume_by_data_scale() {
             after.max_age,
         );
     }
+}
+
+// Impact: the cap's dating runs on a node-local clock rebuilt from
+// rotation history after every restart; an understated age would hold a
+// stamp past the cap.
+// Should: never date a stamp younger than it is, through restarts.
+#[test]
+fn clock_never_understates_a_stamps_age_through_restarts() {
+    let mut scenario = Scenario::quiet_mesh(REFRESH, 3);
+    scenario.nodes[0].restart_every_secs = Some(40 * 60);
+    let out = run(&scenario);
+    assert_eq!(out.understated, 0);
+}
+
+// Impact: a crash-looping node can restart every 20-60 minutes. The cursor is
+// saved only with every buffer drained, so a refresh page that waits long
+// holds it back, and a node restarting faster than the wait would sweep
+// the same shards over and over and never finish a rotation.
+// Should: let a node restarting every 40 minutes keep completing rotations
+// and keep its stamps inside the window.
+#[test]
+fn a_restart_looping_node_keeps_completing_rotations() {
+    let rotations_of = |buffer_secs: u64| {
+        let mut scenario = Scenario::quiet_mesh(REFRESH, 3);
+        scenario.refresh_buffer_secs = buffer_secs;
+        scenario.nodes[0].restart_every_secs = Some(40 * 60);
+        let out = run(&scenario);
+        (out.rotations[0], out.rotations[1], out.max_age)
+    };
+    for buffer_secs in [600, 1800] {
+        let (looping, steady, max_age) = rotations_of(buffer_secs);
+        eprintln!(
+            "refresh wait {buffer_secs}s: restarting node {looping} rotations, steady node {steady}, max age {max_age}"
+        );
+    }
+    let (looping, steady, max_age) = rotations_of(REFRESH_BUFFER_MAX_SECS);
+    let window = crate::lifecycle::ATTESTATION_RECENCY_HEIGHTS;
+    assert!(max_age <= window, "a stamp reached {max_age} heights");
+    assert!(
+        looping * 2 >= steady,
+        "the restarting node completed {looping} rotations against {steady}"
+    );
 }

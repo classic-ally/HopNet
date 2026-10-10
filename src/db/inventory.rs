@@ -56,6 +56,20 @@ pub fn compute_shard_inventory_differential(
         .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))
 }
 
+/// This node's stamps on one rolling-sweep shard, for the attestation
+/// refresh (`hopnet_storage::store::shard_inventory_stamps`).
+pub fn shard_inventory_stamps(
+    conn: &rusqlite::Connection,
+    node_id: i32,
+    shard: u8,
+) -> Result<
+    std::collections::HashMap<hopnet_common::Blake3Hash, hopnet_storage::sweep::InventoryStamp>,
+    DatabaseError,
+> {
+    hopnet_storage::store::shard_inventory_stamps(conn, node_id, shard)
+        .map_err(|e| DatabaseError::classified(&e, DatabaseError::RecallError))
+}
+
 /// Blob-scoped belief for the prompt path after a pull: this node's held
 /// classes of `blob_id` with no inventory row yet (the pulled, rebuilt and
 /// origin classes). One indexed query under a consistent snapshot; the

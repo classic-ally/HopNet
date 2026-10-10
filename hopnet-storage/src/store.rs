@@ -20,7 +20,7 @@ use hopnet_common::height::{height_from_db, height_to_db};
 use hopnet_common::Blake3Hash;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// One fragment's replicated metadata (the substrate half of the legacy
 /// FragmentHash — stored_locally is probed at apply, never carried).
@@ -1082,6 +1082,40 @@ pub fn compute_shard_inventory_differential(
     })
 }
 
+/// This node's stamps on one rolling-sweep shard (`fragment_inventory`),
+/// for the attestation refresh to tell the fresh from the due. A range
+/// seek on `idx_fragment_inventory_node`.
+pub fn shard_inventory_stamps(
+    conn: &rusqlite::Connection,
+    node_id: i32,
+    shard: u8,
+) -> Result<HashMap<Blake3Hash, crate::sweep::InventoryStamp>, rusqlite::Error> {
+    let (lo, hi) = crate::sweep::shard_bounds(shard);
+    let last = hi.is_none();
+    let range = shard_clause("fragment_hash", last);
+    let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&lo];
+    if let Some(hi) = &hi {
+        bound.push(hi);
+    }
+    bound.push(&node_id);
+    let node = if last { "?2" } else { "?3" };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT fragment_hash, verified_height, provenance, suspect
+         FROM fragment_inventory WHERE node_id = {node} AND {range}"
+    ))?;
+    let rows = stmt.query_map(bound.as_slice(), |row| {
+        Ok((
+            row.get::<_, Blake3Hash>(0)?,
+            crate::sweep::InventoryStamp {
+                verified_height: row.get::<_, Option<i64>>(1)?.map(height_from_db),
+                provenance: row.get(2)?,
+                suspect: row.get::<_, i64>(3)? != 0,
+            },
+        ))
+    })?;
+    rows.collect()
+}
+
 /// Blob-scoped belief for the prompt path (RFC-STORAGE-003 S3/S5): the
 /// hashes of ONE blob this node holds (`stored_locally`) that have no
 /// inventory row for it yet — the classes a pull just landed or rebuilt
@@ -1832,6 +1866,62 @@ mod tests {
             Some((None, Some(8), 0)),
             "disk-verified after the report: the removal is stale"
         );
+    }
+
+    // Should: read this node's stamps on one shard, flags and all.
+    // Should not: read another node's rows, or rows outside the shard
+    // (including the last shard, which has no upper bound).
+    #[test]
+    fn shard_inventory_stamps_reads_this_nodes_shard_only() {
+        let conn = test_conn();
+        inventory_schema(&conn);
+        let in_shard = |first: u8, rest: u8| {
+            let mut bytes = [rest; 32];
+            bytes[0] = first;
+            Blake3Hash::from_bytes(bytes)
+        };
+        let (a, b, other_shard, last) = (
+            in_shard(0x10, 1),
+            in_shard(0x10, 2),
+            in_shard(0x11, 3),
+            in_shard(0xff, 4),
+        );
+        conn.execute_batch(&format!(
+            "INSERT INTO fragment_inventory (fragment_hash, node_id, verified_height, provenance, suspect)
+             VALUES (X'{a}', 1, 50, 0, 0), (X'{b}', 1, NULL, NULL, 1),
+                    (X'{a}', 2, 70, 0, 0), (X'{other_shard}', 1, 60, 0, 0),
+                    (X'{last}', 1, 80, 1, 0);",
+            a = a.to_hex(),
+            b = b.to_hex(),
+            other_shard = other_shard.to_hex(),
+            last = last.to_hex(),
+        ))
+        .unwrap();
+
+        let stamps = shard_inventory_stamps(&conn, 1, 0x10).unwrap();
+        assert_eq!(
+            stamps,
+            HashMap::from([
+                (
+                    a,
+                    crate::sweep::InventoryStamp {
+                        verified_height: Some(50),
+                        provenance: Some(0),
+                        suspect: false,
+                    }
+                ),
+                (
+                    b,
+                    crate::sweep::InventoryStamp {
+                        verified_height: None,
+                        provenance: None,
+                        suspect: true,
+                    }
+                ),
+            ])
+        );
+        let last_shard = shard_inventory_stamps(&conn, 1, 0xff).unwrap();
+        assert_eq!(last_shard.keys().collect::<Vec<_>>(), vec![&last]);
     }
 
     // Impact: the sweep's pages commit over minutes and a prompt pull
