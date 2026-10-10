@@ -99,13 +99,17 @@ pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionS
     // v6 (own-upload ledger): storage step 0006 adds the node-local
     // upload ledger; the covered set is unchanged, and storage@5
     // artifacts import through the frozen v5 spec below.
-    format_version: 6,
+    // v7 (sweep rotation history): storage step 0007 adds the node-local
+    // rotation history the attestation refresh budgets and dates against;
+    // the covered set is unchanged, and storage@6 artifacts import through
+    // the frozen v6 spec below.
+    format_version: 7,
     tables: STORAGE_TABLES,
 };
 
 /// The covered tables shared by every spec since v3: the v4 (index), v5
-/// (node-local cursor) and v6 (node-local ledger) bumps changed no covered
-/// table or column.
+/// (node-local cursor), v6 (node-local ledger) and v7 (node-local rotation
+/// history) bumps changed no covered table or column.
 const STORAGE_TABLES: &[hopnet_common::TableSpec] = &[
     hopnet_common::TableSpec::exported("data_blocks"),
     hopnet_common::TableSpec::exported("storage_view_transitions"),
@@ -155,6 +159,17 @@ pub const PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION: hopnet_common::SectionSpec =
     hopnet_common::SectionSpec {
         name: "storage",
         format_version: 5,
+        tables: STORAGE_TABLES,
+    };
+
+/// The storage section as sealed by 2026.10.11 through 2026.10.13
+/// (ordinal 6). FROZEN — the import mapping for storage@6 artifacts (the
+/// seals from those releases and the previous-release join fixture).
+/// Identical tables; only the hashed format_version differs.
+pub const PRE_ROTATION_HISTORY_SNAPSHOT_SECTION: hopnet_common::SectionSpec =
+    hopnet_common::SectionSpec {
+        name: "storage",
+        format_version: 6,
         tables: STORAGE_TABLES,
     };
 
@@ -220,6 +235,7 @@ pub const NODE_LOCAL_TABLES: &[&str] = &[
     "hopnet_storage_pins",
     "hopnet_storage_sweep_cursor",
     "hopnet_storage_local_uploads",
+    "hopnet_storage_sweep_rotations",
 ];
 
 /// This module's schema chain (RFC-020): replay is the only installer.
@@ -257,6 +273,11 @@ pub static CHAIN: hopnet_common::Chain = hopnet_common::Chain {
             6,
             "local_uploads",
             include_str!("../migrations/storage/0006_local_uploads.sql"),
+        ),
+        hopnet_common::Step::sql(
+            7,
+            "sweep_rotations",
+            include_str!("../migrations/storage/0007_sweep_rotations.sql"),
         ),
     ],
 };
@@ -674,6 +695,60 @@ pub fn write_sweep_cursor(
         ],
     )
     .map(|_| ())
+}
+
+/// Completed rotations kept in `hopnet_storage_sweep_rotations`: about a
+/// week of hourly rotations, more than the refresh's cap and history need.
+pub const SWEEP_ROTATIONS_KEPT: i64 = 200;
+
+/// Record a completed rotation of the rolling sweep (replacing a row with
+/// the same number), keeping the newest `SWEEP_ROTATIONS_KEPT`.
+pub fn record_sweep_rotation(
+    conn: &rusqlite::Connection,
+    rotation: &crate::sweep::SweepRotation,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO hopnet_storage_sweep_rotations
+         (rotation, started_unix, started_height, ended_unix, ended_height)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            rotation.rotation as i64,
+            rotation.started_unix as i64,
+            rotation.started_height as i64,
+            rotation.ended_unix as i64,
+            rotation.ended_height as i64
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM hopnet_storage_sweep_rotations WHERE rotation <=
+         (SELECT MAX(rotation) FROM hopnet_storage_sweep_rotations) - ?1",
+        [SWEEP_ROTATIONS_KEPT],
+    )
+    .map(|_| ())
+}
+
+/// The newest `limit` completed rotations, oldest first.
+pub fn recent_sweep_rotations(
+    conn: &rusqlite::Connection,
+    limit: usize,
+) -> Result<Vec<crate::sweep::SweepRotation>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT rotation, started_unix, started_height, ended_unix, ended_height
+         FROM hopnet_storage_sweep_rotations ORDER BY rotation DESC LIMIT ?1",
+    )?;
+    let mut rows = stmt
+        .query_map([limit as i64], |row| {
+            Ok(crate::sweep::SweepRotation {
+                rotation: row.get::<_, i64>(0)? as u64,
+                started_unix: row.get::<_, i64>(1)? as u64,
+                started_height: row.get::<_, i64>(2)? as u64,
+                ended_unix: row.get::<_, i64>(3)? as u64,
+                ended_height: row.get::<_, i64>(4)? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.reverse();
+    Ok(rows)
 }
 
 /// Record a `put`'s fragments in this node's upload ledger
@@ -1874,6 +1949,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    fn rotation_row(rotation: u64) -> crate::sweep::SweepRotation {
+        crate::sweep::SweepRotation {
+            rotation,
+            started_unix: 1_000 + rotation * 3_600,
+            started_height: 100 + rotation * 50,
+            ended_unix: 1_000 + (rotation + 1) * 3_600,
+            ended_height: 100 + (rotation + 1) * 50,
+        }
+    }
+
+    // Should: read back the newest rotations oldest first, as many as asked.
+    // Should: replace a rotation recorded twice rather than duplicate it.
+    // Should not: keep more than the newest SWEEP_ROTATIONS_KEPT rotations.
+    #[test]
+    fn sweep_rotations_round_trip_newest_kept() {
+        let conn = test_conn();
+        conn.execute_batch(include_str!(
+            "../migrations/storage/0007_sweep_rotations.sql"
+        ))
+        .unwrap();
+        assert!(recent_sweep_rotations(&conn, 3).unwrap().is_empty());
+        let total = SWEEP_ROTATIONS_KEPT as u64 + 20;
+        for rotation in 0..total {
+            record_sweep_rotation(&conn, &rotation_row(rotation)).unwrap();
+        }
+        let again = crate::sweep::SweepRotation {
+            ended_height: 9_999,
+            ..rotation_row(total - 1)
+        };
+        record_sweep_rotation(&conn, &again).unwrap();
+
+        assert_eq!(
+            recent_sweep_rotations(&conn, 3).unwrap(),
+            vec![rotation_row(total - 3), rotation_row(total - 2), again]
+        );
+        let (rows, oldest): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(rotation) FROM hopnet_storage_sweep_rotations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, SWEEP_ROTATIONS_KEPT);
+        assert_eq!(oldest as u64, total - SWEEP_ROTATIONS_KEPT as u64);
     }
 
     /// The ledger beside a real fragment store: `(dir, fragments_dir, conn)`.

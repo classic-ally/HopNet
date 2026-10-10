@@ -1109,6 +1109,29 @@ mod tests {
     const STEP_FIXTURE_STORAGE_0006_HASH: &str =
         "7c904d25b2c5506c897af60d637afeaa700645d7eb03e1102c393540bc9ce0db";
 
+    // Should: add the empty node-local sweep rotation history without
+    // touching any replicated row.
+    // Impact: what the attestation refresh budgets and dates against; the
+    // step is pure DDL and must replay identically.
+    #[test]
+    fn step_fixture_storage_0007_sweep_rotations() {
+        let hash = run_step_fixture(
+            "storage",
+            7,
+            "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes, file_size)
+             VALUES ('01890a5d-ac96-774b-b9aa-9f8b24f0c9a1', X'00', 1, 0, 1);",
+        );
+        assert_eq!(
+            hash, STEP_FIXTURE_STORAGE_0007_HASH,
+            "storage/0007 output moved — a released step may never change \
+             (contract rules 1-2); if this is an intentional pre-release \
+             redefinition, re-pin in the same commit"
+        );
+    }
+
+    const STEP_FIXTURE_STORAGE_0007_HASH: &str =
+        "7544b3d1909c91ef2affda374051f0cc299a5ee55d2c05cc3e514d8e104a6e31";
+
     // Should: land the documented backfill values, not just a stable hash.
     #[test]
     fn storage_0002_backfill_values() {
@@ -1336,6 +1359,49 @@ mod tests {
         scratch
             .prepare("SELECT 1 FROM hopnet_storage_local_uploads LIMIT 0")
             .expect("the build fast-forwards through step 0006");
+    }
+
+    // Impact: 2026.10.11 through 2026.10.13 sealed storage@6; the rotation
+    // history step moves the hashed format_version to 7, so their seals
+    // (and the previous-release join fixture) need the frozen v6 spec.
+    // Should: resolve a storage@6 artifact to the frozen v6 spec at
+    // ordinal 6, build and verify it against its own hash, and
+    // fast-forward through step 0007.
+    #[test]
+    fn storage_v6_artifact_builds_against_its_own_hash() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        install(&conn).unwrap();
+        crate::db::snapshot::tests::seed(&conn);
+        let specs: Vec<&'static hopnet_common::SectionSpec> = crate::db::snapshot::sections()
+            .into_iter()
+            .map(|s| {
+                if s.name == "storage" {
+                    &hopnet_storage::store::PRE_ROTATION_HISTORY_SNAPSHOT_SECTION
+                } else {
+                    s
+                }
+            })
+            .collect();
+        let tx = conn.transaction().unwrap();
+        let (artifact, _manifest) =
+            hopnet_common::snapshot::serialize_snapshot(&tx, &specs).unwrap();
+        drop(tx);
+
+        let headers = hopnet_common::snapshot::read_section_headers(&artifact).unwrap();
+        let plan = crate::db::snapshot::resolve_import_plan(&headers).unwrap();
+        assert_eq!(plan.targets.get("storage"), Some(&6));
+
+        let scratch = rusqlite::Connection::open_in_memory().unwrap();
+        build_artifact_db(
+            &scratch,
+            &plan,
+            &artifact,
+            blake3::hash(&artifact).as_bytes(),
+        )
+        .unwrap();
+        scratch
+            .prepare("SELECT 1 FROM hopnet_storage_sweep_rotations LIMIT 0")
+            .expect("the build fast-forwards through step 0007");
     }
 
     // Should: refuse artifact headers this binary cannot place — an

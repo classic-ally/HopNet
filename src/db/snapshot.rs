@@ -180,6 +180,20 @@ pub fn resolve_import_plan(headers: &[(String, u32)]) -> Result<ImportPlan, Stri
             }
             "storage"
                 if *fv
+                    == hopnet_storage::store::PRE_ROTATION_HISTORY_SNAPSHOT_SECTION
+                        .format_version =>
+            {
+                // Node-local bump (storage step 0007, the sweep rotation
+                // history): same covered tables, hashed format_version, so
+                // storage@6 verifies with the frozen v6 spec at ordinal 6,
+                // then fast-forwards through step 0007.
+                plan.specs
+                    .push(&hopnet_storage::store::PRE_ROTATION_HISTORY_SNAPSHOT_SECTION);
+                plan.expected.insert(name.clone(), *fv);
+                plan.targets.insert("storage", *fv);
+            }
+            "storage"
+                if *fv
                     == hopnet_storage::store::PRE_UPLOAD_LEDGER_SNAPSHOT_SECTION.format_version =>
             {
                 // Node-local bump (storage step 0006, the own-upload
@@ -544,7 +558,7 @@ pub(crate) mod tests {
         assert_eq!(report.manifest.top_hash.to_hex(), EMPTY_TOP_HASH);
     }
 
-    const EMPTY_TOP_HASH: &str = "0f4e514334040bf713264254f83739c746f05898d0f78a6bd4bdbd3aa15cfba5";
+    const EMPTY_TOP_HASH: &str = "a012279f09287bedf9e1ddf5ca93d3c4b7c0ae5bed13186dfe47d96af361ebb7";
     const EMPTY_SECTION_HASHES: &[(&str, &str)] = &[
         (
             "identity",
@@ -563,7 +577,7 @@ pub(crate) mod tests {
             // the covered set and data_blocks gained a column. v3 (S5):
             // fragment_inventory gained the disk-truth columns.
             "storage",
-            "4e59ad0b2d83665164f1a206299e505b49da77d14148222d094a04819fd93866",
+            "d5d5b04644d1f1e0b0c7d4de794219c1f7a7efcfc33dd5f9f03084fce1fa4e15",
         ),
         (
             "drive",
@@ -599,9 +613,9 @@ pub(crate) mod tests {
     }
 
     const SEEDED_TOP_HASH: &str =
-        "4d512b137461c3dd7da0ec13ae1bab2f6fb40e90e69a91d0cfacba31ab53365b";
+        "c747133fe9539800596190b2d3a481273f93b11a1dc3837d96df70b384f038a5";
     const SEEDED_ARTIFACT_HASH: &str =
-        "0fed55a9d3cb623e14ed575f7414a87e53e07dcf2c700de1489c90505e471c64";
+        "41eec9cec96d8dbcdf7d147815ffc9a98d0aa536a7a716c6d131871b4a9a64bb";
     // 5159 pre-split + 25: the "host" section header (16 bytes) became
     // identity (20) + telemetry (21) headers. Row bytes unchanged — the
     // delta being exactly the header arithmetic is the cheap proof the

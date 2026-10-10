@@ -646,6 +646,91 @@ pub const REFRESH_BUFFER_MAX_HEIGHTS: u64 = REFRESH_MARGIN_HEIGHTS / 2;
 /// a sudden drain plus one failed sweep pushes them past it (`sweep_sim`).
 pub const REFRESH_ROTATION_FLOOR_HEIGHTS: u64 = 2_700;
 
+/// One completed rotation of the rolling sweep
+/// (`hopnet_storage_sweep_rotations`, node-local).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepRotation {
+    pub rotation: u64,
+    pub started_unix: u64,
+    pub started_height: u64,
+    pub ended_unix: u64,
+    pub ended_height: u64,
+}
+
+impl SweepRotation {
+    /// The heights the rotation spanned.
+    pub fn heights(&self) -> u64 {
+        self.ended_height.saturating_sub(self.started_height)
+    }
+}
+
+/// When the tip stood at which height, as this node saw it: `(height,
+/// unix)` samples, ascending in height, for dating a stamp's height
+/// against the refresh's wall-clock cap. Blocks carry no time, so this is
+/// node-local: the sweep records a sample at every step, and completed
+/// rotations seed it across restarts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeightClock {
+    samples: Vec<(u64, u64)>,
+}
+
+impl HeightClock {
+    /// The tip stood at `height` at `unix`. Kept only when the height has
+    /// moved past the newest sample: the first sight of each height.
+    pub fn record(&mut self, height: u64, unix: u64) {
+        if self.samples.last().is_none_or(|&(h, _)| height > h) {
+            self.samples.push((height, unix));
+        }
+    }
+
+    /// Fold in completed rotations' start and end points (a restart's
+    /// history), keeping the earliest sight of each height.
+    pub fn seed(&mut self, rotations: &[SweepRotation]) {
+        for r in rotations {
+            self.samples.push((r.started_height, r.started_unix));
+            self.samples.push((r.ended_height, r.ended_unix));
+        }
+        self.samples.sort_unstable();
+        self.samples.dedup_by_key(|(height, _)| *height);
+    }
+
+    /// Drop samples older than `before_unix`, keeping the newest of them
+    /// so a stamp from just before the cutoff can still be dated.
+    pub fn prune(&mut self, before_unix: u64) {
+        let fresh = self
+            .samples
+            .partition_point(|&(_, unix)| unix < before_unix);
+        self.samples.drain(..fresh.saturating_sub(1));
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    /// How long ago a stamp at `verified_height` was made. Dated by the
+    /// newest sample strictly below it: the tip had not reached the
+    /// stamp's height then, so the stamp is later and the age is never
+    /// understated — a refresh comes early, never late. A stamp below
+    /// every sample gets the age of the oldest one, a lower bound that
+    /// can only show it already past a cap; a stamp at the oldest
+    /// sample's height can't be dated at all.
+    pub fn wall_age(&self, verified_height: u64, now: u64) -> Option<u64> {
+        let below = self.samples.partition_point(|&(h, _)| h < verified_height);
+        match below.checked_sub(1) {
+            Some(i) => Some(now.saturating_sub(self.samples[i].1)),
+            None => self
+                .samples
+                .first()
+                .filter(|&&(h, _)| verified_height < h)
+                .map(|&(_, unix)| now.saturating_sub(unix)),
+        }
+    }
+}
+
 /// This node's replicated stamp on one fragment (`fragment_inventory`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InventoryStamp {
@@ -1324,5 +1409,66 @@ mod tests {
             Some(5000),
             "an overrunning rotation is its own length"
         );
+    }
+
+    // Impact: the cap's only clock; an age understated by it would hold a
+    // stamp past the cap, an age overstated only refreshes it early.
+    // Should: date a stamp by the newest sample strictly below its height,
+    // never under its true age, wherever between samples it was made.
+    // Should: give a stamp below every sample the oldest sample's age, and
+    // leave a stamp at the oldest sample's height undated.
+    #[test]
+    fn height_clock_never_understates_a_stamps_age() {
+        // The tip as it moved: height 10 + t/60 at second t, sampled every
+        // 14 s (a shard step), each sample its first sight of a height.
+        let tip = |t: u64| 10 + t / 60;
+        let mut clock = HeightClock::default();
+        for t in (0..7_200).step_by(14) {
+            clock.record(tip(t), t);
+        }
+        let now = 9_000;
+        for made in 60..7_200 {
+            let age = clock.wall_age(tip(made), now).expect("dated");
+            assert!(age >= now - made, "stamp at {made}: aged {age}");
+            // Over by at most the dwell at the height below, the time
+            // already spent at the stamp's own, and one sampling step.
+            assert!(
+                age <= now - made + 2 * 60 + 14,
+                "stamp at {made}: aged {age}"
+            );
+        }
+        assert_eq!(clock.wall_age(10, now), None, "at the oldest sample");
+        let mut later = HeightClock::default();
+        later.record(50, 1_000);
+        later.record(60, 2_000);
+        assert_eq!(later.wall_age(40, 5_000), Some(4_000), "a lower bound");
+    }
+
+    // Should: keep one sample per height, its first sight, whether recorded
+    // step by step or seeded from completed rotations.
+    // Should: prune samples before a cutoff but the newest of them.
+    #[test]
+    fn height_clock_keeps_first_sights_and_prunes_to_the_cutoff() {
+        let mut clock = HeightClock::default();
+        clock.record(5, 100);
+        clock.record(5, 200);
+        clock.record(4, 300);
+        clock.record(6, 400);
+        assert_eq!(clock.samples, vec![(5, 100), (6, 400)]);
+
+        clock.seed(&[SweepRotation {
+            rotation: 0,
+            started_unix: 50,
+            started_height: 3,
+            ended_unix: 150,
+            ended_height: 5,
+        }]);
+        assert_eq!(clock.samples, vec![(3, 50), (5, 100), (6, 400)]);
+
+        clock.prune(120);
+        assert_eq!(clock.samples, vec![(5, 100), (6, 400)]);
+        clock.prune(1_000);
+        assert_eq!(clock.samples, vec![(6, 400)]);
+        assert_eq!(clock.len(), 1);
     }
 }
