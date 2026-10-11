@@ -150,45 +150,59 @@ impl HopNetApplication {
                 .into());
             }
             if origin == ValidationOrigin::Live {
-                // Vote-iff-match (Rule-8, RFC-013 precedent): recompute
-                // the canonical snapshot ARTIFACT over OWN state at this
-                // height and vote only on a byte-identity match. A quorum
-                // deciding despite our mismatch means our replica is the
-                // anomaly (divergence surfacing, not being caused). Never
-                // at Sync — decided is decided, and the certificate
-                // carries the quorum's word.
-                let started = std::time::Instant::now();
-                let local =
-                    crate::db::snapshot::compute_artifact_hash_tx(db_tx).map_err(|e| match e {
-                        crate::db::DatabaseError::Transient(code) => {
-                            ValidateFailure::Transient(format!("vote-iff-match snapshot: {code:?}"))
-                        }
-                        other => {
-                            ValidateFailure::Semantic(format!("vote-iff-match snapshot: {other:?}"))
-                        }
-                    })?;
-                tracing::info!(
-                    height = height.0,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "vote-iff-match: artifact recomputed inside the round (OQ1 timing)"
-                );
-                if local.as_bytes() != commit.snapshot_hash.as_slice() {
-                    return Err(format!(
-                        "vote-iff-match: local artifact {} != proposed {}",
-                        local.to_hex(),
-                        hopnet_common::Blake3Hash::from_bytes(commit.snapshot_hash).to_hex()
-                    )
-                    .into());
-                }
-                // Own-drain check: refuse to seal past work this node has
-                // accepted but not yet seen decided (one dissenting vote,
-                // not a veto — protects the drain promise).
+                // Own-drain check first: refuse to seal past work this node
+                // has accepted but not yet seen decided (one dissenting
+                // vote, not a veto — protects the drain promise). A refusal
+                // needs no artifact.
                 let pool = self.app_state.consensus_queue.pending_pool();
                 if pool.staged_len() > 0 || pool.inflight_len() > 0 {
                     return Err(format!(
                         "own pool not drained (staged {}, inflight {}): refusing to seal",
                         pool.staged_len(),
                         pool.inflight_len()
+                    )
+                    .into());
+                }
+                // Vote-iff-match (Rule-8, RFC-013 precedent): the canonical
+                // snapshot ARTIFACT over OWN state at this height, voted on
+                // only at a byte-identity match. A quorum deciding despite
+                // our mismatch means our replica is the anomaly (divergence
+                // surfacing, not being caused). Never at Sync — decided is
+                // decided, and the certificate carries the quorum's word.
+                // The hash is this node's own, precomputed at this tip off
+                // the shell (`regenesis::artifact_cache`); while that
+                // computation is still running the vote is undetermined, so
+                // the shell never stalls for minutes on a second one.
+                let started = std::time::Instant::now();
+                let computed =
+                    self.app_state
+                        .artifact_cache
+                        .at_tip(db_tx)
+                        .map_err(|e| match e {
+                            crate::db::DatabaseError::Transient(code) => {
+                                ValidateFailure::Transient(format!(
+                                    "vote-iff-match snapshot: {code:?}"
+                                ))
+                            }
+                            other => ValidateFailure::Semantic(format!(
+                                "vote-iff-match snapshot: {other:?}"
+                            )),
+                        })?;
+                let Some((_, local)) = computed else {
+                    return Err(ValidateFailure::Transient(
+                        "vote-iff-match: seal artifact still being computed at this tip".into(),
+                    ));
+                };
+                tracing::info!(
+                    height = height.0,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "vote-iff-match: seal artifact compared"
+                );
+                if local.as_bytes() != commit.snapshot_hash.as_slice() {
+                    return Err(format!(
+                        "vote-iff-match: local artifact {} != proposed {}",
+                        local.to_hex(),
+                        hopnet_common::Blake3Hash::from_bytes(commit.snapshot_hash).to_hex()
                     )
                     .into());
                 }

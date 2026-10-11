@@ -72,6 +72,9 @@ pub struct AppState {
     /// The rolling walker's rotation in progress, with its running step
     /// timings — the operator route's `in_progress`. Process state.
     pub sweep_progress: Arc<std::sync::Mutex<Option<hopnet_storage::sweep::SweepProgress>>>,
+    /// The seal artifact's hash at this node's latest tip, computed outside the
+    /// consensus round (`regenesis::artifact_cache`). Process state.
+    pub artifact_cache: Arc<crate::regenesis::artifact_cache::ArtifactCache>,
     /// The last policy tick's tally (RFC-STORAGE-003 S7) — the pane's
     /// re-encode backlog source. Process state.
     pub last_tick: Arc<std::sync::Mutex<Option<storage_host::jobs::PolicyTickReport>>>,

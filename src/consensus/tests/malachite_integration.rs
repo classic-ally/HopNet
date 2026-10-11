@@ -940,11 +940,28 @@ async fn start_engine_production_with_chain(
 // real-engine end-to-end.
 #[test]
 fn regenesis_seal_halts_mesh_and_writes_artifact() {
+    seal_mesh_end_to_end("seal-e2e", Duration::ZERO);
+}
+
+// Impact: 2026.10.14 crossing — on the live mesh the seal's artifact took
+// 75-150 s to compute against ~3 s round timeouts. Proposing and voting both
+// recomputed it inside the round on the consensus shell, every attempt timed
+// out, and the mesh sat in moratorium until aborted.
+// Should: seal a mesh whose artifact takes far longer than a round to
+// compute, on default timeouts, with the same guarantees as a fast one.
+#[test]
+fn regenesis_seals_when_the_artifact_outlasts_a_round() {
+    seal_mesh_end_to_end("seal-slow-e2e", Duration::from_secs(30));
+}
+
+/// The 3-node seal end to end, every artifact computation taking at least
+/// `compute_delay` (`ArtifactCache::set_compute_delay`).
+fn seal_mesh_end_to_end(label: &str, compute_delay: Duration) {
     // The artifact path derives from XDG_DATA_HOME; isolate it for this
     // process (set_var is process-global — hence the lock shared with
     // the transition e2e).
     let _guard = crate::test_env::lock_env();
-    let data_dir = std::env::temp_dir().join(format!("hopnet-seal-e2e-{}", std::process::id()));
+    let data_dir = std::env::temp_dir().join(format!("hopnet-{label}-{}", std::process::id()));
     std::fs::create_dir_all(data_dir.join("hopnet")).unwrap();
     crate::test_env::set(&_guard, "XDG_DATA_HOME", &data_dir);
 
@@ -954,6 +971,9 @@ fn regenesis_seal_halts_mesh_and_writes_artifact() {
     rt.block_on(async move {
         for node in &network.nodes {
             install_consensus_schema(&node.app_state);
+            node.app_state
+                .artifact_cache
+                .set_compute_delay(compute_delay);
             // The start precondition: every seated validator runs the
             // target. Identical direct writes on every replica keep the
             // fixtures consistent (the S3 attestation path needs the very

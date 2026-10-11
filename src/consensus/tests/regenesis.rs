@@ -1156,3 +1156,39 @@ fn a_forward_is_refused_against_the_receivers_moratorium() {
         0
     );
 }
+
+// Impact: the seal's hash is precomputed per tip; a cached value that is
+// not byte-identical to a fresh computation would make every validator vote
+// against an honest seal (or for a diverged one).
+// Should: cache the hash computed at the tip, identical to computing it
+// directly, and answer from the cache at that tip.
+// Should not: answer from the cache once another block has decided.
+#[test]
+fn the_seal_artifact_is_cached_per_tip_and_matches_a_fresh_computation() {
+    use crate::regenesis::artifact_cache::tip;
+
+    let node = MockNode::new(3);
+    register_node(&node);
+    let mut conn = node.app_state.db_pool.get().unwrap();
+    let decide = |conn: &rusqlite::Connection, height: i64, byte: u8| {
+        conn.execute(
+            "INSERT INTO decided_blocks (height, block_hash, round, block) VALUES (?1, ?2, 0, X'00')",
+            rusqlite::params![height, vec![byte; 32]],
+        )
+        .unwrap();
+    };
+    decide(&conn, 1, 0x11);
+
+    let cache = &node.app_state.artifact_cache;
+    let tx = conn.transaction().unwrap();
+    let fresh = crate::db::snapshot::compute_artifact_hash_tx(&tx).unwrap();
+    let (at, cached) = cache.at_tip(&tx).unwrap().expect("computed");
+    let at = at.expect("a decided tip");
+    assert_eq!(cached, fresh);
+    assert_eq!(cache.get(&at), Some(fresh), "kept for that tip");
+    drop(tx);
+
+    decide(&conn, 2, 0x22);
+    let next = tip(&conn).unwrap().expect("tip");
+    assert_eq!(cache.get(&next), None, "a new block is a new tip");
+}

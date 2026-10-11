@@ -500,6 +500,7 @@ fn create_test_app_state_on_manager(
         test_mode: true,
         last_sweep: Arc::new(std::sync::Mutex::new(None)),
         sweep_progress: Arc::new(std::sync::Mutex::new(None)),
+        artifact_cache: Arc::default(),
         last_tick: Arc::new(std::sync::Mutex::new(None)),
         comms,
         setup_complete,

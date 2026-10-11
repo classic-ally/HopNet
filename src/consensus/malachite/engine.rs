@@ -61,29 +61,36 @@ const EMPTY_POOL_LINGER_MS: u64 = 500;
 const NONCE_CLEANUP_INTERVAL: u64 = 97;
 
 /// Consensus timeouts, optionally scaled by `HOPNET_CONSENSUS_TIMEOUT_MS`
-/// (the round-0 propose timeout in milliseconds; votes and per-round deltas
-/// scale proportionally). Orchestrator tests use small values so leader-down
-/// round advances happen in seconds instead of the default 3s+.
+/// (`timeouts_for_override`). Orchestrator tests use small values so
+/// leader-down round advances happen in seconds instead of the default 3s+.
 fn consensus_timeouts() -> LinearTimeouts {
     match std::env::var("HOPNET_CONSENSUS_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
     {
-        Some(ms) => {
-            let propose = Duration::from_millis(ms);
-            let vote = Duration::from_millis((ms / 3).max(100));
-            let delta = Duration::from_millis((ms / 6).max(50));
-            LinearTimeouts {
-                propose,
-                propose_delta: delta,
-                prevote: vote,
-                prevote_delta: delta,
-                precommit: vote,
-                precommit_delta: delta,
-                rebroadcast: propose + vote + vote,
-            }
-        }
+        Some(ms) => timeouts_for_override(ms),
         None => LinearTimeouts::default(),
+    }
+}
+
+/// Timeouts for a round-0 propose timeout of `ms` milliseconds: votes scale
+/// with it, but the per-round deltas and the rebroadcast stay near
+/// malachite's defaults however long the base. Rebroadcast grows by all three
+/// deltas a round and is the only resend of a vote or round certificate a
+/// peer missed while restarting; scaled with a 300 s base it reached ~40 min
+/// by round 12 (2026.10.14 crossing), capped it stays under a minute.
+fn timeouts_for_override(ms: u64) -> LinearTimeouts {
+    let propose = Duration::from_millis(ms);
+    let vote = Duration::from_millis((ms / 3).max(100));
+    let delta = Duration::from_millis((ms / 6).clamp(50, 500));
+    LinearTimeouts {
+        propose,
+        propose_delta: delta,
+        prevote: vote,
+        prevote_delta: delta,
+        precommit: vote,
+        precommit_delta: delta,
+        rebroadcast: (propose + vote + vote).min(Duration::from_secs(30)),
     }
 }
 
@@ -756,16 +763,32 @@ fn seal_candidate(
     let tx_snapshot = conn
         .transaction()
         .map_err(|e| format!("snapshot tx: {e}"))?;
-    let artifact_hash = crate::db::snapshot::compute_artifact_hash_tx(&tx_snapshot)
-        .map_err(|e| format!("snapshot compute: {e:?}"))?;
+    // The hash precomputed at this tip (`regenesis::artifact_cache`, warmed
+    // by the drain watcher), or computed here on the build thread when no
+    // other computation is running — never a second one in parallel.
+    let (tip, artifact_hash) = app_state
+        .artifact_cache
+        .at_tip(&tx_snapshot)
+        .map_err(|e| format!("snapshot compute: {e:?}"))?
+        .ok_or("seal artifact still being computed at this tip")?;
     drop(tx_snapshot);
+    // The hash is the state at the tip it was read with; the block being
+    // built must extend exactly that tip.
+    if let Some(tip) = &tip
+        && tip.height + 1 != seal_height
+    {
+        return Err(format!(
+            "seal artifact is at height {}, not the parent of {seal_height}",
+            tip.height
+        ));
+    }
     let mut snapshot_hash = [0u8; 32];
     snapshot_hash.copy_from_slice(artifact_hash.as_bytes());
     tracing::info!(
         seal_height,
         elapsed_ms = started.elapsed().as_millis() as u64,
         artifact_hash = %artifact_hash.to_hex(),
-        "regenesis commit candidate: artifact recomputed (OQ1 timing)"
+        "regenesis commit candidate"
     );
     // The target is already committed (regenesis_start decided it); copying
     // it into the commit is what puts it inside the certified block, where a
@@ -860,11 +883,17 @@ pub(crate) fn spawn_drain_watcher(
         loop {
             tokio::time::sleep(Duration::from_millis(1000)).await;
             if committed_regenesis_phase(&app_state)
-                == Some(crate::db::regenesis::RegenesisPhase::Moratorium)
-                && pool.staged_len() == 0
-                && pool.inflight_len() == 0
-                && input_tx.send(HostInput::Resume).await.is_err()
+                != Some(crate::db::regenesis::RegenesisPhase::Moratorium)
+                || pool.staged_len() > 0
+                || pool.inflight_len() > 0
             {
+                continue;
+            }
+            // Drained: precompute the seal artifact at this tip off the
+            // shell, so proposing and voting the seal find it ready
+            // (`regenesis::artifact_cache`).
+            crate::regenesis::artifact_cache::warm(&app_state);
+            if input_tx.send(HostInput::Resume).await.is_err() {
                 return; // engine gone
             }
         }
@@ -947,6 +976,7 @@ async fn handle_need_value(
         && candidates.is_empty()
         && pool.inflight_len() == 0;
     let hook_allowed = regenesis_phase == Some(crate::db::regenesis::RegenesisPhase::Normal);
+    let moratorium = regenesis_phase == Some(crate::db::regenesis::RegenesisPhase::Moratorium);
 
     // Dedicated build connection: proposal building must never lose a pool
     // checkout race under load (a failed build wastes the whole round — the
@@ -967,7 +997,7 @@ async fn handle_need_value(
         if propose_seal {
             match seal_candidate(&build_state, &mut conn, height.0) {
                 Ok(tx) => candidates.push(tx),
-                // A failed recompute wastes this round only — the drain
+                // A failed attempt wastes this round only — the drain
                 // watcher keeps nudging and the next NeedValue retries.
                 Err(e) => tracing::warn!("regenesis commit candidate failed: {e}"),
             }
@@ -984,15 +1014,27 @@ async fn handle_need_value(
                 Err(e) => tracing::warn!("staleness propose hook skipped: {e}"),
             }
         }
+        // In a moratorium an empty block carries nothing, yet deciding it
+        // moves the tip — and with it the seal artifact every validator has
+        // just precomputed. Propose nothing instead: the round times out
+        // nil, the tip stays, the next attempt finds the hash ready.
+        if moratorium && candidates.is_empty() {
+            return Ok::<_, String>((conn, None));
+        }
         let result = build_value(&build_state, &mut conn, height, round, candidates);
-        Ok::<_, String>((conn, result))
+        Ok::<_, String>((conn, Some(result)))
     })
     .await;
 
     let built = match joined {
-        Ok(Ok((conn, result))) => {
+        Ok(Ok((conn, Some(result)))) => {
             *build_conn = Some(conn);
             result
+        }
+        Ok(Ok((conn, None))) => {
+            *build_conn = Some(conn);
+            pool.restage(entries);
+            return;
         }
         Ok(Err(e)) => {
             tracing::error!("build_value setup failed at height {}: {e}", height.0);
@@ -1102,4 +1144,36 @@ pub fn kick_sync_if_behind(app_state: &AppState, target: u64, hint_peer: i32) {
         }
         flag.store(false, Ordering::SeqCst);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hopnet_consensus::{Round, Timeout};
+
+    fn at(t: &LinearTimeouts, timeout: Timeout) -> Duration {
+        t.duration_for(timeout)
+    }
+
+    // Impact: a 300 s override scaled the rebroadcast with it, to ~40 min by
+    // round 12; a validator that missed its peer's round certificate while
+    // restarting waited that long for the resend (2026.10.14 crossing).
+    // Should: keep a long override's rebroadcast under a minute at round 12
+    // while its propose timeout stays the full base.
+    // Should: leave a short override (orchestrator tests) as it was.
+    #[test]
+    fn a_long_override_keeps_the_rebroadcast_short() {
+        let long = timeouts_for_override(300_000);
+        assert_eq!(
+            at(&long, Timeout::propose(Round::new(0))),
+            Duration::from_secs(300)
+        );
+        assert!(at(&long, Timeout::rebroadcast(Round::new(12))) < Duration::from_secs(60));
+
+        let short = timeouts_for_override(2_000);
+        assert_eq!(short.propose, Duration::from_millis(2_000));
+        assert_eq!(short.prevote, Duration::from_millis(666));
+        assert_eq!(short.propose_delta, Duration::from_millis(333));
+        assert_eq!(short.rebroadcast, Duration::from_millis(3_332));
+    }
 }

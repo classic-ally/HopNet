@@ -9,6 +9,7 @@
 //! the engine obligations are hopnet-consensus/spec/
 //! regenesis-seal-contract.md.
 
+pub mod artifact_cache;
 pub mod boot;
 #[cfg(test)]
 pub mod compat_g0;
