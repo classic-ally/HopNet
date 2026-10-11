@@ -22,7 +22,7 @@ use hopnet_consensus::host::{HostCore, HostError, HostOutput};
 use hopnet_consensus::signing::sign_vote;
 use hopnet_consensus::sim::{MemGossip, MemTimers};
 use hopnet_consensus::store::{SqliteStorage, StoreError};
-use malachitebft_core_types::{Context, NilOrVal, Round};
+use malachitebft_core_types::{Context, NilOrVal, Round, Timeout};
 
 type SqlCore = HostCore<SqlApp, SqliteStorage, MemGossip, MemTimers>;
 type FlakyCore = HostCore<SqlApp, FlakyStorage, MemGossip, MemTimers>;
@@ -271,5 +271,157 @@ fn resume_counts_the_appends_made_while_replaying_buffered_votes() {
     assert_eq!(decided_outputs(core.take_outputs()), vec![2]);
     drop(core);
     assert_eq!(decided_heights(&path).len(), 2);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The `NeedValue` requests in `outputs`, as `(height, round)`.
+fn need_values(outputs: &[HostOutput]) -> Vec<(u64, u32)> {
+    outputs
+        .iter()
+        .filter_map(|o| match o {
+            HostOutput::NeedValue { height, round } => Some((height.0, round.as_u32()?)),
+            _ => None,
+        })
+        .collect()
+}
+
+// Impact: 2026.10.14 crossing — a regenesis seal takes ~100 s to build, the
+// validators were restarted mid build, and the replay dropped every value
+// request on the assumption it had supplied the value. Nothing was in the
+// WAL, so the restarted proposer never proposed in its round and the two
+// validators waited on each other for over half an hour.
+// Should: ask a restarted proposer again for the value of the round it ends
+// in when the replay held no proposal of its own, and decide once given.
+#[test]
+fn a_restarted_proposer_is_asked_again_for_a_value_it_never_proposed() {
+    let path = temp_db("wal-owed-value");
+    let mut core = sql_core(open_storage(&path));
+    core.start_height(Height::INITIAL, false).unwrap();
+    assert_eq!(need_values(&core.take_outputs()), vec![(1, 0)]);
+
+    // The build outlives round 0: nil prevote and precommit, round 1 begins
+    // and asks for a value again — which is still being built at the crash.
+    core.on_timeout(Timeout::propose(Round::new(0))).unwrap();
+    core.on_timeout(Timeout::precommit(Round::new(0))).unwrap();
+    assert_eq!(need_values(&core.take_outputs()), vec![(1, 1)]);
+    drop(core);
+
+    let mut core = sql_core(open_storage(&path));
+    core.start_height(Height::INITIAL, false).unwrap();
+    assert_eq!(
+        need_values(&core.take_outputs()),
+        vec![(1, 1)],
+        "the replay supplied no value for round 1, so it is asked for again"
+    );
+    let block = build_block(Height::INITIAL, Round::new(1), 0, None);
+    core.propose(Height::INITIAL, Round::new(1), block).unwrap();
+    assert_eq!(decided_outputs(core.take_outputs()), vec![1]);
+    drop(core);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Node 1 of a two-validator Majority set: the proposer of height 1 round 0,
+/// which needs its peer's votes to decide.
+fn second_of_two(storage: SqliteStorage) -> SqlCore {
+    let valset = common::valset(2);
+    HostCore::new(
+        common::chain_id(),
+        common::key(1),
+        Address(1),
+        QuorumProfile::Majority,
+        common::params(1, QuorumProfile::Majority),
+        Height::INITIAL,
+        valset.clone(),
+        SqlApp { valset },
+        storage,
+        MemGossip::default(),
+        MemTimers::default(),
+    )
+}
+
+// Impact: re-asking a proposer that DID propose would have the shell build
+// and ship a second, different block for the same (height, round).
+// Should not: ask a restarted proposer for a value when its replay supplied
+// its own proposal for the round.
+#[test]
+fn a_restarted_proposer_is_not_asked_for_a_value_it_already_proposed() {
+    let path = temp_db("wal-replayed-value");
+    let mut core = second_of_two(open_storage(&path));
+    core.start_height(Height::INITIAL, false).unwrap();
+    assert_eq!(need_values(&core.take_outputs()), vec![(1, 0)]);
+    let block = build_block(Height::INITIAL, Round::new(0), 1, None);
+    core.propose(Height::INITIAL, Round::new(0), block).unwrap();
+    assert!(
+        decided_outputs(core.take_outputs()).is_empty(),
+        "one of two votes"
+    );
+    drop(core);
+
+    let mut core = second_of_two(open_storage(&path));
+    core.start_height(Height::INITIAL, false).unwrap();
+    assert!(
+        need_values(&core.take_outputs()).is_empty(),
+        "the replayed proposal is the round's value"
+    );
+    drop(core);
+    let _ = std::fs::remove_file(&path);
+}
+
+// Impact: proposals were gossiped before the engine appended them to the
+// WAL; a crash in between shipped a block the restarted node knew nothing
+// of, and it then built a second one for the same (height, round).
+// Should not: ship a proposal whose WAL append failed.
+#[test]
+fn a_proposal_is_not_gossiped_unless_persisted() {
+    let (path, mut core, _calls, gossip) = flaky_core("wal-propose-order", 1, false);
+    core.start_height(Height::INITIAL, false).unwrap();
+    core.take_outputs();
+    gossip.take_outbox();
+
+    let block = build_block(Height::INITIAL, Round::new(0), 0, None);
+    core.propose(Height::INITIAL, Round::new(0), block)
+        .expect_err("a permanent append failure reaches the caller");
+    let shipped = gossip
+        .take_outbox()
+        .into_iter()
+        .filter(|m| matches!(m, WireConsensusMsg::ProposedValue(_)))
+        .count();
+    assert_eq!(shipped, 0, "an unpersisted proposal never leaves the node");
+    drop(core);
+    let _ = std::fs::remove_file(&path);
+}
+
+// Impact: a liveness certificate whose round failed to decode returned a
+// codec error out of `on_wire`; the shell treats any step error as fatal
+// and aborts, so one bad peer message crashed the node.
+// Should: drop an undecodable polka or round certificate and keep running.
+#[test]
+fn an_undecodable_liveness_certificate_is_dropped() {
+    let path = temp_db("wal-bad-liveness");
+    let mut core = sql_core(open_storage(&path));
+    core.start_height(Height::INITIAL, false).unwrap();
+    core.take_outputs();
+
+    let polka = hopnet_consensus::codec::WirePolkaCertificate {
+        height: 1,
+        round: -7,
+        value_id: hopnet_consensus::types::Blake3Hash::from_bytes([1u8; 32]),
+        signatures: Vec::new(),
+    };
+    core.on_wire(WireConsensusMsg::LivenessPolka(polka))
+        .expect("an undecodable polka certificate is dropped, not fatal");
+    let skip = hopnet_consensus::codec::WireRoundCertificate {
+        height: 1,
+        round: -7,
+        cert_type: hopnet_consensus::codec::WireRoundCertificateType::Skip,
+        signatures: Vec::new(),
+    };
+    core.on_wire(WireConsensusMsg::LivenessSkipRound(skip))
+        .expect("an undecodable round certificate is dropped, not fatal");
+
+    let block = build_block(Height::INITIAL, Round::new(0), 0, None);
+    core.propose(Height::INITIAL, Round::new(0), block).unwrap();
+    assert_eq!(decided_outputs(core.take_outputs()), vec![1]);
+    drop(core);
     let _ = std::fs::remove_file(&path);
 }

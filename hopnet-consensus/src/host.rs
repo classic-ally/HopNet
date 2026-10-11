@@ -369,17 +369,41 @@ where
             }
         }
 
-        // Recovery-time value-build requests are moot: the replay supplied the
-        // value. Drop them so the shell doesn't build a stale proposal.
-        if self.phase == Phase::Recovering {
-            self.outputs
-                .retain(|o| !matches!(o, HostOutput::NeedValue { .. }));
-        }
+        // Value-build requests are suppressed while replaying (`GetValue`
+        // fires on every replayed round entry, before that round's value is
+        // replayed). They are moot only when the replay supplied our
+        // proposal for the round we end in; a proposer that crashed after
+        // GetValue but before `propose` has none in its WAL and must be
+        // asked again, or it never proposes in that round (2026.10.14
+        // crossing: a restart mid seal build left two validators waiting on
+        // each other's proposals in rounds 12 and 13).
+        let recovered = self.phase == Phase::Recovering;
         self.phase = Phase::Running;
+        if let Some(round) = self.owed_proposal().filter(|_| recovered) {
+            self.outputs.push(HostOutput::NeedValue {
+                height: self.state.height(),
+                round,
+            });
+        }
         // A proposal for this height may have arrived while it was deferred
         // (on-demand) or before the previous height finished — validate it
         // NOW, against the tip it belongs to.
         self.drain_stashed_proposals()
+    }
+
+    /// The current round, when this node is its proposer, is still in the
+    /// propose step, and holds no proposal of its own for it: a value it
+    /// still owes the round.
+    fn owed_proposal(&self) -> Option<Round> {
+        let (height, round) = (self.state.height(), self.state.round());
+        (round.is_defined()
+            && *self.state.get_proposer(height, round) == self.my_addr
+            && self.state.driver.step_is_propose()
+            && self
+                .state
+                .full_proposal_at_round_and_proposer(&height, round, &self.my_addr)
+                .is_none())
+        .then_some(round)
     }
 
     /// Boot entry for on-demand mode. A height with persisted WAL entries was
@@ -448,14 +472,17 @@ where
                 // here; drop without validating (a dry-run against the wrong
                 // tip only produces noise).
             }
-            WireConsensusMsg::LivenessPolka(w) => {
-                let cert = (&w).try_into().map_err(HostError::Codec)?;
-                self.feed(Input::PolkaCertificate(cert))?;
-            }
-            WireConsensusMsg::LivenessSkipRound(w) => {
-                let cert = (&w).try_into().map_err(HostError::Codec)?;
-                self.feed(Input::RoundCertificate(cert))?;
-            }
+            // A peer's undecodable certificate is the peer's problem: drop it
+            // as `feed` drops a bad vote, never fail the step (the shell
+            // treats a step error as fatal and aborts the process).
+            WireConsensusMsg::LivenessPolka(w) => match (&w).try_into() {
+                Ok(cert) => self.feed(Input::PolkaCertificate(cert))?,
+                Err(e) => tracing::warn!("dropping undecodable polka certificate: {e:?}"),
+            },
+            WireConsensusMsg::LivenessSkipRound(w) => match (&w).try_into() {
+                Ok(cert) => self.feed(Input::RoundCertificate(cert))?,
+                Err(e) => tracing::warn!("dropping undecodable round certificate: {e:?}"),
+            },
         }
         // Any input can complete a decide and advance the height (votes most
         // of all) — give stashed proposals for the new height their shot.
@@ -568,12 +595,20 @@ where
             validity: Validity::Valid,
         };
         let wire = WireConsensusMsg::ProposedValue((&pv).into());
-        self.gossip.broadcast(&wire);
 
+        // Persist before shipping: the engine appends our ProposedValue to
+        // the WAL while handling Propose. Gossiping first let a crash in
+        // between ship a block the restarted node knew nothing of, and it
+        // would then build and ship a second, different one for the same
+        // (height, round).
         self.remember_block(height, block.clone());
-        self.feed(Input::Propose(LocallyProposedValue::new(
+        let fed = self.feed(Input::Propose(LocallyProposedValue::new(
             height, round, block,
-        )))
+        )));
+        if fed.is_ok() {
+            self.gossip.broadcast(&wire);
+        }
+        fed
     }
 
     /// A scheduled timeout fired (delivered by the shell's clock).
