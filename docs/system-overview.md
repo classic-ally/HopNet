@@ -158,6 +158,15 @@ an audit found a view-change safety hole. See RFC-013 for the full design
     And the sealed marker is derived from the committed phase, so a crash
     between the decide and the seal work can no longer leave a node
     running on a retired chain.
+  - **Seal at scale** (2026.10.15, consensus-bugs.md 23): the 2026.10.14
+    crossing never sealed and was aborted. The seal artifact took
+    75-150 s per computation inside ~3 s rounds, lagging nodes kept the
+    pools full through the moratorium, and a restarted proposer never
+    proposed. The artifact hash is now computed once per tip off the
+    round, forwarded work is gated at the receiver, and recovery asks
+    again for a value the WAL never held. The crossing out of 2026.10.13
+    runs its old seal code and needs the hand-held procedure recorded in
+    the bug entry.
   - **RFC-020 redesigned post-regenesis**
     ([RFC-020](specs/module-versioning.md), Draft 2026-08-16): schema
     evolution via per-module append-only migration chains — replay is

@@ -156,11 +156,16 @@ the existing pipeline:
   - proposed as the SOLE transaction of the final block, once the
     proposer observes drain complete (empty pool, tip applied)
   - Rule-8-style validation before voting (RFC-013 precedent): each
-    validator recomputes the snapshot over its own state at the same
-    height and votes ONLY if its hash matches — snapshot computation
-    inside the round is acceptable under on-demand heights (no other
-    work is pending by construction; timeout tuning noted in Open
-    Questions)
+    validator computes the snapshot over its own state at the same
+    height and votes ONLY if its hash matches. The hash is computed
+    once per decided tip, OUTSIDE the round: every node warms its own
+    cache from the drain watcher once the moratorium has drained
+    (`regenesis::artifact_cache`), the proposer reads it with the tip in
+    one transaction, and a validator whose own computation is still
+    running votes nil rather than computing on the shell. In a
+    moratorium a proposer with nothing to propose proposes nothing (an
+    empty block would move the tip and void the precomputed hashes).
+    See Open Question 1
     - if the proposal reaches quorum DESPITE a local mismatch, the
       decided hash wins — decided is decided. The dissenting
       validator's own state is the anomaly: silent divergence or
@@ -611,10 +616,16 @@ protocol it checks.
       admissibility predicate (`regenesis::gate`) is ONE seam,
       deliberately generic: future dynamic module enable/disable adds
       committed-state inputs to it, no new chokepoints
-    - drain semantics kept per spec (staged work completes; the
-      forwarded path stays ungated BY DESIGN). Byzantine drain-padding
-      degrades to the wedged-drain failure mode, answered by abort; a
-      consensus-visible drain deadline is noted as future hardening
+    - drain semantics kept per spec: work already pooled at a proposer
+      completes, a re-forward of it included. NEW forwarded work is
+      refused at the receiver against the receiver's committed phase
+      (`rpc::handle_transaction_forward`), not the forwarder's: a node
+      still syncing toward the tip reads Normal through the whole
+      boundary, and its crons kept the pools from draining in the
+      2026.10.14 crossing (consensus-bugs.md 23). Byzantine
+      drain-padding degrades to the wedged-drain failure mode,
+      answered by abort; a consensus-visible drain deadline is noted
+      as future hardening
     - the sealed mesh parks: `spawn_engine` refuses over the durable
       `regenesis_sealed_at` marker and recomputes a missing artifact
       idempotently — the S6 restart consumes both
@@ -901,9 +912,14 @@ No new verification machinery — new scenarios for existing tools:
 
 ## Open Questions
 
-1. Commit-round pacing: Rule-8 recompute of the snapshot inside the
-   voting round is seconds-slow on large states — acceptable under
-   on-demand heights, but timeout tuning needs measurement
+1. ~~Commit-round pacing~~ — RESOLVED for 2026.10.15. Measured on the
+   live mesh at the 2026.10.14 crossing: 75-150 s per artifact
+   computation (~6.7M inventory rows, ~3.1M fragment hashes), against
+   ~3 s round timeouts, so no seal decided inside a round. The hash is
+   now computed once per decided tip outside the round (see the
+   vote-iff-match rule above; consensus-bugs.md 23). Crossings OUT OF
+   2026.10.13 and earlier still compute in the round and need the
+   hand-held procedure recorded there
 2. Authorization class for the boundary routes: "network admin" still
    needs a concrete definition (genesis user? explicit role?) — shared
    with issue #21's remove_node authorization. **Partially narrowed**,
