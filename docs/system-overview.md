@@ -860,7 +860,10 @@ Cross-platform desktop application providing file management and network adminis
 ### 6. Security & Authentication ([RFC-006](specs/security.md))
 **Status**: Core Complete, Extensions Planned
 
-End-to-end encryption and comprehensive authentication system.
+Server-side encryption and comprehensive authentication system. Not
+client E2E as built: the node serving a session holds the user's key
+([RFC-014](specs/hopnet-storage.md) trust model); client-held keys are
+specified in [RFC-027](specs/untrusted-sessions.md).
 
 - [x] Ed25519 cryptographic identity for nodes and users
 - [x] X25519 key derivation for file access control
@@ -870,6 +873,16 @@ End-to-end encryption and comprehensive authentication system.
 - [x] Consensus operation authentication and validation
 - [x] TLS-only network surface with per-node self-signed cert and SPKI pairing ([RFC-022](specs/pinned-https.md)); plaintext HTTP is loopback-only
 - [x] Android Hop Drive client — live SAF provider over pinned HTTPS with RFC-023 client compat (identity header, typed 426, upgrade banner/notification) and an automated e2e harness (`nix develop .#android` + `scripts/android/e2e.sh`) ([spec](specs/hop-drive-android.md))
+- [ ] Sessions on untrusted nodes — client-held keys, signed ingest,
+      module-owned reads ([RFC-027](specs/untrusted-sessions.md),
+      Draft 2026-10-11; tracking #12): delegated device keys replace
+      RFC-012's wrapped-key tokens, clients sign their own transactions
+      and upload ciphertext. Phase 0 prerequisites (fragment fsync, RS
+      goldens, signed nonces) [ ]; Phase 1 device identity + both
+      ingests + ingress [ ]; Phase 2 drive-core on the node [ ];
+      Phase 3 Hop Drive client mode [ ]; Phase 4 mount [ ]; Phase 5
+      iroh binding [ ]; Phase 6 co-resident clients + RFC-012
+      retirement [ ]
 - [ ] Advanced permission models (read-only, time-limited access)
 - [ ] Key rotation and recovery mechanisms
 - [ ] Audit logging and security monitoring
