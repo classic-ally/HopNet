@@ -895,23 +895,28 @@ where
                     outcome.failed += unserved.len().saturating_sub(r.regenerated);
                 }
                 Err(EngineError::NoSpace) => outcome.held_for_space += unserved.len(),
+                // Fewer than K shards anywhere reachable: retrying next pass
+                // only sweeps the storage view again for nothing, so the
+                // blob parks with backoff like one whose holders are dark.
                 Err(e) => {
                     tracing::warn!(
                         "pull: blob {blob_id} chunk {chunk}: {} classes unsourceable and rebuild failed: {e}",
                         unserved.len()
                     );
                     outcome.failed += unserved.len();
+                    park = true;
                 }
             }
         }
 
-        // A class whose known holders are all dark parks the blob so the
-        // window admits blobs that can move. A blob with nothing left
-        // failing leaves the park book.
+        // A class whose known holders are all dark, or whose rebuild could
+        // not source K shards, parks the blob so the window admits blobs
+        // that can move. A blob with nothing left failing leaves the park
+        // book.
         let now = std::time::Instant::now();
         if park {
             sched.park_blob(blob_id, now);
-            tracing::debug!("pull: blob {blob_id} parked: its sources are unreachable");
+            tracing::debug!("pull: blob {blob_id} parked: its sources are unreachable or below K");
         } else if wait_for_rebuild_slot {
             outcome.retry_after = sched.park_blob_for_rebuild(blob_id, now);
             tracing::debug!("pull: blob {blob_id} waits for a rebuild slot");
@@ -1333,22 +1338,31 @@ mod tests {
     // outside every cap, for classes the holder would serve once back.
     // Should: park a blob whose unserved classes are held only by dark
     // peers, without rebuilding.
-    // Should: still try a rebuild (and not park) when the holders answer
-    // but do not serve the class.
+    // Should: still rebuild (and not park) the classes the holders answer
+    // for but do not serve.
     #[tokio::test(flavor = "multi_thread")]
     async fn dark_holders_park_the_blob_instead_of_rebuilding() {
         let base = std::env::temp_dir().join(format!("hopnet-pull-dark-{}", std::process::id()));
         let dir_src = base.join("src").to_str().unwrap().to_string();
         let dir_dst = base.join("dst").to_str().unwrap().to_string();
         std::fs::create_dir_all(&dir_dst).unwrap();
-        let (blob_id, _outcome, manifest) = encoded_blob(&dir_src).await;
+        let (blob_id, outcome, manifest) = encoded_blob(&dir_src).await;
         let net = Arc::new(PullNet {
             manifest: Mutex::new(Some(manifest)),
             target: Some(all_mine(9)),
             ..Arc::try_unwrap(idle_net()).ok().unwrap()
         });
+        // Node 2 serves only the K originals: reachable, the 20 recovery
+        // classes it does not serve are rebuilt from them.
+        for f in outcome.fragments.iter().filter(|f| !f.recovery) {
+            let data = fragstore::read_fragment(&dir_src, &f.fragment_hash).unwrap();
+            net.served.lock().unwrap().insert(f.fragment_hash, data);
+        }
 
-        for (two_reachable, parks) in [(false, true), (true, false)] {
+        // (node 2 reachable, failed, rebuilt, parked); dark runs first, so
+        // nothing is on disk yet.
+        for (two_reachable, failed, rebuilt, parks) in [(false, 30, 0, true), (true, 0, 20, false)]
+        {
             let seams = Seams {
                 transport: net.clone(),
                 state: Arc::new(HeldOnTwo {
@@ -1366,8 +1380,8 @@ mod tests {
             };
             let sched = FetchScheduler::new(PullLimits::default());
             let (result, _) = pull_with_sched(&seams, &dir_dst, &blob_id, &sched).await;
-            assert_eq!(result.failed, 30);
-            assert_eq!(result.rebuilt, 0);
+            assert_eq!(result.failed, failed, "node 2 reachable: {two_reachable}");
+            assert_eq!(result.rebuilt, rebuilt, "node 2 reachable: {two_reachable}");
             assert_eq!(
                 sched.blob_parked(&blob_id, std::time::Instant::now()),
                 parks,
@@ -1391,9 +1405,22 @@ mod tests {
     async fn departed_holders_rebuild_and_dark_members_do_not() {
         let base = std::env::temp_dir().join(format!("hopnet-pull-escal-{}", std::process::id()));
         let dir_src = base.join("src").to_str().unwrap().to_string();
-        let dir_dst = base.join("dst").to_str().unwrap().to_string();
-        std::fs::create_dir_all(&dir_dst).unwrap();
-        let (blob_id, _outcome, manifest) = encoded_blob(&dir_src).await;
+        let (blob_id, outcome, mut manifest) = encoded_blob(&dir_src).await;
+        // This node already holds the K originals, so a rebuild that runs
+        // regenerates the 20 recovery classes from local shards.
+        for (originals, _) in manifest.chunks.values_mut() {
+            for (_, _, stored_locally) in originals.values_mut() {
+                *stored_locally = true;
+            }
+        }
+        let holding_originals = |name: &str| {
+            let dir = base.join(name).to_str().unwrap().to_string();
+            for f in outcome.fragments.iter().filter(|f| !f.recovery) {
+                let data = fragstore::read_fragment(&dir_src, &f.fragment_hash).unwrap();
+                fragstore::store_fragment(&dir, &f.fragment_hash, data).unwrap();
+            }
+            dir
+        };
         let net = Arc::new(PullNet {
             manifest: Mutex::new(Some(manifest)),
             target: Some(all_mine(9)),
@@ -1415,10 +1442,12 @@ mod tests {
             local_state: net.clone(),
         };
 
-        // Departed: its rows are not holders; the rebuild runs (and, with
-        // no shards anywhere, fails), and the blob is not parked.
+        // Departed: its rows are not holders; the rebuild runs, and the
+        // blob is not parked.
         let sched = FetchScheduler::new(PullLimits::default());
-        pull_with_sched(&seams_for(false), &dir_dst, &blob_id, &sched).await;
+        let dir_dst = holding_originals("departed");
+        let (result, _) = pull_with_sched(&seams_for(false), &dir_dst, &blob_id, &sched).await;
+        assert_eq!(result.rebuilt, 20);
         assert!(!sched.blob_parked(&blob_id, std::time::Instant::now()));
 
         // A member dark for a long time (its park entry hours old): still
@@ -1428,6 +1457,7 @@ mod tests {
         if let Some(long_ago) = now.checked_sub(std::time::Duration::from_secs(4 * 3600)) {
             sched.park_blob(&blob_id, long_ago);
         }
+        let dir_dst = holding_originals("member");
         let (result, _) = pull_with_sched(&seams_for(true), &dir_dst, &blob_id, &sched).await;
         assert_eq!(result.rebuilt, 0);
         assert!(sched.blob_parked(&blob_id, std::time::Instant::now()));
@@ -1715,6 +1745,52 @@ mod tests {
         assert!(
             !sched.blob_parked(&blob_id, now + fetch::REBUILD_WAIT_PARK),
             "a short flat wait, not the unreachable backoff"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Impact: a rebuild that found fewer than K shards neither parked nor
+    // unparked the blob, so the planner offered it again every pass: a
+    // fetch sweep across the storage view every few seconds per lost
+    // chunk, with the rebuild slots held by blobs that could never rebuild
+    // (2026.10.15: three such blobs kept a laptop at ~36 W).
+    // Should: park a blob whose rebuild cannot source K shards, with the
+    // unreachable backoff.
+    // Should: double that backoff when the rebuild fails again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unsourceable_rebuild_parks_with_backoff() {
+        let base =
+            std::env::temp_dir().join(format!("hopnet-pull-unsourceable-{}", std::process::id()));
+        let dir_src = base.join("src").to_str().unwrap().to_string();
+        let dir_dst = base.join("dst").to_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir_dst).unwrap();
+        let (blob_id, _outcome, manifest) = encoded_blob(&dir_src).await;
+        // Nothing is served anywhere: every class is unserved, and the
+        // rebuild finds 0 of K shards.
+        let net = Arc::new(PullNet {
+            manifest: Mutex::new(Some(manifest)),
+            target: Some(all_mine(9)),
+            ..Arc::try_unwrap(idle_net()).ok().unwrap()
+        });
+        let sched = FetchScheduler::new(PullLimits::default());
+        let secs = std::time::Duration::from_secs;
+
+        let (first, _) = pull_with_sched(&seams(net.clone()), &dir_dst, &blob_id, &sched).await;
+        assert_eq!(first.rebuilt, 0);
+        assert_eq!(first.failed, 30);
+        let now = std::time::Instant::now();
+        assert!(
+            sched.blob_parked(&blob_id, now + fetch::BLOB_PARK_BASE - secs(1)),
+            "parked with the unreachable backoff, not offered again next pass"
+        );
+        assert!(!sched.blob_parked(&blob_id, now + fetch::BLOB_PARK_BASE + secs(1)));
+
+        let (second, _) = pull_with_sched(&seams(net.clone()), &dir_dst, &blob_id, &sched).await;
+        assert_eq!(second.failed, 30);
+        let now = std::time::Instant::now();
+        assert!(
+            sched.blob_parked(&blob_id, now + fetch::BLOB_PARK_BASE + secs(1)),
+            "the backoff doubles"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
