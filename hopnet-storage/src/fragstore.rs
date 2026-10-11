@@ -375,9 +375,28 @@ pub fn fetch_and_verify_fragment(
     Ok(chunk_data)
 }
 
+/// Verify a fragment on disk without keeping its bytes: the file is hashed
+/// as it is read, through a fixed buffer, so memory stays flat whatever the
+/// fragment's size. Errors as `fetch_and_verify_fragment`.
+pub fn verify_fragment(
+    fragment_hash: &Blake3Hash,
+    fragments_dir: &str,
+) -> Result<(), StorageError> {
+    let dir_path = create_fragment_path(fragments_dir, fragment_hash)?;
+    let file = fs::File::open(format!("{}/{}", dir_path, fragment_hash.to_hex()))
+        .map_err(StorageError::Io)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(file).map_err(StorageError::Io)?;
+    if Blake3Hash::new(hasher.finalize()) != *fragment_hash {
+        tracing::error!("Fragment hash mismatch: expected {:?}", fragment_hash);
+        return Err(StorageError::HashMismatch);
+    }
+    Ok(())
+}
+
 /// Check if a fragment exists on disk and is valid (hash matches)
 pub fn fragment_exists_and_valid(fragments_dir: &str, fragment_hash: &Blake3Hash) -> bool {
-    fetch_and_verify_fragment(fragment_hash, fragments_dir).is_ok()
+    verify_fragment(fragment_hash, fragments_dir).is_ok()
 }
 
 /// What the scrub found over one slice. Only `corrupt` is a verdict on the
@@ -428,8 +447,8 @@ pub fn verify_listing(
         if d.hash.as_bytes()[0] % slices.max(1) != slice {
             continue;
         }
-        match fetch_and_verify_fragment(&d.hash, fragments_dir) {
-            Ok(_) => {
+        match verify_fragment(&d.hash, fragments_dir) {
+            Ok(()) => {
                 outcome.files_read += 1;
                 outcome.bytes_read = outcome.bytes_read.saturating_add(d.size);
             }
@@ -670,6 +689,49 @@ mod tests {
         assert!(!fragment_exists_and_valid(&dir, &hash));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Impact: the rehash after a pull and the sweep's scrub verify without
+    // reading the file into memory; their verdict must stay the one
+    // fetch_and_verify_fragment gives.
+    // Should: accept an intact fragment larger than the hashing buffer.
+    // Should: reject a fragment with one flipped byte, or truncated, as a
+    // hash mismatch.
+    // Should: report a missing fragment as a not-found I/O error.
+    #[test]
+    fn streaming_verify_agrees_with_reading_the_whole_fragment() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().to_str().unwrap();
+        let data: Vec<u8> = (0..(4 << 20) + 17).map(|i| (i * 13 + 5) as u8).collect();
+        let hash = Blake3Hash::new(blake3::hash(&data));
+        store_fragment(dir, &hash, data.clone()).unwrap();
+        assert!(verify_fragment(&hash, dir).is_ok());
+        assert!(fetch_and_verify_fragment(&hash, dir).is_ok());
+
+        let path = format!(
+            "{}/{}",
+            create_fragment_path(dir, &hash).unwrap(),
+            hash.to_hex()
+        );
+        let mut flipped = data.clone();
+        flipped[3 << 20] ^= 1;
+        for bad in [flipped, data[..data.len() - 1].to_vec()] {
+            fs::write(&path, &bad).unwrap();
+            assert!(matches!(
+                verify_fragment(&hash, dir),
+                Err(StorageError::HashMismatch)
+            ));
+            assert!(matches!(
+                fetch_and_verify_fragment(&hash, dir),
+                Err(StorageError::HashMismatch)
+            ));
+        }
+
+        fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            verify_fragment(&hash, dir),
+            Err(StorageError::Io(e)) if e.kind() == io::ErrorKind::NotFound
+        ));
     }
 
     // Impact: the 2026-10-01 live scrub reported 5,525 corrupt fragments
