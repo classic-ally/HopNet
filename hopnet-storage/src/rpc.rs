@@ -34,6 +34,10 @@ pub enum FragmentRequest {
     /// Store a fragment (content-addressed; the server verifies).
     Store {
         fragment_hash: Blake3Hash,
+        // As bytes, not a sequence of u8: one allocation of the exact size
+        // and a memcpy, where the sequence form grows a Vec element by
+        // element. The bincode encoding is identical either way.
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
 }
@@ -46,6 +50,8 @@ pub enum FragmentResponse {
     },
     Fetch {
         found: bool,
+        // As bytes (see FragmentRequest::Store).
+        #[serde(with = "serde_bytes")]
         data: Option<Vec<u8>>,
     },
     Store {
@@ -248,6 +254,111 @@ impl<R: hopnet_comms::Rpc> Transport for RpcTransport<R> {
             other => Err(TransportError::Transport(format!(
                 "unexpected response to Health: {other:?}"
             ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The messages as they were encoded before the byte fields were
+    /// marked `serde_bytes`: what a peer on an older release sends and
+    /// expects.
+    mod sequence_form {
+        use super::*;
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        pub enum FragmentRequest {
+            Health {
+                fragment_hash: Blake3Hash,
+            },
+            Fetch {
+                fragment_hash: Blake3Hash,
+            },
+            Store {
+                fragment_hash: Blake3Hash,
+                data: Vec<u8>,
+            },
+        }
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        pub enum FragmentResponse {
+            Health {
+                healthy: bool,
+            },
+            Fetch {
+                found: bool,
+                data: Option<Vec<u8>>,
+            },
+            Store {
+                success: bool,
+                already_existed: bool,
+            },
+            Error {
+                message: String,
+            },
+        }
+    }
+
+    fn bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 7 + 3) as u8).collect()
+    }
+
+    // Impact: the byte fields' serde form is a wire contract with peers on
+    // older releases; a different encoding would break fetch and store
+    // across a mixed mesh.
+    // Should: encode fetch replies and store requests to the same bytes as
+    // the sequence form, for empty, small and multi-megabyte payloads.
+    // Should: decode what the sequence form encodes, and vice versa.
+    #[test]
+    fn byte_fields_keep_the_sequence_wire_format() {
+        let hash = Blake3Hash::new(blake3::hash(b"fragment"));
+        for len in [0, 1, 300, 4 << 20] {
+            let data = bytes(len);
+
+            let new = encode(&FragmentRequest::Store {
+                fragment_hash: hash,
+                data: data.clone(),
+            });
+            let old = encode(&sequence_form::FragmentRequest::Store {
+                fragment_hash: hash,
+                data: data.clone(),
+            });
+            assert_eq!(new, old, "store request, {len} bytes");
+            let (back, _): (FragmentRequest, usize) =
+                bincode::serde::decode_from_slice(&old, bincode::config::standard()).unwrap();
+            assert!(matches!(back, FragmentRequest::Store { data: d, .. } if d == data));
+
+            for payload in [None, Some(data.clone())] {
+                let new = encode(&FragmentResponse::Fetch {
+                    found: payload.is_some(),
+                    data: payload.clone(),
+                });
+                let old = encode(&sequence_form::FragmentResponse::Fetch {
+                    found: payload.is_some(),
+                    data: payload.clone(),
+                });
+                assert_eq!(
+                    new,
+                    old,
+                    "fetch reply, {len} bytes, some={}",
+                    payload.is_some()
+                );
+                assert!(matches!(
+                    decode_response(&old).unwrap(),
+                    FragmentResponse::Fetch { data: d, .. } if d == payload
+                ));
+                let (back, _): (sequence_form::FragmentResponse, usize) =
+                    bincode::serde::decode_from_slice(&new, bincode::config::standard()).unwrap();
+                assert_eq!(
+                    back,
+                    sequence_form::FragmentResponse::Fetch {
+                        found: payload.is_some(),
+                        data: payload
+                    }
+                );
+            }
         }
     }
 }

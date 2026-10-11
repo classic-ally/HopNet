@@ -3113,6 +3113,7 @@ dependencies = [
  "reed-solomon-simd",
  "rusqlite",
  "serde",
+ "serde_bytes",
  "serde_json",
  "tempfile",
  "tokio",
