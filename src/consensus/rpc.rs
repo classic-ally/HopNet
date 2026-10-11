@@ -76,9 +76,28 @@ pub async fn handle_transaction_forward(
     let mut pending_txs = Vec::new();
     let mut pending_indices = Vec::new();
 
+    // Regenesis admission (RFC-019 S5), checked HERE against this node's
+    // committed phase: the forwarder checked its own, and a node still
+    // syncing toward the tip reads Normal through the whole boundary. Its
+    // crons kept every validator's pool from draining and the seal was
+    // vetoed round after round (2026.10.14 crossing). Work already pooled
+    // here was accepted before the boundary and still drains: a re-forward
+    // of it joins its pooled entry.
+    let boundary = app_state
+        .db_pool
+        .get()
+        .ok()
+        .and_then(|conn| crate::db::regenesis::read_regenesis_state(&conn).ok())
+        .filter(|state| state.phase != crate::db::regenesis::RegenesisPhase::Normal);
+    let pool = app_state.consensus_queue.pending_pool();
+
     for (i, tx) in req.transactions.into_iter().enumerate() {
         if committed_nonces.contains(&tx.nonce.to_string()) {
             results_map[i] = Some(TransactionForwardResult::Committed);
+        } else if let Some(reason) = moratorium_refusal(boundary.as_ref(), &tx.rpc.function, || {
+            pool.contains_nonce(&tx.nonce)
+        }) {
+            results_map[i] = Some(TransactionForwardResult::Retry { reason });
         } else {
             pending_indices.push(i);
             pending_txs.push(tx);
@@ -106,6 +125,28 @@ pub async fn handle_transaction_forward(
 
     let results = results_map.into_iter().map(|r| r.unwrap()).collect();
     TransactionForwardResponse { results }
+}
+
+/// The `Retry` reason refusing a forwarded `function` while a regenesis
+/// boundary holds this node's committed state, or `None` to accept it: the
+/// boundary's own ops pass, and so does work already pooled here
+/// (`pooled`, asked only when it matters).
+pub(crate) fn moratorium_refusal(
+    boundary: Option<&crate::db::regenesis::RegenesisState>,
+    function: &str,
+    pooled: impl FnOnce() -> bool,
+) -> Option<String> {
+    let state = boundary?;
+    if crate::regenesis::gate::admissible_in_phase(state.phase, function) || pooled() {
+        return None;
+    }
+    Some(
+        super::queue::ConsensusSubmitError::Moratorium {
+            phase: crate::regenesis::gate::phase_str(state.phase),
+            target_version_code: state.target_version_code,
+        }
+        .to_string(),
+    )
 }
 
 /// Result from the two-phase forward protocol.

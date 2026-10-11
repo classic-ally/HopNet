@@ -1108,3 +1108,51 @@ fn status_g0_roundtrip_through_the_head_adapter() {
     assert_eq!(epoch, 1);
     assert_eq!(version_code, crate::version::effective_running_code());
 }
+
+// Impact: 2026.10.14 crossing — the forwarder's own gate read its own
+// committed phase, Normal on a node 200k blocks behind; its forwards filled
+// the validators' pools and the seal was vetoed round after round.
+// Should: refuse a forwarded ordinary transaction at the receiver while the
+// receiver's committed state holds the moratorium, with the retryable
+// moratorium reason, and leave it out of the pool.
+#[test]
+fn a_forward_is_refused_against_the_receivers_moratorium() {
+    let node = MockNode::new(3);
+    register_node(&node);
+    {
+        let mut conn = node.app_state.db_pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        set_moratorium_tx(&db_tx, 20261015).unwrap();
+        db_tx.commit().unwrap();
+    }
+    let tx = Transaction::new(
+        "attest_fragments".to_string(),
+        vec![],
+        node.node_id,
+        &node.signing_key,
+    )
+    .unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let response = rt.block_on(crate::consensus::rpc::handle_transaction_forward(
+        crate::consensus::rpc::TransactionForwardRequest {
+            transactions: vec![tx],
+            height: 1,
+        },
+        &node.app_state,
+    ));
+    match &response.results[..] {
+        [crate::consensus::rpc::TransactionForwardResult::Retry { reason }] => assert_eq!(
+            crate::consensus::queue::moratorium_phase(reason),
+            Some("moratorium")
+        ),
+        other => panic!("expected a moratorium refusal, got {other:?}"),
+    }
+    assert_eq!(
+        node.app_state.consensus_queue.pending_pool().staged_len(),
+        0
+    );
+}

@@ -83,3 +83,83 @@ fn rejection_of_a_locally_committed_nonce_resolves_as_committed() {
         ConsensusResult::Rejected(reason) if reason == "ProcessingError"
     ));
 }
+
+// Impact: 2026.10.14 crossing — lagging nodes, still Normal on their own
+// stale state, kept forwarding their crons through the moratorium; re-queued
+// forever on every refusal, they kept the validators' pools from draining.
+// Should: resolve a forward the proposer refused for a regenesis boundary as
+// the retryable moratorium result, without scheduling a retry.
+// Should: still re-queue any other transient refusal.
+#[test]
+fn a_moratorium_refusal_resolves_instead_of_retrying() {
+    let network = MockNetwork::setup_with_validators(3);
+    let app_state = &network.nodes[0].app_state;
+    let mut conn = app_state.db_pool.get().expect("pool");
+    let pool = PendingPool::default();
+    let (refused, mut refused_rx) = QueuedTransaction::new(signed_tx(&network));
+    let (busy, _busy_rx) = QueuedTransaction::new(signed_tx(&network));
+    let moratorium = crate::consensus::rpc::moratorium_refusal(
+        Some(&crate::db::regenesis::RegenesisState {
+            phase: crate::db::regenesis::RegenesisPhase::Moratorium,
+            target_version_code: Some(20261015),
+            snapshot_hash: None,
+            seal_height: None,
+        }),
+        "submit_metrics",
+        || false,
+    )
+    .expect("an ordinary function is refused in a moratorium");
+
+    let (retries, _) = process_forward_results(
+        vec![refused, busy],
+        vec![
+            TransactionForwardResult::Retry { reason: moratorium },
+            TransactionForwardResult::Retry {
+                reason: "queue full".into(),
+            },
+        ],
+        2,
+        &mut conn,
+        &pool,
+    );
+    assert_eq!(retries.len(), 1, "only the other transient refusal retries");
+    assert!(matches!(
+        refused_rx.try_recv().expect("resolved"),
+        ConsensusResult::Moratorium {
+            phase: "moratorium"
+        }
+    ));
+}
+
+// Should: refuse a forwarded ordinary function while a boundary holds.
+// Should not: refuse the boundary's own ops, work already pooled here, or
+// anything outside a boundary.
+#[test]
+fn forwarded_work_is_refused_only_during_a_boundary_and_only_when_new() {
+    use crate::consensus::rpc::moratorium_refusal;
+    use crate::db::regenesis::{RegenesisPhase, RegenesisState};
+    let state = |phase| RegenesisState {
+        phase,
+        target_version_code: Some(20261015),
+        snapshot_hash: None,
+        seal_height: None,
+    };
+    let moratorium = state(RegenesisPhase::Moratorium);
+
+    assert!(moratorium_refusal(Some(&moratorium), "attest_fragments", || false).is_some());
+    assert!(
+        moratorium_refusal(
+            Some(&state(RegenesisPhase::Sealed)),
+            "attest_fragments",
+            || false
+        )
+        .is_some()
+    );
+    assert!(moratorium_refusal(Some(&moratorium), "regenesis_abort", || false).is_none());
+    assert!(moratorium_refusal(Some(&moratorium), "regenesis_commit", || false).is_none());
+    assert!(
+        moratorium_refusal(Some(&moratorium), "attest_fragments", || true).is_none(),
+        "already pooled here: it drains"
+    );
+    assert!(moratorium_refusal(None, "attest_fragments", || false).is_none());
+}

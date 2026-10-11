@@ -4,10 +4,15 @@
 //! cron funnels through `ConsensusQueue::submit`/`submit_batch`) and at
 //! the proposer's own injection site (`system.cleanup_nonces`).
 //!
-//! Deliberately NOT consulted: `enqueue_forwarded` and the pending pool —
-//! already-accepted work drains through the moratorium by design
-//! (spec: "accepted work completes consensus"; Quint model: `drainOne`
-//! carries no phase guard, `admitOne` does).
+//! Also consulted for forwarded work, at the receiver
+//! (`rpc::handle_transaction_forward`) against the receiver's own committed
+//! phase: a forwarder still syncing toward the tip reads Normal through the
+//! whole boundary, and its crons kept the validators' pools from draining
+//! (2026.10.14 crossing). Deliberately NOT consulted for the pending pool:
+//! work already pooled at a proposer was accepted before the boundary and
+//! drains through the moratorium by design (spec: "accepted work completes
+//! consensus"; Quint model: `drainOne` carries no phase guard, `admitOne`
+//! does), a re-forward of it included.
 //!
 //! This is also the future insertion point for dynamic module
 //! enable/disable (RFC-020 territory): new committed-state inputs join

@@ -59,6 +59,27 @@ pub(crate) enum ConsensusResult {
     },
     Rejected(String),
     Failed(String),
+    /// The proposer refused the forward because a regenesis boundary is in
+    /// progress on its committed state (`moratorium_phase`): retryable,
+    /// surfaced as `ConsensusSubmitError::Moratorium`. Local only — the wire
+    /// carries it as a `Retry` reason older nodes still decode.
+    Moratorium {
+        phase: &'static str,
+    },
+}
+
+/// The regenesis phase a forward refusal names, when its reason is a
+/// moratorium refusal (`ConsensusSubmitError::Moratorium`'s Display, as the
+/// receiver sends it in `TransactionForwardResult::Retry`).
+pub(crate) fn moratorium_phase(reason: &str) -> Option<&'static str> {
+    ["moratorium", "sealed"].into_iter().find(|phase| {
+        reason
+            == ConsensusSubmitError::Moratorium {
+                phase,
+                target_version_code: None,
+            }
+            .to_string()
+    })
 }
 
 /// Every submitter waiting on one queued transaction. Normally one; a
@@ -262,6 +283,21 @@ impl PendingPool {
         queued.push(entry);
         drop(queued);
         self.work.notify_one();
+    }
+
+    /// Whether a transaction with `nonce` is staged or in flight here.
+    pub fn contains_nonce(&self, nonce: &hopnet_common::CustomUUID) -> bool {
+        self.inflight
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|i| &i.entry.tx.nonce == nonce)
+            || self
+                .queued
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|q| &q.tx.nonce == nonce)
     }
 
     /// Wait for staged work (engine driver wake rule 1). Consumes at most one
@@ -541,6 +577,9 @@ impl ConsensusQueue {
 
     /// Enqueue forwarded transactions (from another node). Skips pre-validation
     /// since the submitting node already validated and the leader's preflight will catch issues.
+    /// The moratorium gate runs before this, at the receiver
+    /// (`rpc::handle_transaction_forward`): a forwarder's own gate reads its
+    /// own committed phase, which is stale while it syncs toward the tip.
     /// Stage forwarded transactions DIRECTLY into the PendingPool, bypassing
     /// the submit channel. The batch was already drained and batched by the
     /// forwarding peer's processor, and it was sent HERE because this node is
@@ -640,6 +679,10 @@ async fn await_result(rx: oneshot::Receiver<ConsensusResult>) -> Result<u64, Con
         Ok(Ok(ConsensusResult::Committed { height })) => Ok(height),
         Ok(Ok(ConsensusResult::Rejected(reason))) => Err(ConsensusSubmitError::Rejected(reason)),
         Ok(Ok(ConsensusResult::Failed(msg))) => Err(ConsensusSubmitError::InternalError(msg)),
+        Ok(Ok(ConsensusResult::Moratorium { phase })) => Err(ConsensusSubmitError::Moratorium {
+            phase,
+            target_version_code: None,
+        }),
         Ok(Err(_)) => Err(ConsensusSubmitError::InternalError(
             "result channel dropped".into(),
         )),
@@ -1176,6 +1219,17 @@ pub(crate) fn process_forward_results(
                 }
             }
             super::rpc::TransactionForwardResult::Retry { reason } => {
+                // The proposer's committed state is past a regenesis start
+                // this node has not caught up to: re-forwarding would only be
+                // refused again until the boundary resolves. Hand the
+                // submitter the retryable 503 now instead.
+                if let Some(phase) = moratorium_phase(&reason) {
+                    tracing::debug!(
+                        "proposer node {proposer} refused a forward: regenesis {phase} in progress"
+                    );
+                    let _ = queued.notifier.send(ConsensusResult::Moratorium { phase });
+                    continue;
+                }
                 tracing::debug!(
                     "Transient forward failure from proposer node {}: {}",
                     proposer,
