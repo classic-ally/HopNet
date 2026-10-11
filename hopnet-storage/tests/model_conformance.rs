@@ -186,7 +186,7 @@ fn protection_memo_and_guard_match_the_model() {
                     .map(|n| *n as i32)
                     .collect();
                 assert_eq!(
-                    p.holders(f),
+                    &p.holders(f).iter().copied().collect::<BTreeSet<i32>>(),
                     &model_holders,
                     "{} state {i} class {f}: memo differs (confirmed {:?}, target {:?})",
                     path.display(),

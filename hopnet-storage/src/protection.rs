@@ -25,8 +25,6 @@
 //! evictor. Single-sourced by design: computing the guard anywhere else is
 //! the only way to reintroduce the loss.
 
-use std::collections::BTreeSet;
-
 /// Class → responsible node under one storage view (index = class).
 pub type Assignment = Vec<i32>;
 
@@ -42,10 +40,16 @@ pub struct ProtectionEpochs {
 
 /// The model's `protectedBy` memo for one blob: per class, the union of
 /// responsible nodes over the confirmed epoch and every in-flight epoch.
+///
+/// Rows are packed: class `c`'s holders are `holders[starts[c]..starts[c + 1]]`,
+/// sorted and deduplicated. The sweep holds one memo per blob of a shard,
+/// and a set per class cost an allocation per class where this costs two
+/// per blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Protection {
     never_confirmed: bool,
-    holders_by_class: Vec<BTreeSet<i32>>,
+    starts: Vec<u32>,
+    holders: Vec<i32>,
 }
 
 impl Protection {
@@ -53,22 +57,31 @@ impl Protection {
     /// differing lengths (should not happen — one blob, one layout) are
     /// unioned up to the longest.
     pub fn from_epochs(epochs: &ProtectionEpochs) -> Self {
-        let n = epochs
-            .confirmed
-            .iter()
-            .chain(epochs.in_flight.iter())
-            .map(|a| a.len())
-            .max()
-            .unwrap_or(0);
-        let mut holders_by_class = vec![BTreeSet::new(); n];
-        for assignment in epochs.confirmed.iter().chain(epochs.in_flight.iter()) {
-            for (class, node) in assignment.iter().enumerate() {
-                holders_by_class[class].insert(*node);
+        let assignments = || epochs.confirmed.iter().chain(epochs.in_flight.iter());
+        let n = assignments().map(|a| a.len()).max().unwrap_or(0);
+        let mut starts = Vec::with_capacity(n + 1);
+        let mut holders = Vec::with_capacity(n * assignments().count());
+        for class in 0..n {
+            let start = holders.len();
+            starts.push(start as u32);
+            holders.extend(assignments().filter_map(|a| a.get(class).copied()));
+            let row = &mut holders[start..];
+            row.sort_unstable();
+            // Deduplicate the row in place: keep each node's first copy.
+            let mut kept = 0;
+            for i in 0..row.len() {
+                if kept == 0 || row[i] != row[kept - 1] {
+                    row[kept] = row[i];
+                    kept += 1;
+                }
             }
+            holders.truncate(start + kept);
         }
+        starts.push(holders.len() as u32);
         Self {
             never_confirmed: epochs.confirmed.is_none(),
-            holders_by_class,
+            starts,
+            holders,
         }
     }
 
@@ -77,8 +90,16 @@ impl Protection {
     pub fn unknown() -> Self {
         Self {
             never_confirmed: true,
-            holders_by_class: Vec::new(),
+            starts: Vec::new(),
+            holders: Vec::new(),
         }
+    }
+
+    /// One class's row, `None` beyond the memo's range.
+    fn row(&self, class: u32) -> Option<&[i32]> {
+        let class = class as usize;
+        let (start, end) = (*self.starts.get(class)?, *self.starts.get(class + 1)?);
+        Some(&self.holders[start as usize..end as usize])
     }
 
     /// The guard. A class beyond the memo's range fails closed.
@@ -86,17 +107,16 @@ impl Protection {
         if pinned || self.never_confirmed {
             return true;
         }
-        match self.holders_by_class.get(class as usize) {
+        match self.row(class) {
             Some(holders) => holders.contains(&node),
             None => true,
         }
     }
 
-    /// The protected holders of one class (the memo row), for parity
-    /// checks and observability. Empty beyond range.
-    pub fn holders(&self, class: u32) -> &BTreeSet<i32> {
-        static EMPTY: BTreeSet<i32> = BTreeSet::new();
-        self.holders_by_class.get(class as usize).unwrap_or(&EMPTY)
+    /// The protected holders of one class (the memo row, ascending), for
+    /// parity checks and observability. Empty beyond range.
+    pub fn holders(&self, class: u32) -> &[i32] {
+        self.row(class).unwrap_or(&[])
     }
 }
 
@@ -137,6 +157,23 @@ mod tests {
         assert!(!p.protects(2, 4, false));
     }
 
+    // Should: union epochs of differing lengths up to the longest, so a
+    // class only the longer epoch names is held by that epoch's node.
+    // Should: fail closed for a class beyond every epoch.
+    #[test]
+    fn epochs_of_differing_lengths_union_up_to_the_longest() {
+        let p = Protection::from_epochs(&ProtectionEpochs {
+            confirmed: Some(vec![1, 2]),
+            in_flight: vec![vec![2, 2, 4]],
+        });
+        assert_eq!(p.holders(0), [1, 2]);
+        assert_eq!(p.holders(1), [2]);
+        assert_eq!(p.holders(2), [4]);
+        assert!(p.holders(3).is_empty());
+        assert!(!p.protects(2, 1, false));
+        assert!(p.protects(3, 1, false));
+    }
+
     // Impact: the S0 counterexample — a supersede-declare must not strip
     // the earlier destination's freshly pulled copy of protection.
     // Should: protect the union of the confirmed epoch and EVERY in-flight
@@ -147,8 +184,8 @@ mod tests {
             confirmed: Some(vec![1, 1]),
             in_flight: vec![vec![2, 3], vec![4, 3]],
         });
-        assert_eq!(p.holders(0), &[1, 2, 4].into_iter().collect());
-        assert_eq!(p.holders(1), &[1, 3].into_iter().collect());
+        assert_eq!(p.holders(0), [1, 2, 4]);
+        assert_eq!(p.holders(1), [1, 3]);
         assert!(p.protects(0, 2, false), "first destination stays protected");
         assert!(p.protects(0, 4, false));
         assert!(!p.protects(1, 2, false));

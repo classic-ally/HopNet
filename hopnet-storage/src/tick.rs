@@ -150,7 +150,7 @@ impl ModelState {
         };
         let prot = Protection::from_epochs(&epochs);
         (0..p.n_frags)
-            .map(|f| (f, prot.holders(f).clone()))
+            .map(|f| (f, prot.holders(f).iter().copied().collect()))
             .collect()
     }
 }
